@@ -23,7 +23,8 @@
   // Model discovery lives outside X: its state survives switching tabs, and a
   // scan is read-only, so re-rendering must not throw the results away.
   var SCAN = { busy: false, rows: [], err: '', custom: '', vram: '',
-               pick: {}, name: {}, def: '', importing: false };
+               pick: {}, name: {}, def: '', importing: false,
+               collapsed: false, collapsedGroups: {} };
   // Same for the Auto-Tune wizard: the answers and the preview survive
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
@@ -720,6 +721,37 @@
     if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
     if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
     if (!SCAN.rows.length) return box;
+    var n = pickedRows().length;
+    box.appendChild(h('div', { class: 'row scan-header' },
+      h('span', { class: 'scan-header-title grow', text: t('settings.scan.header', { total: SCAN.rows.length, selected: n }, 'Scanned models (' + SCAN.rows.length + ') \u00b7 ' + n + ' selected') }),
+      h('button', {
+        id: 'scanCollapseBtn',
+        type: 'button',
+        class: 'small ghost',
+        'aria-expanded': SCAN.collapsed ? 'false' : 'true',
+        text: SCAN.collapsed
+          ? '\u25B8 ' + t('settings.scan.show_list', null, 'Show list')
+          : '\u25BE ' + t('settings.scan.hide_list', null, 'Hide list'),
+        onclick: function () { SCAN.collapsed = !SCAN.collapsed; render(); }
+      }),
+      h('button', {
+        id: 'scanCloseBtn',
+        type: 'button',
+        class: 'small ghost',
+        title: t('settings.scan.close_title', null, 'Dismiss scanned models list'),
+        text: '\u2715 ' + t('settings.scan.close', null, 'Close'),
+        onclick: function () {
+          SCAN.rows = [];
+          SCAN.pick = {};
+          SCAN.name = {};
+          SCAN.def = '';
+          SCAN.err = '';
+          SCAN.collapsed = false;
+          SCAN.collapsedGroups = {};
+          render();
+        }
+      })));
+    if (SCAN.collapsed) return box;
     // pick whole sets at once: with 15+ GGUFs on one server you tick the two
     // you want by unselecting everything, not by hunting fourteen checkboxes
     box.appendChild(h('div', { class: 'row', style: 'margin:10px 0 4px' },
@@ -733,15 +765,28 @@
     SCAN.rows.forEach(function (r, i) {
       var k = rowKey(r);
       var skey = normUrl(r.server_url);
+      var grpCollapsed = !!SCAN.collapsedGroups[skey];
       if (skey !== last) {
         last = skey;
         var grp = groupRows(skey);
         tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7' },
           h('div', { class: 'row sg-group' },
-            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url }),
+            h('button', {
+              type: 'button',
+              class: 'small ghost scan-fold',
+              'aria-expanded': grpCollapsed ? 'false' : 'true',
+              title: t('settings.scan.toggle_group', null, "Expand or collapse this server's models"),
+              text: grpCollapsed ? '\u25B8' : '\u25BE',
+              onclick: function () {
+                SCAN.collapsedGroups[skey] = !SCAN.collapsedGroups[skey];
+                render();
+              }
+            }),
+            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url + (grpCollapsed ? '  (' + grp.length + ')' : '') }),
             h('button', { class: 'small ghost', text: 'select all', onclick: function () { setPicks(grp, true); } }),
             h('button', { class: 'small ghost', text: 'unselect', onclick: function () { setPicks(grp, false); } })))));
       }
+      if (grpCollapsed) return;
       var name = h('input', { type: 'text', class: 'mono', value: SCAN.name[k] === undefined ? r.suggested_profile_name : SCAN.name[k], disabled: r.already_imported });
       name.addEventListener('input', function () {
         var fixed = sanitizeName(name.value);
@@ -761,14 +806,13 @@
           : r.loaded ? h('span', { class: 'tag act', text: 'loaded' }) : null)));
     });
     box.appendChild(h('table', { class: 'scan-table' }, h('thead', {}, head), tbody));
-    var n = pickedRows().length;
     box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
       h('button', { class: 'primary', text: SCAN.importing ? 'Importing\u2026' : 'Import Selected (' + n + ')', disabled: !n || SCAN.importing, onclick: doImport }),
       h('span', { class: 'muted small-text grow', text: 'each import becomes an editable profile, so you can tune per-model limits afterwards' })));
     return box;
   }
   function doScan() {
-    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; render();
+    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; SCAN.collapsed = false; SCAN.collapsedGroups = {}; render();
     var body = {};
     var extra = (SCAN.custom || '').trim();
     if (extra) body.urls = [extra];
@@ -820,6 +864,7 @@
         var k = rowKey(r);
         if (done[SCAN.name[k] || r.suggested_profile_name]) { r.already_imported = true; SCAN.pick[k] = false; if (SCAN.def === k) SCAN.def = ''; }
       });
+      SCAN.collapsed = true;
       X.data = j; pickDefaults(); render();
       PDC.toast((j.imported || []).length + ' profile(s) imported' + ((j.skipped || []).length ? ', ' + j.skipped.length + ' already there' : '') + (j.default_profile ? '; default is "' + j.default_profile + '"' : ''));
       PDC.refreshState();

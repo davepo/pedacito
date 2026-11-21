@@ -107,6 +107,44 @@ def test_gui_static_has_lang_switch_and_i18n_hooks():
     assert ".lang-switch" in app_css
 
 
+def test_gui_scan_collapse_close_and_topbar_row2_layout():
+    static_dir = Path(gui_server.STATIC)
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+    settings_js = (static_dir / "settings.js").read_text(encoding="utf-8")
+    app_css = (static_dir / "app.css").read_text(encoding="utf-8")
+
+    # WP-06: collapsible & closeable Scanned Models list in settings.js
+    assert "id: 'scanCollapseBtn'" in settings_js
+    assert "id: 'scanCloseBtn'" in settings_js
+    assert "collapsedGroups" in settings_js
+    assert "SCAN.collapsed = true" in settings_js
+    assert "settings.scan.header" in settings_js
+    assert "settings.scan.hide_list" in settings_js
+    assert "settings.scan.show_list" in settings_js
+    assert "settings.scan.close" in settings_js
+
+    # WP-06: per-run execution toggles moved out of #tbRow2 into Composer #composerBtns
+    tb_row2 = app_js[app_js.index('id="tbRow2"'):app_js.index("</header>", app_js.index('id="tbRow2"'))]
+    assert 'id="scoutChip"' in tb_row2
+    assert 'id="autoRouteChip"' not in tb_row2
+    assert 'id="postEditVerifyChip"' not in tb_row2
+    assert "!teleVisible && s.usage && s.usage.calls" in tb_row2
+
+    composer_btns = app_js[
+        app_js.index('id="composerBtns"'):app_js.index("function OptField", app_js.index('id="composerBtns"'))
+    ]
+    assert 'id="autoRouteChip"' in composer_btns
+    assert 'id="postEditVerifyChip"' in composer_btns
+    assert 'id="creativeBtn"' in composer_btns
+    assert 'id="refineBtn"' in composer_btns
+    assert 'id="optsBtn"' in composer_btns
+
+    # WP-06: responsive wrapping on #tbRow2 and compact HardwareBadge
+    assert "#tbRow2 { flex-wrap: wrap;" in app_css
+    assert "#modelChip b {" in app_css
+    assert "function _memCompact(" in app_js
+
+
 # --------------------------------------------------------------------- TUI --
 
 def test_tui_f3_parse_and_toggle(tmp_path, isolated_user_config):

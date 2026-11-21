@@ -80,8 +80,8 @@ __all__ = ["TuiSession", "enable_vt_mode", "parse_escape_sequence",
 # (SGR click capture) stay OFF by default; /mouse on or F2 enables them.
 _ALT_SCREEN_ON = ("\x1b[?1049h\x1b[?1007h\x1b[?1000l\x1b[?1006l"
                   "\x1b[?25l\x1b[2J\x1b[H")
-_ALT_SCREEN_OFF = ("\x1b[?1007l\x1b[?1000l\x1b[?1006l"
-                   "\x1b[?1049l\x1b[r\x1b[?25h")
+_ALT_SCREEN_OFF = ("\x1b[?2026l\x1b[0m\x1b[r\x1b[?1007l\x1b[?1000l\x1b[?1006l"
+                   "\x1b[?1049l\x1b[?25h")
 _MOUSE_SGR_ON = "\x1b[?1007l\x1b[?1000h\x1b[?1006h"
 _MOUSE_SGR_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?1007h"
 _SYNC_ON = "\x1b[?2026h"

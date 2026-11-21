@@ -3195,10 +3195,16 @@ PDC.consolidateSession = consolidateSession;
 // Background servers, model-server lifecycle, and live VRAM/RAM telemetry.
 // The badge polls slowly (15 s); the modal refreshes after every action.
 function _gb(n) { return Number(n || 0).toFixed(1); }
+function _gbShort(n) { return String(Math.round(Number(n || 0))); }
 function _memText(mem) {
   const v = (mem && mem.vram) || {}, r = (mem && mem.ram) || {};
   return 'VRAM: ' + _gb(v.used_gb) + ' / ' + _gb(v.total_gb) + ' GB | RAM: '
     + _gb(r.used_gb) + ' / ' + _gb(r.total_gb) + ' GB';
+}
+function _memCompact(mem) {
+  const v = (mem && mem.vram) || {}, r = (mem && mem.ram) || {};
+  return 'RAM ' + _gbShort(r.used_gb) + '/' + _gbShort(r.total_gb)
+    + 'G \u00B7 VRAM ' + _gbShort(v.used_gb) + '/' + _gbShort(v.total_gb) + 'G';
 }
 
 function HardwareBadge() {
@@ -3224,12 +3230,13 @@ function HardwareBadge() {
   const cards = (v.cards || []).map((c) => c.card + ' ' + _gb(c.used_gb)
     + '/' + _gb(c.total_gb) + ' GB (' + (c.source || '?') + ')').join('\n');
   return html`<span class="chip" id="hwChip"
-      title=${'hardware totals only \u2014 no per-process GPU attribution'
+      title=${_memText(mem)
+        + '\nhardware totals only \u2014 no per-process GPU attribution'
         + '\nRAM source: ' + (src.ram_total_gb || 'unavailable')
         + '\nVRAM source: ' + (src.vram_total_gb || 'unavailable')
         + (cards ? '\n' + cards : '')}
       onClick=${() => serversDialog()}>
-    <b>${_memText(mem)}</b>
+    <b>${_memCompact(mem)}</b>
   </span>`;
 }
 
@@ -3864,6 +3871,7 @@ function TopBar() {
   const activeCal = (s.calibration || {})[activeProf] || {};
   const activeHosted = !!activeCal.is_hosted;
   const eng = s.engine || {};
+  const teleVisible = Boolean((s.root && s.telemetry && s.telemetry.context_tokens) || s.job || (s.llm_call && s.llm_call.started));
   const phase = eng.phase || (j ? 'gather' : 'idle');
   const phaseName = {
     idle: PDC.t('gui.phase.idle', null, 'Idle'),
@@ -3986,24 +3994,6 @@ function TopBar() {
               onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
           <b>${PDC.t('gui.scout', null, 'Scout')}: ${s.scout_profile}</b>
         </span>` : null}
-        <label class="chip" id="autoRouteChip"
-              title=${PDC.t('gui.auto_route_title', null, 'Specialist auto-routing (auto_route_specialties): each task runs on the profile whose specialty tags fit it best (model-card tags, or explicit specialties in Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean VRAM handoff when the profiles share one local server.')}>
-          <input type="checkbox" checked=${!!s.auto_route_specialties}
-                 onChange=${(e) => setAutoRoute(e.target.checked)} />
-          <b>\u2726 ${PDC.t('gui.auto_route', null, 'Auto-route')}</b>
-        </label>
-        <label class="chip" id="postEditVerifyChip"
-              title=${'Post-edit verification (auto_verify): '
-                + (s.auto_verify ? 'ON \u2014 ' + s.auto_verify : 'off')
-                + '. Detected test command: '
-                + (s.detected_test_command || 'none detected')
-                + '. The syntax, static and interface-contract gates and the scoped'
-                + ' impacted tests always run on every edit; the full suite is this'
-                + ' verify command.'}>
-          <input type="checkbox" checked=${!!s.auto_verify}
-                 onChange=${(e) => setPostEditVerify(e.target.checked)} />
-          <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
-        </label>
         ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
               title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('
                 + (eng.specialist.model || '?') + ') for specialty \''
@@ -4019,7 +4009,7 @@ function TopBar() {
             ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} ${PDC.t('gui.files_unit', null, 'files')} \u00B7 ${PDC.fmtInt(s.index_chunks)} ${PDC.t('gui.units', null, 'units')}</span>` : null}
             <i class="reidx" aria-hidden="true">\u21BB</i>
           </button>
-          ${(s.usage && s.usage.calls) ? html`
+          ${(!teleVisible && s.usage && s.usage.calls) ? html`
             <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
               <b>${s.usage.calls + ' ' + PDC.t('gui.calls', null, 'calls') + ' \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
                 + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
@@ -4691,6 +4681,24 @@ function Composer() {
                 aria-pressed=${S.creative ? 'true' : 'false'}
                 title=${PDC.t('gui.composer.creative_title', null, 'Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected.')}
                 onClick=${toggleCreative}>${S.creative ? '\u2728 ' + PDC.t('gui.composer.creative_on', null, 'Creative: on') : '\u2728 ' + PDC.t('gui.composer.creative', null, 'Creative')}</button>
+        <label class="chip composer-toggle" id="autoRouteChip"
+              title=${PDC.t('gui.auto_route_title', null, 'Specialist auto-routing (auto_route_specialties): each task runs on the profile whose specialty tags fit it best (model-card tags, or explicit specialties in Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean VRAM handoff when the profiles share one local server.')}>
+          <input type="checkbox" checked=${!!s.auto_route_specialties}
+                 onChange=${(e) => setAutoRoute(e.target.checked)} />
+          <b>\u2726 ${PDC.t('gui.auto_route', null, 'Auto-route')}</b>
+        </label>
+        <label class="chip composer-toggle" id="postEditVerifyChip"
+              title=${'Post-edit verification (auto_verify): '
+                + (s.auto_verify ? 'ON \u2014 ' + s.auto_verify : 'off')
+                + '. Detected test command: '
+                + (s.detected_test_command || 'none detected')
+                + '. The syntax, static and interface-contract gates and the scoped'
+                + ' impacted tests always run on every edit; the full suite is this'
+                + ' verify command.'}>
+          <input type="checkbox" checked=${!!s.auto_verify}
+                 onChange=${(e) => setPostEditVerify(e.target.checked)} />
+          <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
+        </label>
         <span class="grow muted small-text" id="sendHint">${isHow ? PDC.t('gui.composer.how_hint', null, 'answers stay out of this chat thread') : (steerable ? PDC.t('gui.composer.steer_hint', null, 'delivered at the next lookup step') : '')}</span>
         <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
                 disabled=${!!(j && j.cancelled && !isHow)}

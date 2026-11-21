@@ -354,5 +354,11 @@
   "settings.tab.raw": "Raw file / reset",
   "settings.quick_links": "Quick links:",
   "settings.search_ph": "search settings\u2026",
-  "settings.no_changes": "No changes"
+  "settings.no_changes": "No changes",
+  "settings.scan.header": "Scanned models ({total}) \u00b7 {selected} selected",
+  "settings.scan.hide_list": "Hide list",
+  "settings.scan.show_list": "Show list",
+  "settings.scan.close": "Close",
+  "settings.scan.close_title": "Dismiss scanned models list",
+  "settings.scan.toggle_group": "Expand or collapse this server's models"
 }

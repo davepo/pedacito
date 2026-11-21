@@ -323,9 +323,9 @@ textarea { resize: none; background: var(--surface); }
 .tb-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 #tbRow1 { flex-wrap: wrap; row-gap: 6px; padding-bottom: 6px; }
 #tbRow1 button, #tbRow1 input, #tbRow1 select { height: 30px; }
-#tbRow2 { flex-wrap: nowrap; min-height: 28px; margin: 0 -12px; padding: 1px 12px 3px;
-  background: var(--surface-alt); border-top: 1px solid var(--border);
-  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+#tbRow2 { flex-wrap: wrap; row-gap: 4px; column-gap: 6px; min-height: 28px;
+  margin: 0 -12px; padding: 3px 12px 4px;
+  background: var(--surface-alt); border-top: 1px solid var(--border); }
 #tbRow2 button, #tbRow2 select { height: 24px; flex: none; }
 .brand { flex: none; font-size: 16px; font-weight: 700; letter-spacing: .5px; }
 .brand span { color: var(--accent); font-weight: 800; }
@@ -333,11 +333,11 @@ textarea { resize: none; background: var(--surface); }
 #projectBar input, #projectBar select { border-color: var(--border); background: var(--surface-alt); }
 #path { flex: 0 1 280px; min-width: 140px; max-width: 360px; font-family: var(--mono); font-size: 12px; }
 #topRight { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
-#tbRow2 .tb-right { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+#tbRow2 .tb-right { display: flex; align-items: center; gap: 6px; flex: none; margin-left: auto; }
 #tbRow2 .chip { flex: none; }
 .tb-label { flex: none; font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
   text-transform: uppercase; color: var(--muted); }
-#profile { max-width: 220px; font-size: 12px; }
+#profile { max-width: 180px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* min-width + padding-right keep long option labels ("Trapper Keeper — ...")
    from clipping under the native dropdown arrow */
 #theme { font-size: 12px; width: auto; min-width: 155px; padding-right: 24px; }
@@ -358,11 +358,12 @@ textarea { resize: none; background: var(--surface); }
 .chip b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chip .small-text { margin-left: 2px; }
 .chip .tag { flex: none; }
-#modelChip { cursor: pointer; max-width: 480px; }   /* long GGUF ids stay readable */
+#modelChip { cursor: pointer; max-width: 280px; }
+#modelChip b { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #indexChip { cursor: pointer; }
-#autoRouteChip { cursor: pointer; }
-#autoRouteChip input { margin: 0; accent-color: var(--accent); cursor: pointer; }
-#autoRouteChip:hover { border-color: var(--line2); }
+#autoRouteChip, #postEditVerifyChip { cursor: pointer; }
+#autoRouteChip input, #postEditVerifyChip input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+#autoRouteChip:hover, #postEditVerifyChip:hover { border-color: var(--line2); }
 #specialistChip .tag { font-size: 10px; }
 .reidx { font-style: normal; font-size: 13px; line-height: 1; opacity: .55; flex: none; }
 #indexChip:hover:not(:disabled) .reidx { opacity: 1; }
@@ -665,7 +666,8 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .composer-resizer::after { content: ""; width: 36px; height: 3px; border-radius: 2px;
   background: var(--border); transition: background .12s; }
 .composer-resizer:hover::after, .composer-resizer.dragging::after { background: var(--accent); }
-#composerBtns { display: flex; gap: 8px; align-items: center; }
+#composerBtns { display: flex; flex-wrap: wrap; row-gap: 6px; column-gap: 8px; align-items: center; }
+#composerBtns .composer-toggle { flex: none; padding: 3px 9px; font-size: 11.5px; }
 #composerBtns #sendBtn { margin-left: auto; min-width: 92px; }
 #composerBtns #optsBtn { min-width: 86px; }
 /* Refine Prompt: a ghost button that breathes while the architect call runs
@@ -1049,6 +1051,10 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 
 /* ------------------------------------------------- discovery / reset tabs -- */
 .ellip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scan-header { margin: 10px 0 4px; padding: 6px 10px;
+  background: var(--surface-alt); border: 1px solid var(--border);
+  border-radius: 6px; gap: 6px; }
+.scan-header-title { font-size: 12px; font-weight: 600; }
 .scan-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .scan-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
   padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -1063,6 +1069,7 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 /* per-server bulk-pick controls sit flush right in the group header row */
 .scan-table tr.scan-server .sg-group { flex-wrap: nowrap; gap: 6px; }
 .scan-table tr.scan-server .sg-group button { flex: none; font-size: 10.5px; padding: 1px 7px; }
+.scan-table tr.scan-server .sg-group .scan-fold { padding: 1px 5px; min-width: 22px; }
 .scan-table tr.imp { opacity: .55; }
 .scan-table input[type=text] { width: 172px; }
 /* the VRAM box keeps its whole "VRAM (GB)" caption on screen: a bare

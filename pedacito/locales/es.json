@@ -354,5 +354,11 @@
   "settings.tab.raw": "Archivo / restablecer",
   "settings.quick_links": "Accesos r\u00e1pidos:",
   "settings.search_ph": "buscar ajustes\u2026",
-  "settings.no_changes": "Sin cambios"
+  "settings.no_changes": "Sin cambios",
+  "settings.scan.header": "Modelos encontrados ({total}) \u00b7 {selected} seleccionados",
+  "settings.scan.hide_list": "Ocultar lista",
+  "settings.scan.show_list": "Mostrar lista",
+  "settings.scan.close": "Cerrar",
+  "settings.scan.close_title": "Cerrar la lista de modelos encontrados",
+  "settings.scan.toggle_group": "Expandir o contraer los modelos de este servidor"
 }

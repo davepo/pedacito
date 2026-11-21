@@ -838,3 +838,40 @@ def test_synchronized_redraw_keeps_partial_prompt_and_cursor(tmp_path):
         assert "\x1b[24;24H" in text
     finally:
         session.close()
+
+
+def test_tui_alt_screen_off_resets_scroll_region_before_leaving_alt_screen(tmp_path):
+    """DECSTBM (`\\x1b[r`) always homes the cursor to (1, 1); emitting it after
+    `\\x1b[?1049l` clobbers the cursor position restored on the main screen."""
+    seq = tui_mod._ALT_SCREEN_OFF
+    assert "\x1b[r" in seq
+    assert "\x1b[?1049l" in seq
+    assert seq.index("\x1b[r") < seq.index("\x1b[?1049l")
+    assert seq.index("\x1b[?2026l") < seq.index("\x1b[?1049l")
+    assert seq.index("\x1b[0m") < seq.index("\x1b[?1049l")
+
+    after = seq.split("\x1b[?1049l", 1)[1]
+    # Only cursor visibility restore (`?25h`) may follow leaving the alt screen;
+    # nothing after `?1049l` may move the cursor or reset scroll margins.
+    assert after == "\x1b[?25h"
+    assert not re.search(r"\x1b\[[0-9;]*[HfABCDEFGJKr]", after)
+
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    out = TtyOutput()
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=out, width=80, height=24)
+    session._prepare_terminal()
+    out.truncate(0)
+    out.seek(0)
+    session.close()
+    teardown = out.getvalue()
+    assert "\x1b[?1049l" in teardown
+    assert teardown.index("\x1b[r") < teardown.index("\x1b[?1049l")
+    assert teardown.split("\x1b[?1049l", 1)[1] == "\x1b[?25h"
