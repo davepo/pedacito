@@ -79,9 +79,12 @@ __all__ = ["TuiSession", "enable_vt_mode", "parse_escape_sequence",
 # left-click-drag selection and the OS copy/paste stay native. ?1000h/?1006h
 # (SGR click capture) stay OFF by default; /mouse on or F2 enables them.
 _ALT_SCREEN_ON = ("\x1b[?1049h\x1b[?1007h\x1b[?1000l\x1b[?1006l"
-                  "\x1b[?25l\x1b[2J\x1b[H")
-_ALT_SCREEN_OFF = ("\x1b[?2026l\x1b[0m\x1b[r\x1b[?1007l\x1b[?1000l\x1b[?1006l"
-                   "\x1b[?1049l\x1b[?25h")
+                  "\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H")
+_ALT_SCREEN_OFF = ("\x1b[?2004l\x1b[?2026l\x1b[0m\x1b[r\x1b[?1007l\x1b[?1000l"
+                   "\x1b[?1006l\x1b[?1049l\x1b[?25h")
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+MAX_PROMPT_ROWS = 6
 _MOUSE_SGR_ON = "\x1b[?1007l\x1b[?1000h\x1b[?1006h"
 _MOUSE_SGR_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?1007h"
 _SYNC_ON = "\x1b[?2026h"
@@ -143,7 +146,9 @@ _SLASH_COMMANDS = [
     "/quit", "/exit",
 ]
 _KNOWN_KEYS = {
-    "ENTER", "TAB", "BACKSPACE", "DELETE", "INSERT", "ESC",
+    "ENTER", "SHIFT_ENTER", "ALT_ENTER", "CTRL_J",
+    "PASTE_START", "PASTE_END",
+    "TAB", "BACKSPACE", "DELETE", "INSERT", "ESC",
     "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END",
     "PAGE_UP", "PAGE_DOWN", "SHIFT_UP", "SHIFT_DOWN",
     "SHIFT_LEFT", "SHIFT_RIGHT", "ALT_PAGE_UP", "ALT_PAGE_DOWN",
@@ -155,17 +160,20 @@ _KNOWN_KEYS = {
 KEYS_TEXT = """\
 Pedacito TUI keybindings
   Enter                 send the task or slash command
+  Shift+Enter / Alt+Enter / \\+Enter
+                        insert a newline (Ctrl+J also inserts a newline)
+  Bracketed paste       paste multi-line text into the draft without sending
   PgUp / PgDn           transcript half a page up / down
   Shift+Up / Shift+Down transcript 3 lines up / down
   Ctrl+U / Ctrl+D       half-page scroll when the prompt is empty
   Alt+PgUp / Alt+PgDn   scroll the Activity / Plan sidebar
   Mouse wheel           transcript 3 lines, or the sidebar under pointer
-  Up / Down             command history (or scroll when scrolled back)
+  Up / Down             move across draft lines, or command history / scroll
   Left / Right          move the prompt cursor
-  Home / End            start / end of the prompt (End returns to live)
+  Home / End            start / end of the current line (End returns to live)
   Esc                   jump to the live bottom
   Backspace / Delete    edit the prompt; Ctrl+W deletes a word
-  Ctrl+K / Ctrl+L       kill to end / force a full repaint
+  Ctrl+K / Ctrl+L       kill to end of line / force a full repaint
   Tab                   complete slash commands and profile names
   F2                    toggle SGR mouse mode (native selection default)
   F3                    toggle interface language (EN <-> ES)
@@ -263,17 +271,20 @@ Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
 KEYS_TEXT_ES = """\
 Atajos de teclado de Pedacito TUI
   Enter                 enviar la tarea o comando con barra
+  Shift+Enter / Alt+Enter / \\+Enter
+                        insertar nueva línea (Ctrl+J también inserta salto)
+  Pegado delimitado     pegar texto multilínea en el borrador sin enviar
   PgUp / PgDn           desplazar transcripción media página arriba / abajo
   Shift+Up / Shift+Down desplazar transcripción 3 líneas arriba / abajo
   Ctrl+U / Ctrl+D       desplazamiento de media página con el prompt vacío
   Alt+PgUp / Alt+PgDn   desplazar el panel lateral de Actividad / Plan
   Rueda del ratón       transcripción 3 líneas, o el panel bajo el puntero
-  Up / Down             historial de comandos (o desplazamiento si subió)
+  Up / Down             mover entre líneas del borrador, historial o desplazar
   Left / Right          mover el cursor en el prompt
-  Home / End            inicio / final del prompt (End vuelve en vivo)
+  Home / End            inicio / final de la línea actual (End vuelve en vivo)
   Esc                   ir al final en vivo
   Backspace / Delete    editar el prompt; Ctrl+W borra una palabra
-  Ctrl+K / Ctrl+L       borrar hasta el final / forzar repintado completo
+  Ctrl+K / Ctrl+L       borrar hasta el final de línea / forzar repintado
   Tab                   completar comandos con barra y nombres de perfiles
   F2                    alternar modo ratón SGR (selección nativa por defecto)
   F3                    alternar idioma de la interfaz (EN <-> ES)
@@ -392,6 +403,12 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
             return key, len(seq)
 
     exact = {
+        "\x1b[200~": "PASTE_START",
+        "\x1b[201~": "PASTE_END",
+        "\x1b[13;2u": "SHIFT_ENTER",
+        "\x1b[27;2;13~": "SHIFT_ENTER",
+        "\x1b\r": "ALT_ENTER",
+        "\x1b\n": "ALT_ENTER",
         "\x1b[5~": "PAGE_UP",
         "\x1b[6~": "PAGE_DOWN",
         "\x1b[5;3~": "ALT_PAGE_UP",
@@ -447,7 +464,7 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
 
     char = buf[0]
     controls = {
-        "\r": "ENTER", "\n": "ENTER", "\t": "TAB",
+        "\r": "ENTER", "\n": "CTRL_J", "\t": "TAB",
         "\x7f": "BACKSPACE", "\x08": "BACKSPACE",
         "\x01": "HOME", "\x05": "END",
         "\x03": "CTRL_C", "\x04": "CTRL_D",
@@ -654,6 +671,8 @@ class TuiSession:
         self.mouse_sgr = False
         self._last_mouse_col = 0
         self._prompt_view_start = 0
+        self._prompt_line_offset = 0
+        self._preferred_col: int | None = None
         self._raw_buf = ""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._old_termios = None
@@ -1109,11 +1128,19 @@ class TuiSession:
             return max(1, left_width - 1)
         return max(1, width - 1)
 
+    def _prompt_row_count(self, height: int | None = None) -> int:
+        if "\n" not in self.input_buf:
+            return 1
+        h = height if height is not None else self._size()[1]
+        max_rows = max(1, min(MAX_PROMPT_ROWS, int(h) - 7))
+        return min(max_rows, self.input_buf.count("\n") + 1)
+
     def _body_height(self, height: int | None = None) -> int:
         height = height if height is not None else self._size()[1]
         header = 2
         footer = 2
-        return max(4, height - header - footer - 2)
+        prompt_rows = self._prompt_row_count(height)
+        return max(2, height - header - footer - 1 - prompt_rows)
 
     def _transcript_viewport_height(self, height: int | None = None) -> int:
         return max(1, self._body_height(height) - 1)
@@ -1306,11 +1333,101 @@ class TuiSession:
             line = display_prefix + shown
         return line, col
 
+    def _prompt_lines(self, width: int,
+                      max_rows: int = MAX_PROMPT_ROWS
+                      ) -> tuple[list[str], int, int]:
+        """Render the prompt zone (1 to `max_rows` lines) plus cursor pos.
+
+        Returns `(rendered_rows, cursor_row_idx, cursor_col)` where
+        `cursor_row_idx` is 0-based within `rendered_rows` and `cursor_col` is
+        0-based within that rendered row. Single-line drafts delegate directly
+        to `_prompt_visible()` to preserve exact prefix and cursor arithmetic.
+        """
+        if "\n" not in self.input_buf:
+            self._prompt_line_offset = 0
+            line, col = self._prompt_visible(width)
+            return [line], 0, col
+
+        width = max(1, int(width))
+        lines = self.input_buf.split("\n")
+        total_lines = len(lines)
+        cur_line, cur_col, _ = self._cursor_line_col()
+        visible_count = min(max(1, int(max_rows)), total_lines)
+
+        offset = int(self._prompt_line_offset)
+        if cur_line < offset:
+            offset = cur_line
+        elif cur_line >= offset + visible_count:
+            offset = cur_line - visible_count + 1
+        offset = max(0, min(offset, total_lines - visible_count))
+        self._prompt_line_offset = offset
+
+        window = lines[offset:offset + visible_count]
+        cursor_row_idx = cur_line - offset
+        scrolled = total_lines > visible_count
+
+        base_prefix = self._prompt_prefix()
+        if self._prompt_banner:
+            base_prefix = f"{self._prompt_banner} "
+        cont_prefix = "  \u2502 "
+
+        rendered_rows: list[str] = []
+        cursor_col = 0
+        for idx, text_line in enumerate(window):
+            if idx == 0:
+                raw_prefix = (f"[L{cur_line + 1}/{total_lines}] {base_prefix}"
+                              if scrolled else base_prefix)
+            else:
+                raw_prefix = cont_prefix
+            avail = max(1, width - len(raw_prefix))
+            safe_line = text_line.replace("\t", " ")
+            if idx == cursor_row_idx:
+                if len(safe_line) <= avail:
+                    start = 0
+                    shown = safe_line
+                else:
+                    start = max(0, cur_col - avail + 1)
+                    start = min(start, max(0, len(safe_line) - avail))
+                    shown = safe_line[start:start + avail]
+                self._prompt_view_start = start
+                cursor_col = min(
+                    max(0, len(raw_prefix) + (cur_col - start)),
+                    max(0, width - 1))
+            else:
+                shown = safe_line[:avail]
+
+            if self._colors_on():
+                if idx == 0:
+                    if self._prompt_banner:
+                        token = (
+                            "danger" if "denied" in raw_prefix.lower()
+                            or "security" in raw_prefix.lower()
+                            else "warning")
+                        display_prefix = self._style(
+                            raw_prefix, token, bold=True)
+                    elif self._stream_status:
+                        display_prefix = self._style(raw_prefix, "muted")
+                    else:
+                        display_prefix = self._style(
+                            raw_prefix, "accent", bold=True)
+                else:
+                    display_prefix = self._style(raw_prefix, "muted")
+                rendered_rows.append(display_prefix + shown)
+            else:
+                rendered_rows.append(raw_prefix + shown)
+
+        return rendered_rows, cursor_row_idx, cursor_col
+
     def _cursor_screen_position(self, width: int,
                                 height: int) -> tuple[int, int]:
-        _line, col = self._prompt_visible(width)
-        # The prompt is the final frame row; terminal coordinates are 1-based.
-        return max(1, int(height)), max(1, min(int(width), col + 1))
+        max_rows = max(1, min(MAX_PROMPT_ROWS, int(height) - 7))
+        rows, cursor_row_idx, col = self._prompt_lines(width, max_rows=max_rows)
+        # The prompt block occupies the final `len(rows)` rows of the frame;
+        # terminal coordinates are 1-based.
+        prompt_top = max(1, int(height) - len(rows) + 1)
+        screen_row = max(1, min(int(height), prompt_top + cursor_row_idx))
+        screen_col = max(1, min(int(width), col + 1))
+        return screen_row, screen_col
 
     def render_frame(self, width: int | None = None,
                      height: int | None = None,
@@ -1330,8 +1447,12 @@ class TuiSession:
         footer = self.telemetry_lines(width)
         hint = i18n.t("tui.hint_bar", lang=self.lang)
         transcript_heading = i18n.t("tui.transcript", lang=self.lang)
-        prompt_text, _cursor_col = self._prompt_visible(width)
-        body_height = max(4, height - len(header) - len(footer) - 2)
+        max_prompt_rows = max(
+            1, min(MAX_PROMPT_ROWS, height - len(header) - len(footer) - 3))
+        prompt_rows, _cursor_row, _cursor_col = self._prompt_lines(
+            width, max_rows=max_prompt_rows)
+        body_height = max(
+            2, height - len(header) - len(footer) - 1 - len(prompt_rows))
 
         if show_sidebar:
             side_width = min(46, max(32, width // 3))
@@ -1356,7 +1477,8 @@ class TuiSession:
         lines.extend(body)
         lines.extend(_fit(row, width) for row in footer)
         lines.append(_fit(hint, width))
-        lines.append(_fit(prompt_text, width))
+        for prompt_row in prompt_rows:
+            lines.append(_fit(prompt_row, width))
 
         if len(lines) < height:
             lines.extend(_fit("", width) for _ in range(height - len(lines)))
@@ -1766,6 +1888,10 @@ class TuiSession:
             fd = self.stdin.fileno()
             self._old_termios = termios.tcgetattr(fd)
             tty.setcbreak(fd)
+            # Disable ICRNL so Enter arrives as \r and Ctrl+J arrives as \n.
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~termios.ICRNL
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
             self._raw_mode = True
         except (AttributeError, ImportError, OSError, ValueError):
             self._old_termios = None
@@ -1846,8 +1972,30 @@ class TuiSession:
         line = self._readline()
         if line is None:
             return False
-        self._raw_buf += line + "\n"
+        self._raw_buf += line + "\r"
         return True
+
+    def _read_bracketed_paste(self, idle_timeout: float = 0.5,
+                              max_bytes: int = 262144) -> str:
+        """Buffer pasted bytes after PASTE_START until PASTE_END arrives."""
+        deadline = time.monotonic() + max(0.05, float(idle_timeout))
+        while True:
+            end_idx = self._raw_buf.find(_PASTE_END)
+            if end_idx != -1:
+                pasted = self._raw_buf[:end_idx]
+                self._raw_buf = self._raw_buf[end_idx + len(_PASTE_END):]
+                return pasted
+            if len(self._raw_buf) >= max_bytes:
+                pasted = self._raw_buf[:max_bytes]
+                self._raw_buf = self._raw_buf[max_bytes:]
+                return pasted
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                pasted = self._raw_buf
+                self._raw_buf = ""
+                return pasted
+            if self._read_raw_chunk(min(0.05, remaining)):
+                deadline = time.monotonic() + max(0.05, float(idle_timeout))
 
     def read_key_event(self, timeout: float = 0.05) -> str | None:
         """Read one parsed key event, or None when `timeout` expires.
@@ -1895,6 +2043,60 @@ class TuiSession:
                 return None
 
     # ----------------------------------------------------- prompt editing
+    def _line_bounds(self, pos: int | None = None) -> tuple[int, int]:
+        """Return `(start, end)` offsets of the logical line containing `pos`."""
+        buf = self.input_buf
+        p = max(0, min(int(self.cursor_pos if pos is None else pos), len(buf)))
+        start = buf.rfind("\n", 0, p) + 1
+        end = buf.find("\n", p)
+        if end == -1:
+            end = len(buf)
+        return start, end
+
+    def _cursor_line_col(self) -> tuple[int, int, list[str]]:
+        """Return `(line_idx, col, lines)` for the current cursor position."""
+        buf = self.input_buf
+        pos = max(0, min(int(self.cursor_pos), len(buf)))
+        lines = buf.split("\n")
+        before = buf[:pos]
+        line_idx = before.count("\n")
+        last_nl = before.rfind("\n")
+        col = pos - (last_nl + 1)
+        return line_idx, col, lines
+
+    def _offset_for_line_col(self, lines: list[str], line_idx: int,
+                             col: int) -> int:
+        line_idx = max(0, min(int(line_idx), len(lines) - 1))
+        col = max(0, min(int(col), len(lines[line_idx])))
+        return sum(len(ln) + 1 for ln in lines[:line_idx]) + col
+
+    def _has_line_continuation(self) -> int | None:
+        """Return index of a lone trailing `\\` right before cursor, or None.
+
+        Only active in interactive mode so headless scripted inputs are never
+        intercepted.
+        """
+        if self.headless or not self.input_buf:
+            return None
+        pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
+        idx = pos - 1
+        if idx < 0 or self.input_buf[idx] != "\\":
+            return None
+        slashes = 0
+        i = idx
+        while i >= 0 and self.input_buf[i] == "\\":
+            slashes += 1
+            i -= 1
+        return idx if (slashes % 2 == 1) else None
+
+    def handle_paste(self, text: str) -> str:
+        """Insert sanitized bracketed-paste text at cursor without submitting."""
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = _untrusted_text(normalized)
+        if cleaned:
+            self._insert_text(cleaned)
+        return self.input_buf
+
     def _insert_text(self, text: str) -> None:
         pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
         self.input_buf = (self.input_buf[:pos] + text
@@ -2016,6 +2218,8 @@ class TuiSession:
         half = max(1, self._transcript_viewport_height(height) // 2)
         side_half = max(1, self._body_height(height) // 2)
         handled = True
+        if key not in ("UP", "DOWN"):
+            self._preferred_col = None
 
         if key == "F2":
             self._toggle_mouse()
@@ -2042,8 +2246,11 @@ class TuiSession:
                 self.scroll_transcript(delta)
         elif key == "CTRL_U":
             if self.input_buf:
-                self.input_buf = self.input_buf[self.cursor_pos:]
-                self.cursor_pos = 0
+                start, _end = self._line_bounds()
+                if self.cursor_pos > start:
+                    self.input_buf = (self.input_buf[:start]
+                                      + self.input_buf[self.cursor_pos:])
+                    self.cursor_pos = start
                 self._dirty = True
             else:
                 self.scroll_transcript(half)
@@ -2055,7 +2262,13 @@ class TuiSession:
             else:
                 self.scroll_transcript(-half)
         elif key == "CTRL_K":
-            self.input_buf = self.input_buf[:self.cursor_pos]
+            _start, end = self._line_bounds()
+            pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
+            if pos < end:
+                self.input_buf = self.input_buf[:pos] + self.input_buf[end:]
+            elif pos < len(self.input_buf):
+                # At end of a logical line: join with the following line.
+                self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
             self._dirty = True
         elif key == "CTRL_L":
             self._dirty = True
@@ -2070,8 +2283,19 @@ class TuiSession:
             self.input_buf = self.input_buf[:start] + self.input_buf[pos:]
             self.cursor_pos = start
             self._dirty = True
+        elif key in ("SHIFT_ENTER", "ALT_ENTER", "CTRL_J"):
+            self._insert_text("\n")
         elif key == "ENTER":
-            self._submit_input()
+            cont_idx = self._has_line_continuation()
+            if cont_idx is not None:
+                self.input_buf = (self.input_buf[:cont_idx] + "\n"
+                                  + self.input_buf[cont_idx + 1:])
+                self.cursor_pos = cont_idx + 1
+                self._dirty = True
+            else:
+                self._submit_input()
+        elif key in ("PASTE_START", "PASTE_END"):
+            pass
         elif key == "TAB":
             self._complete()
         elif key == "ESC":
@@ -2081,12 +2305,38 @@ class TuiSession:
                 self.scroll_to_bottom()
                 self.sidebar_scroll_offset = 0
         elif key == "UP":
-            if not self.input_buf and self.scroll_offset > 0:
+            if "\n" in self.input_buf:
+                line_idx, line_col, lines = self._cursor_line_col()
+                if line_idx > 0:
+                    target_col = (self._preferred_col
+                                  if self._preferred_col is not None
+                                  else line_col)
+                    self._preferred_col = target_col
+                    self.cursor_pos = self._offset_for_line_col(
+                        lines, line_idx - 1, target_col)
+                    self._dirty = True
+                else:
+                    self._preferred_col = None
+                    self._history_prev()
+            elif not self.input_buf and self.scroll_offset > 0:
                 self.scroll_transcript(1)
             else:
                 self._history_prev()
         elif key == "DOWN":
-            if not self.input_buf and self.scroll_offset > 0:
+            if "\n" in self.input_buf:
+                line_idx, line_col, lines = self._cursor_line_col()
+                if line_idx < len(lines) - 1:
+                    target_col = (self._preferred_col
+                                  if self._preferred_col is not None
+                                  else line_col)
+                    self._preferred_col = target_col
+                    self.cursor_pos = self._offset_for_line_col(
+                        lines, line_idx + 1, target_col)
+                    self._dirty = True
+                else:
+                    self._preferred_col = None
+                    self._history_next()
+            elif not self.input_buf and self.scroll_offset > 0:
                 self.scroll_transcript(-1)
             else:
                 self._history_next()
@@ -2097,10 +2347,12 @@ class TuiSession:
             self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
             self._dirty = True
         elif key == "HOME":
-            self.cursor_pos = 0
+            start, _end = self._line_bounds()
+            self.cursor_pos = start
             self._dirty = True
         elif key == "END":
-            self.cursor_pos = len(self.input_buf)
+            _start, end = self._line_bounds()
+            self.cursor_pos = end
             self.scroll_offset = 0
             self.sidebar_scroll_offset = 0
             self._dirty = True
@@ -2157,6 +2409,16 @@ class TuiSession:
                     key, used = parse_escape_sequence(raw)
                     if not key or used <= 0:
                         break
+                    if key == "PASTE_START":
+                        rest = raw[used:]
+                        end_idx = rest.find(_PASTE_END)
+                        if end_idx != -1:
+                            self.handle_paste(rest[:end_idx])
+                            raw = rest[end_idx + len(_PASTE_END):]
+                        else:
+                            self.handle_paste(rest)
+                            raw = ""
+                        continue
                     self.handle_key(
                         key, col=(int(mouse.group(2)) if mouse else col))
                     raw = raw[used:]
@@ -2187,6 +2449,17 @@ class TuiSession:
                 self._poll_events()
                 if self._dirty:
                     self._redraw()
+                continue
+            if key == "PASTE_START":
+                pasted = self._read_bracketed_paste()
+                if pasted:
+                    cleaned = _untrusted_text(
+                        pasted.replace("\r\n", " ").replace("\r", " ")
+                        .replace("\n", " "))
+                    buf += cleaned
+                    self.input_buf = buf
+                    self.cursor_pos = len(buf)
+                    self._redraw(force=True)
                 continue
             if key == "ENTER":
                 self.input_buf = ""
@@ -4372,6 +4645,12 @@ class TuiSession:
             key = self.read_key_event(0.05)
             if key is None:
                 self._idle_tick()
+                continue
+            if key == "PASTE_START":
+                pasted = self._read_bracketed_paste()
+                if pasted:
+                    self.handle_paste(pasted)
+                    self._redraw()
                 continue
             if key == "CTRL_C":
                 if self.input_buf:

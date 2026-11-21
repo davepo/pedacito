@@ -875,3 +875,206 @@ def test_tui_alt_screen_off_resets_scroll_region_before_leaving_alt_screen(tmp_p
     assert "\x1b[?1049l" in teardown
     assert teardown.index("\x1b[r") < teardown.index("\x1b[?1049l")
     assert teardown.split("\x1b[?1049l", 1)[1] == "\x1b[?25h"
+
+
+def test_bracketed_paste_sequences_and_handle_paste(tmp_path):
+    assert "\x1b[?2004h" in tui_mod._ALT_SCREEN_ON
+    assert "\x1b[?2004l" in tui_mod._ALT_SCREEN_OFF
+    assert (tui_mod._ALT_SCREEN_OFF.index("\x1b[?2004l")
+            < tui_mod._ALT_SCREEN_OFF.index("\x1b[?1049l"))
+    assert parse_escape_sequence("\x1b[200~") == ("PASTE_START", 6)
+    assert parse_escape_sequence("\x1b[201~") == ("PASTE_END", 6)
+
+    submitted: list[str] = []
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    session.handle_line = lambda line: (submitted.append(line) or True)
+    try:
+        # Multi-line paste normalizes \r\n and \r, keeps \t and \n, strips escapes,
+        # and never triggers submit.
+        raw_paste = "def foo():\r\n\t\x1b[31mreturn\x1b[0m \x1b]0;evil\x071\r# done"
+        session.handle_paste(raw_paste)
+        assert submitted == []
+        assert session.input_buf == "def foo():\n\treturn 1\n# done"
+        assert session.cursor_pos == len(session.input_buf)
+
+        # Bracketed paste through feed_keys also inserts without submitting.
+        session.input_buf = ""
+        session.cursor_pos = 0
+        session.feed_keys(["\x1b[200~alpha\r\nbeta\x1b[201~"])
+        assert submitted == []
+        assert session.input_buf == "alpha\nbeta"
+    finally:
+        session.close()
+
+
+def test_bracketed_paste_in_interactive_reader_loop(tmp_path):
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    submitted: list[str] = []
+    out = TtyOutput()
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=out, width=80, height=24)
+
+    def capture(line: str) -> bool:
+        submitted.append(line)
+        session._quit = True
+        return False
+
+    session.handle_line = capture
+    # Pre-seed raw buffer with a bracketed multi-line paste followed by Enter.
+    session._raw_buf = "\x1b[200~first line\r\nsecond line\x1b[201~\r"
+    try:
+        assert session.run() == 0
+        assert submitted == ["first line\nsecond line"]
+        text = out.getvalue()
+        assert "\x1b[?2004h" in text
+        assert "\x1b[?2004l" in text
+        assert text.index("\x1b[?2004l") < text.index("\x1b[?1049l")
+    finally:
+        session.close()
+
+
+def test_multiline_keys_and_backslash_continuation(tmp_path):
+    assert parse_escape_sequence("\x1b[13;2u") == ("SHIFT_ENTER", 7)
+    assert parse_escape_sequence("\x1b[27;2;13~") == ("SHIFT_ENTER", 10)
+    assert parse_escape_sequence("\x1b\r") == ("ALT_ENTER", 2)
+    assert parse_escape_sequence("\x1b\n") == ("ALT_ENTER", 2)
+    assert parse_escape_sequence("\n") == ("CTRL_J", 1)
+    assert parse_escape_sequence("\r") == ("ENTER", 1)
+
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    submitted: list[str] = []
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=TtyOutput(),
+                         width=100, height=24)
+    session.handle_line = lambda line: (submitted.append(line) or True)
+    try:
+        session.feed_keys("line1")
+        session.handle_key("SHIFT_ENTER")
+        session.feed_keys("line2")
+        session.handle_key("ALT_ENTER")
+        session.feed_keys("line3")
+        session.handle_key("CTRL_J")
+        session.feed_keys("line4\\")
+        # Lone trailing backslash + ENTER in interactive mode inserts newline.
+        session.handle_key("ENTER")
+        assert submitted == []
+        assert session.input_buf == "line1\nline2\nline3\nline4\n"
+
+        session.feed_keys("line5")
+        session.handle_key("ENTER")
+        assert submitted == ["line1\nline2\nline3\nline4\nline5"]
+        assert session.input_buf == ""
+    finally:
+        session.close()
+
+
+def test_multiline_navigation_home_end_and_line_kills(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    try:
+        session.command_history = ["older cmd"]
+        session._history_pos = 1
+        session.input_buf = "long first line\nhi\nanother long line"
+        # Place cursor at col 10 on line 2 ("another lo|ng line")
+        session.cursor_pos = len("long first line\nhi\n") + 10
+
+        # UP moves to line 1 ("hi"), clamping to end of line 1 (col 2),
+        # while remembering preferred col 10.
+        session.handle_key("UP")
+        assert session.cursor_pos == len("long first line\n") + 2
+
+        # Second UP moves to line 0, restoring target col 10!
+        session.handle_key("UP")
+        assert session.cursor_pos == 10
+
+        # UP on logical line 0 steps into command history.
+        session.handle_key("UP")
+        assert session.input_buf == "older cmd"
+
+        # DOWN restores the multi-line draft.
+        session.handle_key("DOWN")
+        assert session.input_buf == "long first line\nhi\nanother long line"
+
+        # HOME / END operate on the current logical line.
+        session.cursor_pos = len("long first line\n") + 1  # middle of "hi"
+        session.handle_key("HOME")
+        assert session.cursor_pos == len("long first line\n")
+        session.handle_key("END")
+        assert session.cursor_pos == len("long first line\nhi")
+
+        # CTRL_U kills to start of current logical line only.
+        session.handle_key("CTRL_U")
+        assert session.input_buf == "long first line\n\nanother long line"
+        assert session.cursor_pos == len("long first line\n")
+
+        # CTRL_K kills to end of current logical line only.
+        session.cursor_pos = 4  # "long| first line"
+        session.handle_key("CTRL_K")
+        assert session.input_buf == "long\n\nanother long line"
+        assert session.cursor_pos == 4
+    finally:
+        session.close()
+
+
+def test_multiline_rendering_height_scroll_and_cursor_position(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=80, height=24, stdout=io.StringIO())
+    try:
+        # 3-line draft: frame height stays exactly 24, cursor on row 2.
+        session.input_buf = "first\nsecond\nthird"
+        # Put cursor on line index 1 ("se|cond", col 2 -> offset 6 + 2 = 8).
+        session.cursor_pos = 8
+        frame3 = session.render_frame(80, 24)
+        lines3 = frame3.splitlines()
+        assert len(lines3) == 24
+        assert lines3[21].startswith("pdc tui (default) > first")
+        assert lines3[22].startswith("  \u2502 second")
+        assert lines3[23].startswith("  \u2502 third")
+        # Prompt occupies 1-based rows 22, 23, 24; row 2 of prompt is row 23.
+        # Prefix "  │ " has len 4, cursor at col 2 -> 1-based col 7.
+        assert session._cursor_screen_position(80, 24) == (23, 7)
+
+        # 8-line draft: capped at MAX_PROMPT_ROWS (6), frame height still 24,
+        # and scroll indicator [L8/8] shown when cursor is at the end.
+        session.input_buf = "\n".join(f"row{i}" for i in range(1, 9))
+        session.cursor_pos = len(session.input_buf)
+        frame8 = session.render_frame(80, 24)
+        lines8 = frame8.splitlines()
+        assert len(lines8) == 24
+        prompt_rows, cur_row, _cur_col = session._prompt_lines(80)
+        assert len(prompt_rows) == tui_mod.MAX_PROMPT_ROWS == 6
+        assert cur_row == 5
+        assert "[L8/8]" in lines8[18]
+        assert "row8" in lines8[23]
+
+        # Moving cursor to line 1 scrolls the prompt window to the top.
+        session.cursor_pos = 0
+        frame8_top = session.render_frame(80, 24)
+        lines8_top = frame8_top.splitlines()
+        assert len(lines8_top) == 24
+        assert "[L1/8]" in lines8_top[18]
+        assert "row1" in lines8_top[18]
+
+        # Help and keys text invariants.
+        assert ("Web: https://www.pedacito.dev \u00b7 "
+                "Contact: contact@pedacito.dev") in tui_mod.HELP_TEXT
+        assert "Shift+Enter" in tui_mod.KEYS_TEXT
+        assert "Bracketed paste" in tui_mod.KEYS_TEXT
+        assert "Shift+Enter" in tui_mod.KEYS_TEXT_ES
+    finally:
+        session.close()
