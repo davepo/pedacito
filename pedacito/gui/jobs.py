@@ -32,7 +32,7 @@ from .. import update as update_mod
 from ..agent import Agent
 from ..config import ConfigError
 from ..llm import CancelledError, LLMClient, LLMError
-from .core import STATE, Job, RUN_KINDS, args_for, remember_recent
+from .core import STATE, Job, args_for, remember_recent
 
 MAX_TEXT_CHARS = 60000
 _EDIT_BLOCK_RE = re.compile(
@@ -43,6 +43,15 @@ _EDIT_BLOCK_RE = re.compile(
 # how to populate it instead of being left on a dead "no index" banner.
 EMPTY_INDEX_MESSAGE = ("Index ready (0 files in workspace — run a Task or Auto "
                        "prompt to create files).")
+
+
+def _uninterruptible(fn, *args, **kwargs):
+    """Run a cleanup step to completion even if Stop injects KeyboardInterrupt."""
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except KeyboardInterrupt:
+            continue
 
 
 # --- running jobs -------------------------------------------------------------
@@ -87,9 +96,6 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                     kind="cancelled")
             except (ConfigError, LLMError) as e:
                 err = str(e)
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
             except SystemExit as e:
                 # index.build signals a fatal condition (e.g. the model cannot
@@ -97,30 +103,19 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                 # this handler it would kill the worker thread silently and
                 # leave the page stuck with no error shown.
                 err = str(e).strip() or "The job stopped before finishing."
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
             except Exception as e:  # surface it in the UI, keep the server up
                 traceback.print_exc()
                 err = f"{type(e).__name__}: {e}"
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
         except KeyboardInterrupt:
             pass            # a Stop that arrived after the job body finished
         finally:
-            job.telemetry = events_mod.end_run()
-            while True:     # a late Stop must not leave the job slot taken
-                try:
-                    STATE.end_job(job, err)
-                    break
-                except KeyboardInterrupt:
-                    continue
+            job.telemetry = _uninterruptible(events_mod.end_run)
+            _uninterruptible(STATE.end_job, job, err)
             # the turn is over: the thread on disk must match what the user
             # just saw, including anything the throttled saves held back
-            STATE.save_active_thread(force=True)
+            _uninterruptible(STATE.save_active_thread, force=True)
 
     job.thread = threading.Thread(target=worker, daemon=True,
                                   name=f"pedacito-gui-job-{job.id}")
@@ -269,7 +264,7 @@ class _Feed:
             self.activity(f"model swap: {f.get('unloaded') or '-'} -> "
                           f"{f.get('loaded', '?')} ({f.get('elapsed_s', 0)}s)")
         elif kind == "call":
-            STATE.bus.publish("usage", usage=STATE.status()["usage"])
+            STATE.bus.publish("usage", usage=STATE.usage_snapshot())
         elif kind == "complex_auto":
             self.activity(str(f.get("text") or
                               "Auto-enabled Complex scaffolding."))
@@ -328,25 +323,29 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
                 raise ConfigError(str(e)) from e
         yield feed
     finally:
-        client.stream_callback, client.echo_stream = saved_cb, saved_echo
-        try:
-            if saved_cancel is _MISSING:
-                delattr(client, "cancel_event")
-            else:
-                client.cancel_event = saved_cancel
-        except Exception:
-            pass
-        try:
-            elog.listeners.remove(feed.event)
-        except ValueError:
-            pass
-        for k, v in had.items():
-            if v is _MISSING:
-                cfg.__dict__.pop(k, None)
-            else:
-                cfg.__dict__[k] = v
+        def _restore_session() -> None:
+            client.stream_callback, client.echo_stream = saved_cb, saved_echo
+            try:
+                if saved_cancel is _MISSING:
+                    if hasattr(client, "cancel_event"):
+                        delattr(client, "cancel_event")
+                else:
+                    client.cancel_event = saved_cancel
+            except Exception:
+                pass
+            try:
+                elog.listeners.remove(feed.event)
+            except ValueError:
+                pass
+            for k, v in had.items():
+                if v is _MISSING:
+                    cfg.__dict__.pop(k, None)
+                else:
+                    cfg.__dict__[k] = v
+
+        _uninterruptible(_restore_session)
         if held:
-            workspace.release_lock(root)
+            _uninterruptible(workspace.release_lock, root)
 
 
 _MISSING = object()
@@ -617,7 +616,11 @@ def run_calibrate(job: Job, opts: dict) -> None:
         "system", f"Calibrating '{label}' \u2014 {cfg.model} at {cfg.base_url} "
         f"({'quick' if quick else 'full'} suite). Progress streams to the "
         "TERMINAL tab.", kind="calibrating")
+    cfg._cancel_event = job.cancel_event
     client = LLMClient(cfg)
+    client.cancel_event = job.cancel_event
+    with STATE.lock:
+        job.client = client
     client.check(warn=False)
     client.warmup()
     card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
@@ -678,7 +681,11 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
             with STATE.lock:
                 job.title = (f"calibrating {n} "
                              f"({done + 1}/{len(todo)})")
+            cfg._cancel_event = job.cancel_event
             client = LLMClient(cfg)
+            client.cancel_event = job.cancel_event
+            with STATE.lock:
+                job.client = client
             try:
                 client.check(warn=False)
                 client.warmup()
@@ -709,6 +716,7 @@ def run_benchmark(job: Job, opts: dict) -> None:
     ``STATE.benchmark`` for the Benchmarks dialog and summarised in chat.
     """
     from .. import benchmarks
+    from .. import config as config_mod
 
     profile = str(opts.get("profile") or "").strip()
     benchmark_id = str(opts.get("benchmark_id") or "").strip()
@@ -716,6 +724,14 @@ def run_benchmark(job: Job, opts: dict) -> None:
     with STATE.lock:
         current_root = STATE.root
         STATE.benchmark = None
+    cfg = config_mod.load(
+        root=Path(current_root).expanduser() if current_root else None,
+        profile=profile or None, require_hardware=False, warn_budgets=False)
+    cfg._cancel_event = job.cancel_event
+    client = LLMClient(cfg)
+    client.cancel_event = job.cancel_event
+    with STATE.lock:
+        job.client = client
     activity = STATE.add_message(
         "activity", f"Benchmark `{benchmark_id}` on profile "
         f"'{profile or 'default'}' starting\u2026", job=job.id)
@@ -726,8 +742,11 @@ def run_benchmark(job: Job, opts: dict) -> None:
 
     result = benchmarks.run_benchmark(
         profile=profile or "", benchmark_id=benchmark_id,
-        base_dir=base_dir, config_root=current_root,
-        current_root=current_root, log=log, job_id=job.id)
+        base_dir=base_dir, cfg=cfg, client=client,
+        config_root=current_root, current_root=current_root,
+        log=log, job_id=job.id)
+    if job.cancelled:
+        raise CancelledError(job.stop_reason or "Stopped by user")
     data = result.to_dict()
     with STATE.lock:
         STATE.benchmark = data

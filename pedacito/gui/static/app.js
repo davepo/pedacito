@@ -96,11 +96,12 @@ PDC.FALLBACK_PROVIDER_CATALOG = [
 ];
 
 // ------------------------------------------------------------------- modal ---
+let modalSeq = 0;
 PDC.modal = (title, body, buttons, opts) => {
   opts = opts || {};
   const overlay = h('div', { class: 'overlay' });
   const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); if (opts.onClose) opts.onClose(); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const onKey = (e) => { if (e.key === 'Escape' && !opts.locked) close(); };
   const foot = h('div', { class: 'modal-foot' });
   (buttons || []).forEach((b) => {
     foot.appendChild(h('button', {
@@ -108,13 +109,21 @@ PDC.modal = (title, body, buttons, opts) => {
       onclick: () => { const keep = b.onclick && b.onclick(close); if (keep !== false && !b.stay) close(); }
     }));
   });
-  const box = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : '') },
-    h('div', { class: 'modal-head' }, h('h3', { text: title }),
-      h('button', { class: 'ghost', text: '\u2715', onclick: close })),
+  const titleId = 'modalTitle-' + (++modalSeq);
+  const box = h('div', {
+    class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : ''),
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-labelledby': titleId,
+  },
+    h('div', { class: 'modal-head' }, h('h3', { id: titleId, text: title }),
+      opts.locked ? null : h('button', { class: 'ghost', text: '\u2715', onclick: close })),
     h('div', { class: 'modal-body' }, body),
     (buttons && buttons.length) ? foot : null);
   overlay.appendChild(box);
-  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+  if (!opts.locked) {
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+  }
   document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
   return { close: close, box: box, body: box.querySelector('.modal-body') };
@@ -216,7 +225,7 @@ function showPermissionModal(pp) {
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
     btn('Deny & Redirect', 'deny', { danger: true }),
-  ], { narrow: true, onClose: () => { permModal = null; permShownId = ''; } });
+  ], { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
 }
 
 // ------------------------------------------------------- markdown to vnodes ---
@@ -794,11 +803,11 @@ function loadSnapshot() {
     if (snap._status !== 200) return;
     S.msgs = (snap.messages || []).map((m) => ({ ...m, rev: 0 }));
     S.msgTick++;
-    S.status = snap.status || {};
-    syncPermissionModal(S.status);
-    lastJobId = S.status.job ? S.status.job.id : 0;
-    lastReviewKey = S.status.review ? S.status.review.id + ':' + S.status.review.outcome : '';
-    lastFilesSig = S.status.files_sig || '';
+    const status = snap.status || {};
+    lastJobId = status.job ? status.job.id : 0;
+    lastReviewKey = status.review ? status.review.id + ':' + status.review.outcome : '';
+    lastFilesSig = status.files_sig || '';
+    applyStatus(status);
     if (term) term.reset(snap.term || '');
     connect(snap.seq || 0);
     loadReview();
@@ -1081,7 +1090,11 @@ PDC.startRun = (payload) => {
   });
 };
 const stick = { current: true };          // chat auto-follow flag
-function stop() { PDC.api('/api/stop', {}).then(refreshState); }
+function stop() {
+  const j = S.status.job;
+  if (j && !j.cancelled) { j.cancelled = true; emit(); }
+  PDC.api('/api/stop', {}).then(refreshState);
+}
 
 // ---- How / Help -------------------------------------------------------------
 function askHow(query) {
@@ -4612,7 +4625,7 @@ function Composer() {
                 disabled=${!!(j && j.cancelled && !isHow)}
                 onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
           ${isHow ? (S.how.loading ? 'Asking\u2026' : 'Ask')
-              : (j ? (j.cancelled ? 'Stopped by user' : 'Stop')
+              : (j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
               : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send))}
         </button>
         <input type="file" id="filePick" multiple hidden
@@ -4710,6 +4723,7 @@ function DiffPane() {
   const R = S.review, D = S.diff;
   const unified = S.ui.diffMode === 'unified';
   const oldRef = useRef(null), newRef = useRef(null);
+  const [editDraft, setEditDraft] = useState('');
   useEffect(() => {                       // keep the two panes in step
     const a = oldRef.current, b = newRef.current;
     if (!a || !b) return;
@@ -4719,8 +4733,117 @@ function DiffPane() {
     return () => { a.removeEventListener('scroll', sa); b.removeEventListener('scroll', sb); };
   }, [D, S.diffRel, S.editing]);
   useEffect(() => {                       // fill the editor when entering it
-    if (S.editing && editBox.current) editBox.current.value = (S.diff && S.diff.after) || '';
+    if (S.editing) {
+      const next = (D && D.after) || '';
+      setEditDraft(next);
+      if (editBox.current) editBox.current.value = next;
+    }
   }, [S.editing, D]);
+  useEffect(() => {                       // keep textarea synced across split/unified toggle
+    if (S.editing && editBox.current && editBox.current.value !== editDraft) {
+      editBox.current.value = editDraft;
+    }
+  }, [unified, S.editing]);
+  const switchDiffFile = useCallback((rel, editAfter) => {
+    if (!R) return;
+    if (rel === S.diffRel) {
+      if (editAfter && !S.editing && S.diff) toggleEdit();
+      return;
+    }
+    if (!S.editing) {
+      S.editAfterLoad = !!editAfter;
+      loadDiffFile(rel);
+      return;
+    }
+    const currentText = editBox.current ? editBox.current.value : editDraft;
+    const dirty = D && currentText !== (D.after || '');
+    if (!dirty) {
+      S.editing = false;
+      S.editAfterLoad = !!editAfter;
+      loadDiffFile(rel);
+      return;
+    }
+    const fromRel = S.diffRel;
+    PDC.modal('Unsaved changes',
+      h('p', { style: 'margin:0', text: 'Save your edits to ' + fromRel + ' before switching to ' + rel + '?' }),
+      [
+        { label: 'Cancel' },
+        { label: 'Discard', danger: true, onclick: () => {
+          S.editing = false;
+          S.editAfterLoad = !!editAfter;
+          loadDiffFile(rel);
+        } },
+        { label: 'Save & switch', primary: true, onclick: () => {
+          PDC.api('/api/review/rediff', { id: R.id, rel: fromRel, text: currentText }).then((d) => {
+            S.editing = false;
+            if (d._status === 200) {
+              const item = (S.review && S.review.files || []).find((x) => x.rel === fromRel);
+              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; }
+              S.editAfterLoad = !!editAfter;
+              loadDiffFile(rel);
+            } else {
+              PDC.toast(d.detail || 'could not update', true);
+              emit();
+            }
+          });
+        } },
+      ], { narrow: true });
+  }, [R, D, editDraft]);
+  useEffect(() => {
+    if (!R || !R.files || R.files.length < 2) return;
+    const onKey = (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key !== '[' && e.key !== ']') return;
+      const t = e.target;
+      const tag = (t && t.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      if (document.querySelector('.overlay') || !S.ui.diffOpen) return;
+      const idx = R.files.findIndex((f) => f.rel === S.diffRel);
+      const len = R.files.length;
+      const next = idx < 0 ? 0 : (idx + (e.key === ']' ? 1 : -1) + len) % len;
+      e.preventDefault();
+      switchDiffFile(R.files[next].rel, false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
+  const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
+  const { oldRows, newRows, uniRows } = useMemo(() => {
+    const oldR = [], newR = [], uniR = [];
+    const rows = (D && D.rows) || [];
+    rows.forEach((r, i) => {
+      const key = 'r' + i;
+      if (r[0] === 'skip') {
+        const foldKey = S.diffRel + '#' + r[2];
+        const opened = S.ui.folds[foldKey] === true;
+        const label = '\u22EF ' + r[1] + ' unchanged line' + (r[1] === 1 ? '' : 's') + ' \u2014 click to show';
+        const mk = () => html`<div key=${key} class="skip" hidden=${opened}
+          onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
+        oldR.push(mk()); newR.push(mk()); uniR.push(mk());
+        return;
+      }
+      const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
+      if (kind === 'equal') {
+        oldR.push(codeLine('equal', r[1], r[2], show, key));
+        newR.push(codeLine('equal', r[3], r[4], show, key));
+        uniR.push(uniLine('equal', r[1], r[2], show, key));
+      } else if (kind === 'replace') {
+        oldR.push(codeLine('replace del', r[1], markedCells(r[2], r[5]), show, key));
+        newR.push(codeLine('replace add', r[3], markedCells(r[4], r[6]), show, key));
+        uniR.push(uniLine('del', r[1], markedCells(r[2], r[5]), show, key + 'a'));
+        uniR.push(uniLine('add', r[3], markedCells(r[4], r[6]), show, key + 'b'));
+      } else if (kind === 'delete') {
+        oldR.push(codeLine('delete', r[1], r[2], show, key));
+        newR.push(codeLine('blank', null, '', show, key));
+        uniR.push(uniLine('del', r[1], r[2], show, key));
+      } else {
+        oldR.push(codeLine('blank', null, '', show, key));
+        newR.push(codeLine('insert', r[3], r[4], show, key));
+        uniR.push(uniLine('add', r[3], r[4], show, key));
+      }
+    });
+    return { oldRows: oldR, newRows: newR, uniRows: uniR };
+  }, [D, S.diffRel, foldSig]);
 
   if (!R) {
     return html`
@@ -4733,39 +4856,6 @@ function DiffPane() {
   const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
-  const rows = (D && D.rows) || [];
-  const oldRows = [], newRows = [], uniRows = [];
-  rows.forEach((r, i) => {
-    const key = 'r' + i;
-    if (r[0] === 'skip') {
-      const foldKey = S.diffRel + '#' + r[2];
-      const opened = S.ui.folds[foldKey] === true;
-      const label = '\u22EF ' + r[1] + ' unchanged line' + (r[1] === 1 ? '' : 's') + ' \u2014 click to show';
-      const mk = () => html`<div key=${key} class="skip" hidden=${opened}
-        onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
-      oldRows.push(mk()); newRows.push(mk()); uniRows.push(mk());
-      return;
-    }
-    const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
-    if (kind === 'equal') {
-      oldRows.push(codeLine('equal', r[1], r[2], show, key));
-      newRows.push(codeLine('equal', r[3], r[4], show, key));
-      uniRows.push(uniLine('equal', r[1], r[2], show, key));
-    } else if (kind === 'replace') {
-      oldRows.push(codeLine('replace del', r[1], markedCells(r[2], r[5]), show, key));
-      newRows.push(codeLine('replace add', r[3], markedCells(r[4], r[6]), show, key));
-      uniRows.push(uniLine('del', r[1], markedCells(r[2], r[5]), show, key + 'a'));
-      uniRows.push(uniLine('add', r[3], markedCells(r[4], r[6]), show, key + 'b'));
-    } else if (kind === 'delete') {
-      oldRows.push(codeLine('delete', r[1], r[2], show, key));
-      newRows.push(codeLine('blank', null, '', show, key));
-      uniRows.push(uniLine('del', r[1], r[2], show, key));
-    } else {
-      oldRows.push(codeLine('blank', null, '', show, key));
-      newRows.push(codeLine('insert', r[3], r[4], show, key));
-      uniRows.push(uniLine('add', r[3], r[4], show, key));
-    }
-  });
   const acceptLabel = !R.partial_ok || nSel === editable.length
     ? (editable.length > 1 ? 'Accept all' : 'Accept')
     : 'Accept ' + nSel + ' of ' + editable.length;
@@ -4798,7 +4888,7 @@ function DiffPane() {
       <div id="fileStrip">
         ${R.files.map((f) => html`
           <div key=${f.rel} class=${'fileitem' + (f.rel === S.diffRel ? ' on' : '') + (f.source ? ' source' : '')}
-               title=${f.message || ''} onClick=${() => { S.editing = false; loadDiffFile(f.rel); }}>
+               title=${f.message || ''} onClick=${() => switchDiffFile(f.rel, false)}>
             ${pending && R.partial_ok && !f.source ? html`
               <input type="checkbox" checked=${S.sel[f.rel] !== false} title="include in Accept"
                      onclick=${(e) => e.stopPropagation()}
@@ -4812,8 +4902,7 @@ function DiffPane() {
               <button class="fedit" title="edit this file's proposed code"
                       onClick=${(e) => {
                         e.stopPropagation();
-                        if (f.rel === S.diffRel && S.diff) { toggleEdit(); }
-                        else { S.editAfterLoad = true; loadDiffFile(f.rel); }
+                        switchDiffFile(f.rel, true);
                       }}>\u270E</button>` : null}
           </div>`)}
       </div>
@@ -4823,7 +4912,9 @@ function DiffPane() {
             <div class="pane-head"><span>${S.diffRel}</span><span>\u2212${D.removed} / +${D.added} lines</span></div>
             <div class="code" hidden=${S.editing}>${uniRows}</div>
             <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
-                      ref=${(el) => { editBox.current = el; }}></textarea>
+                      value=${editDraft}
+                      onInput=${(e) => setEditDraft(e.target.value)}
+                      ref=${(el) => { editBox.current = el; if (el && S.editing && el.value !== editDraft) el.value = editDraft; }}></textarea>
           </div>
         </div>` : html`
         <div id="panes">
@@ -4835,7 +4926,9 @@ function DiffPane() {
             <div class="pane-head"><span>Updated code</span><span>+${D.added} lines</span></div>
             <div class="code" ref=${newRef} hidden=${S.editing}>${newRows}</div>
             <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
-                      ref=${(el) => { editBox.current = el; }}></textarea>
+                      value=${editDraft}
+                      onInput=${(e) => setEditDraft(e.target.value)}
+                      ref=${(el) => { editBox.current = el; if (el && S.editing && el.value !== editDraft) el.value = editDraft; }}></textarea>
           </div>
         </div>`)}
     </div>`;
@@ -4890,7 +4983,7 @@ function ActivityPane() {
           <i class=${'dot ' + (j ? 'busy' : 'idle')}></i><b>${phase}</b></span>
         <span class="muted small-text grow" id="engCount">
           ${PDC.fmtInt(eng.calls || 0)} calls \u00B7 ${PDC.fmtInt(eng.steps || 0)} steps</span>
-        ${j ? html`<button class="ghost small" onClick=${() => stop()}>${j.cancelled ? 'Stopped by user' : 'Stop'}</button>` : null}
+        ${j ? html`<button class="ghost small" disabled=${!!j.cancelled} onClick=${() => stop()}>${j.cancelled ? 'Stopping\u2026' : 'Stop'}</button>` : null}
       </div>
       <div id="activityBody">
         <${LiveStreamDrawer} />
@@ -5026,9 +5119,10 @@ function WorkspacePane() {
   return html`
     <section class=${'panel' + (S.ui.wsCollapsed ? ' collapsed' : '')} id="wsPanel">
       <div class="panel-head">
-        <div id="wsTabs">
+        <div id="wsTabs" role="tablist">
           ${tabs.map(([k, lbl]) => html`
-            <button key=${k} class=${tab === k ? 'on' : ''}
+            <button key=${k} role="tab" aria-selected=${tab === k ? 'true' : 'false'}
+                    class=${tab === k ? 'on' : ''}
                     onClick=${() => setWsTab(k)}>${lbl}</button>`)}
         </div>
         <span class="muted small-text grow ws-sub">
@@ -5333,7 +5427,7 @@ function App() {
           <div class="panel-head">
             <h2>${S.mode === 'how' ? 'How / Help' : 'Chat'}</h2>
             <span class="muted small-text grow" id="busyLbl">
-              ${s.job ? (s.job.cancelled ? 'stopping\u2026' : s.job.title + '\u2026') : ''}</span>
+              ${s.job ? (s.job.cancelled ? 'Stopping\u2026' : s.job.title + '\u2026') : ''}</span>
             <${LlmHeartbeat} />
             ${S.mode === 'how' ? html`<span class="muted small-text">CLI commands \u00b7 GUI paths \u00b7 settings</span>` : null}
             ${dm === 'collapsed' ? html`
@@ -5372,11 +5466,14 @@ function App() {
         </aside>
       </main>
       <${TelemetryBar} />
-      <nav id="mobileTabs">
-        <button data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>Chat</button>
-        <button data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}
+      <nav id="mobileTabs" role="tablist">
+        <button role="tab" aria-selected=${S.ui.view === 'chat' ? 'true' : 'false'}
+                data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>Chat</button>
+        <button role="tab" aria-selected=${S.ui.view === 'diff' ? 'true' : 'false'}
+                data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}
                 disabled=${dm === 'none'} onClick=${() => { S.ui.diffOpen = true; setView('diff'); }}>Changes</button>
-        <button data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>Activity</button>
+        <button role="tab" aria-selected=${S.ui.view === 'right' ? 'true' : 'false'}
+                data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>Activity</button>
       </nav>
     </div>`;
 }
@@ -5399,5 +5496,5 @@ function initViewState() {
 render(html`<${App}/>`, $('root'));
 initViewState();
 loadActiveTheme();
-refreshState().then(() => loadSnapshot());
+loadSnapshot();
 setInterval(() => { if (!document.hidden) refreshState(); }, 2500);

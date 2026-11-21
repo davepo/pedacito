@@ -919,6 +919,43 @@ def test_gui_restart_reports_a_windows_spawn_failure_and_stays_alive(
     assert calls == {"shutdown": False, "exit": None}
 
 
+def test_gui_restart_refuses_while_job_active_and_closes_subsystems(
+        gui, monkeypatch):  # noqa: F811
+    with core.STATE.lock:
+        core.STATE.update_run = {
+            "running": False, "ok": True, "code": 0, "output": "",
+            "command": [], "detail": "", "cancelling": False,
+        }
+        core.STATE.job = core.Job(77, "task", "busy")
+    try:
+        status, j = gui.post("/api/update/restart", {})
+        assert status == 409 and j["ok"] is False
+    finally:
+        with core.STATE.lock:
+            core.STATE.job = None
+
+    from pedacito import lsp, mcp
+    order = []
+
+    class FakeSrv:
+        def server_close(self):
+            order.append("server_close")
+
+    monkeypatch.setattr(gui_server.os, "name", "posix")
+    monkeypatch.setattr(gui_server.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(mcp, "close_all", lambda: order.append("mcp"))
+    monkeypatch.setattr(lsp, "close_all", lambda: order.append("lsp"))
+    monkeypatch.setattr(gui_server, "shutdown_server",
+                        lambda: order.append("shutdown"))
+    monkeypatch.setattr(gui_server, "_SERVER", FakeSrv())
+    monkeypatch.setattr(gui_server.os, "execv",
+                        lambda exe, argv: order.append(("execv", exe, argv)))
+
+    gui_server._restart_process(["python", "-m", "pedacito", "gui"])
+    assert order[:4] == ["mcp", "lsp", "shutdown", "server_close"]
+    assert order[4][0] == "execv"
+
+
 def test_gui_manual_check_opt_out_never_touches_network(gui, monkeypatch):  # noqa: F811
     calls = []
 

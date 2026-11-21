@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ from . import settings
 from .core import STATE
 
 SECRET_MASK_KEYS = settings.SECRET_KEYS
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 def config_path(which: str) -> Path:
@@ -47,13 +49,14 @@ def _read_text(path: Path) -> str:
 def write_config(path: Path, text: str) -> None:
     """Validate, back up the old file as `<name>.bak`, and write atomically."""
     settings.validate_text(text, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        try:
-            Path(str(path) + ".bak").write_bytes(path.read_bytes())
-        except OSError:
-            pass
-    fileio.write_bytes(path, text.encode("utf-8"))
+    with _CONFIG_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                Path(str(path) + ".bak").write_bytes(path.read_bytes())
+            except OSError:
+                pass
+        fileio.write_bytes(path, text.encode("utf-8"))
 
 
 def _mask(body: dict) -> dict:
@@ -272,10 +275,8 @@ def rename_profile(which: str, old_name: str, new_name: str) -> dict:
     with STATE.lock:
         requested = STATE.profile_request
         active = STATE.cfg.active_profile if STATE.cfg is not None else ""
-    out = reload_state_config(profile=new_name
-                              if requested == old_name else None)
-    if out["active_profile"] == "" and active == old_name:
-        out = reload_state_config(profile=new_name)
+    target = new_name if (requested == old_name or active == old_name) else None
+    out = reload_state_config(profile=target)
     out["renamed"] = {"from": old_name, "to": new_name}
     out["profiles"] = sorted(set((out["user"].get("profiles") or {}))
                              | set((out["project"].get("profiles") or {})))
@@ -490,15 +491,16 @@ def reset_to_baseline() -> dict:
     assignments, and restore the recommended baseline defaults."""
     path = config_path("user")
     backup = ""
-    if path.exists():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        bp = Path(f"{path}.reset.{stamp}.bak")
-        bp.write_bytes(path.read_bytes())
-        backup = str(bp)
     text = baseline_text()
     settings.validate_text(text, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fileio.write_bytes(path, text.encode("utf-8"))
+    with _CONFIG_WRITE_LOCK:
+        if path.exists():
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bp = Path(f"{path}.reset.{stamp}.bak")
+            bp.write_bytes(path.read_bytes())
+            backup = str(bp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fileio.write_bytes(path, text.encode("utf-8"))
     out = reload_state_config()
     out["backup"] = backup
     return out
@@ -508,7 +510,8 @@ def reset_to_baseline() -> dict:
 
 def save_theme(name: str) -> dict:
     """Persist `gui_theme` in the user config and reflect it in the live
-    config. Purely cosmetic, so nothing is reloaded or restarted. When no
+    theme state only. Purely cosmetic, so nothing is reloaded or restarted and
+    live `STATE.client`/`STATE.agent` are never swapped (safe mid-job). When no
     user config exists yet it is created from the starter template first, so
     a project-less GUI session still remembers the choice."""
     name = str(name or "").strip().lower()
@@ -519,13 +522,15 @@ def save_theme(name: str) -> dict:
     created = not USER_CONFIG.exists()
     text = _read_text(USER_CONFIG) if not created else config_mod.TEMPLATE
     write_config(USER_CONFIG, settings.set_values(text, {"gui_theme": name}))
-    # Re-read the user file so /api/state reports the new theme even when no
-    # project is open (STATE.cfg is None until one is). In-place and job-free
-    # -- the whole point of a dedicated theme route -- and the dropdown's
-    # explicit profile pick survives the reload.
     with STATE.lock:
-        keep = STATE.profile_request or None
-    reload_state_config(profile=keep)
+        if STATE.cfg is not None:
+            STATE.cfg.gui_theme = name
+        if STATE._user_cfg is not None:
+            STATE._user_cfg.gui_theme = name
+        if STATE._global_cfg is not None:
+            STATE._global_cfg.gui_theme = name
+        STATE._user_cfg_stamp = None
+        STATE._global_cfg_stamp = None
     return {"gui_theme": name, "themes": themes, "persisted": True,
             "created": created}
 

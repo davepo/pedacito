@@ -370,36 +370,44 @@ def _update_run(q, body=None):
         if STATE.update_run["running"]:
             return 409, {"ok": False,
                          "detail": "An upgrade is already running."}
+        STATE.update_run["running"] = True
         info = STATE.update
-    if not update_mod.updates_enabled(cfg):
-        method = update_mod.detect_install_method(query_pipx=False)
-        _cmd, instructions = update_mod.upgrade_command(method)
-        return 200, {"ok": False, "detail": instructions}
-    method = (info or {}).get("method") or update_mod.detect_install_method()
-    command, instructions = update_mod.upgrade_command(method)
-    if command is None:
-        return 200, {"ok": False, "detail": instructions}
-    cancel = STATE.update_run_start(command)
+    started_worker = False
+    try:
+        if not update_mod.updates_enabled(cfg):
+            method = update_mod.detect_install_method(query_pipx=False)
+            _cmd, instructions = update_mod.upgrade_command(method)
+            return 200, {"ok": False, "detail": instructions}
+        method = (info or {}).get("method") or update_mod.detect_install_method()
+        command, instructions = update_mod.upgrade_command(method)
+        if command is None:
+            return 200, {"ok": False, "detail": instructions}
+        cancel = STATE.update_run_start(command)
 
-    def worker():
-        started = time.monotonic()
-        code = update_mod.run_upgrade(
-            command, on_line=STATE.note_update_output,
-            timeout=UPDATE_RUN_TIMEOUT, cancel=cancel)
-        detail = ""
-        if code != 0:
-            if cancel.is_set():
-                why = "Upgrade cancelled"
-            elif time.monotonic() - started >= UPDATE_RUN_TIMEOUT:
-                why = "Upgrade timed out"
-            else:
-                why = f"Upgrade failed (exit {code})"
-            detail = f"{why}. {instructions}"
-        STATE.update_run_done(code, detail)
+        def worker():
+            started = time.monotonic()
+            code = update_mod.run_upgrade(
+                command, on_line=STATE.note_update_output,
+                timeout=UPDATE_RUN_TIMEOUT, cancel=cancel)
+            detail = ""
+            if code != 0:
+                if cancel.is_set():
+                    why = "Upgrade cancelled"
+                elif time.monotonic() - started >= UPDATE_RUN_TIMEOUT:
+                    why = "Upgrade timed out"
+                else:
+                    why = f"Upgrade failed (exit {code})"
+                detail = f"{why}. {instructions}"
+            STATE.update_run_done(code, detail)
 
-    threading.Thread(target=worker, name="pedacito-gui-update-run",
-                     daemon=True).start()
-    return 202, {"ok": True, "running": True, "command": command}
+        threading.Thread(target=worker, name="pedacito-gui-update-run",
+                         daemon=True).start()
+        started_worker = True
+        return 202, {"ok": True, "running": True, "command": command}
+    finally:
+        if not started_worker:
+            with STATE.lock:
+                STATE.update_run["running"] = False
 
 
 @post("/api/update/cancel")
@@ -424,6 +432,23 @@ def _restart_argv() -> list[str]:
     return argv
 
 
+def _close_for_restart() -> None:
+    """Tear down MCP/LSP subprocesses and close the listening HTTP socket
+    before spawning or re-execing on the same port."""
+    from .. import lsp, mcp
+    for fn in (mcp.close_all, lsp.close_all):
+        try:
+            fn()
+        except Exception:
+            pass
+    shutdown_server()
+    if _SERVER is not None:
+        try:
+            _SERVER.server_close()
+        except Exception:
+            pass
+
+
 def _restart_process(argv: list[str], ready=None, outcome=None) -> dict:
     """Replace this GUI with the freshly upgraded one. Windows has no execv
     semantics (the call returns and the old interpreter keeps running), so
@@ -434,6 +459,14 @@ def _restart_process(argv: list[str], ready=None, outcome=None) -> dict:
     server down, so the old GUI keeps serving. `ready` is set once the spawn
     has succeeded or failed, letting the route answer with the real result."""
     result = outcome if outcome is not None else {}
+    with STATE.lock:
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        result.update(ok=False,
+                      detail="A job is running. Stop it before restarting.")
+        if ready is not None:
+            ready.set()
+        return result
     time.sleep(0.5)          # let the HTTP answer reach the page first
     if os.name == "nt":
         try:
@@ -449,12 +482,12 @@ def _restart_process(argv: list[str], ready=None, outcome=None) -> dict:
         if ready is not None:
             ready.set()
             time.sleep(0.2)      # let the route's answer flush first
-        shutdown_server()
+        _close_for_restart()
         os._exit(0)
         return result
     if ready is not None:
         ready.set()
-    shutdown_server()
+    _close_for_restart()
     try:
         os.execv(sys.executable, argv)
     except OSError as exc:
@@ -474,6 +507,10 @@ def _update_restart(q, body=None):
     running."""
     with STATE.lock:
         ok = bool(STATE.update_run.get("ok"))
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        return 409, {"ok": False,
+                     "detail": "A job is running. Stop it before restarting."}
     if not ok:
         return 409, {"ok": False,
                      "detail": "No successful upgrade to restart into."}
@@ -593,6 +630,7 @@ def _reindex_after_restore(restored, deleted) -> None:
         idx.save()
         with STATE.lock:
             STATE.idx = idx
+            STATE.index_gen += 1
         STATE.apply_index(idx)
     except Exception:
         pass
@@ -665,6 +703,11 @@ def _checkpoints_restore(q, body):
     root = _project_root()
     if root is None:
         return 400, {"ok": False, "detail": "No project is open."}
+    with STATE.lock:
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        return 409, {"ok": False,
+                     "detail": "A job is running. Wait for it or press Stop."}
     checkpoint_id = str(body.get("id") or body.get("checkpoint") or "")
     if not checkpoint_id:
         return 400, {"ok": False, "detail": "A checkpoint id is required."}
@@ -674,14 +717,21 @@ def _checkpoints_restore(q, body):
     if isinstance(files, str):
         files = [files]
     try:
-        out = checkpoints_mod.restore_checkpoint(root, checkpoint_id,
-                                                 files=files)
-    except checkpoints_mod.CheckpointError as e:
-        return 404, {"ok": False, "detail": str(e)}
-    except OSError as e:
-        return 400, {"ok": False, "detail": str(e)}
-    _reindex_after_restore(out.get("restored") or [],
-                           out.get("deleted") or [])
+        workspace.acquire_lock(root)
+    except workspace.ProjectBusy as e:
+        return 409, {"ok": False, "detail": str(e)}
+    try:
+        try:
+            out = checkpoints_mod.restore_checkpoint(root, checkpoint_id,
+                                                     files=files)
+        except checkpoints_mod.CheckpointError as e:
+            return 404, {"ok": False, "detail": str(e)}
+        except OSError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        _reindex_after_restore(out.get("restored") or [],
+                               out.get("deleted") or [])
+    finally:
+        workspace.release_lock(root)
     detail = (f"Restored {out['files']} file(s) from {out['checkpoint']}."
               + (f" Removed {len(out['deleted'])} created file(s)."
                  if out.get("deleted") else ""))
@@ -736,14 +786,21 @@ def _arena_apply(q, body):
         return 400, {"ok": False, "detail": "No arena to apply -- run one first."}
     winner = str(body.get("winner") or "a").strip().lower()
     try:
-        out = arena_mod.apply_arena_winner(root, arena_id, winner)
-    except arena_mod.ArenaError as e:
-        return 400, {"ok": False, "detail": str(e)}
-    except (checkpoints_mod.CheckpointError, OSError) as e:
-        return 400, {"ok": False, "detail": str(e)}
-    deleted = out.get("deleted") or []
-    _reindex_after_restore([f for f in out.get("files_changed") or []
-                            if f not in deleted], deleted)
+        workspace.acquire_lock(root)
+    except workspace.ProjectBusy as e:
+        return 409, {"ok": False, "detail": str(e)}
+    try:
+        try:
+            out = arena_mod.apply_arena_winner(root, arena_id, winner)
+        except arena_mod.ArenaError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        except (checkpoints_mod.CheckpointError, OSError) as e:
+            return 400, {"ok": False, "detail": str(e)}
+        deleted = out.get("deleted") or []
+        _reindex_after_restore([f for f in out.get("files_changed") or []
+                                if f not in deleted], deleted)
+    finally:
+        workspace.release_lock(root)
     detail = (f"Arena winner applied: {out['model']} "
               f"({len(out['files_changed'])} file(s) changed).")
     STATE.add_message("system", detail, kind="arena")
@@ -1172,6 +1229,7 @@ def _project_reset(q, body):
         return 200, out
     with STATE.lock:
         STATE.idx = None
+        STATE.agent = None
         STATE.plan_path = None
         STATE.last_backup_dir = None
     STATE.apply_index(None)
@@ -1917,10 +1975,12 @@ def _refactor_rename(q, body):
     new = str(body.get("new") or "").strip()
     if not old or not new:
         return 400, {"ok": False, "detail": "Both `old` and `new` are required."}
-    root = STATE.root
+    with STATE.lock:
+        root = STATE.root
+        busy = STATE.job is not None and STATE.job.active
     if root is None:
         return 409, {"ok": False, "detail": "Open a workspace first."}
-    if STATE.job is not None and STATE.job.active:
+    if busy:
         return 409, {"ok": False, "detail": "An agent run is active; stop it "
                        "before renaming."}
     scope = str(body.get("file") or "").strip() or None
@@ -1936,19 +1996,35 @@ def _refactor_rename(q, body):
         fileio.backup_copy(path, state["dir"] / rel)
         return None
 
-    res = refactor_mod.rename_symbol_across_project(
-        root, old, new, scope_file=scope, dry_run=not apply_it,
-        before_write=_snapshot if apply_it else None)
-    if not res.get("ok"):
-        return 400, res
-    if state["dir"] is not None:
-        res["backup"] = str(state["dir"].relative_to(root))
-    if apply_it and res["files_modified"] and STATE.idx is not None:
-        # keep the GUI's index truthful after the rename (the next agent run
-        # rebuilds anyway; this only prevents stale search results)
-        from ..index import reindex_file
-        for rel in res["files_modified"]:
-            reindex_file(STATE.idx, rel, STATE.cfg, save=False)
+    lock_held = False
+    if apply_it:
+        try:
+            workspace.acquire_lock(root)
+            lock_held = True
+        except workspace.ProjectBusy as e:
+            return 409, {"ok": False, "detail": str(e)}
+    try:
+        res = refactor_mod.rename_symbol_across_project(
+            root, old, new, scope_file=scope, dry_run=not apply_it,
+            before_write=_snapshot if apply_it else None)
+        if not res.get("ok"):
+            return 400, res
+        if state["dir"] is not None:
+            res["backup"] = str(state["dir"].relative_to(root))
+        if apply_it and res["files_modified"]:
+            with STATE.lock:
+                idx, cfg = STATE.idx, STATE.cfg
+            if idx is not None:
+                from ..index import reindex_file
+                for rel in res["files_modified"]:
+                    idx = reindex_file(idx, rel, cfg, save=False)
+                with STATE.lock:
+                    STATE.idx = idx
+                    STATE.index_gen += 1
+                STATE.apply_index(idx)
+    finally:
+        if lock_held:
+            workspace.release_lock(root)
     return 200, res
 
 
@@ -2203,12 +2279,26 @@ POST_ROUTES["/api/settings/setup"] = _settings_write(
         b.get("vram_gb")))
 POST_ROUTES["/api/settings/trust"] = _settings_write(
     lambda b: settings_api.trust_project_config())
-POST_ROUTES["/api/profiles/rename"] = _settings_write(
-    lambda b: settings_api.rename_profile(
-        b.get("file", "user"), str(b.get("old_name", "")),
-        str(b.get("new_name", ""))))
-POST_ROUTES["/api/settings/scout"] = _settings_write(
-    lambda b: settings_api.configure_scout(dict(b or {})))
+
+
+@post("/api/profiles/rename")
+def _profiles_rename(q, body):
+    """Rename a profile; `rename_profile` already reloads STATE synchronously."""
+    try:
+        return 200, {"ok": True, **settings_api.rename_profile(
+            body.get("file", "user"), str(body.get("old_name", "")),
+            str(body.get("new_name", "")))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/settings/scout")
+def _settings_scout(q, body):
+    """Save a Scout + Architect pairing; `configure_scout` already reloads STATE."""
+    try:
+        return 200, {"ok": True, **settings_api.configure_scout(dict(body or {}))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
 
 
 @post("/api/settings/theme")

@@ -187,11 +187,16 @@ class Bus:
 
     def wait(self, after: int, timeout: float = 15.0) -> tuple[list[dict], bool]:
         """Events newer than `after`, blocking up to `timeout` seconds when
-        there are none. The flag is True when `after` fell off the buffer, so
-        the consumer must resynchronise from a snapshot."""
+        there are none. The flag is True when `after` fell off the buffer or
+        exceeds the current sequence (e.g., server restarted on the same port),
+        so the consumer must resynchronise from a snapshot."""
         with self._cond:
+            if after > self.seq:
+                return [], True
             if not self.closed and self.seq <= after:
                 self._cond.wait(timeout)
+            if after > self.seq:
+                return [], True
             if not self._events:
                 return [], False
             oldest = self._events[0]["seq"]
@@ -901,12 +906,15 @@ class State:
                          for m in rec["messages"]],
         }
 
-    def _write_thread_file(self, payload: dict) -> None:
+    def _write_thread_file(self, payload: dict, root: Path | None = None,
+                           *, use_state_root: bool = False) -> None:
         """Persist one thread payload atomically (temp file + rename, so a
-        crash mid-save cannot truncate a conversation). Writes to the scope
-        that is current at call time: the project's folder, or the per-user
-        `threads/global/` when no project is open."""
-        path = threads_dir(self.root) / (payload["id"] + ".json")
+        crash mid-save cannot truncate a conversation). Writes to the snapshotted
+        `root` (or the current `self.root` when `use_state_root` is True)."""
+        if use_state_root:
+            with self.lock:
+                root = self.root
+        path = threads_dir(root) / (payload["id"] + ".json")
         with self._thread_io:            # serialize writers; never hold `lock` during I/O
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -923,17 +931,19 @@ class State:
         Streaming appends are throttled to ~1/s; the save on job end is forced.
         The thread follows the scope: switching projects, or opening one from
         the project-less scope, never moves these files."""
-        rec = self.threads.get(self.thread_id)
-        if rec is None:
-            return
         now = time.monotonic()
-        if not force and (now - self._last_thread_save) < 1.0:
-            return
         with self.lock:
+            tid = self.thread_id
+            rec = self.threads.get(tid)
+            if rec is None:
+                return
+            if not force and (now - self._last_thread_save) < 1.0:
+                return
             self._last_thread_save = now
             rec["updated_at"] = time.time()
+            root = self.root
             payload = self._thread_payload_locked(rec)
-        self._write_thread_file(payload)
+        self._write_thread_file(payload, root=root)
 
     def rename_thread(self, tid: str, title: str) -> str | None:
         """Give a thread a hand-picked name and mark it `title_custom`, so no
@@ -951,8 +961,9 @@ class State:
                 return None
             rec["title"] = title
             rec["title_custom"] = True
+            root = self.root
             payload = self._thread_payload_locked(rec)
-        self._write_thread_file(payload)
+        self._write_thread_file(payload, root=root)
         self.bus.publish("status")
         return title
 
@@ -1319,7 +1330,7 @@ class State:
             actions = [dict(a) for a in self.actions][-12:]
             steps = self.gather_steps
             specialist = dict(self.specialist)
-            stats = dict(client.stats) if client is not None else {}
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
             if job is None:
                 phase = self.phase or "idle"
             else:
@@ -1727,6 +1738,23 @@ class State:
             idx = self.idx
             return f"{self.index_gen}:{len(idx.files) if idx else 0}"
 
+    def usage_snapshot(self) -> dict:
+        """Fast in-memory usage snapshot for SSE `usage` events (no disk I/O)."""
+        with self.lock:
+            client = self.client
+            if client is None and self.job is not None \
+                    and self.job.client is not None:
+                client = self.job.client
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
+        return {
+            "calls": stats.get("calls", 0),
+            "tokens_in": stats.get("prompt_tokens", 0),
+            "tokens_out": stats.get("completion_tokens", 0),
+            "cache_hit": cache_hit_ratio(stats) if stats else 0.0,
+            "cost": stats.get("cost", 0.0),
+            "seconds": stats.get("seconds", 0.0),
+        }
+
     def status(self) -> dict:
         """The JSON payload the page polls to update itself."""
         theme = self.user_theme()       # disk read/cache outside the lock
@@ -1747,6 +1775,24 @@ class State:
         # Runner detection walks test files, so it runs here, outside the
         # state lock; the value only feeds the topbar tooltip/assist.
         detected_cmd = self.detected_test_command()
+        # Model card calibration, recent projects, backup listing, and
+        # config existence are disk reads -- run them outside `self.lock`.
+        calibration: dict = {}
+        if cfg is not None:
+            try:
+                from .. import modelcard
+                calibration = modelcard.calibration_map(cfg)
+                active = cfg.active_profile or ""
+                if active not in calibration:
+                    calibration[active] = modelcard.profile_calibration(cfg)
+            except Exception:
+                calibration = {}
+        details = profile_catalog(cfg, calibration)
+        recent = load_recent()
+        snapshots = [p.name for p in
+                     (workspace.list_backups(root)[:8] if root else [])]
+        needs_setup = not USER_CONFIG.exists()
+        engine_payload = self.engine()
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -1757,7 +1803,7 @@ class State:
                 # (no project, so STATE.client stays None); the panel keeps
                 # showing that client's last-call numbers after the job.
                 client = self.job.client
-            stats = dict(client.stats) if client is not None else {}
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
             # Live telemetry for the footer: the worker client's snapshot,
             # overridden by the specialist's own last-call numbers while a
             # specialist holds the card (the shared ledger keeps the session
@@ -1784,22 +1830,11 @@ class State:
                             telemetry[k] = st[k]
                     except Exception:
                         pass
-            calibration: dict = {}
-            if cfg is not None:
-                try:
-                    from .. import modelcard
-                    calibration = modelcard.calibration_map(cfg)
-                    active = cfg.active_profile or ""
-                    if active not in calibration:
-                        calibration[active] = modelcard.profile_calibration(cfg)
-                except Exception:
-                    calibration = {}
             profile_models = {}
             if cfg:
                 for name, body in (cfg.profiles or {}).items():
                     model = body.get("model") if isinstance(body, dict) else ""
                     profile_models[name] = str(model or cfg.model or "")
-            details = profile_catalog(cfg, calibration)
             no_project = self.root is None
             return {
                 "root": str(self.root) if self.root else "",
@@ -1873,7 +1908,7 @@ class State:
                 # live permission broker: the modal's payload (or null)
                 "pending_permission": (dict(self.pending_permission)
                                         if self.pending_permission else None),
-                "recent": load_recent(),
+                "recent": recent,
                 # the chat thread currently open, plus the project's history
                 # (see `_load_threads`), so the page can offer "switch back"
                 "active_thread_id": self.thread_id,
@@ -1882,7 +1917,7 @@ class State:
                 "thread_title_custom": bool((self.threads.get(self.thread_id) or
                                              {}).get("title_custom")),
                 "threads": self._threads_summary_locked(),
-                "needs_setup": not USER_CONFIG.exists(),
+                "needs_setup": needs_setup,
                 "context_tokens": cfg.context_tokens if cfg else 0,
                 "context_origin": (cfg.sources.get("context_tokens", "default")
                                    if cfg else ""),
@@ -1947,12 +1982,10 @@ class State:
                 "planner_profile": (str((getattr(cfg, "roles", None) or {})
                                         .get("planner") or "")
                                     if cfg else ""),
-                "snapshots": [p.name for p in
-                              (workspace.list_backups(self.root)[:8]
-                               if self.root else [])],
+                "snapshots": snapshots,
                 "plan_file": (cfg.auto_plan_file if cfg else "PLAN.md"),
                 "last_auto": dict(self.last_auto),
-                "engine": self.engine(),
+                "engine": engine_payload,
             }
 
     def review_meta_brief(self) -> dict | None:
@@ -1990,17 +2023,27 @@ def install_runner() -> None:
         deadline = time.time() + float(timeout or 1800)
         while not rv.done.wait(0.5):
             if time.time() > deadline:
-                STATE._finish_review(
-                    rv, "timeout",
-                    "Review window timed out; nothing was written.",
-                    discard=on_discard is not None)
+                with STATE.apply_lock:
+                    with STATE.lock:
+                        already = bool(rv.outcome)
+                    if not already:
+                        STATE._finish_review(
+                            rv, "timeout",
+                            "Review window timed out; nothing was written.",
+                            discard=on_discard is not None)
                 break
             if job is not None and job.cancelled:
-                STATE._finish_review(rv, "cancelled",
-                                     "Cancelled; nothing was written.",
-                                     discard=on_discard is not None)
+                with STATE.apply_lock:
+                    with STATE.lock:
+                        already = bool(rv.outcome)
+                    if not already:
+                        STATE._finish_review(
+                            rv, "cancelled",
+                            "Cancelled; nothing was written.",
+                            discard=on_discard is not None)
                 break
-        return rv.outcome, rv.detail
+        with STATE.lock:
+            return rv.outcome, rv.detail
 
     review_mod.RUNNER = runner
 
