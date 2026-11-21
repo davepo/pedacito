@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
+from .. import i18n
 from .. import review as review_mod
 from .. import prompts as prompts_mod
 from .. import runner as runner_mod
@@ -105,21 +106,27 @@ def _within(root: Path, rel: str) -> Path | None:
 
 
 def index_html(data: bytes) -> bytes:
-    """The page HTML with the saved theme already on <html>, so a reload
-    with no project open paints in the user's colorscheme instead of
-    flashing the default until /api/state answers. theme.js still lets a
-    browser-local pick override it."""
+    """The page HTML with the saved language and theme already on <html>,
+    so a reload with no project open paints in the user's language and
+    colorscheme instead of flashing defaults until /api/state answers.
+    theme.js still lets a browser-local pick override them."""
     theme = STATE.user_theme()
-    if not theme or theme == "slate":
+    lang = i18n.normalize_lang(STATE.user_language())
+    need_theme = bool(theme and theme != "slate")
+    need_lang = bool(lang and lang != "en")
+    if not need_theme and not need_lang:
         return data
     text = data.decode("utf-8", errors="replace")
     marker = '<html lang="en">'
     if marker not in text:
         return data
-    # `theme` is a closed enum from config.py; still escape defensively.
-    safe = (str(theme).replace("&", "&amp;").replace('"', "&quot;")
-            .replace("<", "&lt;").replace(">", "&gt;"))
-    text = text.replace(marker, f'<html lang="en" data-theme="{safe}">', 1)
+    attrs = f'lang="{lang}"'
+    if need_theme:
+        # `theme` is a closed enum from config.py; still escape defensively.
+        safe = (str(theme).replace("&", "&amp;").replace('"', "&quot;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+        attrs += f' data-theme="{safe}"'
+    text = text.replace(marker, f'<html {attrs}>', 1)
     return text.encode("utf-8")
 
 
@@ -2308,6 +2315,28 @@ def _theme(q, body):
     try:
         return 200, {"ok": True, **settings_api.save_theme(
             str(body.get("gui_theme", "")))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@get("/api/i18n")
+def _i18n_get(q, body=None):
+    """Active interface language, supported codes, and full flat catalogs."""
+    return 200, {
+        "ok": True,
+        "lang": STATE.user_language(),
+        "supported": list(i18n.SUPPORTED_LANGUAGES),
+        "catalogs": i18n.all_catalogs(),
+    }
+
+
+@post("/api/settings/language")
+def _settings_language(q, body):
+    """Persist the interface language in the user config. UI-only: no
+    project reload, no jobs touched."""
+    try:
+        res = settings_api.save_language(str((body or {}).get("language", "")))
+        return 200, {"ok": True, **res, "catalogs": i18n.all_catalogs()}
     except ConfigError as e:
         return 400, {"ok": False, "detail": str(e)}
 

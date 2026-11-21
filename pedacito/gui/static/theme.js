@@ -30,6 +30,10 @@
         if (cached[k]) r.setProperty(k, cached[k]);
       });
     }
+    var lang = localStorage.getItem('pedacito_lang');
+    if (lang === 'en' || lang === 'es') {
+      document.documentElement.lang = lang;
+    }
     var w = JSON.parse(localStorage.getItem('pedacito_layout') || '{}');
     if (w.left) r.setProperty('--left', w.left + 'px');
     if (w.right) r.setProperty('--right', w.right + 'px');

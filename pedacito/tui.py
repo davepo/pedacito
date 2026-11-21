@@ -47,6 +47,7 @@ from pathlib import Path
 from . import checkpoints as checkpoints_mod
 from . import events as events_mod
 from . import gitinfo
+from . import i18n
 from . import index as index_mod
 from . import llm as llm_mod
 from . import loop
@@ -126,13 +127,14 @@ _TAB_PREFIX = {
     "/unl": "/unload ",
     "/hy": "/hybrid ",
     "/ar": "/arena ",
+    "/la": "/lang ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
-    "/theme",
+    "/theme", "/lang",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/update",
@@ -145,7 +147,7 @@ _KNOWN_KEYS = {
     "PAGE_UP", "PAGE_DOWN", "SHIFT_UP", "SHIFT_DOWN",
     "SHIFT_LEFT", "SHIFT_RIGHT", "ALT_PAGE_UP", "ALT_PAGE_DOWN",
     "WHEEL_UP", "WHEEL_DOWN", "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_L",
-    "CTRL_U", "CTRL_W", "F2", "SHIFT_TAB",
+    "CTRL_U", "CTRL_W", "F2", "F3", "SHIFT_TAB",
 }
 
 # Commands shown by /help and in the prompt bar's hint line.
@@ -165,6 +167,7 @@ Pedacito TUI keybindings
   Ctrl+K / Ctrl+L       kill to end / force a full repaint
   Tab                   complete slash commands and profile names
   F2                    toggle SGR mouse mode (native selection default)
+  F3                    toggle interface language (EN <-> ES)
   Ctrl+C                cancel the running task
   /quit or /exit        leave and restore the terminal"""
 
@@ -184,6 +187,7 @@ Pedacito TUI commands
   /plan [GOAL]              show PLAN.md, or generate it from GOAL
   /consolidate /compact     compact the session into a handoff checkpoint
   /profile [NAME]           list profiles, or switch to NAME
+  /profiles                 list all configured profiles
   /profile show|run|reset   hardware snapshot + last probe + active auto-tune;
                             run forces a probe, reset drops cached measurements
   /model ID                 switch to a model id directly
@@ -207,6 +211,7 @@ Pedacito TUI commands
                             off=surgical edits (warmer sampling + whole-file CSS/HTML)
   /theme [NAME]             list color themes, or switch to NAME and save it
                             (shared with the GUI Theme Manager)
+  /lang [en|es]             switch interface language (F3 toggles EN/ES)
   /apply [on|off]           write edits to disk, or preview them
   /verify [on|off|status]   post-edit verification: on detects the project's
                             test command, off clears it, status shows the
@@ -247,9 +252,93 @@ Pedacito TUI commands
   /quit  /exit              leave and restore the terminal
 
 Enter: send | PgUp/PgDn/Wheel: scroll | Up/Down: history | Tab: complete
-F2: mouse mode | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
+F2: mouse mode | F3: [EN|es] | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
 Plain text is a task: it runs through the normal gather/edit/verify loop.
 Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
+
+
+KEYS_TEXT_ES = """\
+Atajos de teclado de Pedacito TUI
+  Enter                 enviar la tarea o comando con barra
+  PgUp / PgDn           desplazar transcripción media página arriba / abajo
+  Shift+Up / Shift+Down desplazar transcripción 3 líneas arriba / abajo
+  Ctrl+U / Ctrl+D       desplazamiento de media página con el prompt vacío
+  Alt+PgUp / Alt+PgDn   desplazar el panel lateral de Actividad / Plan
+  Rueda del ratón       transcripción 3 líneas, o el panel bajo el puntero
+  Up / Down             historial de comandos (o desplazamiento si subió)
+  Left / Right          mover el cursor en el prompt
+  Home / End            inicio / final del prompt (End vuelve en vivo)
+  Esc                   ir al final en vivo
+  Backspace / Delete    editar el prompt; Ctrl+W borra una palabra
+  Ctrl+K / Ctrl+L       borrar hasta el final / forzar repintado completo
+  Tab                   completar comandos con barra y nombres de perfiles
+  F2                    alternar modo ratón SGR (selección nativa por defecto)
+  F3                    alternar idioma de la interfaz (EN <-> ES)
+  Ctrl+C                cancelar la tarea en ejecución
+  /quit o /exit         salir y restaurar la terminal"""
+
+HELP_TEXT_ES = """\
+Comandos de Pedacito TUI
+  /help                     esta lista y los atajos de teclado
+  /keys                     atajos de teclado y modos de ratón detallados
+  /status  /telemetry       tabla de telemetría y tokens por etapa
+  /new DIR PROMPT           crear un proyecto nuevo en DIR y cambiar a él
+  /auto OBJETIVO            planificar OBJETIVO y ejecutar cada tarea en vivo
+  /auto! OBJETIVO           forzar el ciclo multi-paso Auto sin sugerencia
+  /plan [OBJETIVO]          mostrar PLAN.md o generarlo desde OBJETIVO
+  /consolidate /compact     compactar la sesión en un punto de entrega
+  /profile [NOMBRE]         listar perfiles o cambiar a NOMBRE
+  /profiles                 listar todos los perfiles configurados
+  /profile show|run|reset   hardware + última sonda + auto-ajuste activo
+  /model ID                 cambiar directamente a un id de modelo
+  /auto-route [on|off]      activar o desactivar el ruteo de especialistas
+  /hybrid [off | PROV MOD]  ruteo híbrido: arquitecto planifica, editor edita
+  /arena A:B PROMPT         comparar dos modelos en entornos aislados
+  /arena apply a|b          aplicar los cambios del modelo ganador
+  /think [on|off]           activar o desactivar el razonamiento del modelo
+  /effort [NIVEL]           esfuerzo de razonamiento: default, low, medium, high
+  /servers                  VRAM/RAM en vivo y estado de servidores locales
+  /unload [SERVIDOR]        descargar modelos del servidor local
+  /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
+  /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
+  /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
+  /apply [on|off]           escribir cambios en disco o solo previsualizar
+  /verify [on|off|status]   verificación posterior a la edición
+  /skills [list|show|draft] listar, inspeccionar o redactar habilidades
+  /skill NOMBRE             cargar la lista de verificación de una habilidad
+  /memory [list|add|forget] consultar o actualizar la memoria del proyecto
+  /procs [list|logs|stop]   administrar procesos en segundo plano
+  /pin [list|add|remove|clear] fijar archivos o símbolos al contexto
+  /rules [list|set|clear]   ver o editar .pedacito/rules.md
+  /security [ack|gitignore] escanear secretos o archivos .env expuestos
+  /diff                     estado de git y diff del árbol de trabajo
+  /checkpoints [N]          mostrar el árbol de checkpoints
+  /undo                     restaurar el estado anterior a la última ejecución
+  /checkout ID              restaurar el espacio de trabajo desde un checkpoint
+  /run [CMD]                ejecutar el punto de entrada detectado o CMD
+  /fix                      enviar el último error de /run para repararlo
+  /update [run]             buscar actualizaciones en PyPI y actualizar
+  /reset                    limpiar el estado de .pedacito (conserva memoria)
+  /sidebar                  mostrar u ocultar el panel de actividad / plan
+  /scroll up|down|top|bottom|N  desplazar la transcripción
+  /mouse [on|off]           captura de rueda del ratón SGR (F2)
+  /clear                    limpiar el panel de transcripción
+  /quit  /exit              salir y restaurar la terminal
+
+Enter: enviar | PgUp/PgDn/Rueda: desplazar | Up/Down: historial | Tab: completar
+F2: ratón | F3: [en|ES] | Esc/End: final | Ctrl+C: cancelar | /help | /quit
+El texto normal es una tarea: se ejecuta en el ciclo gather/edit/verify.
+Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
+
+
+def help_text(lang: str = "en") -> str:
+    """Localized TUI /help text."""
+    return HELP_TEXT_ES if i18n.normalize_lang(lang) == "es" else HELP_TEXT
+
+
+def keys_text(lang: str = "en") -> str:
+    """Localized TUI /keys text."""
+    return KEYS_TEXT_ES if i18n.normalize_lang(lang) == "es" else KEYS_TEXT
 
 
 def _windows_key_sequence(code: str) -> str:
@@ -259,6 +348,7 @@ def _windows_key_sequence(code: str) -> str:
         "G": "\x1b[H", "O": "\x1b[F", "S": "\x1b[3~",
         "I": "\x1b[5~", "Q": "\x1b[6~",
         "<": "\x1bOQ",           # F2 on the Windows console
+        "=": "\x1bOR",           # F3 on the Windows console
         "R": "\x1b[2~",          # Insert (recognised as UNKNOWN)
     }.get(code, "")
 
@@ -315,6 +405,8 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
         "\x1b[8~": "END",
         "\x1bOQ": "F2",
         "\x1b[12~": "F2",
+        "\x1bOR": "F3",
+        "\x1b[13~": "F3",
         "\x1b[Z": "SHIFT_TAB",
         "\x00I": "PAGE_UP", "\xe0I": "PAGE_UP",
         "\x00Q": "PAGE_DOWN", "\xe0Q": "PAGE_DOWN",
@@ -322,6 +414,7 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
         "\x00O": "END", "\xe0O": "END",
         "\x00S": "DELETE", "\xe0S": "DELETE",
         "\x00<": "F2", "\xe0<": "F2",
+        "\x00=": "F3", "\xe0=": "F3",
     }
     for seq, key in exact.items():
         if buf.startswith(seq):
@@ -509,9 +602,12 @@ class TuiSession:
                  apply: bool = True, headless: bool | None = None,
                  stdin=None, stdout=None, initial_task: str = "",
                  width: int | None = None, height: int | None = None,
-                 color: bool | None = None, sidebar: bool = True):
+                 color: bool | None = None, sidebar: bool = True,
+                 lang: str | None = None):
         self.root = Path(str(root)).expanduser().resolve()
         self.cfg = cfg if cfg is not None else Config()
+        self.lang = i18n.detect_lang(lang, self.cfg)
+        i18n.set_current_lang(self.lang)
         # The active palette is shared with the GUI. Loading is tolerant:
         # a hand-edited themes.json can never stop the session from opening.
         try:
@@ -892,17 +988,26 @@ class TuiSession:
         model_text = self._style(model, "text")
         badge_text = self._style(
             badge, "warning" if badge.startswith("\u2601") else "success")
+        line1_profile = i18n.t("tui.header.profile", lang=self.lang)
+        line1_model = i18n.t("tui.header.model", lang=self.lang)
+        line2_auto_route = i18n.t("tui.header.auto_route", lang=self.lang)
+        line2_scout = i18n.t("tui.header.scout", lang=self.lang)
+        line2_sidebar = i18n.t("tui.header.sidebar", lang=self.lang)
+        lang_label = i18n.t("tui.header.lang", lang=self.lang)
+        lang_pill = "[en|ES]" if self.lang == "es" else "[EN|es]"
         line1 = (f"{brand}{sep} {self._style(project, 'text')} "
-                 f"{sep} profile: {profile_text} {sep} model: {model_text} "
+                 f"{sep} {line1_profile}: {profile_text} {sep} {line1_model}: {model_text} "
                  f"{sep} {badge_text}")
-        line2 = (f" {self._style('Auto-Route:', 'muted')} "
+        line2 = (f" {self._style(line2_auto_route + ':', 'muted')} "
                  f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
-                 f"{sep} {self._style('Scout:', 'muted')} "
+                 f"{sep} {self._style(line2_scout + ':', 'muted')} "
                  f"{self._style(scout, 'text')} "
                  f"{sep} {self._style('git:', 'muted')} "
                  f"{self._style(branch + ('*' if dirty else ''), 'warning' if dirty else 'text')} "
-                 f"{sep} {self._style('sidebar:', 'muted')} "
-                 f"{self._style(sidebar, 'text')}")
+                 f"{sep} {self._style(line2_sidebar + ':', 'muted')} "
+                 f"{self._style(sidebar, 'text')} "
+                 f"{sep} {self._style(lang_label + ':', 'muted')} "
+                 f"{self._style(lang_pill, 'accent')}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -928,7 +1033,7 @@ class TuiSession:
 
     def _all_sidebar_rows(self, width: int) -> list[str]:
         width = max(20, width)
-        rows: list[str] = ["ACTIVITY & PLAN"]
+        rows: list[str] = [i18n.t("tui.sidebar.title", lang=self.lang)]
         items = self.plan_items()
         rows.append(f"PLAN: {self._plan_path().name}")
         if items:
@@ -936,21 +1041,21 @@ class TuiSession:
                 mark = "x" if checked else " "
                 rows.append(f"[{mark}] {text}")
         else:
-            rows.append("[ ] (no PLAN.md tasks yet)")
+            rows.append(i18n.t("tui.sidebar.no_plan", lang=self.lang))
         rows.append("")
-        rows.append("LIVE ACTIVITY / ROUTING")
+        rows.append(i18n.t("tui.sidebar.activity", lang=self.lang))
         if self.activity:
             for row in self.activity:
                 rows.append(row if row.startswith("\u00b7 ") else f"\u00b7 {row}")
         else:
-            rows.append("\u00b7 (waiting for a task)")
+            rows.append(i18n.t("tui.sidebar.waiting", lang=self.lang))
         rows.append("")
-        rows.append("MODIFIED FILES")
+        rows.append(i18n.t("tui.sidebar.modified", lang=self.lang))
         if self.modified:
             for rel in self.modified:
                 rows.append(f"~ {rel}")
         else:
-            rows.append("~ (none yet)")
+            rows.append(i18n.t("tui.sidebar.none_yet", lang=self.lang))
         return rows
 
     def _sidebar_lines(self, width: int, height: int) -> list[str]:
@@ -1204,15 +1309,15 @@ class TuiSession:
 
         header = self.header_lines(width)
         footer = self.telemetry_lines(width)
-        hint = ("Enter: send | PgUp/PgDn/Wheel: scroll | \u2191/\u2193: history | "
-                "Tab: complete | F2: mouse mode | /help | /quit")
+        hint = i18n.t("tui.hint_bar", lang=self.lang)
+        transcript_heading = i18n.t("tui.transcript", lang=self.lang)
         prompt_text, _cursor_col = self._prompt_visible(width)
         body_height = max(4, height - len(header) - len(footer) - 2)
 
         if show_sidebar:
             side_width = min(46, max(32, width // 3))
             left_width = width - side_width - 1
-            left = ["TRANSCRIPT"] + self._transcript_rows(
+            left = [transcript_heading] + self._transcript_rows(
                 left_width - 1, body_height - 1)
             right = self._sidebar_lines(side_width - 1, body_height)
             body: list[str] = []
@@ -1222,7 +1327,7 @@ class TuiSession:
                 body.append(_fit(lt, left_width) + "\u2502"
                             + _fit(rt, side_width))
         else:
-            body = ["TRANSCRIPT"] + self._transcript_rows(
+            body = [transcript_heading] + self._transcript_rows(
                 width - 1, body_height - 1)
             body = [_fit(row, width) for row in body[:body_height]]
             while len(body) < body_height:
@@ -1895,6 +2000,8 @@ class TuiSession:
 
         if key == "F2":
             self._toggle_mouse()
+        elif key == "F3":
+            self._toggle_lang()
         elif key == "PAGE_UP":
             self.scroll_transcript(half)
         elif key == "PAGE_DOWN":
@@ -2777,10 +2884,13 @@ class TuiSession:
             self._append("Goodbye.", "system")
             return
         if cmd in ("help", "h", "?"):
-            self._append(HELP_TEXT, "system")
+            self._append(help_text(self.lang), "system")
             return
         if cmd == "keys":
-            self._append(KEYS_TEXT, "system")
+            self._append(keys_text(self.lang), "system")
+            return
+        if cmd == "lang":
+            self._lang_command(arg)
             return
         if cmd == "scroll":
             self._scroll_command(arg)
@@ -4298,6 +4408,40 @@ class TuiSession:
             self.close()
         return 0
 
+    def _set_lang(self, new_lang: str, *, persist: bool = True) -> str:
+        """Switch the TUI's active interface language, persist it, and log a notice."""
+        if not i18n.is_valid_lang(new_lang):
+            self._append(i18n.t("tui.lang_invalid", lang=self.lang,
+                                value=str(new_lang)), "error")
+            return self.lang
+        code = i18n.normalize_lang(new_lang)
+        self.lang = code
+        self.cfg.language = code
+        i18n.set_current_lang(code)
+        if persist:
+            try:
+                i18n.save_user_language(code)
+            except OSError:
+                pass
+        name = i18n.t(f"lang.{code}", lang=code)
+        self._append(i18n.t("tui.lang_switched", lang=code,
+                            name=name, code=code), "system")
+        self._dirty = True
+        return code
+
+    def _toggle_lang(self) -> str:
+        """Toggle interface language en <-> es (F3)."""
+        return self._set_lang("es" if self.lang == "en" else "en", persist=True)
+
+    def _lang_command(self, arg: str) -> None:
+        raw = str(arg or "").strip().lower()
+        if not raw:
+            name = i18n.t(f"lang.{self.lang}", lang=self.lang)
+            self._append(i18n.t("tui.lang_current", lang=self.lang,
+                                name=name, code=self.lang), "system")
+            return
+        self._set_lang(raw, persist=True)
+
     def handle_command(self, line: str) -> bool:
         """Compatibility alias for callers that drive the session directly."""
         return self.handle_line(line)
@@ -4305,7 +4449,7 @@ class TuiSession:
 
 def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
             headless: bool = False, stdin=None, stdout=None,
-            client=None, apply: bool = True) -> int:
+            client=None, apply: bool = True, lang: str | None = None) -> int:
     """Entry point for `pedacito tui`; returns the process exit code.
 
     `headless=True`, or any non-TTY stdin, reads commands from `stdin` and
@@ -4314,5 +4458,5 @@ def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
     """
     session = TuiSession(root, cfg, client=client, apply=apply,
                          headless=headless, stdin=stdin, stdout=stdout,
-                         initial_task=initial_task)
+                         initial_task=initial_task, lang=lang)
     return session.run()

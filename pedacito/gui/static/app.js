@@ -60,6 +60,64 @@ PDC.fmtTokens = (n) => {
   return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 };
 
+// ------------------------------------------------------------------- i18n ----
+PDC.lang = (document.documentElement.lang === 'es') ? 'es' : 'en';
+PDC.i18n = { en: {}, es: {} };
+PDC.t = (key, vars, fallback) => {
+  const cat = PDC.i18n[PDC.lang] || {};
+  const en = PDC.i18n.en || {};
+  let text = (cat[key] !== undefined && cat[key] !== '') ? cat[key]
+    : (en[key] !== undefined && en[key] !== '') ? en[key]
+    : (fallback !== undefined ? fallback : key);
+  if (vars && typeof vars === 'object') {
+    text = String(text).replace(/\{([A-Za-z0-9_]+)\}/g, (m, k) => (
+      Object.prototype.hasOwnProperty.call(vars, k) && vars[k] !== undefined && vars[k] !== null
+        ? String(vars[k]) : m
+    ));
+  }
+  return text;
+};
+PDC.setLang = (lang, persist) => {
+  const code = (String(lang || '').trim().toLowerCase() === 'es') ? 'es' : 'en';
+  PDC.lang = code;
+  document.documentElement.lang = code;
+  try { localStorage.setItem('pedacito_lang', code); } catch (e) {}
+  emit();
+  if (typeof PDC.rerenderSettings === 'function') {
+    try { PDC.rerenderSettings(); } catch (e) {}
+  }
+  if (persist !== false) {
+    PDC.api('/api/settings/language', { language: code }).then((j) => {
+      if (j && j.catalogs) {
+        PDC.i18n = j.catalogs;
+        emit();
+        if (typeof PDC.rerenderSettings === 'function') {
+          try { PDC.rerenderSettings(); } catch (e) {}
+        }
+      }
+      if (j && !j.ok) PDC.toast(j.detail || PDC.t('errors.unknown', null, 'Something went wrong.'), true);
+    }, () => {});
+  }
+};
+function loadI18n() {
+  return PDC.api('/api/i18n').then((j) => {
+    if (!j || !j.ok) return;
+    if (j.catalogs) PDC.i18n = j.catalogs;
+    let saved = '';
+    try { saved = localStorage.getItem('pedacito_lang') || ''; } catch (e) {}
+    const serverLang = (j.lang === 'es' || j.lang === 'en') ? j.lang : 'en';
+    const next = (saved === 'en' || saved === 'es') ? saved : serverLang;
+    if (next !== PDC.lang) {
+      PDC.lang = next;
+      document.documentElement.lang = next;
+    }
+    emit();
+    if (typeof PDC.rerenderSettings === 'function') {
+      try { PDC.rerenderSettings(); } catch (e) {}
+    }
+  }, () => {});
+}
+
 // Built-in hosted-provider catalog. settings.js seeds its "Add Hosted
 // Provider" dialog from this immediately, so the provider selector renders
 // even before (or if) GET /api/providers/presets ever answers; the server's
@@ -3742,40 +3800,40 @@ function TelemetryBar() {
   const drawer = open ? html`
     <div class="tele-drawer" id="teleDrawer">
       <div class="tele-grid">
-        <div><span class="muted">Last turn</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
-        <div><span class="muted">Last turn total</span><b>${PDC.fmtInt(t.last_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.last_reasoning_tokens)} reasoning</b></div>
-        <div><span class="muted">Latency</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
-        <div><span class="muted">Speed (last / avg)</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
-        <div><span class="muted">Context window</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
-        <div><span class="muted">Session</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
-        <div><span class="muted">Session total</span><b>${PDC.fmtInt(t.session_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.session_reasoning_tokens)} reasoning</b></div>
-        <div><span class="muted">KV cache hit</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
-        <div><span class="muted">Context folds</span><b>${s.folds || 0}</b></div>
-        <div><span class="muted">Cost</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
-        <div><span class="muted">Provider</span><b>${t.provider || '\u2014'}</b></div>
-        <div><span class="muted">Active model</span><b>${activeName} (${activeTag})</b></div>
-        <div><span class="muted">Orchestrator</span><b>${s.planner_profile || '\u2014'}</b></div>
-        ${s.scout_profile ? html`<div><span class="muted">Scout</span><b>${s.scout_profile}</b></div>` : null}
+        <div><span class="muted">${PDC.t('gui.tele.last_turn', null, 'Last turn')}</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.last_turn_total', null, 'Last turn total')}</span><b>${PDC.fmtInt(t.last_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.last_reasoning_tokens)} reasoning</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.latency', null, 'Latency')}</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.speed', null, 'Speed (last / avg)')}</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.context_window', null, 'Context window')}</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.session', null, 'Session')}</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.session_total', null, 'Session total')}</span><b>${PDC.fmtInt(t.session_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.session_reasoning_tokens)} reasoning</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.kv_cache', null, 'KV cache hit')}</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.folds', null, 'Context folds')}</span><b>${s.folds || 0}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.cost', null, 'Cost')}</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.provider', null, 'Provider')}</span><b>${t.provider || '\u2014'}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.active_model', null, 'Active model')}</span><b>${activeName} (${activeTag})</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.orchestrator', null, 'Orchestrator')}</span><b>${s.planner_profile || '\u2014'}</b></div>
+        ${s.scout_profile ? html`<div><span class="muted">${PDC.t('gui.tele.scout', null, 'Scout')}</span><b>${s.scout_profile}</b></div>` : null}
       </div>
     </div>` : null;
   return html`
     <footer id="telemetryBar" class=${open ? 'open' : ''}>
       ${drawer}
       <div class="tele-row" onClick=${() => setOpen(!open)}
-           title=${'Live model telemetry \u2014 click to ' + (open ? 'collapse' : 'expand')}>
-        <span class=${'tele-bar ' + heat} title=${'context utilization ' + pct + '%'}>
+           title=${PDC.t('gui.tele.toggle_title', { action: open ? PDC.t('gui.collapse', null, 'collapse') : PDC.t('gui.expand', null, 'expand') }, 'Live model telemetry \u2014 click to ' + (open ? 'collapse' : 'expand'))}>
+        <span class=${'tele-bar ' + heat} title=${PDC.t('gui.tele.ctx_util', { pct: pct }, 'context utilization ' + pct + '%')}>
           <i style=${'width:' + Math.max(0, Math.min(100, pct)) + '%'}></i>
         </span>
-        <span class="tele-item">Context: <b>${PDC.fmtInt(t.last_prompt_tokens)} / ${PDC.fmtInt(t.context_tokens)}</b> (${pct}%)</span>
-        <span class="tele-item">Turn: <b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></span>
-        <span class="tele-item">Session: <b>${PDC.fmtTokens(t.session_prompt_tokens)} in / ${PDC.fmtTokens(t.session_completion_tokens)} out</b></span>
-        <span class="tele-item">Speed: <b>${fmt1(t.last_tok_per_s)} tok/s</b> (avg ${fmt1(t.avg_tok_per_s)} tok/s) \u00B7 ${fmt1(t.last_elapsed_s)}s</span>
-        <span class="tele-item">KV Cache Hit: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | Folds: <b>${s.folds || 0}</b></span>
-        <span class="tele-item">Active: <b>${activeName}</b> (${activeTag})</span>
-        ${s.planner_profile ? html`<span class="tele-item">Orchestrator: <b>${s.planner_profile}</b></span>` : null}
+        <span class="tele-item">${PDC.t('gui.tele.context', null, 'Context')}: <b>${PDC.fmtInt(t.last_prompt_tokens)} / ${PDC.fmtInt(t.context_tokens)}</b> (${pct}%)</span>
+        <span class="tele-item">${PDC.t('gui.tele.turn', null, 'Turn')}: <b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.session', null, 'Session')}: <b>${PDC.fmtTokens(t.session_prompt_tokens)} in / ${PDC.fmtTokens(t.session_completion_tokens)} out</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.speed_short', null, 'Speed')}: <b>${fmt1(t.last_tok_per_s)} tok/s</b> (avg ${fmt1(t.avg_tok_per_s)} tok/s) \u00B7 ${fmt1(t.last_elapsed_s)}s</span>
+        <span class="tele-item">${PDC.t('gui.tele.kv_cache_short', null, 'KV Cache Hit')}: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | ${PDC.t('gui.tele.folds_short', null, 'Folds')}: <b>${s.folds || 0}</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.active', null, 'Active')}: <b>${activeName}</b> (${activeTag})</span>
+        ${s.planner_profile ? html`<span class="tele-item">${PDC.t('gui.tele.orchestrator', null, 'Orchestrator')}: <b>${s.planner_profile}</b></span>` : null}
         <button id="consolidateBtn" class="small ghost"
-                title="Compact this session into a handoff checkpoint; the next turn starts from it alone"
-                onClick=${(e) => { e.stopPropagation(); consolidateSession(); }}>Consolidate Session</button>
+                title=${PDC.t('gui.tele.consolidate_title', null, 'Compact this session into a handoff checkpoint; the next turn starts from it alone')}
+                onClick=${(e) => { e.stopPropagation(); consolidateSession(); }}>${PDC.t('gui.tele.consolidate', null, 'Consolidate Session')}</button>
         <i class="tele-caret">${open ? '\u25BE' : '\u25B4'}</i>
       </div>
     </footer>`;
@@ -3807,102 +3865,118 @@ function TopBar() {
   const activeHosted = !!activeCal.is_hosted;
   const eng = s.engine || {};
   const phase = eng.phase || (j ? 'gather' : 'idle');
-  const phaseName = { idle: 'Idle', gather: 'Gathering', edit: 'Editing',
-                      verify: 'Verifying', repair: 'Repairing', done: 'Done' }[phase] || 'Idle';
+  const phaseName = {
+    idle: PDC.t('gui.phase.idle', null, 'Idle'),
+    gather: PDC.t('gui.phase.gather', null, 'Gathering'),
+    edit: PDC.t('gui.phase.edit', null, 'Editing'),
+    verify: PDC.t('gui.phase.verify', null, 'Verifying'),
+    repair: PDC.t('gui.phase.repair', null, 'Repairing'),
+    done: PDC.t('gui.phase.done', null, 'Done'),
+  }[phase] || PDC.t('gui.phase.idle', null, 'Idle');
   return html`
     <header id="topbar">
       <div class="tb-row" id="tbRow1">
         <div class="brand">pe<span>da</span>cito</div>
         <div id="projectBar">
-          <input type="text" id="path" ref=${pathRef} placeholder="/path/to/your/project"
+          <input type="text" id="path" ref=${pathRef} placeholder=${PDC.t('gui.project.path_ph', null, '/path/to/your/project')}
                  spellcheck="false" autocomplete="off"
                  oninput=${(e) => { S.peek = null; peeked = ''; peek(e.target.value.trim()); }}
                  onkeydown=${(e) => { if (e.key === 'Enter') open(); }} />
-          <button id="browseBtn" title="browse folders on this machine"
-                  onClick=${() => PDC.browse({ title: 'Choose a project folder',
+          <button id="browseBtn" title=${PDC.t('gui.browse_title', null, 'browse folders on this machine')}
+                  onClick=${() => PDC.browse({ title: PDC.t('gui.browse_dialog_title', null, 'Choose a project folder'),
                     start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
-                    pickLabel: 'Open this folder',
-                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse\u2026</button>
-          <${Menu} button=${html`<button id="recent" title="projects you opened here before">Recent \u25BE</button>`}>
+                    pickLabel: PDC.t('gui.browse_pick', null, 'Open this folder'),
+                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>${PDC.t('gui.browse', null, 'Browse\u2026')}</button>
+          <${Menu} button=${html`<button id="recent" title=${PDC.t('gui.recent_title', null, 'projects you opened here before')}>${PDC.t('gui.recent', null, 'Recent')} \u25BE</button>`}>
             ${(s.recent || []).length ? (s.recent || []).map((r) => html`
               <button key=${r} class="menuitem ellip" title=${r}
                       onClick=${() => { if (pathRef.current) pathRef.current.value = r; openProject(r, ''); }}>${r}</button>`)
-              : html`<button class="menuitem" disabled>no recent projects yet</button>`}
+              : html`<button class="menuitem" disabled>${PDC.t('gui.recent_empty', null, 'no recent projects yet')}</button>`}
           <//>
-          <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
-          <button id="newProjectBtn" title="start a new project from a description"
-                  disabled=${!!j} onClick=${startNewProject}>+ New</button>
-          <${Menu} button=${html`<button id="projMenuBtn" title="calibrate, index, restore and other project actions">Project \u25BE</button>`}>
-            <${MenuItem} label="New project\u2026" disabled=${!!j} action=${startNewProject} />
-            <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf || activeHosted}
-                       title=${activeHosted ? 'Calibration disabled for hosted models' : ''}
+          <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>${PDC.t('gui.open', null, 'Open')}</button>
+          <button id="newProjectBtn" title=${PDC.t('gui.new_project_title', null, 'start a new project from a description')}
+                  disabled=${!!j} onClick=${startNewProject}>+ ${PDC.t('gui.new', null, 'New')}</button>
+          <${Menu} button=${html`<button id="projMenuBtn" title=${PDC.t('gui.project_menu_title', null, 'calibrate, index, restore and other project actions')}>${PDC.t('gui.project', null, 'Project')} \u25BE</button>`}>
+            <${MenuItem} label=${PDC.t('gui.menu.new_project', null, 'New project\u2026')} disabled=${!!j} action=${startNewProject} />
+            <${MenuItem} label=${PDC.t('gui.menu.calibrate_active', null, 'Calibrate active profile')} disabled=${!!j || !activeProf || activeHosted}
+                       title=${activeHosted ? PDC.t('gui.menu.calibrate_hosted_disabled', null, 'Calibration disabled for hosted models') : ''}
                        action=${() => calibrateProfile(activeProf)} />
-            <${MenuItem} label="Calibrate All Local Models\u2026" disabled=${!!j}
-                       title="Calibrate every local profile in turn (hosted models are skipped)"
+            <${MenuItem} label=${PDC.t('gui.menu.calibrate_all', null, 'Calibrate All Local Models\u2026')} disabled=${!!j}
+                       title=${PDC.t('gui.menu.calibrate_all_title', null, 'Calibrate every local profile in turn (hosted models are skipped)')}
                        action=${calibrateAllProfiles} />
-            <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
-            <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
-            <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
-            <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
-            <${MenuItem} label="Checkpoints / Undo\u2026" disabled=${!s.root} action=${openCheckpointsDialog} />
-            <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
-            <${MenuItem} label="Memory & repo lessons\u2026" action=${memoryDialog}
-                       title="scratchpad memory while no project is open" />
-            <${MenuItem} label="Skills library & creator\u2026" action=${skillsDialog}
-                       title="browse the built-in, user and project skills; write or auto-draft custom ones" />
-            <${MenuItem} label="Background servers\u2026" action=${procsDialog}
-                       title="servers live in the scratchpad while no project is open" />
-            <${MenuItem} label="Run project checks\u2026" disabled=${!s.root} action=${checksDialog} />
-            <${MenuItem} label="Prune old sessions/backups\u2026" action=${pruneDialog}
-                       title="prunes the scratchpad while no project is open" />
-            <${MenuItem} label="Reset project state\u2026" disabled=${!!j} action=${resetDialog}
-                       title="resets the scratchpad state while no project is open" />
-            <${MenuItem} label="Consolidate session\u2026" disabled=${!!j} action=${consolidateSession}
-                       title="compact the transcript into a handoff checkpoint (also in the telemetry bar)" />
-            <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
-            <${MenuItem} label="Clear terminal" action=${clearTerm} />
-            <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
+            <${MenuItem} label=${PDC.t('gui.menu.check_model', null, 'Check model (loads it)')} disabled=${!!j || !s.root} action=${checkModel} />
+            <${MenuItem} label=${PDC.t('gui.menu.index_project', null, 'Index project (with summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
+            <${MenuItem} label=${PDC.t('gui.menu.quick_index', null, 'Quick index (no summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
+            <${MenuItem} label=${PDC.t('gui.menu.restore_backup', null, 'Restore from a backup\u2026')} disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.checkpoints', null, 'Checkpoints / Undo\u2026')} disabled=${!s.root} action=${openCheckpointsDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.rename_symbol', null, 'Rename symbol\u2026')} disabled=${!!j || !s.root} action=${renameSymbolDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.memory', null, 'Memory & repo lessons\u2026')} action=${memoryDialog}
+                       title=${PDC.t('gui.menu.memory_title', null, 'scratchpad memory while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.skills', null, 'Skills library & creator\u2026')} action=${skillsDialog}
+                       title=${PDC.t('gui.menu.skills_title', null, 'browse the built-in, user and project skills; write or auto-draft custom ones')} />
+            <${MenuItem} label=${PDC.t('gui.menu.procs', null, 'Background servers\u2026')} action=${procsDialog}
+                       title=${PDC.t('gui.menu.procs_title', null, 'servers live in the scratchpad while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.checks', null, 'Run project checks\u2026')} disabled=${!s.root} action=${checksDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.prune', null, 'Prune old sessions/backups\u2026')} action=${pruneDialog}
+                       title=${PDC.t('gui.menu.prune_title', null, 'prunes the scratchpad while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.reset', null, 'Reset project state\u2026')} disabled=${!!j} action=${resetDialog}
+                       title=${PDC.t('gui.menu.reset_title', null, 'resets the scratchpad state while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.consolidate', null, 'Consolidate session\u2026')} disabled=${!!j} action=${consolidateSession}
+                       title=${PDC.t('gui.menu.consolidate_title', null, 'compact the transcript into a handoff checkpoint (also in the telemetry bar)')} />
+            <${MenuItem} label=${PDC.t('gui.menu.provider_settings', null, 'Provider settings\u2026')} action=${() => callSettings()} />
+            <${MenuItem} label=${PDC.t('gui.menu.clear_term', null, 'Clear terminal')} action=${clearTerm} />
+            <${MenuItem} label=${PDC.t('gui.menu.clear_chat', null, 'Clear chat')} action=${() => PDC.api('/api/clear', {})} />
           <//>
         </div>
         <div id="topRight">
-          <button id="checkpointsBtn" title="time-travel: inspect, diff, restore or branch from any checkpoint"
-                  disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 Checkpoints / Undo</button>
-          <button id="rulesBtn" title="edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call"
-                  onClick=${openRulesDialog}>\uD83D\uDCDC Rules</button>
-          <button id="serversBtn" title="live VRAM/RAM and local model-server lifecycle"
-                  onClick=${() => serversDialog()}>Servers</button>
-          <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
-          <button id="arenaBtn" title="compare two models on one prompt in isolated sandboxes, then apply the winner"
-                  disabled=${!s.root} onClick=${() => openArena()}>\u2694 Arena</button>
-          <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
-          <button id="themeBtn" title="theme manager and custom color editor"
-                  onClick=${() => openThemeManager()}>\uD83C\uDFA8 Theme</button>
-          <button class="danger" id="exitBtn" title="stop the pedacito gui server"
-                  onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
+          <button id="checkpointsBtn" title=${PDC.t('gui.checkpoints_title', null, 'time-travel: inspect, diff, restore or branch from any checkpoint')}
+                  disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 ${PDC.t('gui.checkpoints', null, 'Checkpoints / Undo')}</button>
+          <button id="rulesBtn" title=${PDC.t('gui.rules_title', null, 'edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call')}
+                  onClick=${openRulesDialog}>\uD83D\uDCDC ${PDC.t('gui.rules', null, 'Rules')}</button>
+          <button id="serversBtn" title=${PDC.t('gui.servers_title', null, 'live VRAM/RAM and local model-server lifecycle')}
+                  onClick=${() => serversDialog()}>${PDC.t('gui.servers', null, 'Servers')}</button>
+          <button id="benchBtn" title=${PDC.t('gui.benchmarks_title', null, 'run a diagnostic benchmark against a configured profile')} onClick=${() => openBenchmarks()}>\u25A6 ${PDC.t('gui.benchmarks', null, 'Benchmarks')}</button>
+          <button id="arenaBtn" title=${PDC.t('gui.arena_title', null, 'compare two models on one prompt in isolated sandboxes, then apply the winner')}
+                  disabled=${!s.root} onClick=${() => openArena()}>\u2694 ${PDC.t('gui.arena', null, 'Arena')}</button>
+          <button id="settingsBtn" title=${PDC.t('gui.settings_title', null, 'profiles and settings')} onClick=${() => callSettings()}>\u2699 ${PDC.t('gui.settings', null, 'Settings')}</button>
+          <button id="themeBtn" title=${PDC.t('gui.theme_title', null, 'theme manager and custom color editor')}
+                  onClick=${() => openThemeManager()}>\uD83C\uDFA8 ${PDC.t('gui.theme', null, 'Theme')}</button>
+          <div id="langSwitch" class="lang-switch" role="group" aria-label="Language / Idioma">
+            <button type="button" class=${'lang-btn' + (PDC.lang === 'en' ? ' on' : '')}
+                    aria-pressed=${PDC.lang === 'en' ? 'true' : 'false'}
+                    title="English"
+                    onClick=${() => PDC.setLang('en', true)}>EN</button>
+            <button type="button" class=${'lang-btn' + (PDC.lang === 'es' ? ' on' : '')}
+                    aria-pressed=${PDC.lang === 'es' ? 'true' : 'false'}
+                    title="Espa\u00f1ol"
+                    onClick=${() => PDC.setLang('es', true)}>ES</button>
+          </div>
+          <button class="danger" id="exitBtn" title=${PDC.t('gui.exit_title', null, 'stop the pedacito gui server')}
+                  onClick=${() => PDC.confirm(PDC.t('gui.exit_confirm', null, 'Stop the pedacito gui server? Run "pedacito gui" again to reopen it.'), PDC.t('gui.exit_stop', null, 'Stop server'), true).then((ok) => {
                     if (!ok) return;
                     PDC.api('/api/shutdown', {}).catch(() => {}).then(() => {
-                      document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">pedacito gui has stopped. You can close this tab.</div>';
+                      document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">' + PDC.t('gui.exit_stopped', null, 'pedacito gui has stopped. You can close this tab.') + '</div>';
                     });
-                  })}>Exit</button>
+                  })}>${PDC.t('gui.exit', null, 'Exit')}</button>
         </div>
       </div>
       <div class="tb-row" id="tbRow2">
-        <label class="tb-label" for="profile">Profile</label>
+        <label class="tb-label" for="profile">${PDC.t('gui.profile', null, 'Profile')}</label>
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
                           onChange=${(name) => switchProfile(name)} />
         <span class="chip" id="modelChip"
-              title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '') + (s.auto_tune ? '\nauto-tune: timeout ' + Number(s.timeout || 0).toFixed(0) + 's, max_concurrency ' + (s.max_concurrency || 0) + '\ncontext: ' + ((s.tuning_sources || {}).context_tokens || s.context_origin || 'default') : '')}
+              title=${(s.model_status || PDC.t('gui.model_check_title', null, 'click to check the model server')) + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '') + (s.auto_tune ? '\nauto-tune: timeout ' + Number(s.timeout || 0).toFixed(0) + 's, max_concurrency ' + (s.max_concurrency || 0) + '\ncontext: ' + ((s.tuning_sources || {}).context_tokens || s.context_origin || 'default') : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
           <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
-          <b>${s.needs_setup ? 'no model selected' : (s.model || (s.root ? '\u2014' : 'no model selected'))}</b>
+          <b>${s.needs_setup ? PDC.t('gui.no_model', null, 'no model selected') : (s.model || (s.root ? '\u2014' : PDC.t('gui.no_model', null, 'no model selected')))}</b>
           ${s.model && !s.needs_setup ? html`<span class="tag ${s.disable_thinking ? '' : 'act'}"
-            title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
-                                       : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
+            title=${s.disable_thinking ? PDC.t('gui.thinking_off_title', null, 'thinking is disabled for this profile (disable_thinking = true)')
+                                       : PDC.t('gui.thinking_on_title', null, 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles')}>${s.disable_thinking ? PDC.t('gui.no_think', null, 'no-think') : PDC.t('gui.thinking', null, 'thinking')}</span>` : null}
         </span>
         <${HardwareBadge} />
         ${!s.root ? html`<span class="chip" id="workspaceChip"
-              title="Questions run on the selected profile in a scratchpad until you open or create a project">
-          <b>${s.workspace_label || 'Workspace: Scratchpad (no project open)'}</b>
+              title=${PDC.t('gui.scratchpad_title', null, 'Questions run on the selected profile in a scratchpad until you open or create a project')}>
+          <b>${PDC.t('gui.scratchpad_label', null, s.workspace_label || 'Workspace: Scratchpad (no project open)')}</b>
         </span>` : null}
         <${CalibrationBadge} name=${activeProf} />
         ${s.scout_profile ? html`<span class="chip" id="scoutChip"
@@ -3910,16 +3984,13 @@ function TopBar() {
                 + s.scout_profile + '\' (a fast model); planning, answers and edits stay on \''
                 + (s.profile || 'active') + '\'. Click to change scout_profile.'}
               onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
-          <b>Scout: ${s.scout_profile}</b>
+          <b>${PDC.t('gui.scout', null, 'Scout')}: ${s.scout_profile}</b>
         </span>` : null}
         <label class="chip" id="autoRouteChip"
-              title=${'Specialist auto-routing (auto_route_specialties): each task runs on the profile'
-                + ' whose specialty tags fit it best (model-card tags, or explicit specialties in'
-                + ' Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean'
-                + ' VRAM handoff when the profiles share one local server.'}>
+              title=${PDC.t('gui.auto_route_title', null, 'Specialist auto-routing (auto_route_specialties): each task runs on the profile whose specialty tags fit it best (model-card tags, or explicit specialties in Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean VRAM handoff when the profiles share one local server.')}>
           <input type="checkbox" checked=${!!s.auto_route_specialties}
                  onChange=${(e) => setAutoRoute(e.target.checked)} />
-          <b>\u2726 Auto-route</b>
+          <b>\u2726 ${PDC.t('gui.auto_route', null, 'Auto-route')}</b>
         </label>
         <label class="chip" id="postEditVerifyChip"
               title=${'Post-edit verification (auto_verify): '
@@ -3931,7 +4002,7 @@ function TopBar() {
                 + ' verify command.'}>
           <input type="checkbox" checked=${!!s.auto_verify}
                  onChange=${(e) => setPostEditVerify(e.target.checked)} />
-          <b>Post-edit verify</b>
+          <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
         </label>
         ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
               title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('
@@ -3944,18 +4015,18 @@ function TopBar() {
           <button class="chip" id="indexChip" title=${idxTitle} disabled=${!!j || !s.root}
                   onClick=${(e) => { if (s.root && !j) buildIndex(!e.shiftKey); }}>
             <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
-            <b>${indexed ? 'indexed' : 'no index'}</b>
-            ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
+            <b>${indexed ? PDC.t('gui.indexed', null, 'indexed') : PDC.t('gui.no_index', null, 'no index')}</b>
+            ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} ${PDC.t('gui.files_unit', null, 'files')} \u00B7 ${PDC.fmtInt(s.index_chunks)} ${PDC.t('gui.units', null, 'units')}</span>` : null}
             <i class="reidx" aria-hidden="true">\u21BB</i>
           </button>
           ${(s.usage && s.usage.calls) ? html`
             <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
-              <b>${s.usage.calls + ' calls \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
+              <b>${s.usage.calls + ' ' + PDC.t('gui.calls', null, 'calls') + ' \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
                 + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
                 + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
             </span>` : null}
           <span class=${'phase ' + phase} id="phaseChip"
-                title=${'engine phase' + (j ? ' of the running job' : '')}>${phaseName}</span>
+                title=${PDC.t('gui.engine_phase', null, 'engine phase')}>${phaseName}</span>
         </div>
       </div>
     </header>`;
@@ -4460,47 +4531,47 @@ function Composer() {
            title="Drag to resize composer (double-click to toggle expand/compact)"
            onMousedown=${dragComposer} onDblclick=${toggleComposer}></div>
       ${S.ui.modeConfirm ? html`
-        <div id="modeConfirm" role="alertdialog" aria-label="Run as a single-pass Task instead?">
-          <b>Run as a single-pass Task instead?</b>
-          <span class="muted">Task mode applies all clauses in one fast pass without creating a 7-step PLAN.md.${S.ui.modeConfirm.reason ? ' ' + S.ui.modeConfirm.reason : ''}</span>
+        <div id="modeConfirm" role="alertdialog" aria-label=${PDC.t('gui.mode_confirm.title', null, 'Run as a single-pass Task instead?')}>
+          <b>${PDC.t('gui.mode_confirm.title', null, 'Run as a single-pass Task instead?')}</b>
+          <span class="muted">${PDC.t('gui.mode_confirm.desc', null, 'Task mode applies all clauses in one fast pass without creating a 7-step PLAN.md.')}${S.ui.modeConfirm.reason ? ' ' + S.ui.modeConfirm.reason : ''}</span>
           <span class="modeConfirmBtns">
-            <button class="small primary" onClick=${runAsTaskFromConfirm}>Run as Task (Recommended)</button>
-            <button class="small" onClick=${runAutoAnyway}>Run Auto Anyway</button>
+            <button class="small primary" onClick=${runAsTaskFromConfirm}>${PDC.t('gui.mode_confirm.run_task', null, 'Run as Task (Recommended)')}</button>
+            <button class="small" onClick=${runAutoAnyway}>${PDC.t('gui.mode_confirm.run_auto', null, 'Run Auto Anyway')}</button>
           </span>
         </div>` : (nudge ? html`
         <div id="modeNudge" role="status">
-          <span>\uD83D\uDCA1 Looks like a single-pass edit \u2014</span>
-          <button class="small primary" onClick=${switchToTaskMode}>Switch to Task mode (Recommended)</button>
-          <button class="small ghost" title="Keep Auto mode for this prompt"
-                  onClick=${() => { S.ui.autoAck = autoText; emit(); }}>Continue with Auto</button>
+          <span>\uD83D\uDCA1 ${PDC.t('gui.mode_nudge.text', null, 'Looks like a single-pass edit \u2014')}</span>
+          <button class="small primary" onClick=${switchToTaskMode}>${PDC.t('gui.mode_nudge.switch', null, 'Switch to Task mode (Recommended)')}</button>
+          <button class="small ghost" title=${PDC.t('gui.mode_nudge.keep_title', null, 'Keep Auto mode for this prompt')}
+                  onClick=${() => { S.ui.autoAck = autoText; emit(); }}>${PDC.t('gui.mode_nudge.continue', null, 'Continue with Auto')}</button>
         </div>` : null)}
       <div id="modeTabs">
         ${MODE_ORDER.map((k) => html`
-          <button key=${k} class=${k === S.mode ? 'on' : ''} title=${MODES[k].title}
-                  onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
+          <button key=${k} class=${k === S.mode ? 'on' : ''} title=${PDC.t('gui.mode.' + k + '.title', null, MODES[k].title)}
+                  onClick=${() => setMode(k)}>${PDC.t('gui.mode.' + k + '.label', null, MODES[k].label)}</button>`)}
       </div>
       <p id="modeHint">
-        ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? 'Open a project first. ' : null}
+        ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? PDC.t('gui.composer.open_project_first', null, 'Open a project first. ') : null}
         ${!s.root && S.mode === 'explain'
-          ? html`Workspace: <b>Scratchpad (no project open)</b> \u2014 answers run on <b>${s.model || 'the selected profile'}</b>. `
+          ? html`${PDC.t('gui.composer.scratchpad_prefix', null, 'Workspace: ')}<b>${PDC.t('gui.composer.scratchpad_name', null, 'Scratchpad (no project open)')}</b> \u2014 ${PDC.t('gui.composer.scratchpad_runs_on', null, 'answers run on ')}<b>${s.model || PDC.t('gui.composer.selected_profile', null, 'the selected profile')}</b>. `
           : null}
-        ${!s.root && S.mode === 'new' ? 'The new project becomes your workspace when it is created. ' : null}
+        ${!s.root && S.mode === 'new' ? PDC.t('gui.composer.new_becomes_ws', null, 'The new project becomes your workspace when it is created. ') : null}
         ${needIndex
-          ? html`No index yet \u2014 build one to start:
-              <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>Build index</button>
-              <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>Quick (no summaries)</button>`
-          : m.hint}
+          ? html`${PDC.t('gui.composer.no_index_yet', null, 'No index yet \u2014 build one to start:')}
+              <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>${PDC.t('gui.composer.build_index', null, 'Build index')}</button>
+              <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>${PDC.t('gui.composer.quick_index', null, 'Quick (no summaries)')}</button>`
+          : PDC.t('gui.mode.' + S.mode + '.hint', null, m.hint)}
       </p>
-      ${planning ? html`<p id="planHint" title=${PLAN_HINT}>${PLAN_HINT}</p>` : null}
+      ${planning ? html`<p id="planHint" title=${PDC.t('gui.plan_hint', null, PLAN_HINT)}>${PDC.t('gui.plan_hint', null, PLAN_HINT)}</p>` : null}
       ${S.mode === 'new' ? html`<div id="newProjectRow">
-        <label for="newProjectPath">Target directory for new project</label>
+        <label for="newProjectPath">${PDC.t('gui.composer.new_dir_label', null, 'Target directory for new project')}</label>
         <input id="newProjectPath" type="text" spellcheck="false" autocomplete="off"
                defaultValue=${opt('new', 'project')}
                placeholder=${s.suggested_new_project || '/path/to/new-project'}
                oninput=${(e) => { S.opts.new.project = e.target.value; saveOpts(); }} />
         <button class="small" onClick=${() => PDC.browse({
-          title: 'Choose the parent folder for the new project',
-          files: false, pickLabel: 'Use this folder',
+          title: PDC.t('gui.composer.new_dir_title', null, 'Choose the parent folder for the new project'),
+          files: false, pickLabel: PDC.t('gui.composer.use_folder', null, 'Use this folder'),
           start: S.status.root || '',
           onPick: (p) => {
             const current = String(opt('new', 'project') || '').trim();
@@ -4510,7 +4581,7 @@ function Composer() {
             const el = $('newProjectPath');
             if (el) el.value = target;
             saveOpts();
-          } })}>Browse\u2026</button>
+          } })}>${PDC.t('gui.browse', null, 'Browse\u2026')}</button>
       </div>` : null}
       <div id="attachRow">
         ${S.attachments.map((a, i) => html`
@@ -4530,7 +4601,7 @@ function Composer() {
           <button class="pin-clear" title="unpin everything" onClick=${() => { S.pinned = []; emit(); }}>clear</button>
         </div>` : null}
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
-                placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
+                placeholder=${isHow ? PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph) : (j ? (steerable ? PDC.t('gui.composer.steer_ph', null, 'Type a note to steer the model (Enter)\u2026') : PDC.t('gui.composer.working_ph', null, 'Working\u2026 press Stop to cancel.')) : PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph))}
                 disabled=${!!j && !steerable && !isHow}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
                   writeDraft(e.target.value);       // F5 must not lose it
@@ -4593,40 +4664,40 @@ function Composer() {
       </div>
       <div id="composerBtns">
         <label id="effortControl" class="effort"
-               title="Reasoning effort forwarded as reasoning_effort to local-moe (Strata/Avalon) and reasoning-capable hosted models. Default sends no field.">
-          <span>Effort</span>
+               title=${PDC.t('gui.composer.effort_title', null, 'Reasoning effort forwarded as reasoning_effort to local-moe (Strata/Avalon) and reasoning-capable hosted models. Default sends no field.')}>
+          <span>${PDC.t('gui.composer.effort', null, 'Effort')}</span>
           <select value=${s.reasoning_effort || 'default'}
                   onChange=${(e) => setReasoningEffort(e.target.value)}>
-            <option value="default">Default</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
+            <option value="default">${PDC.t('gui.effort.default', null, 'Default')}</option>
+            <option value="low">${PDC.t('gui.effort.low', null, 'Low')}</option>
+            <option value="medium">${PDC.t('gui.effort.medium', null, 'Medium')}</option>
+            <option value="high">${PDC.t('gui.effort.high', null, 'High')}</option>
           </select>
         </label>
-        <button id="attachBtn" title="attach a text file (or drop one here)"
+        <button id="attachBtn" title=${PDC.t('gui.composer.attach_title', null, 'attach a text file (or drop one here)')}
                 hidden=${isHow}
-                disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE Attach</button>
+                disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE ${PDC.t('gui.composer.attach', null, 'Attach')}</button>
         <button id="optsBtn" class="ghost" hidden=${!OPTS[S.mode].length}
-                onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>Options \u25BE</button>
+                onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>${PDC.t('gui.composer.options', null, 'Options')} \u25BE</button>
         <button id="refineBtn" class="ghost${S.ui.refining ? ' busy' : ''}" hidden=${isHow}
-                title="expand this brief into a full spec with interface contracts (one architect call)"
+                title=${PDC.t('gui.composer.refine_title', null, 'expand this brief into a full spec with interface contracts (one architect call)')}
                 disabled=${!!j || S.ui.refining || !(S.drafts[S.mode] || '').trim()}
-                onClick=${refinePrompt}>${S.ui.refining ? '\u2726 Refining\u2026' : '\u2726 Refine Prompt'}</button>
+                onClick=${refinePrompt}>${S.ui.refining ? '\u2726 ' + PDC.t('gui.composer.refining', null, 'Refining\u2026') : '\u2726 ' + PDC.t('gui.composer.refine', null, 'Refine Prompt')}</button>
         <button id="undoRefineBtn" class="ghost" hidden=${isHow || S.ui.previousPrompt == null}
-                title="restore the prompt as it was before refining"
-                onClick=${undoRefine}>↶ Undo Refine</button>
+                title=${PDC.t('gui.composer.undo_refine_title', null, 'restore the prompt as it was before refining')}
+                onClick=${undoRefine}>\u21B6 ${PDC.t('gui.composer.undo_refine', null, 'Undo Refine')}</button>
         <button id="creativeBtn" class=${'ghost' + (S.creative ? ' on' : '')}
                 hidden=${isHow || S.mode === 'explain'}
                 aria-pressed=${S.creative ? 'true' : 'false'}
-                title="Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected."
-                onClick=${toggleCreative}>${S.creative ? '✨ Creative: on' : '✨ Creative'}</button>
-        <span class="grow muted small-text" id="sendHint">${isHow ? 'answers stay out of this chat thread' : (steerable ? 'delivered at the next lookup step' : '')}</span>
+                title=${PDC.t('gui.composer.creative_title', null, 'Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected.')}
+                onClick=${toggleCreative}>${S.creative ? '\u2728 ' + PDC.t('gui.composer.creative_on', null, 'Creative: on') : '\u2728 ' + PDC.t('gui.composer.creative', null, 'Creative')}</button>
+        <span class="grow muted small-text" id="sendHint">${isHow ? PDC.t('gui.composer.how_hint', null, 'answers stay out of this chat thread') : (steerable ? PDC.t('gui.composer.steer_hint', null, 'delivered at the next lookup step') : '')}</span>
         <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
                 disabled=${!!(j && j.cancelled && !isHow)}
                 onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
-          ${isHow ? (S.how.loading ? 'Asking\u2026' : 'Ask')
-              : (j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
-              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send))}
+          ${isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
+              : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
+              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)))}
         </button>
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />
@@ -4857,30 +4928,30 @@ function DiffPane() {
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
   const acceptLabel = !R.partial_ok || nSel === editable.length
-    ? (editable.length > 1 ? 'Accept all' : 'Accept')
-    : 'Accept ' + nSel + ' of ' + editable.length;
+    ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
+    : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
   return html`
     <div class="diffwrap">
       <div id="reviewBar">
-        <b id="reviewTitle" title=${R.task || ''}>${R.task || 'Proposed changes'}</b>
+        <b id="reviewTitle" title=${R.task || ''}>${R.task || PDC.t('gui.diff.proposed_changes', null, 'Proposed changes')}</b>
         ${!pending ? html`<span class=${'badge-out ' + R.outcome}>
-            ${R.outcome === 'applied' ? 'accepted' : R.outcome === 'cancelled' ? 'rejected' : R.outcome}</span>` : null}
+            ${R.outcome === 'applied' ? PDC.t('gui.diff.accepted', null, 'accepted') : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
         ${!pending && (R.unaccepted || []).length ? html`
           <span class="badge-out unaccepted"
                 title=${R.unaccepted.map((c) => c + ': ' + ((R.clause_texts || {})[c] || '')).join('\n')}>
             clause(s) left open: ${R.unaccepted.join(', ')}</span>` : null}
         <div id="reviewActions">
-          <button class="ghost small" title="collapse the diff (Chat stays full-width)"
-                  onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 Collapse</button>
-          <span id="diffViewToggle" title="diff layout: two panes or one unified column">
-            <button class=${'small' + (unified ? '' : ' on')} onClick=${() => setDiffMode('split')}>Side by side</button>
-            <button class=${'small' + (unified ? ' on' : '')} onClick=${() => setDiffMode('unified')}>Unified</button>
+          <button class="ghost small" title=${PDC.t('gui.diff.collapse_title', null, 'collapse the diff (Chat stays full-width)')}
+                  onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 ${PDC.t('gui.collapse', null, 'Collapse')}</button>
+          <span id="diffViewToggle" title=${PDC.t('gui.diff.layout_title', null, 'diff layout: two panes or one unified column')}>
+            <button class=${'small' + (unified ? '' : ' on')} onClick=${() => setDiffMode('split')}>${PDC.t('gui.diff.side_by_side', null, 'Side by side')}</button>
+            <button class=${'small' + (unified ? ' on' : '')} onClick=${() => setDiffMode('unified')}>${PDC.t('gui.diff.unified', null, 'Unified')}</button>
           </span>
           ${pending ? html`
             <button class="small" id="editBtn" hidden=${!R.partial_ok}
-                    title="edit the proposed code for the selected file by hand before accepting"
-                    onClick=${toggleEdit}>${S.editing ? '\u2716 Show diff' : '\u270E Edit proposed'}</button>
-            <button class="small danger" onClick=${() => decide('reject')}>Reject${R.files.length > 1 ? ' all' : ''}</button>
+                    title=${PDC.t('gui.diff.edit_title', null, 'edit the proposed code for the selected file by hand before accepting')}
+                    onClick=${toggleEdit}>${S.editing ? '\u2716 ' + PDC.t('gui.diff.show_diff', null, 'Show diff') : '\u270E ' + PDC.t('gui.diff.edit_proposed', null, 'Edit proposed')}</button>
+            <button class="small danger" onClick=${() => decide('reject')}>${R.files.length > 1 ? PDC.t('gui.diff.reject_all', null, 'Reject all') : PDC.t('gui.diff.reject', null, 'Reject')}</button>
             <button class="small primary" disabled=${nSel === 0}
                     onClick=${() => decide('apply')}>${acceptLabel}</button>` : null}
         </div>
@@ -4978,31 +5049,31 @@ function ActivityPane() {
   return html`
     <section class="panel" id="activityPanel">
       <div class="panel-head">
-        <h2>Activity</h2>
+        <h2>${PDC.t('gui.panel.activity', null, 'Activity')}</h2>
         <span class="chip">
           <i class=${'dot ' + (j ? 'busy' : 'idle')}></i><b>${phase}</b></span>
         <span class="muted small-text grow" id="engCount">
-          ${PDC.fmtInt(eng.calls || 0)} calls \u00B7 ${PDC.fmtInt(eng.steps || 0)} steps</span>
-        ${j ? html`<button class="ghost small" disabled=${!!j.cancelled} onClick=${() => stop()}>${j.cancelled ? 'Stopping\u2026' : 'Stop'}</button>` : null}
+          ${PDC.fmtInt(eng.calls || 0)} ${PDC.t('gui.calls', null, 'calls')} \u00B7 ${PDC.fmtInt(eng.steps || 0)} ${PDC.t('gui.steps', null, 'steps')}</span>
+        ${j ? html`<button class="ghost small" disabled=${!!j.cancelled} onClick=${() => stop()}>${j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop')}</button>` : null}
       </div>
       <div id="activityBody">
         <${LiveStreamDrawer} />
-        <div class="eng-bar" title="Engine V2 state (during and after runs)">
+        <div class="eng-bar" title=${PDC.t('gui.activity.engine_title', null, 'Engine V2 state (during and after runs)')}>
           <span class=${'phase ' + phase}>${phase}</span>
-          <span class="estat" title="model calls this session">calls
+          <span class="estat" title=${PDC.t('gui.activity.calls_title', null, 'model calls this session')}>${PDC.t('gui.calls', null, 'calls')}
             <b>${PDC.fmtInt(eng.calls || 0)}</b></span>
-          <span class="estat" title="gather steps in the last run">step
+          <span class="estat" title=${PDC.t('gui.activity.step_title', null, 'gather steps in the last run')}>${PDC.t('gui.activity.step', null, 'step')}
             <b>${PDC.fmtInt(eng.steps || 0)}</b></span>
-          <span class="estat" title="read spans recorded in the ledger">read spans
+          <span class="estat" title=${PDC.t('gui.activity.spans_title', null, 'read spans recorded in the ledger')}>${PDC.t('gui.activity.read_spans', null, 'read spans')}
             <b>${PDC.fmtInt(eng.read_spans || 0)}</b></span>
           ${eng.specialist && eng.specialist.profile ? html`
             <span class="estat" title=${'specialist routed: ' + eng.specialist.profile
               + ' (' + (eng.specialist.model || '?') + ') for specialty \''
-              + (eng.specialist.specialty || '?') + '\''}>specialist
+              + (eng.specialist.specialty || '?') + '\''}>${PDC.t('gui.activity.specialist', null, 'specialist')}
               <b>${eng.specialist.profile}</b></span>` : null}
         </div>
         ${reqs.length ? html`
-          <div class="eng-sec"><b>Requirement ledger</b><ol class="reqs">
+          <div class="eng-sec"><b>${PDC.t('gui.activity.req_ledger', null, 'Requirement ledger')}</b><ol class="reqs">
             ${reqs.map((rq, i) => html`
               <li key=${i} class="reqrow" title=${rq.text}>
                 <span class=${'rq st-' + String(rq.state || 'UNLOCATED').toLowerCase()}>${rq.state}</span>
@@ -5011,7 +5082,7 @@ function ActivityPane() {
               </li>`)}
           </ol></div>` : null}
         ${acts.length ? html`
-          <div class="eng-sec"><b>Recent actions</b><ul class="acts">
+          <div class="eng-sec"><b>${PDC.t('gui.activity.recent_actions', null, 'Recent actions')}</b><ul class="acts">
             ${acts.map((a, i) => html`
               <li key=${i} class=${'actrow' + (a.ok === false ? ' bad' : '')}>
                 <span class=${'atool k-' + String(a.tool || 'step').toLowerCase().replace(/[^a-z0-9-]+/g, '')}>${a.tool}</span>
@@ -5020,9 +5091,9 @@ function ActivityPane() {
         ${tail.length ? html`<ol class="steps" hidden=${!!acts.length}>
             ${tail.map((l, i) => html`<li key=${'l' + (lines.length - tail.length + i)}>
               <span class="tx">${l}</span></li>`)}
-          </ol>` : (acts.length ? null : html`<div class="tip">No lookups yet \u2014 run something.</div>`)}
+          </ol>` : (acts.length ? null : html`<div class="tip">${PDC.t('gui.activity.empty', null, 'No lookups yet \u2014 run something.')}</div>`)}
         ${lastStream && lastStream.text ? html`
-          <div class="streamtail" title="live model output"><b>${lastStream.site || 'answer'}</b>
+          <div class="streamtail" title=${PDC.t('gui.activity.live_output', null, 'live model output')}><b>${lastStream.site || 'answer'}</b>
           <pre>${lastStream.text.slice(-2000)}</pre></div>` : null}
       </div>
     </section>`;
@@ -5043,25 +5114,23 @@ function PlanPane() {
   return html`
     <section class="panel" id="planPanel">
       <div class="panel-head">
-        <h2>Plan</h2>
-        ${S.ui.planGenerating ? html`<span class="badge">new plan\u2026</span>`
+        <h2>${PDC.t('gui.panel.plan', null, 'Plan')}</h2>
+        ${S.ui.planGenerating ? html`<span class="badge">${PDC.t('gui.plan.new_plan', null, 'new plan\u2026')}</span>`
           : tasks.length ? html`<span class="badge">${done}/${tasks.length}</span>` : null}
         <span class="muted small-text grow mono" id="planPath">${p.exists ? p.path : ''}</span>
         ${p.exists && !S.ui.planGenerating ? html`
           <button class="small" onClick=${() => { S.ui.planEditing = !S.ui.planEditing; emit(); }}>
-            ${S.ui.planEditing ? 'Cancel' : 'Edit'}</button>
-          ${S.ui.planEditing ? html`<button class="small primary" onClick=${() => savePlan()}>Save</button>` : null}
-          <button class="small primary" disabled=${running || !openN} title="run this plan now"
-                  onClick=${() => PDC.runPlan()}>Run</button>` : null}
+            ${S.ui.planEditing ? PDC.t('common.cancel', null, 'Cancel') : PDC.t('gui.edit', null, 'Edit')}</button>
+          ${S.ui.planEditing ? html`<button class="small primary" onClick=${() => savePlan()}>${PDC.t('common.save', null, 'Save')}</button>` : null}
+          <button class="small primary" disabled=${running || !openN} title=${PDC.t('gui.plan.run_title', null, 'run this plan now')}
+                  onClick=${() => PDC.runPlan()}>${PDC.t('gui.run', null, 'Run')}</button>` : null}
       </div>
       <div id="planBody" hidden=${S.ui.planEditing}>
         ${S.ui.planGenerating ? html`
-          <div class="tip"><b>Generating new plan\u2026</b><br>The previous
-          checklist is complete; the planner is replacing it for this goal.</div>`
+          <div class="tip"><b>${PDC.t('gui.plan.generating', null, 'Generating new plan\u2026')}</b><br>${PDC.t('gui.plan.generating_desc', null, 'The previous checklist is complete; the planner is replacing it for this goal.')}</div>`
         : !p.exists ? html`
-          <div class="tip">No plan yet. Use <b>Auto</b> to turn a goal into a
-          checklist; its progress shows here as it runs.</div>` : html`
-          <div class="muted small-text">${done} of ${tasks.length} tasks done</div>
+          <div class="tip">${PDC.t('gui.plan.empty', null, 'No plan yet. Use Auto to turn a goal into a checklist; its progress shows here as it runs.')}</div>` : html`
+          <div class="muted small-text">${PDC.t('gui.plan.progress', { done: done, total: tasks.length }, done + ' of ' + tasks.length + ' tasks done')}</div>
           <div class="progress"><div style=${'width:' + pct + '%'}></div></div>
           ${tasks.map((t, i) => {
             const cur = t.status === 'todo' && firstTodo && running;
@@ -5089,9 +5158,9 @@ function WorkspacePane() {
   useEffect(() => {
     if (termRef.current && !term) term = new Term(termRef.current);
   }, []);
-  const tabs = [WS_TABS[0], ['runner', '\u25B6 Run']]
-    .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 Preview']] : [])
-    .concat(WS_TABS.slice(1));
+  const tabs = [['files', PDC.t('gui.panel.files', null, 'Files')], ['runner', '\u25B6 ' + PDC.t('gui.run', null, 'Run')]]
+    .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 ' + PDC.t('gui.panel.preview', null, 'Preview')]] : [])
+    .concat([['backups', PDC.t('gui.panel.backups', null, 'Backups')], ['logs', PDC.t('gui.panel.logs', null, 'Logs')]]);
   let tab = S.ws.tab;
   if (tab === 'preview' && !S.ws.pages.length) tab = 'runner';  // saved tab, no pages
   const idxSet = S.ws.indexedSet || new Set();
@@ -5288,10 +5357,10 @@ function SecurityBanner() {
   return html`
     <div id="securityNotice" role="status" aria-live="polite">
       <div class="security-head">
-        <span>\u26A0 Security Notice</span>
-        <span class="grow">Potential credentials are present in this workspace. Nothing was sent or changed without your choice.</span>
-        <button class="ghost small" title="dismiss this notice for now"
-                onClick=${() => { S.ui.securityDismissed = true; emit(); }}>Dismiss</button>
+        <span>\u26A0 ${PDC.t('gui.security.title', null, 'Security Notice')}</span>
+        <span class="grow">${PDC.t('gui.security.desc', null, 'Potential credentials are present in this workspace. Nothing was sent or changed without your choice.')}</span>
+        <button class="ghost small" title=${PDC.t('gui.security.dismiss_title', null, 'dismiss this notice for now')}
+                onClick=${() => { S.ui.securityDismissed = true; emit(); }}>${PDC.t('gui.dismiss', null, 'Dismiss')}</button>
       </div>
       ${findings.length ? html`
         <ul class="security-list">
@@ -5299,25 +5368,25 @@ function SecurityBanner() {
             <li key=${f.fingerprint} class="security-row">
               <code>${f.file}:${f.line}</code>
               <span class="mask">[${f.kind}] ${f.masked_preview}</span>
-              <button class="small" title="ignore this exact key from now on"
-                      onClick=${() => ack(f.fingerprint)}>Acknowledge (Ignore)</button>
+              <button class="small" title=${PDC.t('gui.security.ack_title', null, 'ignore this exact key from now on')}
+                      onClick=${() => ack(f.fingerprint)}>${PDC.t('gui.security.ack', null, 'Acknowledge (Ignore)')}</button>
             </li>`)}
         </ul>
         ${findings.length > 1 ? html`
           <div class="security-actions">
-            <button class="small" onClick=${ackAll}>Acknowledge all (${findings.length})</button>
+            <button class="small" onClick=${ackAll}>${PDC.t('gui.security.ack_all', { count: findings.length }, 'Acknowledge all (' + findings.length + ')')}</button>
           </div>` : null}` : null}
       ${files.length ? html`
         <ul class="security-list">
           ${files.map((f) => html`
             <li key=${'file:' + f.file} class="security-row">
               <code>${f.file}</code>
-              <span class="mask">${f.kind === 'unignored_env' ? 'environment secrets file' : 'credential file'} is not ignored by .gitignore</span>
+              <span class="mask">${f.kind === 'unignored_env' ? PDC.t('gui.security.unignored_env', null, 'environment secrets file is not ignored by .gitignore') : PDC.t('gui.security.unignored_cred', null, 'credential file is not ignored by .gitignore')}</span>
             </li>`)}
         </ul>` : null}
       ${(sec.unignored_env || []).length ? html`
         <div class="security-actions">
-          <button class="small primary" onClick=${gitignore}>Add .env to .gitignore</button>
+          <button class="small primary" onClick=${gitignore}>${PDC.t('gui.security.add_gitignore', null, 'Add .env to .gitignore')}</button>
         </div>` : null}
     </div>`;
 }
@@ -5361,24 +5430,24 @@ function UpdateBanner() {
       refreshState();
     }, () => PDC.toast('Could not stop the upgrade.', true));
   };
-  const runLabel = run.running ? 'Upgrading\u2026'
-    : run.ok === true ? 'Upgrade finished'
-    : run.ok === false ? 'Upgrade failed' : 'Upgrade';
+  const runLabel = run.running ? PDC.t('gui.update.upgrading', null, 'Upgrading\u2026')
+    : run.ok === true ? PDC.t('gui.update.finished', null, 'Upgrade finished')
+    : run.ok === false ? PDC.t('gui.update.failed', null, 'Upgrade failed') : PDC.t('gui.update.upgrade', null, 'Upgrade');
   const runNote = run.running ? (run.command || []).join(' ')
-    : run.ok === true ? 'Restart Pedacito to run the new version.'
-    : run.ok === false ? (run.detail || 'See the output below.')
+    : run.ok === true ? PDC.t('gui.update.restart_note', null, 'Restart Pedacito to run the new version.')
+    : run.ok === false ? (run.detail || PDC.t('gui.update.see_output', null, 'See the output below.'))
     : manual;
   return html`
     <div id="updateNotice" role="status" aria-live="polite">
       ${showBanner ? html`
         <div class="update-head">
-          <span>\u2B06 Pedacito v${info.latest} is available</span>
-          <span class="grow">(you have ${info.current})</span>
+          <span>\u2B06 ${PDC.t('gui.update.available', { version: info.latest }, 'Pedacito v' + info.latest + ' is available')}</span>
+          <span class="grow">${PDC.t('gui.update.current', { version: info.current }, '(you have ' + info.current + ')')}</span>
           <button class="small primary" disabled=${!!run.running}
-                  title="run the detected upgrade command"
-                  onClick=${startUpgrade}>Update</button>
-          <button class="ghost small" title="hide this notice until a newer release"
-                  onClick=${() => { S.ui.updateDismissed = info.latest; writeUpdateDismissed(info.latest); emit(); }}>Dismiss</button>
+                  title=${PDC.t('gui.update.run_title', null, 'run the detected upgrade command')}
+                  onClick=${startUpgrade}>${PDC.t('gui.update.btn', null, 'Update')}</button>
+          <button class="ghost small" title=${PDC.t('gui.update.dismiss_title', null, 'hide this notice until a newer release')}
+                  onClick=${() => { S.ui.updateDismissed = info.latest; writeUpdateDismissed(info.latest); emit(); }}>${PDC.t('gui.dismiss', null, 'Dismiss')}</button>
         </div>` : null}
       ${showRun ? html`
         <div class="update-run">
@@ -5386,22 +5455,22 @@ function UpdateBanner() {
             <span>${runLabel}</span>
             <span class="grow">${runNote}</span>
             ${run.ok === true && !run.running ? html`
-              <button class="small primary" onClick=${restart}>Restart Pedacito</button>` : null}
+              <button class="small primary" onClick=${restart}>${PDC.t('gui.update.restart', null, 'Restart Pedacito')}</button>` : null}
             ${run.running ? html`
               <button class="small danger" disabled=${!!run.cancelling}
-                      title="stop the upgrade process and its children"
-                      onClick=${stopUpgrade}>${run.cancelling ? 'Stopping\u2026' : 'Stop'}</button>` : null}
+                      title=${PDC.t('gui.update.stop_title', null, 'stop the upgrade process and its children')}
+                      onClick=${stopUpgrade}>${run.cancelling ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop')}</button>` : null}
             <button class="ghost small"
                     onClick=${() => { S.ui.updateDrawerOpen = !S.ui.updateDrawerOpen; emit(); }}>
-              ${S.ui.updateDrawerOpen ? 'Hide output' : 'Show output'}</button>
+              ${S.ui.updateDrawerOpen ? PDC.t('gui.update.hide_output', null, 'Hide output') : PDC.t('gui.update.show_output', null, 'Show output')}</button>
             ${!run.running ? html`
-              <button class="ghost small" title="hide this upgrade panel"
-                      onClick=${() => { S.ui.updateRunHidden = true; S.ui.updateManual = ''; emit(); }}>Close</button>` : null}
+              <button class="ghost small" title=${PDC.t('gui.update.close_title', null, 'hide this upgrade panel')}
+                      onClick=${() => { S.ui.updateRunHidden = true; S.ui.updateManual = ''; emit(); }}>${PDC.t('common.close', null, 'Close')}</button>` : null}
           </div>
           ${run.ok === false && info && info.instructions ? html`
             <p class="update-manual">${info.instructions}</p>` : null}
           ${S.ui.updateDrawerOpen ? html`
-            <pre class="update-out">${run.output || manual || '(no output yet)'}</pre>` : null}
+            <pre class="update-out">${run.output || manual || PDC.t('gui.update.no_output', null, '(no output yet)')}</pre>` : null}
         </div>` : null}
     </div>`;
 }
@@ -5425,30 +5494,30 @@ function App() {
       <main id="app" ref=${appRef} data-diff=${dm}>
         <section class="panel" id="chatPanel">
           <div class="panel-head">
-            <h2>${S.mode === 'how' ? 'How / Help' : 'Chat'}</h2>
+            <h2>${S.mode === 'how' ? PDC.t('gui.panel.how', null, 'How / Help') : PDC.t('gui.panel.chat', null, 'Chat')}</h2>
             <span class="muted small-text grow" id="busyLbl">
-              ${s.job ? (s.job.cancelled ? 'Stopping\u2026' : s.job.title + '\u2026') : ''}</span>
+              ${s.job ? (s.job.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : s.job.title + '\u2026') : ''}</span>
             <${LlmHeartbeat} />
-            ${S.mode === 'how' ? html`<span class="muted small-text">CLI commands \u00b7 GUI paths \u00b7 settings</span>` : null}
+            ${S.mode === 'how' ? html`<span class="muted small-text">${PDC.t('gui.how.subtitle', null, 'CLI commands \u00b7 GUI paths \u00b7 settings')}</span>` : null}
             ${dm === 'collapsed' ? html`
-              <button class="small primary" id="diffPill" title="show the staged diff beside the chat"
+              <button class="small primary" id="diffPill" title=${PDC.t('gui.diff.pill_title', null, 'show the staged diff beside the chat')}
                       onClick=${() => { S.ui.diffOpen = true; emit(); }}>
-                \u29C6 ${s.review.pending ? 'Review staged' : 'Review'}
-                ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' file(s)' : ''} \u2014 expand</button>` : null}
-            <select id="threadSel" title="this project's saved conversations"
+                \u29C6 ${s.review.pending ? PDC.t('gui.diff.review_staged', null, 'Review staged') : PDC.t('gui.diff.review', null, 'Review')}
+                ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' ' + PDC.t('gui.files_unit', null, 'file(s)') : ''} \u2014 ${PDC.t('gui.expand', null, 'expand')}</button>` : null}
+            <select id="threadSel" title=${PDC.t('gui.thread.select_title', null, "this project's saved conversations")}
                     value=${s.active_thread_id || ''} disabled=${!!s.job}
                     onchange=${(e) => selectThread(e.target.value)}>
               ${(s.threads || []).map((t) => html`
                 <option key=${t.id} value=${t.id}>${t.title_custom ? '\u270E ' : ''}${t.title} \u00b7 ${t.message_count} msg${t.message_count === 1 ? '' : 's'}</option>`)}
             </select>
-            <button class="ghost small" id="newThread" title="start a new conversation (this one stays saved in the project)"
-                    disabled=${!!s.job} onClick=${newThread}>+ New</button>
-            <button class="ghost small" id="renameThreadBtn" title=${'rename \u201c' + (s.thread_title || 'this conversation') + '\u201d'}
-                    disabled=${!!s.job || !s.active_thread_id} onClick=${renameThread}>Rename</button>
-            <button class="ghost small danger" id="delThread" title="delete this conversation and its saved thread"
-                    disabled=${!!s.job} onClick=${deleteCurrentThread}>Delete</button>
-            <button class="ghost small" id="clearChat" title="clear the conversation"
-                    onClick=${() => PDC.api('/api/clear', {})}>Clear</button>
+            <button class="ghost small" id="newThread" title=${PDC.t('gui.thread.new_title', null, 'start a new conversation (this one stays saved in the project)')}
+                    disabled=${!!s.job} onClick=${newThread}>+ ${PDC.t('gui.new', null, 'New')}</button>
+            <button class="ghost small" id="renameThreadBtn" title=${PDC.t('gui.thread.rename_title', { title: s.thread_title || 'this conversation' }, 'rename \u201c' + (s.thread_title || 'this conversation') + '\u201d')}
+                    disabled=${!!s.job || !s.active_thread_id} onClick=${renameThread}>${PDC.t('gui.rename', null, 'Rename')}</button>
+            <button class="ghost small danger" id="delThread" title=${PDC.t('gui.thread.delete_title', null, 'delete this conversation and its saved thread')}
+                    disabled=${!!s.job} onClick=${deleteCurrentThread}>${PDC.t('gui.delete', null, 'Delete')}</button>
+            <button class="ghost small" id="clearChat" title=${PDC.t('gui.thread.clear_title', null, 'clear the conversation')}
+                    onClick=${() => PDC.api('/api/clear', {})}>${PDC.t('gui.clear', null, 'Clear')}</button>
           </div>
           <${MessageList} />
           <${Composer} />
@@ -5468,12 +5537,12 @@ function App() {
       <${TelemetryBar} />
       <nav id="mobileTabs" role="tablist">
         <button role="tab" aria-selected=${S.ui.view === 'chat' ? 'true' : 'false'}
-                data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>Chat</button>
+                data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>${PDC.t('gui.panel.chat', null, 'Chat')}</button>
         <button role="tab" aria-selected=${S.ui.view === 'diff' ? 'true' : 'false'}
                 data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}
-                disabled=${dm === 'none'} onClick=${() => { S.ui.diffOpen = true; setView('diff'); }}>Changes</button>
+                disabled=${dm === 'none'} onClick=${() => { S.ui.diffOpen = true; setView('diff'); }}>${PDC.t('gui.panel.changes', null, 'Changes')}</button>
         <button role="tab" aria-selected=${S.ui.view === 'right' ? 'true' : 'false'}
-                data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>Activity</button>
+                data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>${PDC.t('gui.panel.activity', null, 'Activity')}</button>
       </nav>
     </div>`;
 }
@@ -5495,6 +5564,7 @@ function initViewState() {
 
 render(html`<${App}/>`, $('root'));
 initViewState();
+loadI18n();
 loadActiveTheme();
 loadSnapshot();
 setInterval(() => { if (!document.hidden) refreshState(); }, 2500);

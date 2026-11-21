@@ -19,6 +19,7 @@ import requests
 from .. import config as config_mod
 from .. import config_editor
 from .. import fileio
+from .. import i18n
 from ..config import USER_CONFIG, ConfigError
 from . import settings
 from .core import STATE
@@ -533,6 +534,35 @@ def save_theme(name: str) -> dict:
         STATE._global_cfg_stamp = None
     return {"gui_theme": name, "themes": themes, "persisted": True,
             "created": created}
+
+
+def save_language(lang: str) -> dict:
+    """Persist `language` in the user config and reflect it in the live
+    language state only. Purely UI/cosmetic, so nothing is reloaded or
+    restarted and live `STATE.client`/`STATE.agent` are never swapped
+    (safe mid-job). When no user config exists yet it is created from the
+    starter template first."""
+    raw = str(lang or "").strip().lower()
+    langs = list(i18n.SUPPORTED_LANGUAGES)
+    if raw not in langs:
+        raise ConfigError(
+            f"unknown language {raw!r}. Use one of: " + ", ".join(langs))
+    with _CONFIG_WRITE_LOCK:
+        res = i18n.save_user_language(raw)
+    code = res["language"]
+    i18n.set_current_lang(code)
+    with STATE.lock:
+        if STATE.cfg is not None:
+            STATE.cfg.language = code
+        if STATE._user_cfg is not None:
+            STATE._user_cfg.language = code
+        if STATE._global_cfg is not None:
+            STATE._global_cfg.language = code
+        STATE._user_cfg_stamp = None
+        STATE._global_cfg_stamp = None
+    return {"language": code, "supported": langs,
+            "persisted": bool(res.get("persisted", True)),
+            "created": bool(res.get("created", False))}
 
 
 # --- dual-GPU Scout + Architect pairing ---------------------------------------

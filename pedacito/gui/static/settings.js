@@ -4,10 +4,13 @@
 (function () {
   'use strict';
   var PDC = window.PDC, h = PDC.h;
+  var t = function (key, vars, fb) {
+    return (PDC.t ? PDC.t(key, vars, fb) : (fb !== undefined ? fb : key));
+  };
 
   var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'timeout',
     'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review',
-    'scout_profile', 'specialties', 'enforce_json_schema'];
+    'scout_profile', 'specialties', 'enforce_json_schema', 'language', 'llm_reply_language'];
   // Profile overrides that the editor surfaces up front, in their own boxed
   // group: how the model thinks, plans, and lands edits (see modelcard.choose
   // \u2014 these are exactly the keys a calibration writes into a profile).
@@ -54,9 +57,18 @@
           target: opts.target || '', pending: {}, models: [],
           search: opts.search || '', focusSearch: !!opts.search };
     UPD = { data: null, loaded: false, busy: false, err: '' };
-    X.modal = PDC.modal('Settings', h('div', { class: 'tip', text: 'Loading\u2026' }), [{ label: 'Close' }]);
+    X.modal = PDC.modal(t('gui.settings', null, 'Settings'), h('div', { class: 'tip', text: t('common.loading', null, 'Loading\u2026') }), [{ label: t('common.close', null, 'Close') }]);
     X.body = X.modal.body;
     PDC.api('/api/settings').then(function (d) { X.data = d; pickDefaults(); render(); });
+  };
+
+  PDC.rerenderSettings = function () {
+    if (!X || !X.data || !X.body || !document.body.contains(X.body)) return;
+    if (X.modal && X.modal.el) {
+      var titleEl = X.modal.el.querySelector('.modal-head h3, .modal-head b, header h3');
+      if (titleEl) titleEl.textContent = t('gui.settings', null, 'Settings');
+    }
+    render();
   };
 
   function file() { return X.data[X.which]; }
@@ -226,32 +238,55 @@
     var d = X.data, f = file();
     var body = PDC.clear(X.body);
     var which = h('div', { class: 'row', style: 'margin-bottom:10px' },
-      h('b', { text: 'Editing:' }),
-      radio('user', 'User config'), radio('project', 'This project (.pedacito.toml)', !d.project_open),
+      h('b', { text: t('settings.editing', null, 'Editing:') }),
+      radio('user', t('settings.user_config', null, 'User config')), radio('project', t('settings.project_config', null, 'This project (.pedacito.toml)'), !d.project_open),
       h('span', { class: 'mono muted small-text grow', text: f.available ? f.path : '' }));
     body.appendChild(which);
     if (!f.available) { body.appendChild(h('div', { class: 'note-box', text: f.error })); return; }
     if (X.which === 'user' && !f.exists) { body.appendChild(wizard()); return; }
     if (X.which === 'project' && !f.exists) {
-      body.appendChild(h('div', { class: 'note-box', text: 'This project has no config file yet. Saving a setting creates .pedacito.toml in the project root (it layers on top of your user config).' }));
+      body.appendChild(h('div', { class: 'note-box', text: t('settings.no_project_config', null, 'This project has no config file yet. Saving a setting creates .pedacito.toml in the project root (it layers on top of your user config).') }));
     }
     if (f.error) body.appendChild(h('div', { class: 'note-box err', text: f.error }));
     if (X.which === 'project' && f.exists && f.trusted === false) {
       body.appendChild(h('div', { class: 'note-box' },
-        'This project config is not trusted yet, so its execution settings (' + f.exec_fields.join(', ') + ') are ignored until you approve it. ',
-        h('button', { class: 'small', text: 'Review & trust\u2026', onclick: trust })));
+        t('settings.untrusted_project', { fields: f.exec_fields.join(', ') }, 'This project config is not trusted yet, so its execution settings (' + f.exec_fields.join(', ') + ') are ignored until you approve it. '),
+        h('button', { class: 'small', text: t('settings.review_trust', null, 'Review & trust\u2026'), onclick: trust })));
     }
     var tabs = h('div', { class: 'stabs' });
-    [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'],
-     ['autotune', 'Auto-Tune'], ['mcp', 'MCP Servers'], ['updates', 'Updates'],
-     ['raw', 'Raw file / reset']].forEach(function (t) {
-      tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
+    [['discovery', t('settings.tab.discovery', null, 'Model discovery')],
+     ['profiles', t('settings.tab.profiles', null, 'Profiles')],
+     ['all', t('settings.tab.all', null, 'All settings')],
+     ['autotune', t('settings.tab.autotune', null, 'Auto-Tune')],
+     ['mcp', t('settings.tab.mcp', null, 'MCP Servers')],
+     ['updates', t('settings.tab.updates', null, 'Updates')],
+     ['raw', t('settings.tab.raw', null, 'Raw file / reset')]].forEach(function (tb) {
+      tabs.appendChild(h('button', { class: X.tab === tb[0] ? 'on' : '', text: tb[1], onclick: function () { X.tab = tb[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
-    body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px' },
-      h('span', { class: 'muted', text: 'Quick links:' }),
-      h('button', { class: 'ghost small', text: 'Skills library & creator\u2026',
-        title: 'browse built-in, user and project skills; write or auto-draft custom ones',
+    var langSel = h('select', { class: 'small', title: t('settings.language_hint', null, 'Choose the language for menus and messages.') },
+      h('option', { value: 'en', text: 'English (en)' }),
+      h('option', { value: 'es', text: 'Espa\u00f1ol (es)' }));
+    langSel.value = (PDC.lang === 'es') ? 'es' : 'en';
+    langSel.addEventListener('change', function () {
+      if (PDC.setLang) PDC.setLang(langSel.value, true);
+    });
+    var replyVal = (d.resolved && d.resolved.llm_reply_language && d.resolved.llm_reply_language.value) || 'match_ui';
+    var replySel = h('select', { class: 'small', title: t('settings.llm_reply_language_hint', null, 'Language the model writes its prose explanations in.') },
+      h('option', { value: 'match_ui', text: t('settings.reply_lang.match_ui', null, 'Match UI (match_ui)') }),
+      h('option', { value: 'auto', text: t('settings.reply_lang.auto', null, 'Auto (auto)') }),
+      h('option', { value: 'en', text: 'English (en)' }),
+      h('option', { value: 'es', text: 'Espa\u00f1ol (es)' }));
+    replySel.value = replyVal;
+    replySel.addEventListener('change', function () {
+      save({ file: 'user', profile: null, changes: { llm_reply_language: replySel.value }, removes: [] }, '/api/settings/set');
+    });
+    body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px;gap:8px;flex-wrap:wrap' },
+      h('span', { class: 'muted', text: t('settings.language', null, 'Interface language') + ':' }), langSel,
+      h('span', { class: 'muted', text: t('settings.llm_reply_language', null, 'Model reply language') + ':' }), replySel,
+      h('span', { class: 'muted', style: 'margin-left:auto', text: t('settings.quick_links', null, 'Quick links:') }),
+      h('button', { class: 'ghost small', text: t('gui.menu.skills', null, 'Skills library & creator\u2026'),
+        title: t('gui.menu.skills_title', null, 'browse built-in, user and project skills; write or auto-draft custom ones'),
         onclick: function () { if (PDC.skillsDialog) PDC.skillsDialog(); } })));
     if (X.tab === 'discovery') body.appendChild(discoveryTab());
     else if (X.tab === 'profiles') body.appendChild(profilesTab());
@@ -1622,9 +1657,9 @@
     var targetSel = h('select', {}, targets.map(function (t) { return h('option', { value: t[0], text: t[1] }); }));
     targetSel.value = X.target;
     targetSel.addEventListener('change', function () { X.target = targetSel.value; X.pending = {}; render(); });
-    var search = h('input', { type: 'text', placeholder: 'search settings\u2026', value: X.search, class: 'grow' });
+    var search = h('input', { type: 'text', placeholder: t('settings.search_ph', null, 'search settings\u2026'), value: X.search, class: 'grow' });
     var holder = h('div');
-    var saveBtn = h('button', { id: 'savePending', class: 'primary', text: 'No changes', disabled: true, onclick: function () { commit(X.target || null); } });
+    var saveBtn = h('button', { id: 'savePending', class: 'primary', text: t('settings.no_changes', null, 'No changes'), disabled: true, onclick: function () { commit(X.target || null); } });
     var cur = X.target ? (f.profiles[X.target] || {}) : (f.settings || {});
     function fill() {
       PDC.clear(holder);

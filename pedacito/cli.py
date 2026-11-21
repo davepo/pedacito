@@ -41,6 +41,7 @@ from . import discovery
 from . import events as events_mod
 from . import fileio
 from . import hooks as hooks_mod
+from . import i18n
 from . import index as index_mod
 from . import llm as llm_mod
 from . import loop
@@ -135,6 +136,9 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--max-cost", type=float, default=None, metavar="USD",
                    help="stop before the next call once the estimated spend "
                         "reaches this (needs price_*_per_mtok in config)")
+    p.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                   default=argparse.SUPPRESS,
+                   help=i18n.t("cli.opt.lang"))
 
 
 def _root(args) -> Path:
@@ -171,6 +175,11 @@ def _config(args) -> Config:
     # labelled a baseline. Process start, not config-load time, so an
     # in-chat config reload cannot launder the run's own fresh failures.
     cfg._run_started = _PROCESS_START
+    cli_lang = getattr(args, "lang", None)
+    if cli_lang:
+        cfg.language = i18n.normalize_lang(cli_lang)
+        cfg.sources["language"] = "--lang"
+    i18n.set_current_lang(i18n.detect_lang(cli_lang, cfg))
     if getattr(args, "no_refs", False):
         cfg.include_references = False
     if getattr(args, "jsonl", False) or getattr(args, "rpc", False) or \
@@ -3021,17 +3030,55 @@ def main(argv=None) -> int:
             workspace.release_lock(_LOCKED.pop())
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _preparse_lang(argv=None) -> str:
+    """Resolve the active CLI language before `build_parser()` runs, so
+    `pdc --lang es --help` and `pdc <subcmd> --lang es --help` print
+    localized descriptions and help text."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    cli_lang = None
+    i = 0
+    while i < len(raw_argv):
+        tok = str(raw_argv[i])
+        if tok == "--lang" and i + 1 < len(raw_argv):
+            cli_lang = raw_argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--lang="):
+            cli_lang = tok.split("=", 1)[1]
+        i += 1
+    cfg_stub = None
+    if cli_lang is None and not os.environ.get("PEDACITO_LANG") \
+            and not os.environ.get("PEDACITO_LANGUAGE"):
+        try:
+            if USER_CONFIG.is_file():
+                cfg_stub = load_config(root=None, require_hardware=False,
+                                       warn_budgets=False,
+                                       upgrade_user_config=False)
+        except Exception:
+            cfg_stub = None
+    lang = i18n.detect_lang(cli_lang, cfg=cfg_stub)
+    i18n.set_current_lang(lang)
+    return lang
+
+
+def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     """The full CLI parser, split out from dispatch so tests can enumerate
     the real subcommand set (the `how` index drift guard)."""
-    ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
+    active_lang = i18n.normalize_lang(
+        lang if lang is not None else i18n.get_current_lang())
+    i18n.set_current_lang(active_lang)
+    t = lambda key, **kw: i18n.t(key, lang=active_lang, **kw)  # noqa: E731
+    desc = t("cli.description") if active_lang == "es" else __doc__
+    ap = argparse.ArgumentParser(prog="pedacito", description=desc,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}",
-                    help="print the installed version and exit")
+                    help=t("cli.opt.version"))
+    ap.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES, default=None,
+                    help=t("cli.opt.lang"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_index = sub.add_parser("index", help="build or refresh the index")
+    p_index = sub.add_parser("index", help=t("cli.cmd.index"))
     _add_common(p_index)
     p_index.add_argument("--no-summaries", action="store_true",
                          help="static index only; instant, no LLM calls")
@@ -3040,14 +3087,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="discard cached summaries and regenerate with the "
                               "current model")
 
-    p_map = sub.add_parser("map", help="print the current index")
+    p_map = sub.add_parser("map", help=t("cli.cmd.map"))
     _add_common(p_map)
     p_map.add_argument("--tier", choices=["auto", "cards", "dirs", "flat", "ranked"],
                        default="auto")
     p_map.add_argument("-t", "--task", default="",
                        help="rank the map for this task (as `ask` would see it)")
 
-    p_conf = sub.add_parser("config", help="show, create, or test the config file")
+    p_conf = sub.add_parser("config", help=t("cli.cmd.config"))
+    p_conf.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                        default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_conf.add_argument("--init", action="store_true",
                         help=f"write a starter config to {USER_CONFIG}")
     p_conf.add_argument("--path", metavar="FILE", help="write --init here instead")
@@ -3079,7 +3128,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--config", metavar="FILE")
 
     p_how = sub.add_parser(
-        "how", help="ask how to use pedacito (smart built-in help)")
+        "how", help=t("cli.cmd.how"))
+    p_how.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                       default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_how.add_argument("question", nargs="*",
                        help="your question; omit for an interactive prompt")
     p_how.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
@@ -3171,15 +3222,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_cost)
     p_cost.add_argument("--tps", type=float, default=25.0, help="your tokens/sec")
 
-    p_ask = sub.add_parser("ask", help="run one task")
+    p_ask = sub.add_parser("ask", help=t("cli.cmd.ask"),
+                           description=t("cli.cmd.ask_desc"))
     _add_common(p_ask)
-    p_ask.add_argument("-t", "--task", required=True)
-    p_ask.add_argument("--apply", action="store_true", help="write edits to disk")
+    p_ask.add_argument("-t", "--task", required=True, help=t("cli.opt.task"))
+    p_ask.add_argument("--apply", action="store_true", help=t("cli.opt.apply"))
     p_ask.add_argument("--review", action="store_true",
-                       help="open a side-by-side review page and apply from there")
+                       help=t("cli.opt.review"))
     p_ask.add_argument("--no-review", dest="no_review", action="store_true",
-                       help="never open the reviewer, even if config enables it")
-    p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
+                       help=t("cli.opt.no_review"))
+    p_ask.add_argument("--reindex", action="store_true", help=t("cli.opt.reindex"))
     p_ask.add_argument("--continue", dest="continue_", action="store_true",
                        help="resume the newest ask checkpoint as context")
     p_ask.add_argument("--plan", action="store_true",
@@ -3222,7 +3274,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "record_trajectories = true for this run only")
 
     p_explain = sub.add_parser(
-        "explain", help="answer questions about an indexed project's code")
+        "explain", help=t("cli.cmd.explain"))
     _add_common(p_explain)
     p_explain.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
                            help="your question; omit for an interactive prompt")
@@ -3353,7 +3405,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="assume yes: skip interactive confirmations, "
                              "including the Task-vs-Auto nudge")
 
-    p_chat = sub.add_parser("chat", help="interactive session")
+    p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
     p_chat.add_argument("--apply", action="store_true")
     p_chat.add_argument("--review", action="store_true")
@@ -3366,8 +3418,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "newline-delimited JSON (see `pedacito rpc`)")
 
     p_tui = sub.add_parser(
-        "tui", help="split-screen terminal UI with live activity, plan and "
-                    "telemetry panes")
+        "tui", help=t("cli.cmd.tui"))
     _add_common(p_tui, paths_nargs="?", dest="project")
     p_tui.add_argument("-t", "--task", default="",
                        help="run this task immediately after the screen opens")
@@ -3428,7 +3479,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_models = sub.add_parser(
-        "models", help="show tuned model numbers or discover model servers")
+        "models", help=t("cli.cmd.models"))
+    p_models.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                          default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_models.add_argument("action", nargs="?", default="show",
                           choices=["scan", "show"],
                           help="'scan' finds local servers and sets up "
@@ -3461,7 +3514,9 @@ def build_parser() -> argparse.ArgumentParser:
                                "(default: the user config)")
 
     p_profiles = sub.add_parser(
-        "profiles", help="list model profiles and their measured scores")
+        "profiles", help=t("cli.cmd.profiles"))
+    p_profiles.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                            default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_profiles.add_argument("--recommend", action="store_true",
                             help="suggest a profile per role, with reasons")
     p_profiles.add_argument("--apply-roles", dest="apply_roles",
@@ -3751,29 +3806,34 @@ def build_parser() -> argparse.ArgumentParser:
         p_bench.add_argument(flag)
     p_bench.add_argument("--root", default=None)
 
-    p_gui = sub.add_parser("gui", help="open the browser control panel")
+    p_gui = sub.add_parser("gui", help=t("cli.cmd.gui"))
     p_gui.add_argument("project", nargs="?", default=None,
                        help="project folder to open at startup")
     p_gui.add_argument("--profile", metavar="NAME",
                        help="model profile for that project")
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
+    p_gui.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                       default=argparse.SUPPRESS, help=t("cli.opt.lang"))
 
-    p_update = sub.add_parser("update",
-                              help="check PyPI for a newer Pedacito and "
-                                   "optionally upgrade this install")
+    p_update = sub.add_parser("update", help=t("cli.cmd.update"))
     p_update.add_argument("--run", action="store_true",
                           help="run the detected upgrade command (pipx/pip); "
                                "editable installs get git instructions")
     p_update.add_argument("--config",
                           help="config file to read check_for_updates from")
+    p_update.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                          default=argparse.SUPPRESS, help=t("cli.opt.lang"))
 
     return ap
 
 
 def _main(argv=None) -> int:
     _configure_stdio()
-    args = build_parser().parse_args(argv)
+    active_lang = _preparse_lang(argv)
+    args = build_parser(lang=active_lang).parse_args(argv)
+    if getattr(args, "lang", None):
+        i18n.set_current_lang(args.lang)
     ask_json = bool(getattr(args, "cmd", "") == "ask"
                     and getattr(args, "json", False))
     if ask_json and getattr(args, "jsonl", False):
@@ -3811,7 +3871,7 @@ def _main(argv=None) -> int:
             print(f"Setup failed: {e}", file=sys.stderr)
             return 2
         except KeyboardInterrupt:
-            print("\nSetup cancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.setup_cancelled"), file=sys.stderr)
             return 130
         return 0
 
@@ -3843,7 +3903,7 @@ def _main(argv=None) -> int:
         try:
             return _cmd_profiles(args, _light_config(args))
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
@@ -3858,7 +3918,7 @@ def _main(argv=None) -> int:
         try:
             return light[args.cmd](args)
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
 
     # `how` needs a model connection but no project, index or vram budget.
@@ -3873,7 +3933,7 @@ def _main(argv=None) -> int:
             print(f"\nERROR: {e}", file=sys.stderr)
             return 1
         except KeyboardInterrupt:
-            print("\nCancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.cancelled"), file=sys.stderr)
             return 130
 
     # `bench --list`/`--recent` need no model or vram; a real run loads the
@@ -3882,10 +3942,10 @@ def _main(argv=None) -> int:
         try:
             return _cmd_bench(args)
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
         except KeyboardInterrupt:
-            print("\nCancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.cancelled"), file=sys.stderr)
             return 130
 
     # `explain` never builds an index; check before touching config or server.
@@ -3942,11 +4002,13 @@ def _main(argv=None) -> int:
                     root, cfg, headless=headless, stdin=sys.stdin,
                     stdout=sys.stdout, apply=bool(getattr(args, "apply", True)),
                     initial_task=str(getattr(args, "task", "") or ""),
-                    width=width, height=height)
+                    width=width, height=height,
+                    lang=getattr(args, "lang", None))
                 return session.run()
             return tui_mod.run_tui(
                 root, cfg, initial_task=str(getattr(args, "task", "") or ""),
-                headless=headless, stdin=sys.stdin, stdout=sys.stdout)
+                headless=headless, stdin=sys.stdin, stdout=sys.stdout,
+                lang=getattr(args, "lang", None))
 
         if args.cmd == "calibrate":
             return _cmd_calibrate(args, cfg)

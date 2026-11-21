@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 from .. import config as config_mod
 from .. import fileio
+from .. import i18n
 from .. import review as review_mod
 from .. import security, workspace
 from .. import update as update_mod
@@ -656,6 +657,38 @@ class State:
             self._user_cfg_stamp = stamp
         return str(getattr(cfg, "gui_theme", "") or "slate") if cfg \
             else "slate"
+
+    def user_language(self) -> str:
+        """The saved `language`, even with no project open.
+
+        Mirrors `user_theme()`: reads `STATE.cfg` when loaded, otherwise
+        caches USER_CONFIG by (mtime, size) without hardware probes so a
+        polling /api/state never re-reads disk.
+        """
+        with self.lock:
+            cfg = self.cfg
+        if cfg is not None:
+            return i18n.normalize_lang(getattr(cfg, "language", "") or "en")
+        try:
+            st = USER_CONFIG.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return i18n.detect_lang()
+        with self.lock:
+            if self._user_cfg is not None and self._user_cfg_stamp == stamp:
+                return i18n.normalize_lang(
+                    getattr(self._user_cfg, "language", "") or "en")
+        try:
+            cfg = config_mod.load(root=None, require_hardware=False,
+                                  warn_budgets=False,
+                                  upgrade_user_config=False)
+        except (config_mod.ConfigError, OSError):
+            cfg = None
+        with self.lock:
+            self._user_cfg = cfg
+            self._user_cfg_stamp = stamp
+        return i18n.normalize_lang(getattr(cfg, "language", "") or "en") \
+            if cfg else i18n.detect_lang()
 
     def set_profile(self, name: str | None) -> None:
         """Remember the profile picked in the topbar for a project-less GUI.
@@ -1758,6 +1791,7 @@ class State:
     def status(self) -> dict:
         """The JSON payload the page polls to update itself."""
         theme = self.user_theme()       # disk read/cache outside the lock
+        lang = self.user_language()     # disk read/cache outside the lock
         with self.lock:
             cfg, client, idx = self.cfg, self.client, self.idx
             root = self.root
@@ -1934,6 +1968,11 @@ class State:
                                 "max_concurrency")},
                 "json_mode": cfg.json_mode if cfg else "",
                 "gui_theme": theme,
+                "language": lang,
+                "llm_reply_language": (
+                    str(getattr(cfg, "llm_reply_language", "match_ui")
+                        or "match_ui")
+                    if cfg else "match_ui"),
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
                 "reasoning_effort": (str(getattr(cfg, "reasoning_effort",
                                                  "default") or "default")
