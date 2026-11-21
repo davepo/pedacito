@@ -857,6 +857,28 @@ _JS_FAMILY_EXT = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts",
                   ".cts")
 
 
+_IMPLAUSIBLE_PATH_CHARS = set('`${};=<>|"*?\x00\n\r\t')
+
+
+def _plausible_new_path(rel: str) -> bool:
+    """Whether `rel` looks like a file path rather than a copied code line.
+
+    A model can emit the line it meant to edit as the `--- FILE:` header. The
+    path is normalised and confined to the project, so that used to create a
+    real file named after the code line (for example
+    `tile.className = `tile tile-${value}`;`) while the target file stayed
+    untouched. New paths must not carry code/prose punctuation or padded
+    segments.
+    """
+    if not rel or len(rel) > 240:
+        return False
+    if any(ch in _IMPLAUSIBLE_PATH_CHARS for ch in rel):
+        return False
+    parts = Path(rel).parts
+    return bool(parts) and all(part and part == part.strip()
+                               and part not in (".", "..") for part in parts)
+
+
 def _wipe_refusal(rel: str) -> str:
     """The shared refusal for a whole-file replacement to nothing."""
     return (f"ERROR: refusing to overwrite {rel}: the replacement is empty, "
@@ -1543,6 +1565,12 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 original = None
                 if path.is_file():
                     original, _sty = fileio.read(path, errors="replace")
+                if original is None and not _plausible_new_path(rel):
+                    results.append(Result(
+                        False, rel,
+                        "refusing to create this file: its name looks like a "
+                        "copied source line, not a project path"))
+                    continue
                 text = _creation_text(group)
                 note = f"created with {len(text.splitlines())} line(s)"
                 if original is not None:
