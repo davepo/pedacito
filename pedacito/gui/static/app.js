@@ -1949,11 +1949,18 @@ function calibrateProfile(name) {
     PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + model + ') is a hosted provider model and uses provider-table defaults automatically.', true);
     return;
   }
-  PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.', 'Run it').then((ok) => {
+  const promptMsg = cal.is_image_model
+    ? PDC.t('gui.cal.probe_image_confirm', { name: name },
+        'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
+    : 'Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.';
+  const okLabel = cal.is_image_model
+    ? PDC.t('gui.cal.probe_image', null, 'Probe image')
+    : 'Run it';
+  PDC.confirm(promptMsg, okLabel).then((ok) => {
     if (!ok) return;
     PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then((j) => {
       if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-      PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+      PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
       refreshState();
     });
   });
@@ -2856,6 +2863,169 @@ function renameSymbolDialog() {
   return m;
 }
 
+// ------------------------------------------------------------------ image generation dialog ---
+function imageGenDialog() {
+  const s = S.status || {};
+  const calMap = s.calibration || {};
+  const models = s.profile_models || {};
+  const imgProfiles = Object.keys(calMap).filter((n) => calMap[n] && calMap[n].is_image_model);
+  const activeProf = s.profile || s.default_profile || '';
+  const initialProf = imgProfiles.indexOf(activeProf) >= 0 ? activeProf : (imgProfiles[0] || '');
+
+  const promptEl = h('textarea', {
+    id: 'imgGenPrompt',
+    rows: '3',
+    placeholder: PDC.t('gui.image.prompt_ph', null, 'Describe the image to generate\u2026'),
+  });
+  const negEl = h('input', {
+    id: 'imgGenNeg',
+    type: 'text',
+    placeholder: PDC.t('gui.image.negative_ph', null, 'Optional negative prompt (what to avoid)'),
+  });
+  const profSel = h('select', { id: 'imgGenProfile' });
+  if (imgProfiles.length) {
+    imgProfiles.forEach((n) => {
+      const m = models[n] ? ' \u00B7 ' + models[n] : '';
+      const optEl = h('option', { value: n, text: n + m });
+      if (n === initialProf) optEl.selected = true;
+      profSel.appendChild(optEl);
+    });
+  } else {
+    profSel.appendChild(h('option', { value: '', text: PDC.t('gui.image.no_profile', null, '(no image profile configured)') }));
+    profSel.disabled = true;
+  }
+
+  const sizes = ['512x512', '768x768', '1024x1024', '1024x768', '768x1024'];
+  const sizeSel = h('select', { id: 'imgGenSize' });
+  sizes.forEach((sz) => {
+    const o = h('option', { value: sz, text: sz });
+    if (sz === '1024x1024') o.selected = true;
+    sizeSel.appendChild(o);
+  });
+  const stepsEl = h('input', { id: 'imgGenSteps', type: 'number', min: '1', max: '150', step: '1', placeholder: 'auto' });
+  const seedEl = h('input', { id: 'imgGenSeed', type: 'number', step: '1', placeholder: 'random' });
+  const outEl = h('input', {
+    id: 'imgGenOut',
+    type: 'text',
+    class: 'mono',
+    spellcheck: false,
+    placeholder: PDC.t('gui.image.out_ph', null, 'Optional save path (e.g. assets/hero.png)'),
+  });
+
+  const statusEl = h('div', { class: 'img-gen-status muted small-text' });
+  const previewWrap = h('div', { class: 'img-gen-preview', hidden: true });
+  const previewImg = h('img', { alt: PDC.t('gui.image.preview_alt', null, 'Generated image preview') });
+  const metaRow = h('div', { class: 'img-gen-meta' });
+  const metaText = h('span', { class: 'mono small-text grow' });
+  let lastRelPath = '';
+  const copyBtn = h('button', {
+    type: 'button',
+    class: 'small',
+    text: PDC.t('gui.image.copy_path', null, 'Copy path'),
+    onclick: () => {
+      if (!lastRelPath) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(lastRelPath).then(
+          () => PDC.toast(PDC.t('gui.image.path_copied', { path: lastRelPath }, 'Copied: ' + lastRelPath)),
+          () => PDC.toast(lastRelPath)
+        );
+      } else {
+        PDC.toast(lastRelPath);
+      }
+    },
+  });
+  metaRow.appendChild(metaText);
+  metaRow.appendChild(copyBtn);
+  previewWrap.appendChild(previewImg);
+  previewWrap.appendChild(metaRow);
+
+  const field = (label, el) => h('label', { class: 'img-gen-field' },
+    h('span', { class: 'muted small-text', text: label }), el);
+
+  const body = h('div', { class: 'img-gen-dialog' },
+    !imgProfiles.length ? h('div', { class: 'note-box', text: PDC.t('gui.image.setup_hint', null, 'No image profile detected yet. Scan a local image server (e.g. Lemonade sd-cpp) or add a profile with modality = "image" in Settings.') }) : null,
+    field(PDC.t('gui.image.prompt_label', null, 'Prompt'), promptEl),
+    field(PDC.t('gui.image.negative_label', null, 'Negative prompt (optional)'), negEl),
+    h('div', { class: 'img-gen-grid' },
+      field(PDC.t('gui.image.profile_label', null, 'Image profile'), profSel),
+      field(PDC.t('gui.image.size_label', null, 'Size'), sizeSel),
+      field(PDC.t('gui.image.steps_label', null, 'Steps (optional)'), stepsEl),
+      field(PDC.t('gui.image.seed_label', null, 'Seed (optional)'), seedEl),
+    ),
+    field(PDC.t('gui.image.out_label', null, 'Save path (optional)'), outEl),
+    statusEl,
+    previewWrap,
+  );
+
+  let busy = false;
+  const doGenerate = () => {
+    if (busy) return false;
+    const prompt = (promptEl.value || '').trim();
+    if (!prompt) {
+      PDC.toast(PDC.t('gui.image.prompt_required', null, 'Enter a prompt first.'), true);
+      promptEl.focus();
+      return false;
+    }
+    const payload = {
+      prompt: prompt,
+      size: sizeSel.value || '1024x1024',
+    };
+    const neg = (negEl.value || '').trim();
+    if (neg) payload.negative_prompt = neg;
+    if (profSel.value) payload.profile = profSel.value;
+    const stepsVal = parseInt(stepsEl.value, 10);
+    if (!isNaN(stepsVal) && stepsVal > 0) payload.steps = stepsVal;
+    const seedVal = parseInt(seedEl.value, 10);
+    if (!isNaN(seedVal)) payload.seed = seedVal;
+    const outVal = (outEl.value || '').trim();
+    if (outVal) payload.output_path = outVal;
+
+    busy = true;
+    statusEl.textContent = PDC.t('gui.image.generating', null, 'Generating image\u2026');
+    statusEl.className = 'img-gen-status muted small-text';
+    const genBtn = modal.box && modal.box.querySelector('.modal-foot button.primary');
+    if (genBtn) genBtn.disabled = true;
+
+    PDC.api('/api/image/generate', payload).then((j) => {
+      busy = false;
+      if (genBtn) genBtn.disabled = false;
+      if (!j.ok) {
+        statusEl.textContent = j.detail || PDC.t('gui.image.failed', null, 'Image generation failed.');
+        statusEl.className = 'img-gen-status err small-text';
+        return;
+      }
+      lastRelPath = j.rel_path || j.path || '';
+      const dims = (j.width && j.height) ? (j.width + '\u00d7' + j.height) : '';
+      const lat = j.elapsed_s != null ? (Number(j.elapsed_s).toFixed(2) + 's') : '';
+      const bits = [lastRelPath, dims, lat, j.model || ''].filter(Boolean);
+      metaText.textContent = bits.join(' \u00B7 ');
+      previewImg.src = j.url + (j.url.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+      previewWrap.hidden = false;
+      statusEl.textContent = PDC.t('gui.image.done', { path: lastRelPath }, 'Saved to ' + lastRelPath);
+      statusEl.className = 'img-gen-status ok small-text';
+      refreshState();
+    }).catch(() => {
+      busy = false;
+      if (genBtn) genBtn.disabled = false;
+      statusEl.textContent = PDC.t('errors.connection_failed', null, 'Could not reach the server.');
+      statusEl.className = 'img-gen-status err small-text';
+    });
+    return false;
+  };
+
+  const modal = PDC.modal(
+    PDC.t('gui.image.dialog_title', null, '\uD83C\uDFA8 Generate Image'),
+    body,
+    [
+      { label: PDC.t('common.close', null, 'Close') },
+      { label: PDC.t('gui.image.generate_btn', null, 'Generate'), primary: true, stay: true, onclick: doGenerate },
+    ],
+    { wide: true },
+  );
+  setTimeout(() => { promptEl.focus(); }, 30);
+  return modal;
+}
+
 // ------------------------------------------------------------------ project dialogs ---
 function _needRoot() {
   if (!S.status.root) { PDC.toast('Open a project first.', true); return false; }
@@ -3679,7 +3849,8 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
   const availability = peek ? {} : (S.profile_availability || {});
   const optionFor = (p) => {
     const model = (s.profile_models || {})[p] || '';
-    const label = p + (model ? ' \u00B7 ' + model : '');
+    const isImg = !!((s.calibration || {})[p] || {}).is_image_model;
+    const label = p + (model ? ' \u00B7 ' + model : '') + (isImg ? ' \u00B7 \uD83C\uDFA8 image' : '');
     const state = availability[p] || 'unknown';
     if (state === 'unavailable') return {
       label: label + ' \u00B7 unavailable', disabled: true,
@@ -3736,6 +3907,21 @@ function CalibrationBadge(props) {
   if (!name && !s.root) return null;
   const cal = (s.calibration || {})[name] || {};
   const openProfiles = () => callSettings({ tab: 'discovery' });
+  if (cal.is_image_model) {
+    const verified = !!(cal.calibrated && (cal.image_ok || cal.card_score > 0));
+    const lat = cal.image_latency_s ? ' (' + Number(cal.image_latency_s).toFixed(1) + 's)' : '';
+    const badgeText = verified
+      ? PDC.t('gui.cal.image_verified', { latency: lat }, '\uD83C\uDFA8 Image \u00B7 \u2713 Verified' + lat)
+      : PDC.t('gui.cal.image_badge', null, '\uD83C\uDFA8 Image');
+    const tip = verified
+      ? PDC.t('gui.cal.image_verified_tip', { at: cal.calibrated_at || '' },
+          'Image generation model \u2014 verified ' + (cal.calibrated_at || '') + '.\nClick to open Settings \u2192 Model discovery')
+      : PDC.t('gui.cal.image_tip', null,
+          'Image generation model \u2014 run Probe image to verify endpoint readiness.\nClick to open Settings \u2192 Model discovery');
+    return html`<span class=${'chip cal-chip image' + (verified ? ' ok' : '')} id="calChip" onClick=${openProfiles}
+      title=${tip}>
+      <b>${badgeText}</b></span>`;
+  }
   if (cal.is_hosted) {
     return html`<span class="chip cal-chip hosted" id="calChip"
       title=${'Hosted provider model \u2014 uses provider-table defaults automatically.\nCalibration disabled for hosted models.'}>
@@ -3870,6 +4056,7 @@ function TopBar() {
   const activeProf = s.profile || s.default_profile || '';
   const activeCal = (s.calibration || {})[activeProf] || {};
   const activeHosted = !!activeCal.is_hosted;
+  const activeImage = !!activeCal.is_image_model;
   const eng = s.engine || {};
   const teleVisible = Boolean((s.root && s.telemetry && s.telemetry.context_tokens) || s.job || (s.llm_call && s.llm_call.started));
   const phase = eng.phase || (j ? 'gather' : 'idle');
@@ -3906,7 +4093,10 @@ function TopBar() {
                   disabled=${!!j} onClick=${startNewProject}>+ ${PDC.t('gui.new', null, 'New')}</button>
           <${Menu} button=${html`<button id="projMenuBtn" title=${PDC.t('gui.project_menu_title', null, 'calibrate, index, restore and other project actions')}>${PDC.t('gui.project', null, 'Project')} \u25BE</button>`}>
             <${MenuItem} label=${PDC.t('gui.menu.new_project', null, 'New project\u2026')} disabled=${!!j} action=${startNewProject} />
-            <${MenuItem} label=${PDC.t('gui.menu.calibrate_active', null, 'Calibrate active profile')} disabled=${!!j || !activeProf || activeHosted}
+            <${MenuItem} label=${PDC.t('gui.menu.generate_image', null, '\uD83C\uDFA8 Generate image\u2026')}
+                       title=${PDC.t('gui.menu.generate_image_title', null, 'Generate an image with a configured image profile')}
+                       action=${imageGenDialog} />
+            <${MenuItem} label=${activeImage ? PDC.t('gui.menu.probe_image_active', null, 'Probe active image profile') : PDC.t('gui.menu.calibrate_active', null, 'Calibrate active profile')} disabled=${!!j || !activeProf || activeHosted}
                        title=${activeHosted ? PDC.t('gui.menu.calibrate_hosted_disabled', null, 'Calibration disabled for hosted models') : ''}
                        action=${() => calibrateProfile(activeProf)} />
             <${MenuItem} label=${PDC.t('gui.menu.calibrate_all', null, 'Calibrate All Local Models\u2026')} disabled=${!!j}
@@ -4487,6 +4677,7 @@ function Composer() {
   const needIndex = s.root && !s.has_index && S.mode !== 'new' && S.mode !== 'how';
   const steerable = j && j.kind === 'task' && s.allow_steering;
   const isHow = S.mode === 'how';
+  const hasImageProfile = Object.values(s.calibration || {}).some((c) => c && c.is_image_model);
   const setMode = (k) => {
     if (taRef.current) {
       S.drafts[S.mode] = taRef.current.value;
@@ -4667,6 +4858,10 @@ function Composer() {
         <button id="attachBtn" title=${PDC.t('gui.composer.attach_title', null, 'attach a text file (or drop one here)')}
                 hidden=${isHow}
                 disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE ${PDC.t('gui.composer.attach', null, 'Attach')}</button>
+        ${hasImageProfile ? html`
+          <button id="imageGenBtn" class="ghost" hidden=${isHow}
+                  title=${PDC.t('gui.composer.image_title', null, 'Generate an image')}
+                  onClick=${imageGenDialog}>\uD83C\uDFA8</button>` : null}
         <button id="optsBtn" class="ghost" hidden=${!OPTS[S.mode].length}
                 onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>${PDC.t('gui.composer.options', null, 'Options')} \u25BE</button>
         <button id="refineBtn" class="ghost${S.ui.refining ? ' busy' : ''}" hidden=${isHow}

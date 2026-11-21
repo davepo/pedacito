@@ -645,6 +645,7 @@
       var sub = (p.model || '(no model set)') + (p.base_url ? ' @ ' + p.base_url : '');
       var cal = ((X.data && X.data.calibration) || {})[n] || {};
       var hosted = !!cal.is_hosted;
+      var isImg = !!cal.is_image_model;
       // Two-part card: the identity block (name + pills over the model line)
       // shrinks and ellipsises; the action buttons never wrap mid-label.
       var row = h('div', { class: 'prow' },
@@ -653,14 +654,16 @@
             h('b', { class: 'prow-name ellip', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
             n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
             n === defName ? h('span', { class: 'tag', text: 'default' }) : null,
+            isImg ? h('span', { class: 'tag image', text: '\uD83C\uDFA8 image' }) : null,
             hosted ? h('span', { class: 'tag hosted', text: '\u2601 hosted' }) : null),
           h('div', { class: 'prow-sub mono ellip', text: sub, title: sub }),
           h('div', { class: 'prow-cal small-text ' + (hosted ? 'muted' : cal.calibrated ? (cal.calibrated_stale ? 'stale' : 'ok') : 'muted'),
             text: calLine(cal), title: calTitle(cal) })),
         h('span', { class: 'prow-actions' },
-          h('button', { class: 'small', text: 'Calibrate', disabled: hosted,
+          h('button', { class: 'small', text: isImg ? t('settings.profile.probe_image', null, 'Probe image') : 'Calibrate', disabled: hosted,
             title: hosted ? 'Calibration disabled for hosted models'
-                          : 'Measure this model and store the scores in its model card',
+                          : (isImg ? t('settings.profile.probe_image_title', null, 'Run a fast 1-call image check to verify endpoint readiness and latency')
+                                   : 'Measure this model and store the scores in its model card'),
             onclick: function () { calibrate(n, 'quick'); } }),
           n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
             : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
@@ -681,6 +684,13 @@
   // The calibration line under each profile row: when it was measured, the
   // score and the specialties the card tagged -- or the honest empty state.
   function calLine(cal) {
+    if (cal.is_image_model) {
+      if (cal.calibrated && (cal.image_ok || cal.card_score > 0)) {
+        var lat = cal.image_latency_s ? ' (' + Number(cal.image_latency_s).toFixed(1) + 's)' : '';
+        return t('gui.cal.image_verified', { latency: lat }, '\uD83C\uDFA8 Image \u00B7 \u2713 Verified' + lat);
+      }
+      return t('gui.cal.image_badge', null, '\uD83C\uDFA8 Image');
+    }
     if (cal.is_hosted) return '\u2601 Hosted API \u2014 uses provider-table defaults automatically';
     if (!cal.calibrated) return 'Not calibrated yet';
     var line = 'Calibrated on ' + cal.calibrated_at + ' (score: ' + Number(cal.card_score || 0).toFixed(2);
@@ -691,6 +701,13 @@
     return line;
   }
   function calTitle(cal) {
+    if (cal.is_image_model) {
+      return cal.calibrated
+        ? t('gui.cal.image_verified_tip', { at: cal.calibrated_at || '' },
+            'Image generation model \u2014 verified ' + (cal.calibrated_at || '') + '.')
+        : t('gui.cal.image_tip', null,
+            'Image generation model \u2014 run Probe image to verify endpoint readiness.');
+    }
     if (cal.is_hosted) return 'Calibration disabled for hosted models';
     if (!cal.calibrated) return 'Run Calibrate to measure this model and tune its defaults';
     var bits = ['score ' + Number(cal.card_score || 0).toFixed(2),
@@ -802,7 +819,9 @@
         h('td', { class: 'mono small-text', text: r.model_id, title: r.model_id }),
         h('td', { class: 'small-text', text: r.context_length ? PDC.fmtInt(r.context_length) : '\u2014' }),
         h('td', { class: 'small-text muted', text: fmtSize(r.size_bytes) + (r.quant ? ' ' + r.quant : '') }),
-        h('td', {}, r.already_imported ? h('span', { class: 'tag', text: 'already imported' })
+        h('td', {},
+          r.is_image_model ? h('span', { class: 'tag image', text: '\uD83C\uDFA8 image' }) : null,
+          r.already_imported ? h('span', { class: 'tag', text: 'already imported' })
           : r.loaded ? h('span', { class: 'tag act', text: 'loaded' }) : null)));
     });
     box.appendChild(h('table', { class: 'scan-table' }, h('thead', {}, head), tbody));
@@ -850,6 +869,7 @@
       SCAN.name[k] = pname;
       return { profile_name: pname, base_url: r.server_url,
         model: r.model_id, context_length: r.context_length || 0, vram_gb: vram,
+        is_image_model: !!r.is_image_model,
         set_default: SCAN.def === k };
     });
     var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
@@ -877,13 +897,18 @@
       PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + (p.model || '') + ') is a hosted provider model and uses provider-table defaults automatically.', true);
       return;
     }
-    PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
-      ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
-      : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.'), 'Run it').then(function (ok) {
+    var msg = cal.is_image_model
+      ? t('gui.cal.probe_image_confirm', { name: name },
+          'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
+      : 'Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
+          ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
+          : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.');
+    var okLabel = cal.is_image_model ? t('gui.cal.probe_image', null, 'Probe image') : 'Run it';
+    PDC.confirm(msg, okLabel).then(function (ok) {
       if (!ok) return;
       PDC.api('/api/models/calibrate', { profile: name, mode: mode }).then(function (j) {
         if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-        PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+        PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
         PDC.refreshState();
       });
     });

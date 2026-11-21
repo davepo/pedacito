@@ -1558,9 +1558,60 @@ def _light_config(args) -> Config:
                        require_hardware=False, warn_budgets=False)
 
 
+def _cmd_image(args) -> int:
+    """`pedacito image PROMPT ...`: generate one image and save it."""
+    import json as _json
+    from . import imagegen, security
+
+    cfg = _light_config(args)
+    root = _root(args)
+    prompt = str(getattr(args, "prompt", "") or "").strip()
+    if not prompt:
+        print(i18n.t("cli.image.empty_prompt"), file=sys.stderr)
+        return 2
+    try:
+        res = imagegen.generate_image(
+            cfg, prompt,
+            output_path=getattr(args, "out", None),
+            size=getattr(args, "size", "") or "",
+            steps=getattr(args, "steps", 0) or 0,
+            cfg_scale=getattr(args, "cfg_scale", None),
+            seed=getattr(args, "seed", None),
+            negative_prompt=getattr(args, "negative", "") or "",
+            profile=getattr(args, "profile", None),
+            root=root,
+        )
+    except (imagegen.ImageGenError, security.SecurityError) as exc:
+        if getattr(args, "json", False):
+            print(_json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            print(i18n.t("cli.error", message=str(exc)), file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(_json.dumps(res, default=str))
+        return 0
+
+    dims = (f"{res['width']}x{res['height']}"
+            if res.get("width") and res.get("height")
+            else str(res.get("format") or ""))
+    model_str = str(res.get("model") or "")
+    if res.get("profile"):
+        model_str = f"{res['profile']} ({model_str})" if model_str else res["profile"]
+    print(i18n.t(
+        "cli.image.saved",
+        path=res.get("rel_path") or res.get("path", ""),
+        dims=dims,
+        elapsed=f"{float(res.get('elapsed_s') or 0.0):.2f}s",
+        model=model_str,
+    ))
+    return 0
+
+
 def _cmd_calibrate(args, cfg) -> int:
     """`pedacito calibrate`: run the scripted mini-suite against the configured
     model and save its model card."""
+    from . import imagegen
     if getattr(args, "all", False):
         return _calibrate_all(args)
     if not llm_mod._is_local_server(cfg):
@@ -1571,6 +1622,13 @@ def _cmd_calibrate(args, cfg) -> int:
     if existing and not args.recalibrate:
         print(modelcard.render(existing))
         print("\nA fresh card exists; pass --recalibrate to measure again.")
+        return 0
+    if imagegen.profile_is_image_model(cfg):
+        card = modelcard.calibrate_image_model(cfg, verbose=True)
+        path = modelcard.save_card(card)
+        print()
+        print(modelcard.render(card))
+        print(f"\nSaved to {path}.")
         return 0
     client = LLMClient(cfg)
     client.check()
@@ -1591,6 +1649,7 @@ def _calibrate_all(args) -> int:
     profiles are skipped (provider-table defaults), fresh cards are skipped
     unless --recalibrate, each card is saved as soon as it finishes, and the
     model is unloaded between profiles so one card's VRAM fits the next."""
+    from . import imagegen
     base = _light_config(args)
     all_names = list(base.profiles or {})
     names = [n for n in all_names
@@ -1625,6 +1684,17 @@ def _calibrate_all(args) -> int:
     done = 0
     try:
         for n, cfg in todo:
+            if imagegen.profile_is_image_model(cfg):
+                print(f"\n=== probing image profile '{n}' ({cfg.model}) [image] ===",
+                      file=sys.stderr)
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                path = modelcard.save_card(card)
+                done += 1
+                m = card.get("measured") or {}
+                status = (f"verified ({m.get('latency_s', '?')}s)"
+                          if m.get("image_ok") else "probe failed")
+                print(f"Saved image card for '{n}' ({status}) to {path}")
+                continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
             client = LLMClient(cfg)
@@ -1704,10 +1774,15 @@ def _scan_filter(models: list[dict], args) -> list[dict]:
 
 def _interactive_pick(label: str, base_url: str, models: list[dict]) -> list[dict]:
     """Let the user pick models from one server's list."""
+    from . import imagegen
     print(f"\n{label}  {base_url}  ({len(models)} model(s))")
     for i, m in enumerate(models, 1):
         mark = "*" if m.get("loaded") else " "
         bits = [f"{i:>2}) {mark} {m['id']}"]
+        if imagegen.is_image_model(m["id"], labels=m.get("labels"),
+                                   recipe=m.get("recipe"),
+                                   modality=m.get("modality")):
+            bits.append("[image]")
         if m.get("size_bytes"):
             bits.append(f"{m['size_bytes'] / (1024 ** 3):.1f} GB")
         print("  " + "  ".join(bits))
@@ -1759,9 +1834,14 @@ def _write_config_backup(target: Path, text: str) -> None:
 
 def _scan_cfg(model: dict) -> Config:
     """A Config for one scanned model, with identity only (no card applied)."""
+    from . import imagegen
     cfg = Config()
     cfg.base_url = model["base_url"]
     cfg.model = model["id"]
+    if imagegen.is_image_model(model["id"], labels=model.get("labels"),
+                               recipe=model.get("recipe"),
+                               modality=model.get("modality")):
+        cfg.modality = "image"
     if model.get("vram_gb"):
         cfg.vram_gb = int(model["vram_gb"])
     if model.get("tier"):
@@ -1774,6 +1854,7 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     """Calibrate the selected models, loaded first, skipping fresh cards. Each
     card is saved as soon as it finishes, so Ctrl-C keeps the cards done so
     far."""
+    from . import imagegen
     order = sorted(models, key=lambda m: (0 if m.get("loaded") else 1))
     todo: list[Config] = []
     for m in order:
@@ -1789,6 +1870,11 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     done = 0
     try:
         for cfg in todo:
+            if imagegen.profile_is_image_model(cfg):
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                modelcard.save_card(card)
+                done += 1
+                continue
             client = LLMClient(cfg)
             client.check()
             client.warmup()
@@ -1849,7 +1935,12 @@ def _scan_hosted(args, urls: list[str]) -> list[dict]:
 
 def _to_scan_entry(m: dict) -> dict:
     """The keys `upsert_profiles` writes for one scanned model."""
+    from . import imagegen
+    is_img = imagegen.is_image_model(m["id"], labels=m.get("labels"),
+                                     recipe=m.get("recipe"),
+                                     modality=m.get("modality"))
     entry: dict = {"model": m["id"], "base_url": m["base_url"],
+                   "modality": "image" if is_img else None,
                    "server_label": m.get("server_label", ""),
                    "tier": m.get("tier") or "",
                    "vram_gb": m.get("vram_gb"),
@@ -3816,6 +3907,30 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_gui.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
                        default=argparse.SUPPRESS, help=t("cli.opt.lang"))
 
+    p_image = sub.add_parser(
+        "image", help=t("cli.cmd.image"))
+    p_image.add_argument("prompt", help=t("cli.image.opt.prompt"))
+    p_image.add_argument("--out", metavar="FILE", default=None,
+                         help=t("cli.image.opt.out"))
+    p_image.add_argument("--size", metavar="WxH", default="",
+                         help=t("cli.image.opt.size"))
+    p_image.add_argument("--steps", type=int, default=0, metavar="N",
+                         help=t("cli.image.opt.steps"))
+    p_image.add_argument("--cfg-scale", dest="cfg_scale", type=float,
+                         default=None, metavar="F",
+                         help=t("cli.image.opt.cfg_scale"))
+    p_image.add_argument("--seed", type=int, default=None, metavar="N",
+                         help=t("cli.image.opt.seed"))
+    p_image.add_argument("--negative", metavar="TEXT", default="",
+                         help=t("cli.image.opt.negative"))
+    p_image.add_argument("--profile", metavar="NAME", default=None)
+    p_image.add_argument("--root", metavar="DIR", default=None)
+    p_image.add_argument("--config", metavar="FILE", default=None)
+    p_image.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                         default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    p_image.add_argument("--json", action="store_true",
+                         help=t("cli.image.opt.json"))
+
     p_update = sub.add_parser("update", help=t("cli.cmd.update"))
     p_update.add_argument("--run", action="store_true",
                           help="run the detected upgrade command (pipx/pip); "
@@ -3913,7 +4028,7 @@ def _main(argv=None) -> int:
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
-             "mcp": _cmd_mcp}
+             "mcp": _cmd_mcp, "image": _cmd_image}
     if args.cmd in light:
         try:
             return light[args.cmd](args)

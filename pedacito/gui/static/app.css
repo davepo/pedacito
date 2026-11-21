@@ -1291,7 +1291,27 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .cal-chip.none b { color: var(--muted); font-weight: 500; }
 .cal-chip.hosted { cursor: default; }
 .cal-chip.hosted b { color: var(--muted); font-weight: 500; }
+.cal-chip.image b { color: var(--accent); }
+.cal-chip.image { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.cal-chip.image.ok b { color: var(--success); }
+.cal-chip.image.ok { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
 .tag.hosted { color: var(--muted); border-style: dashed; }
+.tag.image { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); margin-right: 4px; }
+
+/* Generate Image dialog */
+.img-gen-dialog { display: flex; flex-direction: column; gap: 10px; }
+.img-gen-field { display: flex; flex-direction: column; gap: 4px; }
+.img-gen-field textarea,
+.img-gen-field input,
+.img-gen-field select { width: 100%; box-sizing: border-box; }
+.img-gen-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.img-gen-status { min-height: 1.2em; }
+.img-gen-status.ok { color: var(--success); }
+.img-gen-status.err { color: var(--danger, #e05d5d); }
+.img-gen-preview { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius, 8px); background: var(--bg2, var(--panel)); align-items: center; }
+.img-gen-preview img { max-width: 100%; max-height: 50vh; border-radius: 6px; object-fit: contain; display: block; }
+.img-gen-meta { display: flex; align-items: center; gap: 8px; width: 100%; }
+#imageGenBtn { padding: 4px 8px; font-size: 14px; line-height: 1; }
 /* Settings -> Profiles: the calibration line under each profile row. */
 .prow-cal { font-size: 11.5px; max-width: 100%; }
 .prow-cal.ok { color: var(--success); }

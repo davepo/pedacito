@@ -600,7 +600,7 @@ def run_calibrate(job: Job, opts: dict) -> None:
     lands in the chat when it finishes. Hosted profiles are refused (the
     endpoint checks too; this keeps a direct job call honest)."""
     from .. import config as config_mod
-    from .. import modelcard
+    from .. import imagegen, modelcard
     from . import settings_api
     name = str(opts.get("profile") or "").strip()
     quick = str(opts.get("mode") or "quick") != "full"
@@ -612,6 +612,24 @@ def run_calibrate(job: Job, opts: dict) -> None:
     cfg = config_mod.load(root=root, profile=name or None,
                           require_hardware=False, warn_budgets=False)
     label = name or cfg.active_profile or "the current config"
+    if imagegen.profile_is_image_model(cfg):
+        STATE.add_message(
+            "system", f"Probing image profile '{label}' \u2014 {cfg.model} at "
+            f"{cfg.base_url} (1-call image check).", kind="calibrating")
+        card = modelcard.calibrate_image_model(cfg, verbose=True)
+        path = modelcard.save_card(card)
+        m = card.get("measured") or {}
+        if m.get("image_ok"):
+            STATE.add_message(
+                "system", f"Image profile '{label}' verified \u2014 "
+                f"{m.get('width', 0)}x{m.get('height', 0)} {m.get('format', '')} "
+                f"in {m.get('latency_s', '?')}s. Card saved to {path}.",
+                kind="calibrated")
+        else:
+            STATE.add_message(
+                "system", f"Image probe for '{label}' failed. "
+                f"Card saved to {path}.", kind="calibrated")
+        return
     STATE.add_message(
         "system", f"Calibrating '{label}' \u2014 {cfg.model} at {cfg.base_url} "
         f"({'quick' if quick else 'full'} suite). Progress streams to the "
@@ -644,6 +662,7 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
     (polling /api/state) can show live progress, and the `calibration` map
     marks each profile done."""
     from .. import config as config_mod
+    from .. import imagegen
     from .. import llm as llm_mod
     from .. import modelcard, roles
     quick = str(opts.get("mode") or "quick") != "full"
@@ -678,6 +697,20 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
         for n, cfg in todo:
             if job.cancelled:
                 break
+            if imagegen.profile_is_image_model(cfg):
+                with STATE.lock:
+                    job.title = (f"probing image {n} "
+                                 f"({done + 1}/{len(todo)})")
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                path = modelcard.save_card(card)
+                done += 1
+                m = card.get("measured") or {}
+                status = (f"verified ({m.get('latency_s', '?')}s)"
+                          if m.get("image_ok") else "probe failed")
+                STATE.add_message(
+                    "system", f"Image probe of '{n}' finished \u2014 "
+                    f"{status}. Card saved to {path}.", kind="calibrated")
+                continue
             with STATE.lock:
                 job.title = (f"calibrating {n} "
                              f"({done + 1}/{len(todo)})")

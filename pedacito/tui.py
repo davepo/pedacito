@@ -128,13 +128,14 @@ _TAB_PREFIX = {
     "/hy": "/hybrid ",
     "/ar": "/arena ",
     "/la": "/lang ",
+    "/im": "/image ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
-    "/theme", "/lang",
+    "/theme", "/lang", "/image",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/update",
@@ -212,6 +213,8 @@ Pedacito TUI commands
   /theme [NAME]             list color themes, or switch to NAME and save it
                             (shared with the GUI Theme Manager)
   /lang [en|es]             switch interface language (F3 toggles EN/ES)
+  /image PROMPT [--out FILE] [--size WxH]
+                            generate an image with the configured image profile
   /apply [on|off]           write edits to disk, or preview them
   /verify [on|off|status]   post-edit verification: on detects the project's
                             test command, off clears it, status shows the
@@ -302,6 +305,8 @@ Comandos de Pedacito TUI
   /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
   /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
   /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
+  /image PROMPT [--out ARCHIVO] [--size WxH]
+                            generar una imagen con el perfil de imagen configurado
   /apply [on|off]           escribir cambios en disco o solo previsualizar
   /verify [on|off|status]   verificación posterior a la edición
   /skills [list|show|draft] listar, inspeccionar o redactar habilidades
@@ -958,6 +963,15 @@ class TuiSession:
 
     def _calibration_badge(self) -> str:
         try:
+            from . import imagegen
+            if imagegen.profile_is_image_model(self.cfg):
+                card = modelcard.load(self.cfg)
+                if card and (card.get("measured") or {}).get("image_ok"):
+                    return "\U0001f3a8 Image \u2713"
+                return "\U0001f3a8 Image"
+        except Exception:
+            pass
+        try:
             hosted = bool(getattr(self.cfg, "_hosted_server", False))
             if not hosted and hasattr(roles_mod, "profile_is_hosted"):
                 hosted = roles_mod.profile_is_hosted(
@@ -986,8 +1000,13 @@ class TuiSession:
         brand = self._style(" pdc tui ", "accent", bold=True)
         profile_text = self._style(profile, "accent")
         model_text = self._style(model, "text")
-        badge_text = self._style(
-            badge, "warning" if badge.startswith("\u2601") else "success")
+        badge_tone = (
+            "success" if badge.endswith("\u2713")
+            else "accent" if badge.startswith("\U0001f3a8")
+            else "warning" if badge.startswith("\u2601")
+            else "success"
+        )
+        badge_text = self._style(badge, badge_tone)
         line1_profile = i18n.t("tui.header.profile", lang=self.lang)
         line1_model = i18n.t("tui.header.model", lang=self.lang)
         line2_auto_route = i18n.t("tui.header.auto_route", lang=self.lang)
@@ -2892,6 +2911,9 @@ class TuiSession:
         if cmd == "lang":
             self._lang_command(arg)
             return
+        if cmd == "image":
+            self._image_command(arg)
+            return
         if cmd == "scroll":
             self._scroll_command(arg)
             return
@@ -4441,6 +4463,113 @@ class TuiSession:
                                 name=name, code=self.lang), "system")
             return
         self._set_lang(raw, persist=True)
+
+    def _image_command(self, arg: str) -> None:
+        """`/image PROMPT [--out FILE] [--size WxH] [--steps N] [--seed N]
+        [--cfg-scale F] [--negative TEXT] [--profile NAME]`."""
+        import shlex
+        from . import imagegen
+
+        raw = str(arg or "").strip()
+        if not raw:
+            self._append(i18n.t("tui.image.usage", lang=self.lang), "error")
+            return
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            tokens = raw.split()
+
+        out: str | None = None
+        size = ""
+        steps = 0
+        cfg_scale: float | None = None
+        seed: int | None = None
+        negative = ""
+        profile: str | None = None
+        prompt_parts: list[str] = []
+
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            flag = ""
+            val: str | None = None
+            if tok.startswith("--") and "=" in tok:
+                flag, val = tok.split("=", 1)
+            elif tok in ("--out", "--size", "--steps", "--cfg-scale",
+                         "--seed", "--negative", "--profile"):
+                flag = tok
+                if i + 1 < len(tokens):
+                    val = tokens[i + 1]
+                    i += 1
+            if flag == "--out" and val is not None:
+                out = val
+            elif flag == "--size" and val is not None:
+                size = val
+            elif flag == "--steps" and val is not None:
+                try:
+                    steps = int(val)
+                except ValueError:
+                    pass
+            elif flag == "--cfg-scale" and val is not None:
+                try:
+                    cfg_scale = float(val)
+                except ValueError:
+                    pass
+            elif flag == "--seed" and val is not None:
+                try:
+                    seed = int(val)
+                except ValueError:
+                    pass
+            elif flag == "--negative" and val is not None:
+                negative = val
+            elif flag == "--profile" and val is not None:
+                profile = val
+            else:
+                prompt_parts.append(tok)
+            i += 1
+
+        prompt = " ".join(prompt_parts).strip()
+        if not prompt:
+            self._append(i18n.t("tui.image.usage", lang=self.lang), "error")
+            return
+
+        self._append(
+            i18n.t("tui.image.generating", lang=self.lang, prompt=prompt[:80]),
+            "system",
+        )
+        holder = self._run_in_worker(lambda: imagegen.generate_image(
+            self.cfg, prompt,
+            output_path=out,
+            size=size,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            negative_prompt=negative,
+            profile=profile,
+            root=self.root,
+        ))
+        err = holder.get("error")
+        if err is not None:
+            if not isinstance(err, KeyboardInterrupt):
+                self._append(
+                    i18n.t("tui.image.error", lang=self.lang, message=str(err)),
+                    "error",
+                )
+            return
+        res = holder.get("result") or {}
+        rel = str(res.get("rel_path") or res.get("path") or "")
+        dims = (f"{res['width']}x{res['height']}"
+                if res.get("width") and res.get("height")
+                else str(res.get("format") or ""))
+        elapsed = f"{float(res.get('elapsed_s') or 0.0):.2f}s"
+        model = str(res.get("model") or "")
+        self._append(
+            i18n.t("tui.image.saved", lang=self.lang,
+                   path=rel, dims=dims, elapsed=elapsed, model=model),
+            "receipt",
+        )
+        if rel and rel not in self.modified:
+            self.modified.append(rel)
 
     def handle_command(self, line: str) -> bool:
         """Compatibility alias for callers that drive the session directly."""

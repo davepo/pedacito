@@ -22,7 +22,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
@@ -862,6 +862,136 @@ def _runner_exec(q, body):
 @get("/api/file")
 def _file(q, body=None):
     return 200, read_project_file(q.get("path", [""])[0])
+
+
+_IMAGE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+
+def _opt_int(val):
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+@post("/api/image/generate")
+def _image_generate(q, body):
+    """Generate one image using a configured image profile and save it inside
+    the active workspace (or scratchpad `.pedacito/images/` when no project is
+    open)."""
+    from .. import config as config_mod
+    from .. import imagegen
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return 400, {"ok": False, "detail": "Prompt is required."}
+    negative = str(body.get("negative_prompt") or "").strip()
+    output_path = str(body.get("output_path") or "").strip() or None
+    size = str(body.get("size") or "").strip()
+    steps = _opt_int(body.get("steps")) or 0
+    cfg_scale = _opt_float(body.get("cfg_scale"))
+    seed = _opt_int(body.get("seed"))
+    profile = str(body.get("profile") or "").strip() or None
+
+    root = _effective_root()
+    if STATE.root is None and output_path:
+        # When no project is open, keep generated files inside scratchpad
+        # `.pedacito/images/` so `/api/image/file` containment stays strict.
+        cleaned = output_path.lstrip("/\\")
+        if not cleaned.startswith(".pedacito/images/"):
+            output_path = str(Path(".pedacito") / "images" / Path(cleaned).name)
+
+    with STATE.lock:
+        cfg = STATE.cfg
+    if cfg is None:
+        cfg = config_mod.load(root=root, require_hardware=False,
+                              warn_budgets=False)
+
+    try:
+        res = imagegen.generate_image(
+            cfg, prompt,
+            output_path=output_path,
+            size=size,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            negative_prompt=negative,
+            profile=profile,
+            root=root,
+        )
+    except security.SecurityError as e:
+        return 403, {"ok": False, "detail": str(e)}
+    except imagegen.ImageGenError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+    rel_path = str(res.get("rel_path") or "")
+    url = "/api/image/file?path=" + quote(rel_path, safe="/")
+    return 200, {
+        "ok": True,
+        "path": str(res.get("path") or ""),
+        "rel_path": rel_path,
+        "url": url,
+        "width": int(res.get("width") or 0),
+        "height": int(res.get("height") or 0),
+        "bytes": int(res.get("bytes") or 0),
+        "elapsed_s": float(res.get("elapsed_s") or 0.0),
+        "model": str(res.get("model") or ""),
+        "profile": str(res.get("profile") or ""),
+    }
+
+
+@get("/api/image/file")
+def _image_file(q, body=None):
+    """Serve a generated image (PNG/JPEG/WebP only) strictly contained to
+    `STATE.root` (or scratchpad `.pedacito/images/` when no project is open)."""
+    from .. import imagegen
+
+    rel = str((q.get("path") or [""])[0] or "").strip()
+    if not rel:
+        return 400, {"ok": False, "detail": "Missing path parameter."}
+    with STATE.lock:
+        proj_root = STATE.root
+    try:
+        if proj_root is not None:
+            dest = security.resolve_safe_path(proj_root, rel)
+        else:
+            scratch = STATE.scratchpad_path()
+            images_dir = (scratch / ".pedacito" / "images").resolve()
+            dest = security.resolve_safe_path(scratch, rel)
+            if not dest.is_relative_to(images_dir):
+                raise security.SecurityError(
+                    "Image path must be inside .pedacito/images/ when no project is open.")
+    except security.SecurityError as e:
+        return 403, {"ok": False, "detail": str(e)}
+
+    if not dest.is_file():
+        return 404, {"ok": False, "detail": "Image not found."}
+    try:
+        data = dest.read_bytes()
+    except OSError as e:
+        return 500, {"ok": False, "detail": str(e)}
+
+    fmt, _w, _h = imagegen.sniff_image_format(data)
+    ctype = _IMAGE_MIME.get(fmt)
+    if not ctype:
+        return 415, {"ok": False,
+                     "detail": "Unsupported file type; only PNG, JPEG and WebP images are served."}
+    return 200, data, ctype
 
 
 @get("/api/preview")
@@ -2843,12 +2973,19 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _call(self, route, query, body) -> None:
         try:
-            code, obj = route(query, body) if body is not None else route(query)
+            res = route(query, body) if body is not None else route(query)
         except ConfigError as e:
-            code, obj = 400, {"ok": False, "detail": str(e)}
+            self._json(400, {"ok": False, "detail": str(e)})
+            return
         except Exception as e:
             print(f"[gui] {self.path}: {type(e).__name__}: {e}", file=sys.stderr)
-            code, obj = 500, {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+            self._json(500, {"ok": False, "detail": f"{type(e).__name__}: {e}"})
+            return
+        if isinstance(res, tuple) and len(res) == 3 and isinstance(res[1], (bytes, bytearray)):
+            code, raw, ctype = res
+            self._send(code, bytes(raw), str(ctype))
+            return
+        code, obj = res
         self._json(code, obj)
 
     def _events(self, query) -> None:

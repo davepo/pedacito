@@ -1621,7 +1621,7 @@ def upsert_profiles(text: str, found, *, now: str | None = None) -> str:
         # written. Provider compatibility keys (prompt_cache, json_mode,
         # tool_mode) are transport settings a hosted scan adds from the C0
         # provider table, and the user can still override them.
-        for k in ("base_url", "model", "tier", "vram_gb", "api_key_env",
+        for k in ("base_url", "model", "modality", "tier", "vram_gb", "api_key_env",
                   "prompt_cache", "json_mode", "tool_mode"):
             if entry.get(k):
                 values[k] = entry[k]

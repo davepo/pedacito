@@ -109,18 +109,22 @@ def card_meta(card: dict | None) -> dict:
         return {"calibrated": False, "calibrated_at": "",
                 "calibrated_age_days": 0, "calibrated_stale": False,
                 "card_score": 0.0, "card_choices": {},
-                "is_image_model": False, "modality": "text"}
+                "is_image_model": False, "modality": "text",
+                "image_ok": False, "image_latency_s": 0.0}
     ts = float(card.get("ts", 0) or 0)
     age_days = int((time.time() - ts) / 86400) if ts else 0
     at = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
     stale = age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
-    score = float((card.get("measured") or {}).get("overall") or 0.0)
+    measured = card.get("measured") or {}
+    score = float(measured.get("overall") or 0.0)
     is_image = _card_is_image(card)
     return {"calibrated": True, "calibrated_at": at,
             "calibrated_age_days": age_days, "calibrated_stale": stale,
             "card_score": score, "card_choices": card.get("choices") or {},
             "is_image_model": is_image,
-            "modality": "image" if is_image else "text"}
+            "modality": "image" if is_image else "text",
+            "image_ok": bool(measured.get("image_ok")) if is_image else False,
+            "image_latency_s": float(measured.get("latency_s") or 0.0) if is_image else 0.0}
 
 
 def _refilter_saved_cards() -> dict:
