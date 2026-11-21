@@ -15,9 +15,11 @@ RELEASE.md for the full checklist.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tomllib
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -25,7 +27,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import __version__ as package_version
-from pedacito import cli
+from pedacito import cli, i18n, imagegen
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,3 +83,39 @@ def test_changelog_has_a_heading_for_the_release_version():
         f"CHANGELOG.md has no '## v{version}' heading. Add the release "
         "notes before tagging (see RELEASE.md)."
     )
+
+
+def test_package_data_ships_locales_and_gui_static():
+    """The wheel must carry the i18n catalogs and GUI assets; a missing
+    package-data pattern leaves an installed `pdc` speaking one language
+    or serving a blank page."""
+    with (ROOT / "pyproject.toml").open("rb") as fh:
+        package_data = tomllib.load(fh)["tool"]["setuptools"]["package-data"]
+    assert "locales/*.json" in package_data.get("pedacito", []), (
+        "[tool.setuptools.package-data] does not ship pedacito/locales/*.json")
+    assert "static/*" in package_data.get("pedacito.gui", []), (
+        "[tool.setuptools.package-data] does not ship "
+        "pedacito/gui/static/*")
+
+    for code in ("en", "es"):
+        raw = resources.files("pedacito").joinpath(
+            "locales", f"{code}.json").read_text(encoding="utf-8")
+        catalog = json.loads(raw)
+        assert isinstance(catalog, dict) and catalog, (
+            f"pedacito/locales/{code}.json is empty or not an object")
+        assert len(catalog) == len(i18n.load_catalog(code))
+
+
+def test_docs_screenshots_exist_and_are_valid_pngs():
+    """The docs link the captured GUI/TUI screenshots; a truncated or
+    placeholder file ships a broken image to every reader."""
+    for name in ("gui-workspace.png", "tui-split.png"):
+        path = ROOT / "docs" / "assets" / name
+        data = path.read_bytes()
+        assert data.startswith(b"\x89PNG\r\n\x1a\n"), (
+            f"docs/assets/{name} does not start with the PNG magic bytes")
+        kind, width, height = imagegen.sniff_image_format(data)
+        assert kind == "png", f"docs/assets/{name} is not sniffed as PNG"
+        assert width >= 320 and height >= 200, (
+            f"docs/assets/{name} is suspiciously small: {width}x{height}")
+

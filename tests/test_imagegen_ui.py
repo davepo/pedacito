@@ -10,7 +10,7 @@ import json
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,7 @@ from pedacito.config import Config
 from pedacito.gui import jobs as gui_jobs
 from pedacito.gui import server as gui_server
 from pedacito.gui.core import STATE, Job
+from pedacito.local_server import LocalHTTPServer
 
 
 def _png(width=256, height=192) -> bytes:
@@ -70,7 +71,7 @@ class _FakeImageServer:
                     self.send_response(404)
                     self.end_headers()
 
-        self._srv = HTTPServer(("127.0.0.1", 0), Handler)
+        self._srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
         self.base_url = f"http://127.0.0.1:{self._srv.server_address[1]}/v1"
         self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
 

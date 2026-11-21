@@ -11,7 +11,7 @@ import json
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import imagegen, modelcard, security, tools
 from pedacito.config import Config
+from pedacito.local_server import LocalHTTPServer
 
 
 # ----------------------------------------------------------- image headers ----
@@ -166,7 +167,7 @@ def _make_handler(bodies, responses):
 
 
 def _start_server(handler):
-    srv = HTTPServer(("127.0.0.1", 0), handler)
+    srv = LocalHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
