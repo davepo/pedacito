@@ -206,3 +206,72 @@ def test_resolve_pinned_reference_accepts_optional_at(reference, tmp_path):
     assert pins
     assert pins[0].kind == "file"
     assert pins[0].path == "gui.py"
+
+
+def test_pinning_class_method_resolves_in_typescript_and_javascript(tmp_path):
+    """@Class.method resolves to the exact method span in JS/TS files,
+    both through a live Index and directly against a workspace root."""
+    from pedacito.chunker_ts import TS_AVAILABLE, chunk_file_ts
+
+    if not TS_AVAILABLE:
+        pytest.skip("tree-sitter unavailable")
+
+    ts_src = (
+        "export class DataStore {\n"
+        "  fetch(id: string): string {\n"
+        "    return id.trim();\n"
+        "  }\n"
+        "  save(item: string): void {\n"
+        "    console.log(item);\n"
+        "  }\n"
+        "}\n"
+    )
+    js_src = (
+        "export class Counter {\n"
+        "  increment() {\n"
+        "    return 1;\n"
+        "  }\n"
+        "  reset() {\n"
+        "    return 0;\n"
+        "  }\n"
+        "}\n"
+    )
+    (tmp_path / "store.ts").write_text(ts_src, encoding="utf-8")
+    (tmp_path / "counter.js").write_text(js_src, encoding="utf-8")
+
+    # Small classes are indexed whole (kind='class' with members); pinning a
+    # method must narrow to that method's span via chunker.locate_symbol_span.
+    chunks = (
+        chunk_file_ts("store.ts", ts_src, ".ts")
+        + chunk_file_ts("counter.js", js_src, ".js")
+    )
+    idx = Index(tmp_path, chunks)
+
+    pins = select.parse_pinned_references(
+        "Update @DataStore.fetch and @Counter.increment please.", idx)
+    by_raw = {p.raw_token: p for p in pins}
+
+    assert "@DataStore.fetch" in by_raw
+    ts_pin = by_raw["@DataStore.fetch"]
+    assert ts_pin.kind == "symbol"
+    assert ts_pin.path == "store.ts"
+    assert (ts_pin.start_line, ts_pin.end_line) == (2, 4)
+    assert "fetch(id: string)" in ts_pin.content
+    assert "class DataStore" not in ts_pin.content
+    assert "save(" not in ts_pin.content
+
+    assert "@Counter.increment" in by_raw
+    js_pin = by_raw["@Counter.increment"]
+    assert js_pin.kind == "symbol"
+    assert js_pin.path == "counter.js"
+    assert (js_pin.start_line, js_pin.end_line) == (2, 4)
+    assert "increment()" in js_pin.content
+    assert "class Counter" not in js_pin.content
+    assert "reset()" not in js_pin.content
+
+    # Also works against a bare workspace root without an Index.
+    root_pins = select.parse_pinned_references("Inspect @DataStore.save.", tmp_path)
+    assert len(root_pins) == 1
+    assert root_pins[0].path == "store.ts"
+    assert (root_pins[0].start_line, root_pins[0].end_line) == (5, 7)
+    assert "save(item: string)" in root_pins[0].content

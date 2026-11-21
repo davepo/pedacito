@@ -105,15 +105,17 @@ def card_meta(card: dict | None) -> dict:
             "card_score": score, "card_choices": card.get("choices") or {}}
 
 
-def _refilter_saved_cards() -> None:
+def _refilter_saved_cards() -> dict:
     """Re-derive the specialty tags of every saved card under the current
     rules (item 15): cards calibrated before the edit-skill gate could tag a
     model that cannot hold the edit format as a coding specialist, and
     routing reads those tags. Persists only when a card actually changes; an
-    explicit config `specialties` list still overrides in `apply()`."""
+    explicit config `specialties` list still overrides in `apply()`. Returns
+    the loaded card dict so callers do not need to read `model_cards.json` a
+    second time."""
     data = _load_all()
     if not data:
-        return
+        return {}
     changed = False
     for key, card in data.items():
         if not isinstance(card, dict):
@@ -137,13 +139,14 @@ def _refilter_saved_cards() -> None:
             ch["specialties"] = list(tags)
         changed = True
     if not changed:
-        return
+        return data
     try:
         p = _path()
         p.parent.mkdir(parents=True, exist_ok=True)
         fileio.write_bytes(p, json.dumps(data, indent=1).encode("utf-8"))
     except OSError:
         pass                      # a read-only config dir must not break runs
+    return data
 
 
 def load(cfg, allow_stale: bool = False) -> dict | None:
@@ -151,8 +154,7 @@ def load(cfg, allow_stale: bool = False) -> dict | None:
     none, it is from an unknown card version, or it has expired. A v1 card is
     returned for display but marked `_needs_recalibrate`: its measurements are
     single-run, so `apply` does not use it and the render says so."""
-    _refilter_saved_cards()
-    card = _load_all().get(card_key(cfg))
+    card = _refilter_saved_cards().get(card_key(cfg))
     if not isinstance(card, dict) or card.get("version") not in (1, CARD_VERSION):
         return None
     card["_needs_recalibrate"] = card.get("version") != CARD_VERSION

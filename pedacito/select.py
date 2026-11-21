@@ -35,11 +35,12 @@ a file reachable by several routes is kept once.
 
 from __future__ import annotations
 
-import ast
 import difflib
 import fnmatch
 import os
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -470,20 +471,26 @@ def _resolve_file(token: str, files: list[str]) -> str | None:
     return None
 
 
-_SYMBOL_CACHE: dict[str, tuple[tuple, list]] = {}
+_SYMBOL_CACHE_MAX = 512
+_SYMBOL_CACHE: OrderedDict[str, tuple[tuple, list]] = OrderedDict()
+_SYMBOL_CACHE_LOCK = threading.Lock()
 
 
 def _symbol_records(root: Path | None, index=None) -> list:
-    """Chunks (or lightweight AST chunks for a root with no index)."""
+    """Chunks (or lightweight AST/tree-sitter chunks for a root with no index)."""
     if index is not None:
         return list(getattr(index, "chunks", []) or [])
     if root is None:
         return []
+    from .chunker import chunk_source
+    from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, chunk_file_ts
+
     files = _workspace_files(root, None)
-    pys = [f for f in files if Path(f).suffix.lower() == ".py"]
-    pys = pys[:_MAX_SYMBOL_SCAN_FILES]
+    code_exts = PY_EXTS | (set(LANG_BY_EXT) if TS_AVAILABLE else set())
+    code_files = [f for f in files if Path(f).suffix.lower() in code_exts]
+    code_files = code_files[:_MAX_SYMBOL_SCAN_FILES]
     sig_parts: list[tuple] = []
-    for rel in pys:
+    for rel in code_files:
         try:
             st = (root / rel).stat()
             sig_parts.append((rel, st.st_mtime_ns, st.st_size))
@@ -491,20 +498,29 @@ def _symbol_records(root: Path | None, index=None) -> list:
             sig_parts.append((rel, 0, 0))
     sig = tuple(sig_parts)
     key = str(root)
-    hit = _SYMBOL_CACHE.get(key)
-    if hit is not None and hit[0] == sig:
-        return hit[1]
-    from .chunker import chunk_source
+    with _SYMBOL_CACHE_LOCK:
+        hit = _SYMBOL_CACHE.get(key)
+        if hit is not None and hit[0] == sig:
+            _SYMBOL_CACHE.move_to_end(key)
+            return hit[1]
     records: list = []
-    for rel in pys:
+    for rel in code_files:
         try:
             text = fileio.read_text(root / rel)
             if len(text) > 2_000_000:
                 continue
-            records.extend(chunk_source(rel, text))
-        except (OSError, SyntaxError, ValueError):
+            suffix = Path(rel).suffix.lower()
+            if suffix == ".py":
+                records.extend(chunk_source(rel, text))
+            elif suffix in LANG_BY_EXT and TS_AVAILABLE:
+                records.extend(chunk_file_ts(rel, text, suffix))
+        except (OSError, SyntaxError, ValueError, RuntimeError):
             continue
-    _SYMBOL_CACHE[key] = (sig, records)
+    with _SYMBOL_CACHE_LOCK:
+        _SYMBOL_CACHE[key] = (sig, records)
+        _SYMBOL_CACHE.move_to_end(key)
+        while len(_SYMBOL_CACHE) > _SYMBOL_CACHE_MAX:
+            _SYMBOL_CACHE.popitem(last=False)
     return records
 
 
@@ -552,41 +568,20 @@ def _symbol_hits(token: str, file: str | None, root: Path | None,
 
 def _ast_symbol_span(root: Path | None, rel: str, token: str
                      ) -> tuple[int, int] | None:
-    """Exact source span of `Class.method`/`method` when the file is Python.
+    """Exact source span of `Class.method`/`method` via `chunker.locate_symbol_span`.
 
     A small class is indexed as one whole-class chunk, so a pin for one of its
-    methods would otherwise quote the entire class. The AST gives the method
-    its own definition boundary, which is what the user asked for.
+    methods would otherwise quote the entire class. Delegating to
+    `locate_symbol_span` gives the method its own definition boundary for
+    Python as well as JS/TS/Go/Rust and other tree-sitter languages.
     """
-    if root is None or not rel.lower().endswith(".py"):
+    if root is None or not rel or not token:
         return None
-    try:
-        tree = ast.parse(fileio.read_text(root / rel))
-    except (OSError, SyntaxError, ValueError):
+    from .chunker import locate_symbol_span
+    hit = locate_symbol_span(root / rel, token)
+    if hit is None:
         return None
-    parts = token.split(".")
-    method = parts[-1]
-    owner = parts[-2] if len(parts) > 1 else ""
-    spans: list[tuple[int, int]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            if owner and node.name != owner:
-                continue
-            for child in node.body:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                        and child.name == method:
-                    start = min([child.lineno] + [
-                        d.lineno for d in child.decorator_list])
-                    spans.append((start, child.end_lineno or start))
-    if not owner:
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and node.name == method:
-                start = min([node.lineno] + [
-                    d.lineno for d in node.decorator_list])
-                spans.append((start, node.end_lineno or start))
-    distinct = sorted(set(spans))
-    return distinct[0] if len(distinct) == 1 else None
+    return hit[0], hit[1]
 
 
 def _symbol_pin(raw_token: str, token: str, chunk, root: Path | None

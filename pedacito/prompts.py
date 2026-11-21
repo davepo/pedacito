@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from . import fileio
@@ -57,7 +59,9 @@ def _enabled(cfg) -> set[str]:
 # Persistent project rules (`.pedacito/rules.md`)
 # --------------------------------------------------------------------------
 RULES_REL = ".pedacito/rules.md"
-_RULES_CACHE: dict[tuple[str, int, int], str] = {}
+_RULES_CACHE_MAX = 512
+_RULES_CACHE: OrderedDict[tuple[str, int, int], str] = OrderedDict()
+_RULES_CACHE_LOCK = threading.Lock()
 
 
 def project_rules_path(root) -> Path | None:
@@ -82,13 +86,20 @@ def load_project_rules(root) -> str:
     except OSError:
         return ""
     key = (str(path), st.st_mtime_ns, st.st_size)
-    text = _RULES_CACHE.get(key)
+    with _RULES_CACHE_LOCK:
+        text = _RULES_CACHE.get(key)
+        if text is not None:
+            _RULES_CACHE.move_to_end(key)
     if text is None:
         try:
             text = fileio.read_text(path, errors="replace")
         except OSError:
             return ""
-        _RULES_CACHE[key] = text
+        with _RULES_CACHE_LOCK:
+            _RULES_CACHE[key] = text
+            _RULES_CACHE.move_to_end(key)
+            while len(_RULES_CACHE) > _RULES_CACHE_MAX:
+                _RULES_CACHE.popitem(last=False)
     return text.strip()
 
 

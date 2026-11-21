@@ -558,7 +558,8 @@ def _attach_lex_and_lineage(chunks: list[Chunk]) -> None:
 def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
                  max_unit_lines: int = 220, max_unit_chars: int = 12000,
                  max_unit_tokens: int = 3000,
-                 unit_overlap_lines: int = 0) -> list[Chunk]:
+                 unit_overlap_lines: int = 0,
+                 tree: ast.Module | None = None) -> list[Chunk]:
     """Chunk one Python file's source into a list of Chunk objects.
 
     Produces, in order: a module-preamble chunk (code before the first
@@ -570,7 +571,8 @@ def chunk_source(rel_path: str, src: str, class_split_lines: int = 60,
     Units larger than the max_unit_* limits are split at statement boundaries
     into `name`, `name#2`, ... parts. Raises SyntaxError on invalid Python.
     """
-    tree = ast.parse(src)
+    if tree is None:
+        tree = ast.parse(src)
     lines = split_lines(src)
     total = len(lines)
     chunks: list[Chunk] = []

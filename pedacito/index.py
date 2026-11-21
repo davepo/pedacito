@@ -19,6 +19,7 @@ signature), which cut a 570-unit stdlib sample from 442 calls to 76.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import hashlib
 import json
@@ -245,6 +246,7 @@ class Index:
             self.file_imports[rel] = imports
         elif not new_chunks:
             self.file_imports.pop(rel, None)
+        self.file_summaries.pop(rel, None)
         self._files_sorted = None
         self.generation += 1
 
@@ -665,8 +667,20 @@ class Index:
         decides WHAT to show when something must be left out."""
         budget = int(cfg.flat_map_token_budget)
         ranked_on = bool(getattr(cfg, "rank_map", True))
+        git_on = bool(getattr(cfg, "git_context", True))
+        git_sig: tuple = ()
+        if git_on:
+            from . import gitinfo
+            if gitinfo.is_repo(self.root):
+                st = gitinfo.status(self.root)
+                git_sig = (
+                    gitinfo.head(self.root),
+                    tuple(sorted(st.get("dirty") or ())),
+                    tuple(sorted(st.get("untracked") or ())),
+                )
         key = (self.generation, budget, bool(cfg.file_card_line_ranges),
-               ranked_on, hashlib.sha1((task or "").encode()).hexdigest()[:10])
+               ranked_on, git_on, git_sig,
+               hashlib.sha1((task or "").encode()).hexdigest()[:10])
         hit = self._map_cache.get(("map",) + key)
         if hit is not None:
             return hit
@@ -992,19 +1006,33 @@ def _chunk_file(rel: str, path: Path, cfg) -> list[Chunk]:
     return _chunk_with_imports(rel, path, cfg)[0]
 
 
-def _chunk_with_imports(rel: str, path: Path, cfg
+def _decode_bytes(raw: bytes) -> str:
+    """LF-normalised UTF-8 text from raw file bytes (matches `fileio.read`)."""
+    style = fileio.detect(raw)
+    text = raw.decode("utf-8", "replace")
+    if text.startswith(fileio.BOM):
+        text = text[1:]
+    if style.newline != "\n":
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def _chunk_with_imports(rel: str, path: Path, cfg, raw: bytes | None = None
                         ) -> tuple[list[Chunk], list[str]]:
-    """(chunks, full import specifiers) for one file; one read of the file."""
+    """(chunks, full import specifiers) for one file; one read and one AST
+    parse of the file."""
     suffix = path.suffix.lower()
     if suffix in PY_EXTS:
-        src = fileio.read_text(path)
+        src = _decode_bytes(raw) if raw is not None else fileio.read_text(path)
+        tree = ast.parse(src)
         return (_unique_qualnames(chunk_source(
             rel, src, cfg.class_split_lines,
             cfg.max_unit_lines, cfg.max_unit_chars,
-            cfg.max_unit_tokens, cfg.unit_overlap_lines)),
-            raw_imports(rel, src))
+            cfg.max_unit_tokens, cfg.unit_overlap_lines,
+            tree=tree)),
+            raw_imports(rel, src, tree=tree))
     if suffix in LANG_BY_EXT and TS_AVAILABLE:
-        src = fileio.read_text(path)
+        src = _decode_bytes(raw) if raw is not None else fileio.read_text(path)
         return (_unique_qualnames(chunk_file_ts(
             rel, src, suffix, cfg.class_split_lines,
             cfg.max_unit_lines, cfg.max_unit_chars,
@@ -1067,7 +1095,8 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
     batch_n = max(1, int(getattr(cfg, "summary_batch", 1) or 1))
     small = [c for c in todo if batch_n > 1 and c.nlines <= 25
              and len(c.source) <= 1500]
-    big = [c for c in todo if c not in small]
+    small_ids = {id(c) for c in small}
+    big = [c for c in todo if id(c) not in small_ids]
     groups: list[list[Chunk]] = [[c] for c in big]
     for i in range(0, len(small), batch_n):
         groups.append(small[i:i + batch_n])
@@ -1281,8 +1310,13 @@ def reindex_file(index: Index, rel: str, cfg, save: bool = True) -> Index:
             if save:
                 index.save()
         return index
+    path = root / rel
+    suffix = path.suffix.lower()
+    raw: bytes | None = None
     try:
-        new, imports = _chunk_with_imports(rel, root / rel, cfg)
+        if suffix in PY_EXTS or (suffix in LANG_BY_EXT and TS_AVAILABLE):
+            raw = path.read_bytes()
+        new, imports = _chunk_with_imports(rel, path, cfg, raw=raw)
     except (SyntaxError, OSError) as e:
         print(f"[warn] {rel} could not be re-indexed ({e}); index left stale",
               file=sys.stderr)
@@ -1300,8 +1334,11 @@ def reindex_file(index: Index, rel: str, cfg, save: bool = True) -> Index:
             if inherited and needs_summary(c, cfg):
                 index.stale_summaries.add(c.key)
     index.replace_file(rel, new, imports)
-    index.file_hashes[rel] = file_hash(root / rel)
-    st = file_stat(root / rel)
+    index.file_hashes[rel] = (
+        hashlib.sha256(raw).hexdigest()[:16] if raw is not None
+        else file_hash(path)
+    )
+    st = file_stat(path)
     if st is not None:
         index.file_stats[rel] = st
     else:

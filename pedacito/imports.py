@@ -64,11 +64,12 @@ def _expand_rust_use(body: str) -> list[str]:
     return out
 
 
-def _python_imports(src: str) -> list[str]:
-    try:
-        tree = ast.parse(src)
-    except (SyntaxError, ValueError):
-        return []
+def _python_imports(src: str, tree: ast.AST | None = None) -> list[str]:
+    if tree is None:
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            return []
     out: list[str] = []
     for n in ast.walk(tree):
         if isinstance(n, ast.Import):
@@ -86,14 +87,14 @@ def _python_imports(src: str) -> list[str]:
     return out
 
 
-def raw_imports(rel: str, src: str) -> list[str]:
+def raw_imports(rel: str, src: str, tree: ast.AST | None = None) -> list[str]:
     """Every module specifier `src` imports, in source order and de-duplicated:
     full relative paths for JS/TS/Ruby/C, dotted names for Python/Java/C#,
     `a::b::c` for Rust (`mod x;` becomes `self::x`), package paths for Go."""
     ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
     found: list[str] = []
     if ext == "py":
-        found = _python_imports(src)
+        found = _python_imports(src, tree=tree)
     elif ext in ("js", "jsx", "mjs", "cjs", "ts", "tsx"):
         for rx in _JS_RES:
             found += rx.findall(src)

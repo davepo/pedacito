@@ -24,6 +24,7 @@ from __future__ import annotations
 import functools
 import gc
 import re
+import threading
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version as _dist_version
 
@@ -50,6 +51,11 @@ def _tree_sitter_is_safe(version: str) -> bool:
     return _version_tuple(version) < (0, 26)
 
 
+_GC_LOCK = threading.Lock()
+_GC_DEPTH = 0
+_GC_WAS_ENABLED = False
+
+
 @contextmanager
 def ts_nodes():
     """Pause the cyclic collector while tree-sitter nodes are alive.
@@ -58,15 +64,22 @@ def ts_nodes():
     (upstream py-tree-sitter#472). The dependency is pinned below 0.26, and
     `_tree_sitter_is_safe` disables it outright in a bad environment; this is
     the third line of defence. Nodes are freed by reference counting when the
-    guarded block returns, so nothing accumulates. Nested uses only re-enable
-    the collector if the outermost block found it enabled."""
-    was_enabled = gc.isenabled()
-    gc.disable()
+    guarded block returns, so nothing accumulates. A lock-protected depth
+    counter keeps GC disabled while ANY thread holds `ts_nodes()`, and only
+    re-enables it when the outermost holder exits and found it enabled."""
+    global _GC_DEPTH, _GC_WAS_ENABLED
+    with _GC_LOCK:
+        if _GC_DEPTH == 0:
+            _GC_WAS_ENABLED = gc.isenabled()
+            gc.disable()
+        _GC_DEPTH += 1
     try:
         yield
     finally:
-        if was_enabled:
-            gc.enable()
+        with _GC_LOCK:
+            _GC_DEPTH -= 1
+            if _GC_DEPTH == 0 and _GC_WAS_ENABLED:
+                gc.enable()
 
 
 def ts_guarded(fn):
@@ -148,15 +161,34 @@ RUBY_METHOD_NODES = {"method", "singleton_method"}
 RUBY_CARVE_NODES = RUBY_CONTAINER_NODES | RUBY_METHOD_NODES
 RUBY_IMPORT_CALLS = {"require", "require_relative", "load"}
 
-_parsers: dict[str, "object"] = {}
+_parser_tls = threading.local()
+_PARSER_INIT_LOCK = threading.Lock()
+
+
+def _thread_parsers() -> dict[str, object]:
+    parsers = getattr(_parser_tls, "parsers", None)
+    if parsers is None:
+        parsers = {}
+        _parser_tls.parsers = parsers
+    return parsers
+
+
+def _clear_parsers() -> None:
+    """Clear the calling thread's cached tree-sitter parsers (test hook)."""
+    parsers = getattr(_parser_tls, "parsers", None)
+    if parsers is not None:
+        parsers.clear()
 
 
 def _get_parser(language: str):
-    """Return a cached tree-sitter Parser for `language`, building it once."""
-    p = _parsers.get(language)
+    """Return a thread-local cached tree-sitter Parser for `language`,
+    building it once per thread so two threads never share a mutable Parser."""
+    parsers = _thread_parsers()
+    p = parsers.get(language)
     if p is None:
-        p = get_parser(language)
-        _parsers[language] = p
+        with _PARSER_INIT_LOCK:
+            p = get_parser(language)
+        parsers[language] = p
     return p
 
 

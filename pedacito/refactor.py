@@ -528,22 +528,25 @@ def _iter_project_files(root: Path) -> list[str]:
     return out
 
 
-def _scoped_files(root: Path, scope_file: str) -> list[str]:
+def _scoped_files(root: Path, scope_file: str, index=None) -> list[str]:
     """`scope_file` plus the files that import it: the resolved import graph
-    from a saved index when there is one, otherwise a textual scan of the
-    import statements for the module stem."""
+    from a live or saved index when there is one, otherwise a textual scan of
+    the import statements for the module stem."""
     rel = fileio.normalise_rel(scope_file)
     if not (root / rel).is_file():
         raise ValueError(f"scope file not found in the project: {rel}")
-    try:
-        from .index import Index
-        idx = Index.load(root)
-    except Exception:
-        idx = None
+    idx = index
+    if idx is None:
+        try:
+            from .index import Index
+            idx = Index.load(root)
+        except Exception:
+            idx = None
     if idx is not None:
-        mapped = idx.resolve_file(rel) or rel
-        return [mapped] + [f for f in idx.importers_of(mapped)
-                           if f != mapped]
+        mapped = idx.resolve_file(rel)
+        if mapped is not None:
+            return [mapped] + [f for f in idx.importers_of(mapped)
+                               if f != mapped]
     stem = Path(rel).stem
     pat = re.compile(r"(?:from|import|require|include|use)[^\n]*"
                      + re.escape(stem) + r"\b")
@@ -565,7 +568,8 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
                                  dry_run: bool = False,
                                  before_write=None,
                                  include_strings: bool = False,
-                                 include_labels: bool = False) -> dict:
+                                 include_labels: bool = False,
+                                 index=None) -> dict:
     """Deterministic, zero-token multi-file symbol rename.
 
     Replaces every EXACT identifier token `old_name` with `new_name` across
@@ -624,7 +628,7 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
         return fail("the old and new names are the same; nothing to rename.")
 
     try:
-        files = (_scoped_files(root, scope_file) if scope_file
+        files = (_scoped_files(root, scope_file, index=index) if scope_file
                  else _iter_project_files(root))
     except ValueError as e:
         return fail(str(e))
@@ -783,7 +787,7 @@ def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
 
     res = rename_symbol_across_project(
         root, old, new, scope_file=(file or None), dry_run=dry_run,
-        before_write=_gate if not dry_run else None)
+        before_write=_gate if not dry_run else None, index=index)
     if not res["ok"]:
         return "ERROR: " + str(res.get("error", "rename failed"))
     if not res["files_modified"]:
