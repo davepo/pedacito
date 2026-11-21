@@ -120,6 +120,8 @@ dependencies, so it works offline. It runs the same engine as the commands.
   Task/Auto/New run: a designer's eye, warmer sampling and whole-file HTML/CSS
   rewrites. With it off, design tasks are still auto-detected (`creative_auto`).
   See [Creative / design mode](#creative--design-mode).
+- The **✦ Auto-route** (specialist routing) and **Post-edit verify** (runs `auto_verify` after each Auto task) toggles now sit beside **✨ Creative**, under the text box, instead of in the top bar, which stays uncrowded next to the `EN | ES` switcher.
+- **Project ▾ → 🎨 Generate image…** opens a dialog that draws an image with your image profile (see [Local image generation](#local-image-generation)).
 - **Changes** show proposed edits as old and new code side by side, with
   per-file accept, reject, or hand edits.
 - **Permission requested** dialogs pause a run when the model asks for web
@@ -193,6 +195,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito update [--run]` | Check PyPI for a newer Pedacito and optionally upgrade this install |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
+| `pedacito image PROMPT` | Generate one image with a configured image-model profile (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Saved under `.pedacito/images/` |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
@@ -600,7 +603,7 @@ Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`
 `/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
 `/hybrid`, `/arena`, `/diff`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
-`/fix`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
+`/fix`, `/image PROMPT`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
 `/mouse [on|off]`, `/clear`, `/quit` (`/exit`). A plain line is a
 task and runs through the normal gather/edit/verify loop. `/creative on` forces
 the Builder persona for every task, `auto` (the default) detects design tasks,
@@ -1059,6 +1062,21 @@ stays with the provider — no temperature key is sent (see
 [Hosted APIs keep their own sampling](CONFIG.md#hosted-apis-keep-their-own-sampling)).
 Pair the mode with the GUI's [Live Preview](#live-preview) to watch the page
 change as the run writes it.
+
+## Local image generation
+
+With a local image server (Lemonade Server's `sd-cpp` recipe, Stable Diffusion, Flux), `pedacito models scan`
+tags it `modality = "image"` and lists it as **🎨 Image**. Set `image_profile` (or leave it empty to use the
+first one) and generate from wherever you work:
+
+```bash
+pedacito image "a lighthouse at dusk, watercolor" --size 1024x1024 --out assets/lighthouse.png
+```
+
+In the TUI use `/image PROMPT [--out FILE] [--size WxH] [--steps N] [--seed N] [--profile NAME]`; in the GUI,
+**Project ▾ → 🎨 Generate image…**. Without `--out` the file is written to `.pedacito/images/`. To let the agent
+call the `generate_image` action itself, turn on `allow_image_gen`
+([details](CONFIG.md#local-image-generation-image_profile-allow_image_gen)).
 
 ## Review page
 

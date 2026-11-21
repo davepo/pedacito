@@ -19,9 +19,9 @@ necesitar un modelo de frontera con una ventana de 200k tokens.
   verificar o escalar, con un tope de gasto.
 - **Seguro por defecto:** escaneo de secretos, sandbox del sistema operativo y checkpoints a los que puedes volver.
 
-> [!NOTE]
-> Las capturas de pantalla están en `docs/assets/`: `docs/assets/gui-workspace.png` (espacio de trabajo en el navegador) y
-> `docs/assets/tui-split.png` (terminal en pantalla dividida). Ejecuta `pdc gui` o `pdc tui` para verlas en vivo.
+![Espacio de trabajo de la GUI de Pedacito: chat con un diff preparado, paneles de actividad y plan en vivo, el compositor con Auto-route, Post-edit verify y Creative, y la barra de telemetría](docs/assets/gui-workspace.png)
+
+![TUI de Pedacito en pantalla dividida: transcripción junto a la barra lateral Activity & Plan, con el medidor de contexto y el selector de idioma EN|ES en el encabezado](docs/assets/tui-split.png)
 
 ## Inicio rápido en 30 segundos
 

@@ -725,6 +725,39 @@ Formas de elegir el idioma, de mayor a menor precedencia:
 - **GUI:** el selector `EN | ES` en la barra superior; la elección se guarda en `language`.
 - **TUI:** `F3` alterna EN/ES, o escribe `/lang es`.
 
+## Generación local de imágenes (`image_profile`, `allow_image_gen`)
+
+La generación de imágenes es una modalidad opcional, no un modelo de chat. Un perfil con
+`modality = "image"` (se define solo cuando `models scan` o la GUI ven una receta `sd-cpp` de
+Lemonade Server, un servidor Stable Diffusion / Flux o un id de modelo de imagen) se enruta a
+`/images/generations` en lugar del ciclo de herramientas de texto.
+
+```toml
+[profiles.flux]
+base_url = "http://127.0.0.1:8000/api/v1"
+model = "SD-Turbo"
+modality = "image"
+image_default_steps = 4
+
+[universal]
+image_profile = "flux"       # vacío = primer perfil de imagen encontrado
+allow_image_gen = true       # expone la acción generate_image del agente
+```
+
+- `pedacito image PROMPT`, el comando `/image` de la TUI y el diálogo **Project ▾ →
+  🎨 Generate image…** de la GUI usan `image_profile`. Los archivos se guardan en
+  `.pedacito/images/` salvo que pases `--out`; la ruta debe quedar dentro del
+  espacio de trabajo.
+- `allow_image_gen` solo controla la acción `generate_image` del agente. Con él
+  desactivado, el intermediario de permisos de la GUI aún puede aprobar una llamada a la vez. Es
+  un interruptor de ejecución, así que el `.pedacito.toml` de un proyecto no puede activarlo
+  hasta que ejecutes `pedacito trust`.
+- `image_default_size` e `image_default_steps` son los valores de respaldo para cualquier
+  petición que no indique ninguno.
+- `pedacito calibrate` sobre un perfil de imagen ejecuta una sola sonda de disponibilidad de 512×512
+  en lugar de las sondas de texto; el botón **Probe image** de la GUI hace lo mismo. Consulta la
+  [guía de modelos](../../MODEL_GUIDE.es.md#modelos-de-imagen-modality--image).
+
 ## Referencia de configuración
 
 `pedacito config` lista cada ajuste con su valor y origen; `pedacito
@@ -775,6 +808,11 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Definición/referencias/hover/diagnósticos exactos mediante un servidor de lenguaje; los comandos por extensión anulan la detección en PATH. |
 | `allow_screenshots` / `allow_browser` | false | Captura de pantalla y de navegador headless. Desde la configuración propia de un proyecto: se ignora hasta `pedacito trust`. |
 | `vision_model` | `""` | Modelo multimodal usado para describir las capturas. |
+| `modality` | `""` | Qué tipo de modelo sirve un perfil: `""` (autodetección por el id del modelo y los metadatos del servidor), `"text"`, `"image"`, `"audio"` o `"embedding"`. Solo `"image"` abre la ruta de [generación local de imágenes](#generación-local-de-imágenes-image_profile-allow_image_gen). |
+| `image_profile` | `""` | La entrada `[profiles.*]` que sirve `/images/generations`. Vacío = usar el primer perfil de modelo de imagen encontrado. |
+| `allow_image_gen` | false | Expone la acción opcional `generate_image` del agente. Desde la configuración propia de un proyecto: se ignora hasta `pedacito trust`. |
+| `image_default_size` | `"1024x1024"` | `size` enviado a `/images/generations` cuando quien llama no indica ninguno. |
+| `image_default_steps` | 0 | Pasos de difusión enviados cuando quien llama no indica ninguno (0 = el valor por defecto del propio servidor). |
 | `semantic_search` | false | Alternativa con embeddings para `grep`. |
 | `circuit_breaker` / `circuit_failures` / `circuit_cooldown` | true / 4 / 60 | Falla rápido tras fallos repetidos de transporte/servidor; los límites de tasa, los desbordamientos de contexto y los errores 4xx no lo activan. |
 | `allow_diff` | true | Acción `diff` de solo lectura. |

@@ -127,6 +127,8 @@ Su luz de estado muestra si el servidor es accesible. La etiqueta **no-think** o
 **thinking** junto a él indica si se permite el razonamiento para ese perfil,
 y una insignia de calibración muestra si el modelo activo tiene una tarjeta de modelo vigente.
 
+La lista de modelos escaneados se puede contraer por servidor (haz clic en el encabezado de un servidor) y cerrar con **Close**, así un escaneo largo nunca empuja el resto de **Model discovery** fuera de la pantalla. Los generadores de imágenes muestran una insignia **🎨 Image** y un botón **Probe image**, que ejecuta una comprobación rápida de 512×512.
+
 Para medir todos los modelos locales a la vez, abre **Project ▾ → Calibrate All Local
 Models…** (también en **Settings → Model discovery**). Una confirmación lista los
 perfiles locales (los alojados se excluyen) y luego un trabajo en segundo plano carga
@@ -202,6 +204,10 @@ en lugar de la disciplina del diff más pequeño. Con el interruptor apagado, la
 (sitios web, rediseños, trabajo en `.html`/`.css`/componentes de UI) se siguen
 detectando automáticamente: eso es `creative_auto`; `creative_mode = true` en la configuración
 lo fuerza para cada tarea (A21).
+
+**Interruptores de enrutamiento y verificación.** **✦ Auto-route** (enviar cada tarea al modelo especialista cuyas etiquetas encajen) y **Post-edit verify** (ejecutar tu comando `auto_verify` tras cada tarea Auto) son casillas en la fila del compositor, junto a **✨ Creative**. La barra superior solo conserva el selector de perfil y el selector `EN | ES`.
+
+**Genera una imagen.** Con un perfil de imagen configurado, abre **Project ▾ → 🎨 Generate image…**, escribe un prompt, define opcionalmente tamaño, pasos, semilla o una ruta de guardado y haz clic en **Generate**. El archivo se guarda en `.pedacito/images/` y se previsualiza en el diálogo.
 
 ### A6. Haz una pregunta (Ask)
 
@@ -610,6 +616,17 @@ ese tope (requiere `price_*_per_mtok` definido para el modelo). En el pie de la 
 **KV Cache Hit %** muestra cuánto del prompt reutilizó tu servidor local, que
 es el número a vigilar si una sesión larga empieza a sentirse lenta.
 
+### B2b. Genera una imagen (`pedacito image`)
+
+```bash
+pedacito image "un faro al atardecer, acuarela"
+pedacito image "icono de app, plano" --size 512x512 --steps 4 --seed 7 --out assets/icono.png
+```
+
+Necesita un perfil con `modality = "image"` (se detecta solo en servidores Lemonade `sd-cpp`, Stable Diffusion y Flux;
+consulta la [guía de modelos](MODEL_GUIDE.es.md#modelos-de-imagen-modality--image)). El archivo se guarda en `.pedacito/images/` salvo que
+pases `--out`. Dentro de `pedacito tui`, `/image PROMPT` hace lo mismo.
+
 ### B3. Mira qué se indexaría
 
 ```bash
@@ -856,7 +873,7 @@ Escribe una tarea como de costumbre, o usa `/help`, `/keys`, `/status`, `/auto G
 ciclo de varios pasos), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
 `/creative [on|off|auto]` (modo de diseño: on = cada tarea, auto = detectar tareas de diseño,
 off = ediciones quirúrgicas), `/apply`,
-`/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
+`/image PROMPT` (genera una imagen con tu perfil de imagen), `/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
 `/scroll up|down|top|bottom|N`, `/mouse [on|off]`, `/clear` y `/quit`.
 Los avisos de permiso aparecen en la barra del prompt (`y` una vez, `a` para la sesión,
 `n` para denegar).
@@ -1084,6 +1101,7 @@ solo el mapa está desactualizado.
 | `pedacito calibrate` | Mide el modelo y guarda una tarjeta de modelo que ajusta los valores por defecto; `--all` recorre cada perfil local (los modelos alojados se rechazan) |
 | `pedacito profiles [--recommend]` | Lista los perfiles y sus puntuaciones; sugiere roles |
 | `pedacito how "..."` | Pregunta cómo usar Pedacito. No se necesita proyecto |
+| `pedacito image PROMPT` | Genera una imagen con un modelo de imagen configurado (`--out`, `--size`, `--steps`, `--seed`) |
 | `pedacito files PROJ` | Qué se indexaría, y por qué. Gratis |
 | `pedacito cost PROJ` | Cuánto costará indexar. Gratis |
 | `pedacito index PROJ` | Construye o actualiza el índice |

@@ -120,6 +120,8 @@ adicionales, así que funciona sin conexión. Ejecuta el mismo motor que los com
   ejecución de Task/Auto/New: el ojo de un diseñador, muestreo más cálido y reescrituras de HTML/CSS
   de archivo completo. Con él desactivado, las tareas de diseño se siguen detectando automáticamente (`creative_auto`).
   Consulta [Modo creativo / de diseño](#modo-creativo--de-diseño).
+- Los interruptores del compositor **✦ Auto-route** (enrutamiento por especialista) y **Post-edit verify** (ejecuta `auto_verify` tras cada tarea Auto) viven ahora junto a **✨ Creative**, debajo del cuadro de texto, y ya no en la barra superior; la barra superior se mantiene despejada con el selector `EN | ES`.
+- **Project ▾ → 🎨 Generate image…** abre un diálogo para generar imágenes con tu perfil de imagen (consulta [Generación local de imágenes](#generación-local-de-imágenes)).
 - **Changes** muestra las ediciones propuestas como código antiguo y nuevo lado a lado, con
   aceptar, rechazar o editar a mano por archivo.
 - Los diálogos **Permission requested** pausan una ejecución cuando el modelo pide acceso web,
@@ -193,6 +195,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito update [--run]` | Verifica en PyPI si hay un Pedacito más reciente y, opcionalmente, actualiza esta instalación |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito rename OLD NEW` | Renombrado de símbolos en varios archivos mediante el AST y el tokenizador, sin llamada al modelo. `--file` lo acota, `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba, `--apply` escribe (por defecto: vista previa del diff) |
+| `pedacito image PROMPT` | Genera una imagen con un perfil de modelo de imagen configurado (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Se guarda en `.pedacito/images/` |
 | `pedacito index`, `map`, `files`, `cost` | Construyen e inspeccionan el índice. No necesitan llamada al modelo, salvo los resúmenes de `index` |
 | `pedacito eval` | Puntúa el arnés sobre repositorios de prueba. Usa `--baseline` como compuerta de regresión |
 | `pedacito bench [BENCHMARK\|all]` | Ejecuta la suite de benchmarks de diagnóstico de seis proyectos y la rúbrica oculta de evaluación. `--list` y `--recent` no necesitan modelo; `--json` y `--strict` encajan en CI |
@@ -598,7 +601,7 @@ Comandos slash: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`
 `/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
 `/hybrid`, `/arena`, `/diff`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
-`/fix`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
+`/fix`, `/image PROMPT`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
 `/mouse [on|off]`, `/clear`, `/quit` (`/exit`). Una línea simple es una
 tarea y corre por el ciclo normal de recolección/edición/verificación. `/creative on` fuerza
 la persona Builder en cada tarea, `auto` (el valor por defecto) detecta las tareas de diseño,
@@ -1056,6 +1059,21 @@ queda en manos del proveedor: no se envía ninguna clave de temperatura (consult
 [Las APIs alojadas conservan su propio muestreo](CONFIG.md#las-apis-alojadas-conservan-su-propio-muestreo)).
 Combina el modo con el [Live Preview](#live-preview) de la GUI para ver cómo cambia
 la página a medida que la ejecución la escribe.
+
+## Generación local de imágenes
+
+Si tienes un servidor de imágenes local (receta `sd-cpp` de Lemonade Server, Stable Diffusion, Flux),
+`pedacito models scan` lo etiqueta con `modality = "image"` y lo muestra como **🎨 Image**. Configura
+`image_profile` (o déjalo vacío para usar el primero) y genera desde donde prefieras:
+
+```bash
+pedacito image "un faro al atardecer, acuarela" --size 1024x1024 --out assets/faro.png
+```
+
+En la TUI usa `/image PROMPT [--out FILE] [--size WxH] [--steps N] [--seed N] [--profile NAME]`; en la GUI,
+**Project ▾ → 🎨 Generate image…**. Sin `--out`, el archivo se escribe en `.pedacito/images/`. Para que el
+agente pueda llamar a la acción `generate_image` por su cuenta, activa `allow_image_gen`
+([detalles](CONFIG.md#generación-local-de-imágenes-image_profile-allow_image_gen)).
 
 ## Página de revisión
 

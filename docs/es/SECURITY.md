@@ -210,7 +210,7 @@ solo. Estos ajustes se ignoran en un archivo de proyecto hasta que lo leas y eje
 - Comandos y hooks: `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
   `allow_serve`, `allow_lsp`, `lsp_servers`, `load_cmd`, `unload_cmd`.
 - Interruptores de capacidades: `allow_shell`, `allow_write`, `allow_browser`,
-  `allow_screenshots`, `allow_fetch`, `enable_mcp`, `allow_mcp`.
+  `allow_screenshots`, `allow_fetch`, `allow_image_gen`, `enable_mcp`, `allow_mcp`.
 - Ajustes del sandbox (`sandbox`, `sandbox_network`, `sandbox_writable`,
   `sandbox_strict`) y la depuración del entorno (`scrub_env`, `env_passthrough`).
 - Redirección de endpoints: `base_url`, `api_key`, `api_key_env`. Un proyecto no puede enviar

@@ -127,6 +127,8 @@ Its status light shows whether the server is reachable. The **no-think** or
 **thinking** chip next to it shows whether reasoning is allowed for that profile,
 and a calibration badge shows whether the active model has a fresh model card.
 
+The scanned models list is collapsible per server (click a server's header) and closable with **Close**, so a long scan never pushes the rest of **Model discovery** off screen. Image generators show a **🎨 Image** badge and a **Probe image** button, which runs one fast 512×512 check.
+
 To measure every local model at once, open **Project ▾ → Calibrate All Local
 Models…** (also in **Settings → Model discovery**). A confirmation lists the
 local profiles — hosted ones are excluded — and one background job then loads
@@ -202,6 +204,10 @@ rewrites instead of the smallest-diff discipline. With the toggle off, design
 tasks (websites, restyles, `.html`/`.css`/UI-component work) are still
 auto-detected — that is `creative_auto`; `creative_mode = true` in the config
 forces it for every task (A21).
+
+**Routing and verification toggles.** **✦ Auto-route** (send each task to the specialist model whose tags fit) and **Post-edit verify** (run your `auto_verify` command after each Auto task) are checkboxes in the composer row, beside **✨ Creative**. The top bar only keeps the profile picker and the `EN | ES` switcher.
+
+**Generate an image.** With an image profile configured, open **Project ▾ → 🎨 Generate image…**, type a prompt, optionally set size, steps, seed or a save path, and click **Generate**. The file is saved under `.pedacito/images/` and previewed in the dialog.
 
 ### A6. Ask a question (Ask)
 
@@ -610,6 +616,17 @@ that cap (it needs `price_*_per_mtok` set for the model). In the GUI footer,
 **KV Cache Hit %** shows how much of the prompt your local server reused, which
 is the number to watch if a long session starts feeling slow.
 
+### B2b. Generate an image (`pedacito image`)
+
+```bash
+pedacito image "a lighthouse at dusk, watercolor"
+pedacito image "app icon, flat" --size 512x512 --steps 4 --seed 7 --out assets/icon.png
+```
+
+Needs a profile with `modality = "image"` (auto-detected for Lemonade `sd-cpp`, Stable Diffusion and Flux
+servers; see [Model guide](MODEL_GUIDE.md#image-models-modality--image)). The file lands in `.pedacito/images/` unless
+you pass `--out`. Inside `pedacito tui`, `/image PROMPT` does the same.
+
 ### B3. See what would be indexed
 
 ```bash
@@ -856,7 +873,7 @@ Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`
 multi-step loop), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
 `/creative [on|off|auto]` (design mode: on = every task, auto = detect design
 tasks, off = surgical edits), `/apply`,
-`/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
+`/image PROMPT` (draw an image with your image profile), `/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
 `/scroll up|down|top|bottom|N`, `/mouse [on|off]`, `/clear` and `/quit`.
 Permission prompts appear in the prompt bar (`y` once, `a` for the session,
 `n` deny).
@@ -1084,6 +1101,7 @@ only the map is stale.
 | `pedacito calibrate` | Measure the model and save a model card that tunes defaults; `--all` walks every local profile (hosted models are refused) |
 | `pedacito profiles [--recommend]` | List profiles and their scores; suggest roles |
 | `pedacito how "..."` | Ask how to use Pedacito. No project needed |
+| `pedacito image PROMPT` | Draw an image with a configured image model (`--out`, `--size`, `--steps`, `--seed`) |
 | `pedacito files PROJ` | What would be indexed, and why. Free |
 | `pedacito cost PROJ` | What indexing will cost. Free |
 | `pedacito index PROJ` | Build or refresh the index |

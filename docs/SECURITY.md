@@ -210,7 +210,7 @@ own. These settings are ignored from a project file until you read it and run
 - Commands and hooks: `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
   `allow_serve`, `allow_lsp`, `lsp_servers`, `load_cmd`, `unload_cmd`.
 - Capability switches: `allow_shell`, `allow_write`, `allow_browser`,
-  `allow_screenshots`, `allow_fetch`, `enable_mcp`, `allow_mcp`.
+  `allow_screenshots`, `allow_fetch`, `allow_image_gen`, `enable_mcp`, `allow_mcp`.
 - Sandbox settings (`sandbox`, `sandbox_network`, `sandbox_writable`,
   `sandbox_strict`) and the environment scrub (`scrub_env`, `env_passthrough`).
 - Endpoint redirection: `base_url`, `api_key`, `api_key_env`. A project cannot send

@@ -19,9 +19,9 @@ frontier model with a 200k-token window.
   verification or escalation, with a spend cap.
 - **Safe by default:** secret scanning, OS sandbox, checkpoints you can roll back.
 
-> [!NOTE]
-> Screenshots live in `docs/assets/`: `docs/assets/gui-workspace.png` (browser workspace) and
-> `docs/assets/tui-split.png` (split-screen terminal). Run `pdc gui` or `pdc tui` to see them live.
+![Pedacito GUI workspace: chat with a staged diff, live activity and plan panes, the Composer with Auto-route, Post-edit verify and Creative toggles, and the telemetry bar](docs/assets/gui-workspace.png)
+
+![Pedacito split-screen terminal UI: transcript beside the Activity & Plan sidebar, with the context meter and the EN|ES language switch in the header](docs/assets/tui-split.png)
 
 ## 30-second quickstart
 

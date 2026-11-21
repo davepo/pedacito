@@ -12,6 +12,7 @@ las skills personalizadas, los servidores MCP con nombre, los hooks JSON y la so
 - [Skills personalizadas](#skills-personalizadas)
 - [Servidores MCP con nombre](#servidores-mcp-con-nombre)
 - [Hooks JSON](#hooks-json)
+- [Acción de generación de imágenes](#acción-de-generación-de-imágenes)
 - [Sobrescritura de prompts](#sobrescritura-de-prompts)
 
 ## Skills incluidas
@@ -101,6 +102,15 @@ hook_timeout = 10
 ```
 
 Consulta [CONFIG.md](CONFIG.md#hooks) para ver la lista completa de eventos y el protocolo.
+
+## Acción de generación de imágenes
+
+`generate_image` es una acción opcional del agente: `prompt` (qué dibujar), `size` opcional (como `1024x1024`) y `file`
+(un destino relativo al espacio de trabajo; por defecto `.pedacito/images/`). Aparece en la lista de herramientas del modelo solo cuando hay un
+perfil de imagen configurado (`image_profile`, o un perfil `modality = "image"` autodetectado) **y** o bien
+`allow_image_gen = true` o bien un intermediario de permisos en vivo (GUI/TUI) puede aprobar cada llamada. Sin perfil de imagen, el esquema de
+herramientas no cambia. La escritura usa la misma contención del espacio de trabajo y escritura atómica que cualquier otra escritura de archivos.
+Consulta [Generación local de imágenes](CONFIG.md#generación-local-de-imágenes-image_profile-allow_image_gen).
 
 ## Sobrescritura de prompts
 

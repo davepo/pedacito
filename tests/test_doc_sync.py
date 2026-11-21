@@ -394,10 +394,27 @@ def test_how_topic_references_resolve():
      "hosted-sampling"),
     ("how do I update pedacito to a newer release?", "update-pedacito"),
     ("how do I switch the interface language to spanish?", "language-switch"),
+    ("how do I generate an image with a local image model?",
+     "image-generation"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]
     assert topic in ids, (question, ids)
+
+
+def test_image_generation_is_discoverable_from_how():
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    assert "image" in cards
+    assert "--out FILE" in {f["flag"] for f in cards["image"]["flags"]}
+    assert "/image" in cards["tui"]["keywords"]
+    assert "/image" in " ".join(cards["tui"]["notes"])
+    topics = {t["id"]: t for t in how_index.GUI_TOPICS}
+    assert "image" in topics["image-generation"]["cli"]
+    assert "allow_image_gen" in topics["image-generation"]["settings"]
+    cli_ids = [c["name"] for c in how_index.search("pedacito image prompt")["cli"]]
+    assert "image" in cli_ids
+    gui_ids = [m["id"] for m in how_index.search("generate image")["gui"]]
+    assert "image-generation" in gui_ids
 
 
 # --- preview isolation (R4.3) ------------------------------------------------

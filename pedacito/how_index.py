@@ -485,7 +485,7 @@ CLI_COMMANDS = [
                      "sidebar", "plan",
                      "slash commands", "live activity", "scroll", "pgup",
                      "pgdn", "mouse wheel", "keybindings", "tab completion",
-                     "command history"],
+                     "command history", "/image"],
         "examples": [
             "pedacito tui .",
             "pedacito tui ~/code/anki --apply",
@@ -522,7 +522,7 @@ CLI_COMMANDS = [
             "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /verify on|off|status, "
-            "/skills, /memory, /procs, /diff, /undo, /update, /reset, "
+            "/skills, /memory, /procs, /diff, /undo, /image, /update, /reset, "
             "/sidebar, /scroll, /mouse, /lang, /clear, /quit",
             "/lang [en|es] switches the interface language; F3 toggles "
             "EN/ES",
@@ -796,6 +796,53 @@ CLI_COMMANDS = [
             {"flag": "--json", "help": "print structured JSON"},
             {"flag": "--config FILE", "help": "use this config file"},
             {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
+        "name": "image",
+        "usage": 'pedacito image PROMPT [--out FILE] [--size WxH] '
+                 '[--steps N] [--seed N] [--profile NAME]',
+        "summary": "Generate one image with a configured image-model "
+                   "profile (modality = \"image\": Lemonade sd-cpp, Stable "
+                   "Diffusion, Flux or a hosted image endpoint) and save it "
+                   "inside the workspace, by default under "
+                   ".pedacito/images/. No chat model is involved. The same "
+                   "call is the /image slash command in the TUI and the "
+                   "Project menu's Generate image dialog in the GUI.",
+        "keywords": ["image", "generate image", "draw", "picture",
+                     "stable diffusion", "flux", "sd-cpp", "lemonade",
+                     "text to image", "image generation", "txt2img"],
+        "examples": [
+            'pedacito image "a lighthouse at dusk, watercolor"',
+            'pedacito image "app icon, flat" --size 512x512 --steps 4 '
+            '--out assets/icon.png',
+            'pedacito image "a red fox" --seed 7 --json',
+        ],
+        "flags": [
+            {"flag": "PROMPT", "help": "description of the image"},
+            {"flag": "--out FILE",
+             "help": "output path inside the workspace (default "
+                     ".pedacito/images/...)"},
+            {"flag": "--size WxH",
+             "help": "dimensions, e.g. 1024x1024 (default image_default_size)"},
+            {"flag": "--steps N",
+             "help": "diffusion steps (default image_default_steps; 0 = "
+                     "the server's own)"},
+            {"flag": "--cfg-scale F", "help": "classifier-free guidance scale"},
+            {"flag": "--seed N", "help": "random seed for reproducible output"},
+            {"flag": "--negative TEXT", "help": "what to avoid"},
+            {"flag": "--profile NAME", "help": "image profile to use"},
+            {"flag": "--json", "help": "print the result as a JSON object"},
+        ],
+        "notes": [
+            "Needs an image profile: modality = \"image\" on the profile "
+            "(auto-detected by models scan) and image_profile naming it; "
+            "empty image_profile uses the first image profile found",
+            "allow_image_gen = true additionally exposes the generate_image "
+            "agent action; it is an execution switch, ignored from a "
+            "project's own config until pedacito trust",
+            "pedacito calibrate on an image profile runs a single 512x512 "
+            "readiness probe instead of the text probes",
         ],
     },
     {
@@ -2129,7 +2176,7 @@ GUI_TOPICS = [
         "steps": [
             "Composer → Auto → Options → Verify command after each task "
             "(e.g. pytest -q)",
-            "Topbar → Post-edit verify checkbox (or TUI /verify on) detects "
+            "Composer row → Post-edit verify checkbox (or TUI /verify on) detects "
             "the project runner and stores it in auto_verify; /verify status "
             "shows the gates, rounds and ratchet",
             "⚙ Settings → All settings → search verify_tests → on; set "
@@ -2444,6 +2491,33 @@ GUI_TOPICS = [
         "cli": ["profiles", "config", "ask"],
     },
     {
+        "id": "image-generation",
+        "title": "Generate an image with a local image model",
+        "summary": "Draw an image with an image-model profile (Lemonade "
+                   "sd-cpp, Stable Diffusion, Flux or a hosted image "
+                   "endpoint). The dialog, the CLI and the TUI all use the "
+                   "image profile and save into the project under "
+                   ".pedacito/images/ unless you choose a path.",
+        "steps": [
+            "Project ▾ → 🎨 Generate image…",
+            "Type the prompt; optionally set Size, Steps, Seed, Negative "
+            "prompt and a Save path, then click Generate",
+            "No image profile yet? ⚙ Settings → Model discovery → Scan "
+            "local servers; image generators get a 🎨 Image badge. Click "
+            "Probe image to verify the endpoint with one fast 512x512 call",
+            "Set image_profile to pick the profile and allow_image_gen = "
+            "true to let the agent call generate_image on its own",
+            "CLI: pedacito image \"PROMPT\"; TUI: /image PROMPT",
+        ],
+        "keywords": ["generate image", "image generation", "draw image",
+                     "picture", "stable diffusion", "flux", "sd-cpp",
+                     "lemonade", "image model", "image profile",
+                     "text to image", "generate_image", "probe image"],
+        "settings": ["image_profile", "allow_image_gen", "image_default_size",
+                     "image_default_steps", "modality"],
+        "cli": ["image", "models scan", "calibrate"],
+    },
+    {
         "id": "specialist-routing",
         "title": "Route tasks to specialist profiles (auto_route_specialties)",
         "summary": "With auto-routing on, each task runs on the profile whose "
@@ -2465,7 +2539,7 @@ GUI_TOPICS = [
             "Or let pedacito calibrate detect the tags: six micro-probes "
             "(SVG/UI, math, translation, SQL, testing, planning) plus the "
             "model name; the card shows them under specialties",
-            "Turn routing on: the ✦ Auto-route checkbox in the topbar, or "
+            "Turn routing on: the ✦ Auto-route checkbox in the composer row, or "
             "auto_route_specialties = true in config.toml, or --auto-route "
             "per run (--no-auto-route overrides the config)",
             "Plans can prefix a task with [specialty: TAG] to force a "
@@ -2774,9 +2848,9 @@ _SETTING_GUI = {
     "default_profile": "⚙ Settings → Profiles → [Select Profile] → Make default",
     "specialties": "⚙ Settings → Profiles → [Select Profile] → Connection & "
                    "Capabilities → specialties (tag pills + custom tag)",
-    "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
+    "auto_route_specialties": "Composer row → ✦ Auto-route checkbox, or ⚙ Settings "
                               "→ All settings → search auto_route_specialties",
-    "auto_verify": "Topbar → Post-edit verify checkbox, TUI /verify on, or "
+    "auto_verify": "Composer row → Post-edit verify checkbox, TUI /verify on, or "
                    "⚙ Settings → All settings → search auto_verify",
     "creative_mode": "✨ Creative button above the composer, or ⚙ Settings → "
                      "All settings → search creative_mode",

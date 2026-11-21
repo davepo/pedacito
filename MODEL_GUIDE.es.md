@@ -486,6 +486,22 @@ equivalente, así que Pedacito trata la acción como una operación nula allí.
 
 ---
 
+## Modelos de imagen (`modality = "image"`)
+
+Algunos servidores también sirven **generadores de imágenes**. Lemonade Server expone modelos Stable Diffusion y Flux mediante
+sus recetas `sd-cpp`, y cualquier servidor compatible con OpenAI que tenga `/images/generations` funciona igual.
+Pedacito los detecta por los metadatos `labels`/`recipe` del servidor o por el id del modelo, marca el perfil con
+`modality = "image"` y le pone la insignia **🎨 Image**. Los perfiles de imagen no son modelos de chat: sirven a
+`pedacito image`, `/image`, el diálogo de la GUI y la acción opcional `generate_image`
+del agente (consulta [`image_profile` y `allow_image_gen`](docs/es/CONFIG.md#generación-local-de-imágenes-image_profile-allow_image_gen)).
+
+Calibrar un perfil de imagen (`pedacito calibrate --profile NAME`, `models scan` o **Probe image** en la GUI)
+no ejecuta las sondas de texto. Hace **una** petición rápida de imagen (512×512, 4 pasos) en una carpeta temporal y
+registra `image_ok`, el formato, las dimensiones y la latencia en la tarjeta del modelo, que es lo que muestra la
+insignia **🎨 Image · ✓ Verified**.
+
+---
+
 ## Razonamiento por perfil
 
 Algunos modelos razonan antes de responder, en un bloque de razonamiento separado. Eso ayuda

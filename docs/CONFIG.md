@@ -727,6 +727,39 @@ Ways to choose the language, from highest to lowest precedence:
 - **GUI:** the `EN | ES` switcher in the top bar; the choice is saved to `language`.
 - **TUI:** `F3` toggles EN/ES, or type `/lang es`.
 
+## Local image generation (`image_profile`, `allow_image_gen`)
+
+Image generation is an opt-in modality, not a chat model. A profile with
+`modality = "image"` (set automatically when `models scan` or the GUI sees a
+Lemonade Server `sd-cpp` recipe, a Stable Diffusion / Flux server, or an image
+model id) is routed to `/images/generations` instead of the text tool loop.
+
+```toml
+[profiles.flux]
+base_url = "http://127.0.0.1:8000/api/v1"
+model = "SD-Turbo"
+modality = "image"
+image_default_steps = 4
+
+[universal]
+image_profile = "flux"       # empty = first image profile found
+allow_image_gen = true       # expose the generate_image agent action
+```
+
+- `pedacito image PROMPT`, the TUI `/image` command and the GUI **Project ▾ →
+  🎨 Generate image…** dialog all use `image_profile`. Files land in
+  `.pedacito/images/` unless you pass `--out`; the path must stay inside the
+  workspace.
+- `allow_image_gen` only controls the agent's `generate_image` action. With it
+  off, the GUI permission broker can still approve one call at a time. It is
+  an execution switch, so a project's own `.pedacito.toml` cannot turn it on
+  until you run `pedacito trust`.
+- `image_default_size` and `image_default_steps` are the fallbacks for any
+  request that names neither.
+- `pedacito calibrate` on an image profile runs a single 512×512 readiness
+  probe instead of the text probes; the GUI's **Probe image** button does the
+  same. See the [Model guide](../MODEL_GUIDE.md#image-models-modality--image).
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito
@@ -777,6 +810,11 @@ config --reference` prints the annotated template. Key settings:
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
 | `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. From a project's own config: ignored until `pedacito trust`. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |
+| `modality` | `""` | What kind of model a profile serves: `""` (auto-detect from the model id and server metadata), `"text"`, `"image"`, `"audio"` or `"embedding"`. Only `"image"` opens the [local image generation](#local-image-generation-image_profile-allow_image_gen) path. |
+| `image_profile` | `""` | The `[profiles.*]` entry that serves `/images/generations`. Empty = use the first image-model profile found. |
+| `allow_image_gen` | false | Expose the opt-in `generate_image` agent action. From a project's own config: ignored until `pedacito trust`. |
+| `image_default_size` | `"1024x1024"` | `size` sent to `/images/generations` when the caller passes none. |
+| `image_default_steps` | 0 | Diffusion steps sent when the caller passes none (0 = the server's own default). |
 | `semantic_search` | false | Embeddings fallback for `grep`. |
 | `circuit_breaker` / `circuit_failures` / `circuit_cooldown` | true / 4 / 60 | Fail fast after repeated transport/server failures; rate limits, context overflows and 4xx errors do not trip it. |
 | `allow_diff` | true | Read-only `diff` action. |

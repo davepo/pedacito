@@ -12,6 +12,7 @@ custom skills, named MCP servers, JSON hooks, and prompt overrides. Settings liv
 - [Custom skills](#custom-skills)
 - [Named MCP servers](#named-mcp-servers)
 - [JSON hooks](#json-hooks)
+- [Image generation action](#image-generation-action)
 - [Prompt overrides](#prompt-overrides)
 
 ## Bundled skills
@@ -101,6 +102,15 @@ hook_timeout = 10
 ```
 
 See [CONFIG.md](CONFIG.md#hooks) for the full event list and protocol.
+
+## Image generation action
+
+`generate_image` is an opt-in agent action: `prompt` (what to draw), optional `size` (such as `1024x1024`) and `file`
+(a workspace-relative target; the default is `.pedacito/images/`). It appears in the model's tool list only when an
+image profile is configured (`image_profile`, or an auto-detected `modality = "image"` profile) **and** either
+`allow_image_gen = true` or a live permission broker (GUI/TUI) can approve each call. With no image profile the tool
+schema is unchanged. The write uses the same workspace containment and atomic write as every other file write.
+See [Local image generation](CONFIG.md#local-image-generation-image_profile-allow_image_gen).
 
 ## Prompt overrides
 

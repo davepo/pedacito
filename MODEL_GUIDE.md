@@ -486,6 +486,22 @@ equivalent, so Pedacito treats the action as a no-op there.
 
 ---
 
+## Image models (`modality = "image"`)
+
+Some servers also serve **image generators**. Lemonade Server exposes Stable Diffusion and Flux models through
+its `sd-cpp` recipes, and any OpenAI-compatible server with `/images/generations` works the same way.
+Pedacito detects them from the server's `labels`/`recipe` metadata or the model id, marks the profile
+`modality = "image"` and badges it **🎨 Image**. Image profiles are not chat models: they serve
+`pedacito image`, `/image`, the GUI dialog and the opt-in `generate_image`
+agent action (see [`image_profile` and `allow_image_gen`](docs/CONFIG.md#local-image-generation-image_profile-allow_image_gen)).
+
+Calibrating an image profile (`pedacito calibrate --profile NAME`, `models scan`, or **Probe image** in the GUI)
+does not run the text probes. It makes **one** quick image request (512×512, 4 steps) into a temporary folder and
+records `image_ok`, the format, the dimensions and the latency on the model card, which is what the
+**🎨 Image · ✓ Verified** badge shows.
+
+---
+
 ## Thinking per profile
 
 Some models reason before they answer, in a separate thinking block. That helps
