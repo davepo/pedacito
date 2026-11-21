@@ -67,8 +67,15 @@ def test_css_scheme_selection_clears_the_engine_tokens():
     assert "function applyThemePayload(payload, explicitEngine)" in app
     assert "if (isCssScheme(marker))" in app
     assert "if (!marker && isCssScheme(attr))" in app
-    # the default preset paints as the crafted slate block, not a derivation
-    assert "if (active === 'pedacito-dark')" in app
+    # a built-in preset paints as its crafted CSS block, not a derivation
+    assert "if (isCssScheme(active))" in app
+
+
+def test_theme_grid_does_not_duplicate_the_builtin_schemes():
+    # The engine presets ARE the crafted schemes: one pill per name, the
+    # engine list only adds custom palettes on top.
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert ".filter((n) => st.cssSchemes.indexOf(n) < 0)" in app
 
 
 def test_settings_theme_edits_repaint_after_the_first_poll():
@@ -131,13 +138,20 @@ def _launch(gui):
 @pytest.fixture
 def page(gui, tmp_path, monkeypatch):
     """The reported broken state: gui_theme=jazz_solo in the user config and
-    catppuccin-mocha active in the engine store, plus a headless browser."""
+    a different (custom) palette active in the engine store, plus a headless
+    browser."""
     if not domcheck.available()[0]:
         pytest.skip("Playwright + Chromium not installed")
     monkeypatch.setattr(themes, "THEMES_FILE", tmp_path / "cfg" / "themes.json")
     (tmp_path / "cfg").mkdir(exist_ok=True)
     (tmp_path / "cfg" / "themes.json").write_text(json.dumps({
-        "active_theme": "catppuccin-mocha", "custom_themes": {},
+        "active_theme": "engine-pick",
+        "custom_themes": {"engine-pick": {
+            "bg": "#1e1e2e", "surface": "#181825", "surface_alt": "#313244",
+            "text": "#cdd6f4", "muted": "#a6adc8", "accent": "#cba6f7",
+            "border": "#45475a", "success": "#a6e3a1", "warning": "#fab387",
+            "danger": "#f38ba8",
+        }},
     }), encoding="utf-8")
     status, body = gui.post("/api/settings/theme", {"gui_theme": "jazz_solo"})
     assert status == 200 and body["ok"]
@@ -152,7 +166,7 @@ def page(gui, tmp_path, monkeypatch):
 @pytest.fixture
 def plain_page(gui, tmp_path, monkeypatch):
     """A fresh install: no user config (gui_theme defaults to slate) and no
-    engine store (the active palette defaults to pedacito-dark)."""
+    engine store (the active palette defaults to slate)."""
     if not domcheck.available()[0]:
         pytest.skip("Playwright + Chromium not installed")
     monkeypatch.setattr(themes, "THEMES_FILE", tmp_path / "cfg" / "themes.json")
@@ -168,8 +182,9 @@ def plain_page(gui, tmp_path, monkeypatch):
 def test_crafted_gui_theme_survives_the_engine_and_repaints(page, gui):
     pg, errors = page
 
-    # 1. The crafted jazz_solo palette paints -- not the engine's catppuccin
-    #    derivation: no inline tokens, full crafted terminal/ansi surfaces.
+    # 1. The crafted jazz_solo palette paints -- not the engine store's
+    #    active derivation: no inline tokens, full crafted terminal/ansi
+    #    surfaces.
     _wait_scheme(pg, "jazz_solo")
     v = pg.evaluate(_READ_VARS)
     assert v["attr"] == "jazz_solo"
@@ -191,17 +206,32 @@ def test_crafted_gui_theme_survives_the_engine_and_repaints(page, gui):
     assert pg.evaluate(
         "() => localStorage.getItem('pedacito_theme_css')") is None
 
-    # 2. An explicit Theme Manager preset pick applies and survives a reload.
+    # 2. An explicit Theme Manager custom-palette pick applies inline tokens
+    #    and survives a reload. (Built-in presets are the crafted schemes
+    #    themselves; only custom palettes paint as engine derivations.)
+    status, body = gui.post("/api/themes/save", {
+        "name": "tokyo-custom",
+        "tokens": {"bg": "#1a1b26", "surface": "#16161e",
+                   "surface_alt": "#24283b", "text": "#c0caf5",
+                   "muted": "#565f89", "accent": "#7aa2f7",
+                   "border": "#292e42", "success": "#9ece6a",
+                   "warning": "#e0af68", "danger": "#f7768e"},
+    })
+    assert status == 200 and body["ok"]
     pg.click("#themeBtn")
-    pg.wait_for_selector('.theme-pill[title="tokyo-night"]', timeout=10000)
-    pg.click('.theme-pill[title="tokyo-night"]')
-    _wait_scheme(pg, "tokyo-night")
+    pg.wait_for_selector('.theme-pill[title="tokyo-custom"]', timeout=10000)
+    # Each built-in scheme appears exactly once -- no second engine pill.
+    assert pg.evaluate(
+        "() => document.querySelectorAll('.theme-pill[title=\"nord\"]').length"
+    ) == 1
+    pg.click('.theme-pill[title="tokyo-custom"]')
+    _wait_scheme(pg, "tokyo-custom")
     v = pg.evaluate(_READ_VARS)
     assert v["inlineBg"] == "#1a1b26"
     assert v["bg"] == "#1a1b26"
     assert v["attr"] is None
     pg.reload()
-    _wait_scheme(pg, "tokyo-night")
+    _wait_scheme(pg, "tokyo-custom")
     v = pg.evaluate(_READ_VARS)
     assert v["bg"] == "#1a1b26"
     assert v["attr"] is None

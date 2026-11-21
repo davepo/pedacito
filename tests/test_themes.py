@@ -36,7 +36,7 @@ def store(tmp_path, monkeypatch):
 
 
 def _tokens(overrides=None):
-    tokens = dict(themes.BUILTIN_THEMES["pedacito-dark"])
+    tokens = dict(themes.BUILTIN_THEMES["slate"])
     tokens.update(overrides or {})
     return tokens
 
@@ -82,22 +82,39 @@ def gui(store, tmp_path):
 
 # --------------------------------------------------------------- built-ins
 
-def test_six_builtin_presets_are_complete_valid_hex_palettes():
-    assert len(themes.BUILTIN_THEMES) >= 6
+def test_nine_builtin_presets_are_the_gui_schemes_and_complete_palettes():
+    # One shared set: the engine presets are exactly the GUI's closed
+    # gui_theme enum (the crafted app.css schemes), no legacy names left.
     expected = {
-        "pedacito-dark", "catppuccin-mocha", "tokyo-night",
-        "gruvbox-dark", "nord", "solarized-dark",
+        "slate", "light", "daylight", "nord", "midnight",
+        "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker",
     }
-    assert expected <= set(themes.BUILTIN_THEMES)
+    assert set(themes.BUILTIN_THEMES) == expected
+    assert expected == set(config_mod._ENUM_FIELDS["gui_theme"])
+    assert themes.DEFAULT_THEME == "slate"
     for name, tokens in themes.BUILTIN_THEMES.items():
         assert set(tokens) == set(themes.THEME_KEYS), name
         for key in themes.THEME_KEYS:
             assert HEX.fullmatch(tokens[key]), (name, key, tokens[key])
-    assert themes.BUILTIN_THEMES["catppuccin-mocha"]["bg"] == "#1e1e2e"
-    assert themes.BUILTIN_THEMES["tokyo-night"]["bg"] == "#1a1b26"
-    assert themes.BUILTIN_THEMES["nord"]["bg"] == "#2e3440"
-    assert themes.BUILTIN_THEMES["solarized-dark"]["bg"] == "#002b36"
-    assert themes.BUILTIN_THEMES["gruvbox-dark"]["bg"] == "#282828"
+    assert themes.BUILTIN_THEMES["slate"]["bg"] == "#0d1117"
+    assert themes.BUILTIN_THEMES["light"]["bg"] == "#f6f8fa"
+    assert themes.BUILTIN_THEMES["daylight"]["bg"] == "#fcfaf2"
+    assert themes.BUILTIN_THEMES["nord"]["bg"] == "#181825"
+    assert themes.BUILTIN_THEMES["midnight"]["bg"] == "#05070a"
+    assert themes.BUILTIN_THEMES["jazz_solo"]["bg"] == "#f4f1ea"
+    assert themes.BUILTIN_THEMES["trapper_keeper"]["bg"] == "#eef2f9"
+    assert themes.BUILTIN_THEMES["memphis_arcade"]["bg"] == "#121324"
+    assert themes.BUILTIN_THEMES["windbreaker"]["bg"] == "#191326"
+
+
+def test_legacy_active_theme_name_falls_back_to_the_default(store):
+    # A themes.json saved by an older version pins a removed preset; the
+    # engine must resolve it to the default instead of failing.
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({"active_theme": "pedacito-dark",
+                                 "custom_themes": {}}), encoding="utf-8")
+    assert themes.get_active_theme_name() == "slate"
+    assert themes.get_active_theme() == themes.BUILTIN_THEMES["slate"]
 
 
 # --------------------------------------------------------- custom store ----
@@ -161,13 +178,13 @@ def test_project_config_override_wins_and_preserves_other_keys(store, tmp_path):
     cfg_path.write_text(json.dumps({"theme": "nord", "keep": {"x": 1}}),
                         encoding="utf-8")
     assert themes.get_active_theme_name(project) == "nord"
-    assert themes.get_active_theme(project)["bg"] == "#2e3440"
+    assert themes.get_active_theme(project)["bg"] == "#181825"
 
-    themes.set_active_theme("gruvbox-dark", project)
+    themes.set_active_theme("midnight", project)
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert data["theme"] == "gruvbox-dark"
+    assert data["theme"] == "midnight"
     assert data["keep"] == {"x": 1}
-    assert themes.get_active_theme_name(project) == "gruvbox-dark"
+    assert themes.get_active_theme_name(project) == "midnight"
     # The global selection is untouched while a project override exists.
     assert themes.get_active_theme_name() == themes.DEFAULT_THEME
 
@@ -257,13 +274,14 @@ def test_tui_theme_command_lists_and_switches(store, tmp_path):
     assert code == 0
     text = out.getvalue()
     assert "Color themes" in text
-    for name in ("pedacito-dark", "catppuccin-mocha", "tokyo-night",
-                 "gruvbox-dark", "nord", "solarized-dark"):
+    for name in ("slate", "light", "daylight", "nord", "midnight",
+                 "jazz_solo", "trapper_keeper", "memphis_arcade",
+                 "windbreaker"):
         assert name in text
     assert "* nord" in text
     assert "Theme: nord (saved)" in text
     assert themes.get_active_theme_name() == "nord"
-    assert themes.get_active_theme()["bg"] == "#2e3440"
+    assert themes.get_active_theme()["bg"] == "#181825"
 
     # The same command reports an unknown name without changing the choice.
     out = io.StringIO()
@@ -280,8 +298,8 @@ def test_tui_uses_active_palette_and_respects_no_color(store, tmp_path,
                          width=100, height=28, stdout=io.StringIO())
     try:
         frame = session.render_frame(100, 28)
-        # Nord's accent is #88c0d0: the prompt/header/banner use 24-bit SGR.
-        assert "\x1b[38;2;136;192;208m" in frame
+        # Nord's accent is #89b4fa: the prompt/header/banner use 24-bit SGR.
+        assert "\x1b[38;2;137;180;250m" in frame
         assert "\x1b[1m" in frame
     finally:
         session.close()

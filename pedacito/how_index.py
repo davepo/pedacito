@@ -1834,8 +1834,9 @@ GUI_TOPICS = [
                    "saved in themes.json beside your config.",
         "steps": [
             "Top bar → palette button (theme manager and custom color editor)",
-            "Pick one of the six built-in presets: pedacito-dark, "
-            "catppuccin-mocha, tokyo-night, gruvbox-dark, nord or solarized-dark",
+            "Pick one of the nine built-in schemes: slate, light, daylight, "
+            "nord, midnight, jazz_solo, trapper_keeper, memphis_arcade or "
+            "windbreaker (the TUI's /theme offers the same set)",
             "Or save a custom theme with ten color tokens; a project can pin "
             "its own theme in .pedacito/config.json",
         ],

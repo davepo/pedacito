@@ -135,14 +135,17 @@ token is rejected, so a typo cannot silently drop a colour.
 | `warning` | Caution status |
 | `danger` | Errors and failures |
 
-The engine ships six built-in presets: `pedacito-dark` (the default), `catppuccin-mocha`,
-`tokyo-night`, `gruvbox-dark`, `nord` and `solarized-dark`. In the TUI, `/theme` lists them and
-`/theme NAME` switches and saves the choice. In the GUI, the palette button in the top bar opens
-the Theme Manager, which lists the same presets and your custom themes.
+The engine ships nine built-in schemes — the same set the GUI offers: `slate` (the default,
+GitHub Dark), `light` (GitHub Light), `daylight` (warm paper), `nord` (modern dark), `midnight`
+(high contrast), and four 1990s palettes: `jazz_solo`, `trapper_keeper`, `memphis_arcade` and
+`windbreaker`. In the TUI, `/theme` lists them and `/theme NAME` switches and saves the choice.
+In the GUI, the palette button in the top bar opens the Theme Manager, which lists the same
+schemes and your custom themes.
 
-The `gui_theme` key in `config.toml` comes from the earlier GUI picker, which had nine legacy palette
-names. The GUI still reads that key for compatibility, but the colours on screen come from the
-selected theme in the Theme Manager. Use the Theme Manager, not `gui_theme`, to change the scheme.
+The `gui_theme` key in `config.toml` holds one of the same nine names; the GUI's Settings picker
+and the Theme Manager's scheme pills both write it. A browser with no `gui_theme` preference
+follows the theme selected in the Theme Manager or the TUI (`themes.json`); custom palettes are
+stored there too. A saved preference naming a removed legacy preset falls back to `slate`.
 
 ### Create a custom scheme
 

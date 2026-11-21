@@ -2418,11 +2418,13 @@ function applyThemePayload(payload, explicitEngine) {
     }
   }
   // Engine-native: an explicit Theme Manager pick, or no CSS preference
-  // anywhere. The default preset is the crafted slate scheme -- let its CSS
-  // block paint the full palette instead of the flattened token derivation.
-  if (active === 'pedacito-dark') {
+  // anywhere. The built-in presets ARE the nine crafted gui_theme schemes,
+  // so let their app.css blocks paint the full palette instead of the
+  // flattened token derivation; only custom palettes use inline tokens.
+  if (isCssScheme(active)) {
     clearThemeTokens();
-    document.documentElement.removeAttribute('data-theme');
+    if (active === 'slate') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', active);
   } else {
     applyThemeTokens(tokens, active);
     document.documentElement.removeAttribute('data-theme');
@@ -2471,10 +2473,13 @@ function showThemeManager(initial) {
     // Which family the GUI currently paints: a CSS-native gui_theme scheme
     // (crafted app.css block) or an engine palette (inline ten tokens).
     mode: isCssScheme(marker0) ? 'css'
-      : (marker0 ? 'engine' : (isCssScheme(attr0) ? 'css' : 'engine')),
+      : (marker0 ? 'engine'
+        : (isCssScheme(attr0) ? 'css'
+          : (isCssScheme(initial.active_theme) ? 'css' : 'engine'))),
     cssActive: '',
   };
-  st.cssActive = st.mode === 'css' ? (marker0 || attr0 || 'slate') : '';
+  st.cssActive = st.mode === 'css'
+    ? (marker0 || attr0 || initial.active_theme || 'slate') : '';
   const grid = h('div', { class: 'theme-grid', id: 'themeGrid' });
   const editor = h('div', { class: 'theme-editor' });
   const status = h('div', { class: 'theme-status', id: 'themeStatus' });
@@ -2515,7 +2520,10 @@ function showThemeManager(initial) {
       }, sw, h('span', { text: meta.label || name })));
     });
     const custom = Object.keys(st.themes).filter((n) => !st.builtin.has(n)).sort();
-    const names = Array.from(st.builtin).concat(custom);
+    // The built-in presets are the crafted schemes above -- one pill each,
+    // not a second engine pill for the same name.
+    const names = Array.from(st.builtin)
+      .filter((n) => st.cssSchemes.indexOf(n) < 0).concat(custom);
     names.forEach((name) => {
       const t = st.themes[name];
       if (!t) return;

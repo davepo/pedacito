@@ -303,9 +303,10 @@ the checked IP so a second DNS answer cannot swap it mid-request.
   same numbers as a one-line ribbon after each task; `show_telemetry = false`
   hides it.
 - **Themes:** open the Theme Manager with the palette button in the top bar. It
-  offers six built-in presets (`pedacito-dark`, `catppuccin-mocha`, `tokyo-night`,
-  `gruvbox-dark`, `nord`, `solarized-dark`) and any custom themes you save. The
-  choice is saved in `themes.json` beside your config.
+  offers nine built-in schemes (`slate`, `light`, `daylight`, `nord`, `midnight`,
+  `jazz_solo`, `trapper_keeper`, `memphis_arcade`, `windbreaker`) and any custom
+  themes you save — the same set the TUI's `/theme` offers. The choice is saved
+  in `themes.json` beside your config.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
   question, or a spec.
 - **Steer:** while a task runs, type a note to redirect the model. You can also

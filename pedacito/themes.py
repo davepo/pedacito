@@ -50,46 +50,69 @@ THEME_KEYS = (
     "danger",       # red / error status
 )
 
-DEFAULT_THEME = "pedacito-dark"
+DEFAULT_THEME = "slate"
 
 # Every preset carries the complete ten-token schema.  Names are stable and
-# are what the GUI and `/theme <name>` use.
+# are what the GUI and `/theme <name>` use.  The nine presets are exactly the
+# GUI's crafted gui_theme schemes (config.py's closed enum, app.css's palette
+# blocks): surface=panel, surface_alt=panel2, border=line, success=ok,
+# warning=warn, danger=err.  The legacy set (pedacito-dark, catppuccin-mocha,
+# tokyo-night, gruvbox-dark, solarized-dark) is gone; a saved preference
+# carrying one of those names falls back to the default.
 BUILTIN_THEMES: dict[str, dict[str, str]] = {
-    "pedacito-dark": {
+    "slate": {
         "bg": "#0d1117", "surface": "#161b22", "surface_alt": "#21262d",
         "text": "#e6edf3", "muted": "#8b949e", "accent": "#58a6ff",
         "border": "#30363d", "success": "#3fb950", "warning": "#d29922",
         "danger": "#f85149",
     },
-    "catppuccin-mocha": {
-        "bg": "#1e1e2e", "surface": "#181825", "surface_alt": "#313244",
-        "text": "#cdd6f4", "muted": "#a6adc8", "accent": "#cba6f7",
-        "border": "#45475a", "success": "#a6e3a1", "warning": "#fab387",
-        "danger": "#f38ba8",
+    "light": {
+        "bg": "#f6f8fa", "surface": "#ffffff", "surface_alt": "#f6f8fa",
+        "text": "#1f2328", "muted": "#59636e", "accent": "#0969da",
+        "border": "#d0d7de", "success": "#1a7f37", "warning": "#9a6700",
+        "danger": "#cf222e",
     },
-    "tokyo-night": {
-        "bg": "#1a1b26", "surface": "#16161e", "surface_alt": "#24283b",
-        "text": "#c0caf5", "muted": "#565f89", "accent": "#7aa2f7",
-        "border": "#292e42", "success": "#9ece6a", "warning": "#e0af68",
-        "danger": "#f7768e",
-    },
-    "gruvbox-dark": {
-        "bg": "#282828", "surface": "#1d2021", "surface_alt": "#3c3836",
-        "text": "#ebdbb2", "muted": "#a89984", "accent": "#fe8019",
-        "border": "#504945", "success": "#b8bb26", "warning": "#fabd2f",
-        "danger": "#fb4934",
+    "daylight": {
+        "bg": "#fcfaf2", "surface": "#f3efe2", "surface_alt": "#f8f5ea",
+        "text": "#1c1e21", "muted": "#6b665a", "accent": "#b54900",
+        "border": "#ddd5c3", "success": "#2f6f3b", "warning": "#8a5a00",
+        "danger": "#b3261e",
     },
     "nord": {
-        "bg": "#2e3440", "surface": "#3b4252", "surface_alt": "#434c5e",
-        "text": "#eceff4", "muted": "#a3aab8", "accent": "#88c0d0",
-        "border": "#4c566a", "success": "#a3be8c", "warning": "#ebcb8b",
-        "danger": "#bf616a",
+        "bg": "#181825", "surface": "#1e1e2e", "surface_alt": "#24243a",
+        "text": "#cdd6f4", "muted": "#a6adc8", "accent": "#89b4fa",
+        "border": "#313244", "success": "#a6e3a1", "warning": "#f9e2af",
+        "danger": "#f38ba8",
     },
-    "solarized-dark": {
-        "bg": "#002b36", "surface": "#073642", "surface_alt": "#0d4654",
-        "text": "#93a1a1", "muted": "#657b83", "accent": "#2aa198",
-        "border": "#586e75", "success": "#859900", "warning": "#b58900",
-        "danger": "#dc322f",
+    "midnight": {
+        "bg": "#05070a", "surface": "#0f141c", "surface_alt": "#151c26",
+        "text": "#ffffff", "muted": "#aab6c8", "accent": "#38bdf8",
+        "border": "#3b4659", "success": "#4ade80", "warning": "#fbbf24",
+        "danger": "#fb7185",
+    },
+    "jazz_solo": {
+        "bg": "#f4f1ea", "surface": "#ffffff", "surface_alt": "#e6f4f3",
+        "text": "#161925", "muted": "#3d5a5b", "accent": "#009688",
+        "border": "#b2dfdb", "success": "#1a7f37", "warning": "#8a5a00",
+        "danger": "#c62828",
+    },
+    "trapper_keeper": {
+        "bg": "#eef2f9", "surface": "#ffffff", "surface_alt": "#dfe7f5",
+        "text": "#101828", "muted": "#475467", "accent": "#2541b2",
+        "border": "#b8c7e0", "success": "#087f3a", "warning": "#8a5a00",
+        "danger": "#b3261e",
+    },
+    "memphis_arcade": {
+        "bg": "#121324", "surface": "#1b1d36", "surface_alt": "#232645",
+        "text": "#f8f9fa", "muted": "#a5accd", "accent": "#00e5ff",
+        "border": "#393e6f", "success": "#00e676", "warning": "#ffe600",
+        "danger": "#ff2a85",
+    },
+    "windbreaker": {
+        "bg": "#191326", "surface": "#241c35", "surface_alt": "#2f2544",
+        "text": "#f3effb", "muted": "#b5a8ce", "accent": "#00d2b8",
+        "border": "#463866", "success": "#3ddc84", "warning": "#ffca28",
+        "danger": "#ff5252",
     },
 }
 

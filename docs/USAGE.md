@@ -85,8 +85,9 @@ dependencies, so it works offline. It runs the same engine as the commands.
   green / amber / red bar, turn and session tokens, generation speed, KV cache
   hits and folds, and which model holds the card. Click it to expand the full
   drawer.
-- **Color schemes** from the Theme Manager (the palette button in the top bar). The six built-in
-  presets and any custom themes come from the shared theme engine. See [Color schemes](CONFIG.md#color-schemes).
+- **Color schemes** from the Theme Manager (the palette button in the top bar). The nine built-in
+  schemes and any custom themes come from the shared theme engine — the same set the TUI's
+  `/theme` offers. See [Color schemes](CONFIG.md#color-schemes).
 - **Five modes** next to the chat box: **Task/Edit** for changes, **Ask** for
   read-only questions, **Auto** for goal-to-checklist runs, **New** for starting
   a project, and **How ?** for the built-in reference.

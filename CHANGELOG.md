@@ -4,6 +4,23 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Unified GUI + TUI Color Schemes
+
+- **One shared set of nine built-in schemes** — the theme engine
+  (`themes.py`) now ships exactly the GUI's crafted `gui_theme` schemes:
+  `slate` (the default, GitHub Dark), `light`, `daylight`, `nord`,
+  `midnight`, `jazz_solo`, `trapper_keeper`, `memphis_arcade` and
+  `windbreaker`. The TUI's `/theme` and the GUI Theme Manager offer the
+  same names and the same palettes; the Theme Manager shows one pill per
+  scheme and paints built-ins from their full crafted CSS blocks, not the
+  flattened ten-token derivation.
+- **Legacy presets removed** — `pedacito-dark`, `catppuccin-mocha`,
+  `tokyo-night`, `gruvbox-dark` and `solarized-dark` are gone; a saved
+  preference naming one of them falls back to `slate`. `nord` keeps its
+  name but now uses the crafted modern-dark palette.
+- Docs: CONFIG's Color schemes section, USAGE, QUICKSTART, README and the
+  built-in `how` change-theme card name the new set.
+
 ### Docs Ownership Split
 
 - **Ownership decision** — `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG,
