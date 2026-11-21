@@ -183,6 +183,21 @@ def _config(args) -> Config:
             raise ConfigError(f"--role {spec!r}: use ROLE=PROFILE with ROLE "
                               f"one of {', '.join(roles_mod.ROLES)}")
         cfg.roles = {**(cfg.roles or {}), role.strip(): prof.strip()}
+    worker_profile = (cfg.roles or {}).get("worker")
+    if worker_profile:
+        # The worker is the default client, not a side client: derive its
+        # config before anything builds the LLMClient, or --role worker=
+        # would be parsed and then silently ignored.
+        derived = roles_mod.derive_config(cfg, worker_profile)
+        if derived is None:
+            print(f"[roles] role 'worker' names unknown profile "
+                  f"'{worker_profile}'; using the active profile",
+                  file=sys.stderr)
+        else:
+            derived.roles = dict(cfg.roles or {})
+            derived.sources["active_profile"] = (
+                f"--role worker={worker_profile}")
+            cfg = derived
     if getattr(args, "auto_route", False):
         cfg.auto_route_specialties = True
         cfg.sources["auto_route_specialties"] = "--auto-route"
