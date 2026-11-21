@@ -4482,7 +4482,7 @@ class Agent:
                                          for rel, ln, txt in hits[:2])
                              if hits else "")
                     for lit in getattr(req, "missing_literals", []):
-                        verb = ("still present" if req.literal_remove
+                        verb = ("still present" if req.literal_must_go(lit)
                                 else "missing")
                         findings.append(verify_mod.Finding(
                             "coverage", "error", hits[0][0] if hits else "",

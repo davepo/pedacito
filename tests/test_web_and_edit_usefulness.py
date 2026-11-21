@@ -284,6 +284,125 @@ def test_coverage_followup_carries_the_disk_location(tmp_path, monkeypatch):
                for f in findings)
 
 
+# --------------------- BUG-009: a completed replace is not owed again ------
+# The coverage pass checked EVERY quoted literal of a replace clause for
+# PRESENCE, so the copy that had just been replaced away ("Our Mission")
+# was reported missing and seeded a follow-up that re-inserted it -- the
+# run kept calling the model until the timeout killed a successful edit.
+REPLACE_TASK = ('In index.html replace "Our Mission" with "About Us". '
+                'Also add a footer saying "Copyright 2026".')
+REPLACE_DONE = ("<h1>About Us</h1>\n<footer>Copyright 2026</footer>\n")
+
+
+def test_replace_from_literal_is_mined_only_for_the_replace_verb():
+    reqs = verify._requirements_from_task(REPLACE_TASK)
+    assert reqs[0].literals == ["Our Mission", "About Us"]
+    assert reqs[0].replace_from == ["Our Mission"]
+    assert not reqs[0].literal_remove
+    # Single quotes and an inserted noun phrase ("the line") still pair up.
+    r = verify._requirements_from_task(
+        "In index.html replace the line 'old line' with 'new line'. "
+        "Also keep the title.")[0]
+    assert r.replace_from == ["old line"]
+    # Ambiguous verbs are not guessed: only "replace" names a from/to pair.
+    for verb in ("change", "rename", "swap"):
+        r = verify._requirements_from_task(
+            f'In index.html {verb} "Our Mission" to "About Us". '
+            "Also keep the title.")[0]
+        assert r.replace_from == [], verb
+    # An unquoted from-side ("the bio text") leaves the quote an insertion.
+    r = verify._requirements_from_task(
+        'In index.html replace the bio text with "I build thoughtful '
+        'software." Also keep the title.')[0]
+    assert r.replace_from == []
+    # A verb inside quoted copy is text, not an instruction.
+    r = verify._requirements_from_task(
+        'In index.html add a note saying "replace \'A\' with \'B\'". '
+        "Also keep the title.")[0]
+    assert r.replace_from == []
+
+
+def test_completed_replace_clause_seeds_no_followup():
+    done = edits.Result(True, "index.html", "replaced 1 block(s)",
+                        after=REPLACE_DONE)
+    assert verify.coverage_seeds(REPLACE_TASK, "Done.", [done]) == []
+    assert verify.check_coverage(REPLACE_TASK, "Done.", [done]) == []
+
+
+def test_replace_from_still_present_is_not_addressed():
+    # The new heading and footer landed, but the old heading was left
+    # behind: only the from-side is still owed.
+    half = edits.Result(True, "index.html", "replaced 1 block(s)",
+                        after="<h2>Our Mission</h2>\n<h1>About Us</h1>\n"
+                              "<footer>Copyright 2026</footer>\n")
+    seeds = verify.coverage_seeds(REPLACE_TASK, "Done.", [half])
+    assert any(r.req_id == "R1" and r.missing_literals == ["Our Mission"]
+               for r in seeds)
+    found = verify.check_coverage(REPLACE_TASK, "Done.", [half])
+    assert any("still present" in f.message and "Our Mission" in f.message
+               for f in found)
+    # Only the from-side is named; the to-side landed and is not owed.
+    assert not any("About Us" in f.message.split(" -- the clause")[0]
+                   for f in found)
+
+
+def test_replace_to_missing_is_named_as_missing():
+    # The heading was deleted outright: the old copy is gone (good) but the
+    # new copy never landed (owed), and only the new copy is named.
+    dropped = edits.Result(True, "index.html", "replaced 1 block(s)",
+                           after="<footer>Copyright 2026</footer>\n")
+    seeds = verify.coverage_seeds(REPLACE_TASK, "Done.", [dropped])
+    assert any(r.req_id == "R1" and r.missing_literals == ["About Us"]
+               for r in seeds)
+    found = verify.check_coverage(REPLACE_TASK, "Done.", [dropped])
+    assert any("missing" in f.message and "About Us" in f.message
+               for f in found)
+    # The from-side is gone (as asked) and is not named as a gap.
+    assert not any("Our Mission" in f.message.split(" -- the clause")[0]
+                   for f in found)
+
+
+def test_unmet_requirements_rechecks_replace_from_on_disk(tmp_path):
+    _w(tmp_path, "index.html", "<h2>Our Mission</h2>\n")
+    unmet = verify.unmet_requirements(tmp_path, REPLACE_TASK, [])
+    assert len(unmet) == 1
+    assert unmet[0].missing_literals == ["Our Mission"]
+    assert unmet[0].literal_hits == [("index.html", 1, "<h2>Our Mission</h2>")]
+    _w(tmp_path, "index.html", REPLACE_DONE)
+    assert verify.unmet_requirements(tmp_path, REPLACE_TASK, []) == []
+
+
+def test_coverage_pass_ends_promptly_after_a_complete_replace(tmp_path,
+                                                              monkeypatch):
+    _w(tmp_path, "index.html", REPLACE_DONE)
+    cfg = Config()
+    cfg.log_sessions = False
+    cfg.log_events = False
+    idx = index_mod.build([str(tmp_path)], cfg, root=tmp_path,
+                          summarise=False, verbose=False)
+    agent = Agent(idx, None, cfg)
+    agent.requirements = verify.RequirementTracker(REPLACE_TASK)
+    calls: list = []
+    monkeypatch.setattr(agent, "apply_edit_intents",
+                        lambda *a, **k: calls.append(1) or ([], "", []))
+    emitted: list = []
+    orig = agent._emit
+
+    def spy(kind, **kw):
+        emitted.append(kind)
+        return orig(kind, **kw)
+
+    monkeypatch.setattr(agent, "_emit", spy)
+    done = edits.Result(True, "index.html", "replaced 1 block(s)",
+                        after=REPLACE_DONE)
+    findings: list = []
+    _res, _reply, findings = agent._coverage_pass(
+        REPLACE_TASK, "", [done], "Done.", findings, verbose=False)
+    assert calls == []
+    assert "coverage_followup" not in emitted
+    assert not [f for f in findings if f.kind == "coverage"]
+
+
 # ------------------------------ D3: stale plans never bind the current task
 def test_completed_checklist_items_are_not_requirements():
     task = ("- [x] Add the tagline to index.html\n"
