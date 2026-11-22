@@ -2343,8 +2343,17 @@ def _review_build(root: Path, plan: Plan, summary: dict, cfg,
     def discard():
         workspace.restore(root, backup_dir)
 
+    def writer():
+        # The build already wrote the files; Apply normally just keeps them.
+        # A partial hunk acceptance reconstructed some after-texts, though:
+        # those must be written over the full build (the pre-build backup
+        # already covers undo).
+        if any(getattr(d, "hunk_selection", None) for d in diffs):
+            return review_mod.write_files(root, diffs, backup_dir)
+        return True, "Build kept."
+
     outcome, detail = review_mod.run(
-        page, nonce, lambda: (True, "Build kept."),
+        page, nonce, writer,
         port=cfg.review_port, open_browser=cfg.open_browser,
         timeout=cfg.review_timeout, on_url=lambda u: print(
             f"  waiting for sign-off at {u}", file=sys.stderr),

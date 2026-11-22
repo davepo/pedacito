@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import hashlib
 import html
+import inspect
 import json
 import re
 import secrets
 import threading
 import webbrowser
+from bisect import bisect_right
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -54,6 +56,26 @@ class Row:
     b_spans: list = field(default_factory=list)
     hidden: int = 0           # for skip rows: how many lines are folded
     fold: str = ""            # ties folded rows to their "show N" button
+    hunk: int = -1            # index into FileDiff.hunks; -1 = context/skip
+
+
+@dataclass
+class Hunk:
+    """One independently sign-off-able change group within a file diff.
+
+    `a_start`/`b_start` are 1-based line numbers (0 when the side is empty,
+    unified-diff style), `a_count`/`b_count` the span lengths including the
+    CONTEXT lines kept either side. `rows` holds the indices of this hunk's
+    rows in `FileDiff.rows`."""
+
+    index: int
+    a_start: int
+    a_count: int
+    b_start: int
+    b_count: int
+    added: int
+    removed: int
+    rows: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -78,6 +100,15 @@ class FileDiff:
     # Requirement clause ids ("R1", ...) this file's edits serve (R8); empty
     # when no tracker evidence is available (e.g. diffs rebuilt from backups).
     clauses: tuple[str, ...] = ()
+    # The change segmented into hunks (build_diff); empty for legacy diffs
+    # and display-only rename sources, which are accepted whole-file only.
+    hunks: list[Hunk] = field(default_factory=list)
+    # The file's exact pre-change text, for reconstruct_from_hunks. Empty
+    # means "rebuild from the rows" (see apply_hunk_selection).
+    before_text: str = ""
+    # Set by apply_hunk_selection when only some hunks were accepted: the
+    # accepted hunk indices. None = the whole file (legacy sign-off).
+    hunk_selection: tuple[int, ...] | None = None
 
 
 def _sha(text: str) -> str:
@@ -99,24 +130,65 @@ def _word_spans(a: str, b: str) -> tuple[list, list]:
     return a_spans, b_spans
 
 
-def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
-    """Row-by-row diff of two texts, with word-level spans on replaced lines
-    and long unchanged runs folded. Returns (rows, lines_added, lines_removed)."""
-    a = before.split("\n")
-    b = after.split("\n")
-    sm = SequenceMatcher(None, a, b, autojunk=False)
+def _hunk_groups(opcodes) -> list[tuple[int, int, int, int, int, int]]:
+    """Group the change opcodes into hunks: consecutive changes separated by
+    an equal run of more than 2*CONTEXT lines start a new hunk. Each group is
+    (first_opcode, last_opcode, a_lo, a_hi, b_lo, b_hi) with up to CONTEXT
+    equal lines of context on either side; the a/b ranges of different
+    groups never overlap (a split gap is wider than both contexts combined)."""
+    spans: list[list[int]] = []
+    for i, (tag, i1, i2, _j1, _j2) in enumerate(opcodes):
+        if tag == "equal":
+            continue
+        if spans and i1 - opcodes[spans[-1][1]][2] <= 2 * CONTEXT:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    out = []
+    for s, e in spans:
+        head = tail = 0
+        if s > 0 and opcodes[s - 1][0] == "equal":
+            head = min(CONTEXT, opcodes[s - 1][2] - opcodes[s - 1][1])
+        if e + 1 < len(opcodes) and opcodes[e + 1][0] == "equal":
+            tail = min(CONTEXT, opcodes[e + 1][2] - opcodes[e + 1][1])
+        first, last = opcodes[s], opcodes[e]
+        out.append((s, e, first[1] - head, last[2] + tail,
+                    first[3] - head, last[4] + tail))
+    return out
+
+
+def _rows_from_opcodes(a: list[str], b: list[str], opcodes,
+                       groups) -> tuple[list[Row], int, int]:
+    """The row-by-row diff table (word spans on replaced lines, long equal
+    runs folded), with every row tagged with its hunk index."""
+    a_los = [g[2] for g in groups]
+    a_his = [g[3] for g in groups]
+    b_los = [g[4] for g in groups]
+    b_his = [g[5] for g in groups]
+
+    def hunk_of(a_no, b_no) -> int:
+        if a_no is not None:
+            gi = bisect_right(a_los, a_no - 1) - 1
+            if gi >= 0 and a_no - 1 < a_his[gi]:
+                return gi
+        if b_no is not None:
+            gi = bisect_right(b_los, b_no - 1) - 1
+            if gi >= 0 and b_no - 1 < b_his[gi]:
+                return gi
+        return -1
+
     rows: list[Row] = []
     folds = [0]
     added = removed = 0
 
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal":
             n = i2 - i1
 
             def eq(k, fold=""):
                 """Build one equal-line Row at offset k within this run."""
                 return Row("equal", i1 + k + 1, a[i1 + k], j1 + k + 1, b[j1 + k],
-                           fold=fold)
+                           fold=fold, hunk=hunk_of(i1 + k + 1, j1 + k + 1))
 
             # A run at the top or bottom of the file only needs context on the
             # side facing a change.
@@ -142,25 +214,147 @@ def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
                 lb = b[j1 + k] if j1 + k < j2 else None
                 if la is not None and lb is not None:
                     sa, sb = _word_spans(la, lb)
-                    rows.append(Row("replace", i1 + k + 1, la, j1 + k + 1, lb, sa, sb))
+                    rows.append(Row("replace", i1 + k + 1, la, j1 + k + 1, lb,
+                                    sa, sb, hunk=hunk_of(i1 + k + 1, j1 + k + 1)))
                     added += 1
                     removed += 1
                 elif la is not None:
-                    rows.append(Row("delete", i1 + k + 1, la))
+                    rows.append(Row("delete", i1 + k + 1, la,
+                                    hunk=hunk_of(i1 + k + 1, None)))
                     removed += 1
                 else:
-                    rows.append(Row("insert", None, "", j1 + k + 1, lb))
+                    rows.append(Row("insert", None, "", j1 + k + 1, lb,
+                                    hunk=hunk_of(None, j1 + k + 1)))
                     added += 1
         elif tag == "delete":
             for k in range(i1, i2):
-                rows.append(Row("delete", k + 1, a[k]))
+                rows.append(Row("delete", k + 1, a[k], hunk=hunk_of(k + 1, None)))
                 removed += 1
         elif tag == "insert":
             for k in range(j1, j2):
-                rows.append(Row("insert", None, "", k + 1, b[k]))
+                rows.append(Row("insert", None, "", k + 1, b[k],
+                                hunk=hunk_of(None, k + 1)))
                 added += 1
 
     return rows, added, removed
+
+
+def build_diff(before: str, after: str) -> tuple[list[Row], int, int, list[Hunk]]:
+    """Like `build_rows`, but also segments the change into hunks a reviewer
+    can accept independently. Returns (rows, added, removed, hunks); each
+    row's `hunk` field indexes into `hunks` (-1 for folded/skip context)."""
+    a = before.split("\n")
+    b = after.split("\n")
+    sm = SequenceMatcher(None, a, b, autojunk=False)
+    opcodes = sm.get_opcodes()
+    groups = _hunk_groups(opcodes)
+    rows, added, removed = _rows_from_opcodes(a, b, opcodes, groups)
+    stats: dict[int, list] = {gi: [0, 0, []] for gi in range(len(groups))}
+    for ri, row in enumerate(rows):
+        if row.hunk >= 0:
+            st = stats[row.hunk]
+            st[2].append(ri)
+            if row.kind in ("replace", "insert"):
+                st[0] += 1
+            if row.kind in ("replace", "delete"):
+                st[1] += 1
+    hunks = []
+    for gi, (_s, _e, a_lo, a_hi, b_lo, b_hi) in enumerate(groups):
+        h_added, h_removed, h_rows = stats[gi]
+        hunks.append(Hunk(gi,
+                          a_lo + 1 if a_hi > a_lo else a_lo, a_hi - a_lo,
+                          b_lo + 1 if b_hi > b_lo else b_lo, b_hi - b_lo,
+                          h_added, h_removed, h_rows))
+    return rows, added, removed, hunks
+
+
+def build_rows(before: str, after: str) -> tuple[list[Row], int, int]:
+    """Row-by-row diff of two texts, with word-level spans on replaced lines
+    and long unchanged runs folded. Returns (rows, lines_added, lines_removed)."""
+    rows, added, removed, _hunks = build_diff(before, after)
+    return rows, added, removed
+
+
+def reconstruct_from_hunks(before_text: str, after_text: str,
+                           accepted_hunk_ids) -> str:
+    """The after-text with only the accepted hunks applied: equal lines always
+    come from `before_text`, an accepted change from `after_text`, an
+    unaccepted delete/replace keeps the before lines and an unaccepted insert
+    is dropped. Accepting every hunk reproduces `after_text` exactly;
+    accepting none reproduces `before_text`."""
+    accepted = set(accepted_hunk_ids or ())
+    a = before_text.split("\n")
+    b = after_text.split("\n")
+    sm = SequenceMatcher(None, a, b, autojunk=False)
+    opcodes = sm.get_opcodes()
+    owner: dict[int, int] = {}
+    for gi, (s, e, *_ranges) in enumerate(_hunk_groups(opcodes)):
+        for oi in range(s, e + 1):
+            owner[oi] = gi
+    out: list[str] = []
+    for oi, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        if tag == "equal":
+            out.extend(a[i1:i2])
+        elif owner.get(oi, -1) in accepted:
+            out.extend(b[j1:j2])
+        elif tag in ("delete", "replace"):
+            out.extend(a[i1:i2])
+        # an unaccepted insert contributes nothing
+    return "\n".join(out)
+
+
+def _before_from_rows(fd) -> str:
+    """Rebuild a file's pre-change text from its diff rows (the fallback when
+    FileDiff.before_text was not recorded)."""
+    return "\n".join(r.a for r in getattr(fd, "rows", ())
+                     if r.kind not in ("insert", "skip"))
+
+
+def apply_hunk_selection(diffs: list[FileDiff],
+                         accepted_hunks: dict) -> tuple[bool, str]:
+    """Apply a {rel: [hunk indices]} selection to staged FileDiffs in place.
+
+    A file absent from the map is accepted whole; an empty index list drops
+    the file; a partial selection reconstructs its after-text from the
+    accepted hunks and refuses (before mutating anything) when the result
+    would not parse. Returns (ok, detail); on failure the diffs are untouched
+    so the review stays retryable."""
+    from . import edits                     # lazy: edits never imports review
+    plans = []
+    any_writable = False
+    for fd in diffs:
+        if fd.removed_source or fd.deleted:
+            continue
+        sel = accepted_hunks.get(fd.rel)
+        if sel is None:
+            any_writable = True             # whole-file acceptance
+            continue
+        hunks = getattr(fd, "hunks", None) or []
+        if not hunks:
+            if sel:                         # legacy diff: kept whole
+                any_writable = True
+            continue
+        ids = sorted(set(sel))
+        if not ids:
+            continue                        # file fully deselected
+        if any(i < 0 or i >= len(hunks) for i in ids):
+            return False, f"Not written: unknown hunk index for {fd.rel}."
+        before = getattr(fd, "before_text", "") or _before_from_rows(fd)
+        text = reconstruct_from_hunks(before, fd.after_text, ids)
+        if len(ids) < len(hunks):
+            err = edits.syntax_error(Path(fd.rel), text)
+            if err:
+                return False, (f"Not written: accepting only part of {fd.rel} "
+                               f"would leave invalid syntax ({err}). Accept "
+                               "the whole file or adjust the hunk selection.")
+        plans.append((fd, text, tuple(ids)))
+        any_writable = True
+    if not any_writable:
+        return False, "Select at least one file or hunk to accept."
+    for fd, text, ids in plans:
+        fd.after_text = text
+        fd.hunk_selection = ids
+    return True, ""
 
 
 def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
@@ -176,11 +370,12 @@ def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
     for r in results:
         if not r.ok or not r.sha:
             continue
-        rows, added, removed = build_rows(r.before, r.after)
+        rows, added, removed, hunks = build_diff(r.before, r.after)
         ids = tuple(clauses.get(r.file, ()))
         out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
                             r.message, renames_from=tuple(r.renames_from),
-                            clauses=ids, deleted=getattr(r, "deleted", False)))
+                            clauses=ids, deleted=getattr(r, "deleted", False),
+                            hunks=hunks, before_text=r.before))
         if root is None:
             continue
         for old in r.renames_from:
@@ -225,9 +420,10 @@ def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
         after, _ = fileio.read(cur, errors="replace")
         if before == after:
             continue
-        rows, added, removed = build_rows(before, after)
+        rows, added, removed, hunks = build_diff(before, after)
         out.append(FileDiff(rel, rows, added, removed, _sha(after), after,
-                            f"built ({added}+ / {removed}-)"))
+                            f"built ({added}+ / {removed}-)",
+                            hunks=hunks, before_text=before))
     return out
 
 
@@ -347,6 +543,26 @@ tr.skip button {
   font: inherit; text-decoration: underline dotted; padding: 2px 6px;
 }
 
+/* Hunk-level sign-off: a header row per hunk, a checkbox per file. */
+.file > h2 input.file-box {
+  width: 16px; height: 16px; accent-color: var(--set); flex: none; cursor: pointer;
+}
+tr.hunk-head td {
+  background: var(--band); border-top: 1px solid var(--rule);
+  padding: 4px 10px; font-size: 12px; color: var(--ink-2);
+}
+tr.hunk-head label {
+  display: flex; align-items: center; gap: 9px; cursor: pointer;
+}
+tr.hunk-head input.hunk-box {
+  width: 15px; height: 15px; accent-color: var(--set); flex: none; cursor: pointer;
+}
+tr.hunk-head .hunk-range {
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px;
+}
+tr.hunk-head .tally { margin-left: auto; }
+tr.hunk-head.off td { opacity: 0.55; }
+
 footer {
   position: fixed; left: 0; right: 0; bottom: 0; background: var(--card);
   border-top: 2px solid var(--rule); padding: 15px 26px;
@@ -422,6 +638,54 @@ document.querySelectorAll('tr.skip button').forEach(function (b) {
   });
 });
 
+// Hunk-level sign-off: a file box selects the whole file, hunk boxes select
+// parts of it; a partially selected file shows an indeterminate file box.
+function hunkBoxes(fid) {
+  return Array.prototype.slice.call(
+    document.querySelectorAll('.hunk-box[data-file="' + fid + '"]'));
+}
+function syncFileBox(fid) {
+  var fb = document.querySelector('.file-box[data-file="' + fid + '"]');
+  if (!fb) return;
+  var hs = hunkBoxes(fid);
+  if (!hs.length) return;
+  var on = hs.filter(function (hb) { return hb.checked; }).length;
+  fb.checked = on > 0;
+  fb.indeterminate = on > 0 && on < hs.length;
+}
+document.querySelectorAll('.file-box').forEach(function (fb) {
+  fb.addEventListener('change', function () {
+    fb.indeterminate = false;
+    hunkBoxes(fb.dataset.file).forEach(function (hb) {
+      hb.checked = fb.checked;
+      hb.closest('tr').classList.toggle('off', !fb.checked);
+    });
+  });
+});
+document.querySelectorAll('.hunk-box').forEach(function (hb) {
+  hb.addEventListener('change', function () {
+    hb.closest('tr').classList.toggle('off', !hb.checked);
+    syncFileBox(hb.dataset.file);
+  });
+});
+function selection() {
+  var accepted = [], acceptedHunks = {};
+  document.querySelectorAll('.file-box').forEach(function (fb) {
+    var rel = fb.dataset.rel;
+    var hs = hunkBoxes(fb.dataset.file);
+    var on = hs.filter(function (hb) { return hb.checked; });
+    if (!hs.length) { if (fb.checked) accepted.push(rel); return; }
+    if (on.length === hs.length) { accepted.push(rel); }
+    else if (on.length > 0) {
+      accepted.push(rel);
+      acceptedHunks[rel] = on.map(function (hb) {
+        return parseInt(hb.dataset.hunk, 10);
+      });
+    }
+  });
+  return { accepted: accepted, accepted_hunks: acceptedHunks };
+}
+
 var box = document.getElementById('attest');
 var write = document.getElementById('write');
 var cancel = document.getElementById('cancel');
@@ -469,7 +733,9 @@ if (write) {
     }
     write.disabled = true;
     cancel.disabled = true;
-    post('/apply', { nonce: window.NONCE }).then(function (res) {
+    var body = selection();
+    body.nonce = window.NONCE;
+    post('/apply', body).then(function (res) {
       if (res.ok) {
         finish('Written', res.detail);
       } else {
@@ -502,9 +768,14 @@ document.addEventListener('keydown', function (e) {
 """
 
 
-def _rows_html(fd: FileDiff, fid: int) -> str:
-    """Render one FileDiff's rows as HTML <tr> elements (folded rows hidden)."""
+def _rows_html(fd: FileDiff, fid: int, interactive: bool = False) -> str:
+    """Render one FileDiff's rows as HTML <tr> elements (folded rows hidden).
+    Interactive pages with hunks get a checkbox header row per hunk."""
     out = []
+    hunks = getattr(fd, "hunks", None) or []
+    show_hunks = (interactive and bool(hunks)
+                  and not fd.removed_source and not fd.deleted)
+    prev_hunk = -1
     for row in fd.rows:
         if row.kind == "skip":
             out.append(
@@ -512,6 +783,19 @@ def _rows_html(fd: FileDiff, fid: int) -> str:
                 f'<button data-fold="{fid}-{row.fold}">show {row.hidden} unchanged '
                 f'line{"s" if row.hidden != 1 else ""}</button></td></tr>')
             continue
+        if show_hunks and row.hunk >= 0 and row.hunk != prev_hunk:
+            prev_hunk = row.hunk
+            h = hunks[row.hunk]
+            out.append(
+                f'<tr class="hunk-head"><td colspan="4"><label>'
+                f'<input type="checkbox" class="hunk-box" data-file="{fid}" '
+                f'data-hunk="{h.index}" checked>'
+                f'Hunk {h.index + 1}'
+                f'<span class="hunk-range">@@ -{h.a_start},{h.a_count} '
+                f'+{h.b_start},{h.b_count} @@</span>'
+                f'<span class="tally"><span class="p">+{h.added}</span> '
+                f'&nbsp;<span class="m">&minus;{h.removed}</span></span>'
+                f'</label></td></tr>')
         a_no = "" if row.a_no is None else row.a_no
         b_no = "" if row.b_no is None else row.b_no
         a_txt = _mark(row.a, row.a_spans) if row.kind == "replace" else (
@@ -543,9 +827,14 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
         badges = "".join(
             f'<span class="clause" title="{html.escape(clause_texts.get(c, c))}">'
             f'{html.escape(c)}</span>' for c in fd.clauses)
+        file_box = ""
+        if interactive and not fd.removed_source:
+            file_box = (f'<input type="checkbox" class="file-box" '
+                        f'data-file="{i}" data-rel="{html.escape(fd.rel)}" '
+                        f'checked title="include this file in the sign-off">')
         files_html.append(f"""
 <section class="file">
-  <h2>{html.escape(fd.rel)}
+  <h2>{file_box}{html.escape(fd.rel)}
     {badges}
     <span class="tally"><span class="p">+{fd.added}</span>
       &nbsp;<span class="m">&minus;{fd.removed}</span></span>
@@ -557,7 +846,7 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
       <th colspan="2" class="right">Proposed</th>
     </tr></thead>
     <tbody>
-{_rows_html(fd, i)}
+{_rows_html(fd, i, interactive)}
     </tbody>
   </table>
 </section>""")
@@ -665,6 +954,46 @@ def read_json_body(handler) -> dict:
     return body if isinstance(body, dict) else {}
 
 
+def _apply_page_selection(diffs: list, accepted, accepted_hunks) -> tuple[bool, str]:
+    """Filter staged diffs to the page's file selection and apply its hunk
+    choices, in place. A refused selection restores the snapshot so the
+    review stays retryable (the same contract as the GUI's decide_review)."""
+    hmap = accepted_hunks if isinstance(accepted_hunks, dict) else {}
+    snapshot = list(diffs)
+    fd_snap = [(fd, fd.after_text, getattr(fd, "hunk_selection", None))
+               for fd in diffs]
+    if isinstance(accepted, list):
+        keep = set(accepted) | set(hmap)
+        diffs[:] = [fd for fd in diffs
+                    if fd.removed_source or fd.rel in keep]
+    ok, detail = apply_hunk_selection(diffs, hmap)
+    if not ok:
+        diffs[:] = snapshot
+        for fd, after, sel in fd_snap:
+            fd.after_text = after
+            if hasattr(fd, "hunk_selection"):
+                fd.hunk_selection = sel
+    return ok, detail
+
+
+def _call_writer(writer, diffs):
+    """Call the sign-off writer. Legacy writers take no arguments and close
+    over the diffs list (which _apply_page_selection just filtered); a writer
+    that declares a required parameter receives the accepted {rel: text} map
+    instead, so it never has to reach into review internals."""
+    try:
+        params = inspect.signature(writer).parameters.values()
+        required = [p for p in params
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    and p.default is p.empty]
+    except (TypeError, ValueError):
+        required = []
+    if required and diffs is not None:
+        return writer({fd.rel: fd.after_text for fd in diffs
+                       if not fd.removed_source and not fd.deleted})
+    return writer()
+
+
 class _Handler(BaseHTTPRequestHandler):
     """Serves the review page on GET and handles /apply and /cancel POSTs."""
 
@@ -734,7 +1063,18 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, b'{"ok":true}', "application/json")
                 return
 
-            ok, detail = self.server.writer()
+            diffs = getattr(self.server, "diffs", None)
+            if diffs is not None and ("accepted" in body
+                                      or "accepted_hunks" in body):
+                ok, detail = _apply_page_selection(
+                    diffs, body.get("accepted"), body.get("accepted_hunks"))
+                if not ok:
+                    self._send(200, json.dumps({"ok": False,
+                                                "detail": detail}).encode(),
+                               "application/json")
+                    return
+
+            ok, detail = _call_writer(self.server.writer, diffs)
             if ok:
                 self.server.outcome = ("applied", detail)
                 self.server.done.set()
@@ -802,6 +1142,18 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     if stale:
         return False, ("Not written: " + ", ".join(stale) +
                        ". Re-run the task to rebuild the review.")
+
+    # Defense in depth: a partial hunk acceptance must never write a file
+    # that no longer parses (apply_hunk_selection already checked; a caller
+    # that set hunk_selection by hand gets the same refusal here).
+    for idx, fd in enumerate(diffs):
+        if getattr(fd, "hunk_selection", None) and not fd.deleted:
+            from . import edits
+            err = edits.syntax_error(safe_targets[idx], fd.after_text)
+            if err:
+                return False, (f"Not written: {fd.rel} would be left with "
+                               f"invalid syntax ({err}). Accept the whole "
+                               "file or adjust the hunk selection.")
 
     for idx, fd in enumerate(diffs):
         p = safe_targets[idx]
@@ -927,7 +1279,9 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
     seconds. `writer()` -> (ok, detail) is called on Apply; `on_discard()` on
     Discard, for flows whose files are already on disk (`new --review`).
     Returns (outcome, detail); outcome is "applied", "cancelled" or "timeout".
-    `diffs`, `task` and `clause_texts` are only used by an installed `RUNNER`."""
+    `diffs` also backs the standalone page's per-file/per-hunk selection (the
+    Apply POST filters this list before calling `writer`); `task` and
+    `clause_texts` are only used by an installed `RUNNER`."""
     if RUNNER is not None:
         return RUNNER(page=page, nonce=nonce, writer=writer, timeout=timeout,
                       on_discard=on_discard, diffs=diffs, task=task,
@@ -938,6 +1292,7 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
         srv.page = page
         srv.nonce = nonce
         srv.writer = writer
+        srv.diffs = diffs
         srv.on_discard = on_discard
         srv.lock = threading.Lock()
         srv.done = threading.Event()

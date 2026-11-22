@@ -1041,6 +1041,7 @@ Every remaining public setting is listed below, grouped by subsystem, with its r
 | `shell_timeout` | `120` | Seconds before a `run` command is killed. |
 | `shell_idle_seconds` | `10` | Kill a `run` command after this many seconds with NO output (keeps GUI apps and servers from blocking the agent); 0 disables the idle rule. |
 | `shell_allowlist` | `[]` | Optional executable allowlist for `run`, e.g. ["pytest", "python"]; empty = any executable once allow_shell is on. |
+| `shell_allowlist_by_project` | `{}` | Per-project shell allow-rules for `run`: a table mapping absolute project roots to pattern lists, e.g. { "/home/me/proj" = ["pytest *", "cargo test *"] }. A matching command skips the permission prompt in that project only. Rules never cover package installs, shells, or commands carrying chaining metacharacters (semicolons, ampersands, pipes, backticks, command substitution). The GUI/TUI "allow in this project" answer writes them here. Trust-gated like `shell_allowlist`: a project config's rules apply only after `pedacito trust`. |
 | `max_shell_output_chars` | `8000` | Cap on command output fed back to the model, in characters. |
 | `security_outbound_mode` | `"warn"` | Outbound cloud-provider guard: before a request leaves for a hosted endpoint, scan its messages for unacknowledged secrets. |
 | `keep_sessions` | `0` | `pedacito prune` defaults (0 = keep everything). |

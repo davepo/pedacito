@@ -478,6 +478,15 @@ class Config:
     # Optional executable allowlist for `run`, e.g. ["pytest", "python"];
     # empty = any executable once allow_shell is on.
     shell_allowlist: tuple[str, ...] = ()
+    # Per-project shell allow-rules: a table mapping absolute project roots
+    # to pattern lists, e.g. { "/home/me/proj" = ["pytest *", "cargo test *"] }.
+    # A matching `run` command skips the permission prompt in that project
+    # only. Rules never cover package installs, shells or commands carrying
+    # chaining metacharacters (; && || | backticks $()). The GUI/TUI "allow
+    # in this project" answer writes them here. Trust-gated like
+    # shell_allowlist: a project config's rules apply only after `pedacito
+    # trust`.
+    shell_allowlist_by_project: dict = field(default_factory=dict)
     # Cap on command output fed back to the model, in characters.
     max_shell_output_chars: int = 8000
     # Let the gather loop capture the screen as text (pixel statistics, OCR,
@@ -1126,7 +1135,8 @@ PROFILE_SECTION = "profiles"
 # settings that are lists of strings (stored as tuples). `mcp_servers` is a
 # table when it uses the named [mcp_servers.<name>] format and a tuple when it
 # uses the legacy list-of-command-strings format, so it is coerced specially.
-_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers")
+_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers",
+                 "shell_allowlist_by_project")
 _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist",
                  "env_passthrough", "protected_paths", "shell_deny",
                  "browser_eval_hosts", "fetch_allowed_hosts",
@@ -1444,6 +1454,21 @@ def _coerce(name: str, value, path: Path | None = None):
             if slug and slug not in out:
                 out.append(slug)
         return tuple(out)
+    if name == "shell_allowlist_by_project":
+        # { project root = [pattern, ...] }; keys stay as written (the
+        # consumer normalises them), values become tuples of strings.
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"{where}{name} must be a table mapping project roots to "
+                'allow-rule lists, e.g. { "/path/to/proj" = ["pytest *"] }')
+        out: dict = {}
+        for k, v in value.items():
+            if not isinstance(v, (list, tuple)):
+                raise ConfigError(
+                    f"{where}{name}[{k!r}] must be a list of patterns, "
+                    'e.g. ["pytest *", "cargo test *"]')
+            out[str(k)] = tuple(str(p) for p in v)
+        return out
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -1536,7 +1561,8 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
-               "shell_allowlist", "browser_eval_hosts",
+               "shell_allowlist", "shell_allowlist_by_project",
+               "browser_eval_hosts",
                "allow_fetch", "fetch_allowed_hosts",
                "enable_web", "wrap_observations", "redact_secrets",
                "security_outbound_mode", "protected_paths", "auto_plan_file",
@@ -1579,6 +1605,64 @@ def trust_project(config_path: Path) -> Path:
     tp.parent.mkdir(parents=True, exist_ok=True)
     tp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     return tp
+
+
+def add_project_shell_pattern(project_root, pattern: str) -> bool:
+    """Persist one scoped allow-rule into the user config's
+    `shell_allowlist_by_project` map, comment-preserving and with a `.bak`.
+    Returns True when the file changed; False when the rule was already
+    there or the config could not be read/validated/written (the caller's
+    live Config update still applies for this session). The user config is
+    always trusted, so no `pedacito trust` step is involved."""
+    from . import config_editor, fileio, security
+    root = security.normalize_project_root(project_root)
+    pattern = str(pattern or "").strip()
+    if not root or not pattern:
+        return False
+    path = Path(USER_CONFIG)
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return False
+    try:
+        data = tomllib.loads(text) if text.strip() else {}
+    except ValueError:
+        return False
+    existing: dict = {}
+    for scope in (data, data.get("universal") or {}):
+        if isinstance(scope, dict) and isinstance(
+                scope.get("shell_allowlist_by_project"), dict):
+            existing = scope["shell_allowlist_by_project"]
+            break
+    merged: dict = {}
+    for k, v in existing.items():
+        nk = security.normalize_project_root(k)
+        if not nk:
+            continue
+        pats = merged.setdefault(nk, [])
+        for p in (v if isinstance(v, (list, tuple)) else ()):
+            p = str(p).strip()
+            if p and p not in pats:
+                pats.append(p)
+    pats = merged.setdefault(root, [])
+    if pattern in pats:
+        return False
+    pats.append(pattern)
+    new_text = config_editor.set_values(
+        text, {"shell_allowlist_by_project": merged})
+    try:
+        config_editor.validate_text(new_text)
+    except ConfigError:
+        return False
+    try:
+        if path.exists():
+            fileio.write_bytes(path.with_name(path.name + ".bak"),
+                               path.read_bytes())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fileio.write_bytes(path, new_text.encode("utf-8"))
+    except OSError:
+        return False
+    return True
 
 
 _warned_untrusted: set[str] = set()
@@ -2930,7 +3014,11 @@ def _toml_literal(value) -> str:
     if isinstance(value, (tuple, list)):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{k} = {_toml_literal(v)}"
+        def _key(k) -> str:
+            k = str(k)
+            # TOML bare keys are [A-Za-z0-9_-]+; project roots need quoting.
+            return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else json.dumps(k)
+        return "{" + ", ".join(f"{_key(k)} = {_toml_literal(v)}"
                                for k, v in value.items()) + "}"
     return json.dumps(str(value))
 
@@ -3347,6 +3435,7 @@ serve_wait = 3.0
 shell_timeout = 120
 shell_idle_seconds = 10
 shell_allowlist = []
+shell_allowlist_by_project = {}
 max_shell_output_chars = 8000
 # Gather-phase `run_test`: scoped pytest runs for live tracebacks. Off = the
 # GUI permission broker is asked per call (category test_execution).
