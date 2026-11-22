@@ -93,8 +93,11 @@ packages = ["pedacito", "pedacito.gui"]
 # their docs/ path so links inside the installed README resolve too.
 [tool.setuptools.data-files]
 "share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md",
-                    "TECHNIQUES.md", "CHANGELOG.md", "README.es.md",
-                    "QUICKSTART.es.md", "MODEL_GUIDE.es.md",
-                    "TECHNIQUES.es.md"]
+                    "TECHNIQUES.md", "CHANGELOG.md", "RELEASE.md",
+                    "LICENSE", "README.es.md", "QUICKSTART.es.md",
+                    "MODEL_GUIDE.es.md", "TECHNIQUES.es.md"]
 "share/pedacito/docs" = ["docs/*.md"]
 "share/pedacito/docs/es" = ["docs/es/*.md"]
+# README links docs/assets/*.png; ship them beside the guides so the
+# screenshots also render in an installed wheel.
+"share/pedacito/docs/assets" = ["docs/assets/*.png"]
