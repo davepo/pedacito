@@ -2267,10 +2267,12 @@ def _answer(q, body):
 @post("/api/permission/decide")
 def _permission_decide(q, body):
     """Answer a live permission request: decision is one of allow_once,
-    allow_run, allow_always, deny. Unblocks the parked worker thread."""
+    allow_run, allow_always, allow_project, deny. Unblocks the parked worker
+    thread."""
     pid = str(body.get("id") or "")
     decision = str(body.get("decision") or "")
-    if decision not in ("allow_once", "allow_run", "allow_always", "deny"):
+    if decision not in ("allow_once", "allow_run", "allow_always",
+                        "allow_project", "deny"):
         return 400, {"ok": False, "detail": f"unknown decision {decision!r}"}
     ok, detail = STATE.decide_permission(pid, decision)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
@@ -2283,9 +2285,22 @@ def _decide(q, body):
     except (TypeError, ValueError):
         return 400, {"ok": False, "detail": "id must be an integer."}
     files = body.get("files")
+    raw_hunks = body.get("accepted_hunks")
+    hunks = None
+    if isinstance(raw_hunks, dict):
+        hunks = {}
+        for rel, ids in raw_hunks.items():
+            if not isinstance(ids, list) or any(
+                    not isinstance(i, int) or isinstance(i, bool)
+                    for i in ids):
+                return 400, {"ok": False, "detail":
+                             "accepted_hunks must map file paths to lists "
+                             "of hunk indices."}
+            hunks[str(rel)] = ids
     ok, detail = STATE.decide_review(
         rid, str(body.get("action", "")),
-        list(files) if isinstance(files, list) else None)
+        list(files) if isinstance(files, list) else None,
+        accepted_hunks=hunks)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 

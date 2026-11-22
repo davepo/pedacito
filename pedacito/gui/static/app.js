@@ -281,12 +281,21 @@ function showPermissionModal(pp) {
     { label: label, stay: true,
       onclick: () => { PDC.decidePermission(pp.id, decision); return false; } },
     extra || {});
-  permModal = PDC.modal('Permission requested', body, [
+  const buttons = [
     btn('Allow Once', 'allow_once', { primary: true }),
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
-    btn('Deny & Redirect', 'deny', { danger: true }),
-  ], { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
+  ];
+  // Scoped persistence: "Allow '<pattern>' in this project" writes a
+  // shell_allowlist_by_project rule, so this command family never asks
+  // again here (installs/shells never get a suggestion).
+  if (pp.suggested_pattern && pp.project_root) {
+    buttons.push(btn(PDC.t('gui.perm.allow_project', { pattern: pp.suggested_pattern },
+      "Allow '" + pp.suggested_pattern + "' in this project"), 'allow_project', {}));
+  }
+  buttons.push(btn('Deny & Redirect', 'deny', { danger: true }));
+  permModal = PDC.modal('Permission requested', body, buttons,
+    { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
 }
 
 // ------------------------------------------------------- markdown to vnodes ---
@@ -418,7 +427,7 @@ const S = {
   memory: null,                           // live RAM/VRAM snapshot (topbar chip + dialog)
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
-  review: null, diff: null, diffRel: '', sel: {}, editing: false,
+  review: null, diff: null, diffRel: '', sel: {}, hsel: {}, editing: false,
   editAfterLoad: false,
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
@@ -1538,6 +1547,33 @@ function handlePromptPaste(e) {
 }
 
 // ---- review (staged diff) ----
+// Hunk-level selection: S.hsel[rel] is an array of accepted hunk indices
+// when only part of a file is accepted; absent/null means "all hunks".
+// S.sel[rel] stays the file-level switch (false = the file is dropped).
+function hselOf(rel) {
+  const v = S.hsel[rel];
+  return Array.isArray(v) ? v : null;
+}
+function fileHunks(rel) {
+  const f = ((S.review && S.review.files) || []).find((x) => x.rel === rel);
+  return (f && f.hunks) || [];
+}
+function toggleHunk(rel, idx, on) {
+  const hunks = fileHunks(rel);
+  if (!hunks.length) return;
+  const cur = hselOf(rel);
+  const set = new Set(cur === null ? hunks.map((h) => h.index) : cur);
+  if (on) set.add(idx); else set.delete(idx);
+  if (set.size === hunks.length) delete S.hsel[rel];
+  else S.hsel[rel] = Array.from(set).sort((a, b) => a - b);
+  S.sel[rel] = set.size > 0;
+  emit();
+}
+function toggleFileSel(rel, on) {
+  S.sel[rel] = on;
+  if (on) delete S.hsel[rel]; else S.hsel[rel] = [];
+  emit();
+}
 function loadReview() {
   return PDC.api('/api/review').then((j) => {
     const meta = j.review || null;
@@ -1550,6 +1586,7 @@ function loadReview() {
     S.editing = false;
     S.editAfterLoad = false;
     S.sel = {};
+    S.hsel = {};
     meta.files.forEach((f) => { S.sel[f.rel] = true; });
     S.ui.folds = {};
     const fresh = !meta.files.some((f) => f.rel === S.diffRel);
@@ -1578,10 +1615,25 @@ function loadDiffFile(rel) {
 function decide(action) {
   if (!S.review) return;
   if (S.editing) { PDC.toast('Click "\u2716 Show diff" to keep your edit first.', true); return; }
-  const files = S.review.partial_ok
-    ? S.review.files.filter((f) => !f.source && S.sel[f.rel] !== false).map((f) => f.rel)
-    : null;
-  PDC.api('/api/review/decide', { id: S.review.id, action: action, files: files }).then((j) => {
+  let files = null, acceptedHunks = null;
+  if (S.review.partial_ok) {
+    files = [];
+    const partial = {};
+    S.review.files.forEach((f) => {
+      if (f.source || S.sel[f.rel] === false) return;
+      const hunks = f.hunks || [];
+      const sel = hselOf(f.rel);
+      if (sel === null || !hunks.length || sel.length === hunks.length) {
+        files.push(f.rel);
+      } else if (sel.length > 0) {
+        files.push(f.rel);
+        partial[f.rel] = sel;
+      }
+    });
+    if (Object.keys(partial).length) acceptedHunks = partial;
+  }
+  PDC.api('/api/review/decide', { id: S.review.id, action: action, files: files,
+                                  accepted_hunks: acceptedHunks }).then((j) => {
     if (j.ok) PDC.toast(action === 'apply' ? j.detail || 'Changes written.' : 'Rejected. No files were changed.');
     else PDC.toast(j.detail || 'failed', true);
     loadReview(); refreshState();
@@ -1596,7 +1648,10 @@ function toggleEdit() {
     S.editing = false;
     if (d._status === 200) {
       S.diff = d;
-      S.review.files.forEach((f) => { if (f.rel === S.diffRel) { f.added = d.added; f.removed = d.removed; f.edited = true; } });
+      // A hand edit re-segments the file: refresh hunks, drop any stale
+      // hunk selection (it referred to the old segmentation).
+      delete S.hsel[S.diffRel];
+      S.review.files.forEach((f) => { if (f.rel === S.diffRel) { f.added = d.added; f.removed = d.removed; f.edited = true; f.hunks = d.hunks || []; } });
     } else PDC.toast(d.detail || 'could not update', true);
     emit();
   });
@@ -5227,7 +5282,8 @@ function DiffPane() {
             S.editing = false;
             if (d._status === 200) {
               const item = (S.review && S.review.files || []).find((x) => x.rel === fromRel);
-              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; }
+              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; item.hunks = d.hunks || []; }
+              delete S.hsel[fromRel];   // re-segmented: old hunk choices are stale
               S.editAfterLoad = !!editAfter;
               loadDiffFile(rel);
             } else {
@@ -5257,9 +5313,14 @@ function DiffPane() {
     return () => document.removeEventListener('keydown', onKey);
   }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
   const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
+  const canSelect = !!(R && R.pending && R.partial_ok);
+  const hselSig = JSON.stringify(hselOf(S.diffRel));
   const { oldRows, newRows, uniRows } = useMemo(() => {
     const oldR = [], newR = [], uniR = [];
     const rows = (D && D.rows) || [];
+    const hunks = (D && D.hunks) || [];
+    const hsel = hselOf(S.diffRel);
+    let lastHunk = -1;
     rows.forEach((r, i) => {
       const key = 'r' + i;
       if (r[0] === 'skip') {
@@ -5270,6 +5331,24 @@ function DiffPane() {
           onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
         oldR.push(mk()); newR.push(mk()); uniR.push(mk());
         return;
+      }
+      // Hunk header before the first row of each hunk (fresh vnode per pane:
+      // one vnode cannot mount in two places).
+      const hi = r[8];
+      if (hi != null && hi >= 0 && hi !== lastHunk && hunks[hi]) {
+        lastHunk = hi;
+        const h = hunks[hi];
+        const hOn = hsel === null || hsel.indexOf(h.index) >= 0;
+        const range = '@@ -' + h.a_start + ',' + h.a_count + ' +' + h.b_start + ',' + h.b_count + ' @@';
+        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (canSelect && !hOn ? ' off' : '')}>
+          ${canSelect ? html`<input type="checkbox" checked=${hOn}
+            title=${PDC.t('gui.diff.hunk_title', null, 'accept this hunk only')}
+            onChange=${(e) => toggleHunk(S.diffRel, h.index, e.target.checked)} />` : null}
+          <span>${PDC.t('gui.diff.hunk', { n: h.index + 1 }, 'Hunk ' + (h.index + 1))}</span>
+          <span class="hunk-range">${range}</span>
+          <span class="tally"><span class="a">+${h.added}</span> <span class="r">\u2212${h.removed}</span></span>
+        </div>`;
+        oldR.push(mkH('a')); newR.push(mkH('b')); uniR.push(mkH('u'));
       }
       const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
       if (kind === 'equal') {
@@ -5292,7 +5371,7 @@ function DiffPane() {
       }
     });
     return { oldRows: oldR, newRows: newR, uniRows: uniR };
-  }, [D, S.diffRel, foldSig]);
+  }, [D, S.diffRel, foldSig, hselSig, canSelect]);
 
   if (!R) {
     return html`
@@ -5304,7 +5383,11 @@ function DiffPane() {
   }
   const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
-  const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
+  const nSel = R.partial_ok ? editable.filter((f) => {
+    if (S.sel[f.rel] === false) return false;
+    const hs = hselOf(f.rel);
+    return hs === null || hs.length > 0;
+  }).length : editable.length;
   const acceptLabel = !R.partial_ok || nSel === editable.length
     ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
     : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
@@ -5340,8 +5423,9 @@ function DiffPane() {
                title=${f.message || ''} onClick=${() => switchDiffFile(f.rel, false)}>
             ${pending && R.partial_ok && !f.source ? html`
               <input type="checkbox" checked=${S.sel[f.rel] !== false} title="include in Accept"
+                     ref=${(el) => { if (el) { const hs = hselOf(f.rel); el.indeterminate = S.sel[f.rel] !== false && hs !== null && hs.length > 0; } }}
                      onclick=${(e) => e.stopPropagation()}
-                     onchange=${(e) => { S.sel[f.rel] = e.target.checked; emit(); }} />` : null}
+                     onchange=${(e) => toggleFileSel(f.rel, e.target.checked)} />` : null}
             <span>${f.rel}</span>
             ${(f.clauses || []).map((c) => html`
               <span key=${c} class="clause" title=${(R.clause_texts || {})[c] || c}>${c}</span>`)}

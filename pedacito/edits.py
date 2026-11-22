@@ -917,6 +917,14 @@ def _validate(path: Path, text: str) -> str | None:
     return None
 
 
+def syntax_error(path, text: str) -> str | None:
+    """Public syntax check: an actionable error message when `text` does not
+    parse as source of `path`'s language, else None. The review's hunk-level
+    sign-off uses it to refuse a partial acceptance that would leave a file
+    syntactically broken (e.g. half of a bracket pair)."""
+    return _validate(Path(path), text)
+
+
 def _creation_text(group: list[Edit]) -> str:
     """Body of a new file: the REPLACE bodies of the empty-SEARCH blocks, in
     reply order (anchored blocks are line replacements, never creation text).

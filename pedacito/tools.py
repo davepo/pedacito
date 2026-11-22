@@ -3344,6 +3344,30 @@ def _allowlist_error(cfg, argv: list[str]) -> str:
             f"({', '.join(allow)}).")
 
 
+def _project_shell_patterns(cfg, root) -> tuple[str, ...]:
+    """The scoped allow-rules (`shell_allowlist_by_project`) that apply to
+    this project root. Map keys are normalised the same way the persistence
+    writer normalises them, so `~/proj`, a relative path and the resolved
+    absolute path all name the same project."""
+    mapping = getattr(cfg, "shell_allowlist_by_project", None) or {}
+    if not isinstance(mapping, dict):
+        return ()
+    want = security.normalize_project_root(root)
+    if not want:
+        return ()
+    out: list[str] = []
+    for key, pats in mapping.items():
+        if security.normalize_project_root(key) != want:
+            continue
+        if isinstance(pats, str):
+            pats = [pats]
+        for p in (pats or ()):
+            p = str(p).strip()
+            if p and p not in out:
+                out.append(p)
+    return tuple(out)
+
+
 # Commands that only mean something to a shell. `run` executes argv directly
 # (no shell), so these never background anything -- they either hand `&` to the
 # program as a literal argument or leave a silent process to the idle-kill.
@@ -3396,12 +3420,21 @@ def tool_run(index, cfg, command: str) -> str:
                 "and is listed/stopped via `pedacito procs`.")
 
     denied = _allowlist_error(cfg, argv)
+    # A scoped project rule (shell_allowlist_by_project) clears a global
+    # shell_allowlist denial -- never a shell_deny hard block -- and skips
+    # the broker prompt: the human already persisted this exact trust.
+    # Installs and metacharacter commands never match a rule (the matcher
+    # refuses them), so they still ask.
+    proj_ok = security.matches_shell_allowlist(
+        argv, _project_shell_patterns(cfg, index.root))
+    if proj_ok and not _deny_error(cfg, argv):
+        denied = ""
     overridable = bool(denied) and broker and not _deny_error(cfg, argv)
     if denied and not overridable:
         return denied
 
-    if broker and (not allow or overridable
-                   or security.is_install_command(argv)):
+    if broker and not proj_ok and (not allow or overridable
+                                   or security.is_install_command(argv)):
         install = security.is_install_command(argv)
         summary = (f"Install packages: `{cmd[:120]}`" if install
                    else f"Run command: `{cmd[:120]}`")
@@ -3419,7 +3452,8 @@ def tool_run(index, cfg, command: str) -> str:
             detail=cmd,
             risk_level="high",
             reason="; ".join(why),
-            key=cmd)
+            key=cmd,
+            project_root=str(index.root))
         if not allowed:
             return msg
         denied = ""               # the human approved this exact command
@@ -4040,21 +4074,28 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
     preview = (f"{tgt}" if tgt else "the whole suite") \
         + (f" -k {filt}" if filt else "")
     if not bool(getattr(cfg, "enable_run_test_in_gather", True)):
-        if not security.permission_broker_active():
-            return ("ERROR: `run_test` is disabled (config "
-                    "enable_run_test_in_gather = false) and no permission "
-                    "broker is listening. Investigate with `read`/`grep`, or "
-                    "ask the user to enable the setting.")
-        allowed, msg = security.request_permission(
-            category=security.CAT_TEST_EXECUTION,
-            action_summary=f"Run scoped tests: `{preview[:120]}`",
-            detail=f"pytest {preview}"[:4000],
-            risk_level="low",
-            reason="enable_run_test_in_gather is off in the config",
-            key=preview[:120],
-            setting_key="enable_run_test_in_gather")
-        if not allowed:
-            return msg
+        # A scoped project rule ("pytest *" in this project) is the human's
+        # standing answer for exactly this: run without asking.
+        rep = ["pytest", tgt] if tgt else ["pytest"]
+        proj_ok = security.matches_shell_allowlist(
+            rep, _project_shell_patterns(cfg, root))
+        if not proj_ok:
+            if not security.permission_broker_active():
+                return ("ERROR: `run_test` is disabled (config "
+                        "enable_run_test_in_gather = false) and no permission "
+                        "broker is listening. Investigate with `read`/`grep`, or "
+                        "ask the user to enable the setting.")
+            allowed, msg = security.request_permission(
+                category=security.CAT_TEST_EXECUTION,
+                action_summary=f"Run scoped tests: `{preview[:120]}`",
+                detail=f"pytest {preview}"[:4000],
+                risk_level="low",
+                reason="enable_run_test_in_gather is off in the config",
+                key=preview[:120],
+                setting_key="enable_run_test_in_gather",
+                project_root=str(root))
+            if not allowed:
+                return msg
 
     # Non-Python test files dispatch to their own runner (JS/TS, Go, Rust).
     # Returns None for a Python target, falling through to pytest.
