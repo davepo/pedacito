@@ -718,8 +718,53 @@ def profile_names(text: str) -> list[str]:
             if r["name"].count(SEP) == 1 and _is_profile(r["name"])]
 
 
+def _pick_replacement_profile(order: list[str], profiles: dict,
+                              *, want_image: bool = False) -> str:
+    """Pick a replacement profile from `order` (preserving config file order).
+
+    When `want_image` is False (replacing `default_profile`), prefer a text /
+    coding profile over an image-generation profile so deleting a worker does
+    not silently promote an image generator to the coding default. Falls back
+    to the first remaining profile if all remaining profiles are image models.
+    """
+    if not order:
+        return ""
+    try:
+        from . import imagegen
+    except Exception:
+        imagegen = None
+
+    def _is_img(name: str) -> bool:
+        if imagegen is None:
+            return False
+        body = profiles.get(name) if isinstance(profiles, dict) else {}
+        if not isinstance(body, dict):
+            body = {}
+        return imagegen.is_image_model(
+            str(body.get("model", "") or ""),
+            modality=str(body.get("modality", "") or "") or None,
+        )
+
+    if want_image:
+        for cand in order:
+            if _is_img(cand):
+                return cand
+        return ""
+    for cand in order:
+        if not _is_img(cand):
+            return cand
+    return order[0]
+
+
 def remove_profile(text: str, name: str) -> str:
-    """Delete `[profiles.NAME]` and any of its sub-tables."""
+    """Delete `[profiles.NAME]` and any of its sub-tables.
+
+    If `default_profile` pointed at the deleted profile, promote the next
+    remaining profile (preferring a non-image profile, or clearing
+    `default_profile` when none remain). Stale `scout_profile`, `image_profile`
+    and `roles` references to the deleted profile are cleaned up too so the
+    config never becomes unstartable.
+    """
     nl = "\r\n" if "\r\n" in text else "\n"
     lines = text.replace("\r\n", "\n").split("\n")
     target = "profiles" + SEP + name
@@ -733,7 +778,27 @@ def remove_profile(text: str, name: str) -> str:
         del lines[a:b]
     while lines and not lines[-1].strip():
         lines.pop()
-    return nl.join(lines) + nl
+    out = nl.join(lines) + nl
+    try:
+        flat, remaining = validate_text(out, "updated config")
+    except ConfigError:
+        return out
+    remaining_order = profile_names(out)
+    updates: dict = {}
+    if flat.get("default_profile") == name:
+        updates["default_profile"] = _pick_replacement_profile(
+            remaining_order, remaining, want_image=False)
+    if flat.get("scout_profile") == name:
+        updates["scout_profile"] = ""
+    if flat.get("image_profile") == name:
+        updates["image_profile"] = _pick_replacement_profile(
+            remaining_order, remaining, want_image=True)
+    roles = flat.get("roles")
+    if isinstance(roles, dict) and any(v == name for v in roles.values()):
+        updates["roles"] = {k: v for k, v in roles.items() if v != name}
+    if updates:
+        out = set_values(out, updates)
+    return out
 
 
 def add_profile(text: str, name: str, values: dict) -> str:

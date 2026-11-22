@@ -1078,3 +1078,32 @@ def test_multiline_rendering_height_scroll_and_cursor_position(tmp_path):
         assert "Shift+Enter" in tui_mod.KEYS_TEXT_ES
     finally:
         session.close()
+
+
+def test_tui_starts_cleanly_when_default_profile_was_deleted(
+        tmp_path, monkeypatch, capsys):
+    """A stale `default_profile` pointing at a deleted profile must not block
+    `pedacito tui` from starting when other valid profiles exist."""
+    cfg_path = tmp_path / "user_config.toml"
+    cfg_path.write_text(
+        'default_profile = "deleted-profile"\n'
+        '[universal]\n'
+        'vram_gb = 16\n'
+        '\n'
+        '[profiles.sdxl]\n'
+        'model = "SDXL-Turbo"\n'
+        'modality = "image"\n'
+        '\n'
+        '[profiles.coder]\n'
+        'model = "qwen3-14b"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    monkeypatch.delenv("PEDACITO_PROFILE", raising=False)
+    args = cli.build_parser().parse_args(["tui", str(tmp_path), "--headless"])
+    cfg = cli._config(args)
+    assert cfg.active_profile == "coder"
+    assert cfg.model == "qwen3-14b"
+    err = capsys.readouterr().err
+    assert "default_profile no longer exists" in err
+    assert "coder" in err

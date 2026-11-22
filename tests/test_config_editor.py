@@ -788,3 +788,41 @@ def test_upsert_mcp_server_handles_an_empty_root_inline_table():
     assert "mcp_servers = {}" not in out
     flat, _ = E.validate_text(out)
     assert flat["mcp_servers"]["docs"]["command"] == "python"
+
+
+def test_remove_default_profile_promotes_next_non_image_profile():
+    text = (
+        'default_profile = "old_default"\n'
+        '[universal]\n'
+        'vram_gb = 16\n'
+        'scout_profile = "old_default"\n'
+        'roles = { planner = "old_default", verifier = "coder" }\n'
+        '\n'
+        '[profiles.old_default]\n'
+        'model = "qwen3-4b"\n'
+        '\n'
+        '[profiles.sdxl]\n'
+        'model = "SDXL-Turbo"\n'
+        'modality = "image"\n'
+        '\n'
+        '[profiles.coder]\n'
+        'model = "qwen3-14b"\n'
+    )
+    out = E.remove_profile(text, "old_default")
+    flat, profiles = E.validate_text(out)
+    assert "old_default" not in profiles
+    # Skips the image profile and promotes the next coding profile.
+    assert flat["default_profile"] == "coder"
+    assert flat.get("scout_profile", "") == ""
+    assert flat["roles"] == {"verifier": "coder"}
+
+    # Deleting the last remaining non-image profile falls back to the remaining
+    # profile; deleting the very last profile clears default_profile to "".
+    out2 = E.remove_profile(out, "coder")
+    flat2, _ = E.validate_text(out2)
+    assert flat2["default_profile"] == "sdxl"
+
+    out3 = E.remove_profile(out2, "sdxl")
+    flat3, profiles3 = E.validate_text(out3)
+    assert profiles3 == {}
+    assert flat3["default_profile"] == ""

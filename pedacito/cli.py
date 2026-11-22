@@ -178,13 +178,74 @@ def _matcher(args, root: Path) -> Matcher:
     return m
 
 
+def _fallback_profile_for_tui(root: Path, explicit: str | None) -> str:
+    """When `default_profile` points at a deleted profile, pick a valid
+    remaining profile (preferring a non-image profile) so `pedacito tui` can
+    still launch and let the user switch profiles interactively."""
+    import tomllib
+    from . import imagegen
+
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    proj = find_project_config(root) if root else None
+    if proj is not None:
+        candidates.append(proj)
+    candidates.append(config.USER_CONFIG)
+
+    profiles: dict[str, dict] = {}
+    order: list[str] = []
+    for path in candidates:
+        if not path or not path.is_file():
+            continue
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw = data.get("profiles") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for pname, body in raw.items():
+                if isinstance(body, dict) and pname not in profiles:
+                    profiles[pname] = body
+                    order.append(pname)
+    if not order:
+        return ""
+    for pname in order:
+        body = profiles[pname]
+        if not imagegen.is_image_model(
+            str(body.get("model", "") or ""),
+            modality=str(body.get("modality", "") or "") or None,
+        ):
+            return pname
+    return order[0]
+
+
 def _config(args) -> Config:
     """Load the Config from files/profile, then apply command-line overrides."""
     # `config` must be able to inspect a file that lacks the mandatory vram_gb.
-    cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
-                      profile=getattr(args, "profile", None),
-                      require_hardware=(getattr(args, "cmd", "") not in
-                                        ("config", "tui")))
+    cmd = getattr(args, "cmd", "")
+    root_dir = _root(args)
+    explicit = getattr(args, "config", None)
+    requested_profile = getattr(args, "profile", None)
+    try:
+        cfg = load_config(root=root_dir, explicit=explicit,
+                          profile=requested_profile,
+                          require_hardware=(cmd not in ("config", "tui")))
+    except ConfigError as exc:
+        if (cmd == "tui" and not requested_profile
+                and not os.environ.get("PEDACITO_PROFILE")
+                and "(from default_profile)" in str(exc)):
+            fallback = _fallback_profile_for_tui(root_dir, explicit)
+            if fallback:
+                print(f"[warning] default_profile no longer exists; "
+                      f"using '{fallback}' instead (run /profile to switch)",
+                      file=sys.stderr)
+                cfg = load_config(root=root_dir, explicit=explicit,
+                                  profile=fallback, require_hardware=False)
+            else:
+                raise
+        else:
+            raise
     # BUG-1007: "pre-existing" means "red before THIS run started" — a
     # failure the run itself just wrote into the ledger must never come back
     # labelled a baseline. Process start, not config-load time, so an

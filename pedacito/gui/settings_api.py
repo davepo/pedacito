@@ -244,6 +244,20 @@ def profile_action(which: str, action: str, name: str, values: dict,
     else:
         raise ConfigError(f"unknown profile action {action!r}")
     write_config(path, new)
+    if action == "delete":
+        with STATE.lock:
+            was_selected = (
+                STATE.profile_request == name
+                or (STATE.cfg is not None
+                    and STATE.cfg.active_profile == name)
+            )
+            if STATE.profile_request == name:
+                STATE.profile_request = ""
+            STATE._user_cfg_stamp = None
+            STATE._user_raw_prefs = None
+            STATE._global_cfg_stamp = None
+        if was_selected:
+            return reload_state_config(profile=None)
     return payload()
 
 
