@@ -593,3 +593,52 @@ def test_installation_no_longer_claims_nvidia_vram_counter_reads():
 def test_config_names_the_local_moe_tier():
     text = (ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8")
     assert "local-moe" in text
+
+
+# --- v0.3.1: native Anthropic caching + multimodal input + TUI composer --------
+
+_CONFIG_DOCS = ("docs/CONFIG.md", "docs/es/CONFIG.md")
+_INPUT_DOCS = ("docs/USAGE.md", "docs/es/USAGE.md", "QUICKSTART.md",
+               "QUICKSTART.es.md")
+
+
+@pytest.mark.parametrize("rel", _CONFIG_DOCS)
+def test_config_docs_cover_anthropic_native(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    assert "anthropic_native" in text
+    assert "cache_read_input_tokens" in text
+    assert "cache_creation_input_tokens" in text
+    assert Config().anthropic_native is True
+
+
+@pytest.mark.parametrize("rel", _INPUT_DOCS)
+def test_input_docs_cover_image_input_and_multiline(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    for needle in ("--image", "/attach", "@image.png", "Shift+Enter",
+                   "Ctrl+J", "?2004h"):
+        assert needle in text, f"{rel} does not mention {needle}"
+
+
+def test_how_index_knows_image_input_and_attach():
+    flags = {f["flag"].split()[0] for f in how_index.COMMON_FLAGS}
+    assert "--image" in flags
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    assert any(f["flag"].startswith("--image") for f in cards["new"]["flags"])
+    tui_text = " ".join(map(str, cards["tui"]["notes"]))
+    assert "/attach" in tui_text and "Shift+Enter" in tui_text
+    topic = next(t for t in how_index.GUI_TOPICS if t["id"] == "image-input")
+    assert "📎 Attach" in " ".join(topic["steps"])
+    hits = how_index.search("how do I attach an image to my task")
+    assert "image-input" in [g["id"] for g in hits["gui"]]
+    assert "anthropic_native" in {s["key"] for s in how_index.settings_dictionary()}
+
+
+def test_readmes_and_changelog_list_v0_3_1_highlights():
+    for rel in ("README.md", "README.es.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "anthropic_native" in text and "/attach" in text, rel
+    section = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = section.split("## v0.3.1", 1)[1].split("\n## ", 1)[0]
+    for needle in ("anthropic_native", "--image", "/attach", "Lemonade",
+                   "bracketed paste"):
+        assert needle in section

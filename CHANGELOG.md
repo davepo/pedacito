@@ -4,6 +4,30 @@ All notable changes to Pedacito (`pdc`) are documented here.
 
 ## v0.3.1 — 2026-11-18
 
+### Bilingual EN / ES, Multimodal Input, Native Anthropic Caching
+
+- **Bilingual EN/ES** — GUI top-bar toggle, TUI `F3` / `/lang`, CLI `--lang es`
+  / `PEDACITO_LANG`; `llm_reply_language` sets the model's reply language.
+  Every guide, `how` card and locale has a Spanish edition (`docs/es/`,
+  `*.es.md`), guarded by a locale/link/anchor integrity suite.
+- **Local image generation** — `pedacito image`, TUI `/image` and a GUI
+  generator dialog drive a local Lemonade Server (`sd-cpp`); model scanning
+  detects image models (`modality = "image"`) and calibration covers them.
+- **TUI fixes and multi-line composer** — the cursor is restored on exit;
+  `Shift+Enter`, `Alt+Enter`, `Ctrl+J` and a trailing `\` + `Enter` insert
+  newlines, and bracketed paste (`?2004h`) keeps pasted blocks intact.
+- **GUI polish** — uncrowded top bar and a collapsible, closable model-scan
+  list.
+- **Multimodal image input** — `--image PATH` (CLI, `new`), GUI paste
+  (`Ctrl+V` / `Cmd+V`), drag-and-drop and `📎 Attach`, and TUI
+  `/attach [PATH | list | clear]` / `@image.png`; PNG/JPEG/WebP/GIF, max 4
+  images of 10 MB each.
+- **Native Anthropic `/v1/messages`** — `anthropic_native` (default `true`)
+  uses the native transport with explicit `cache_control` breakpoints,
+  `5m`/`1h` TTL, `cache_read_input_tokens` / `cache_creation_input_tokens`
+  accounting, native extended thinking, tool calls and images; `false` falls
+  back to the OpenAI-compatible layer.
+
 ### Unified GUI + TUI Color Schemes
 
 - **One shared set of nine built-in schemes** — the theme engine

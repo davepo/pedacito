@@ -256,6 +256,15 @@ Free inspection commands (no model needed):
   (`--tps` sets your tokens/second).
 - `pedacito map PROJ`, print the index (`--tier auto|flat|cards|dirs|ranked`).
 
+### Multimodal chat input
+
+Send images with a task to a vision-capable model: up to **4 images, 10 MB
+each**, as PNG, JPEG, WebP or GIF.
+
+- **CLI**: `--image PATH` (repeatable), e.g. `pedacito ask . -t "match this mockup" --image mock.png`; `new` accepts it too.
+- **GUI**: paste with `Ctrl+V` / `Cmd+V`, drag and drop onto the composer, or click `📎 Attach`.
+- **TUI**: `/attach [PATH | list | clear]` or `@image.png`.
+
 ### `ask`
 
 Gathers the source the task needs, then proposes edits. **It is a dry run by
@@ -587,6 +596,16 @@ slash commands and profile names, and `Esc`/`End` jump back to the live bottom.
 A scrolled-back transcript ([ ↑ Scrolled back N lines ... ]) stays stationary
 while background log lines arrive. Repaints use DEC synchronized output and
 place the hardware cursor inside `pdc tui (profile) > ...`.
+
+**Multi-line input.** `Shift+Enter`, `Alt+Enter` and `Ctrl+J` insert a newline in
+the prompt; a trailing `\` followed by `Enter` does the same on terminals that
+cannot tell `Shift+Enter` apart. Pasted text arrives through bracketed paste
+(`?2004h`), so a multi-line paste stays in the prompt as one block and is not
+run line by line. Plain `Enter` submits.
+
+**Image attachments.** `/attach [PATH | list | clear]` (or `@image.png` in the
+prompt) stages PNG/JPEG/WebP/GIF images for the next task; `list` shows what is
+staged and `clear` drops it. See [Multimodal input](#multimodal-chat-input).
 
 The footer updates after every model call and event: a green/amber/red
 **Context Meter** (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), turn and

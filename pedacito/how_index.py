@@ -212,6 +212,9 @@ COMMON_FLAGS = [
      "help": "server base URL, e.g. http://localhost:1234/v1"},
     {"flag": "--model ID", "help": "model id/name as the server reports it"},
     {"flag": "--root DIR", "help": "project root (default: inferred)"},
+    {"flag": "--image PATH",
+     "help": "attach a PNG/JPEG/WebP/GIF image to the task; repeatable "
+             "(max 4, 10 MB each)"},
     {"flag": "--config FILE", "help": "use this config file as well"},
     {"flag": "--lang {en,es}",
      "help": "interface language for this run (also PEDACITO_LANG)"},
@@ -402,6 +405,9 @@ CLI_COMMANDS = [
              "help": "new project directory (created; must be empty)"},
             {"flag": "-t, --task TEXT", "help": "one-line project description"},
             {"flag": "--spec FILE", "help": "larger spec (.md/.txt)"},
+            {"flag": "--image PATH",
+             "help": "attach a reference image (PNG/JPEG/WebP/GIF); "
+                     "repeatable, max 4 at 10 MB each"},
             {"flag": "--refine",
              "help": "expand a one-line idea into a repo-aware spec first"},
             {"flag": "--plan-only",
@@ -485,7 +491,8 @@ CLI_COMMANDS = [
                      "sidebar", "plan",
                      "slash commands", "live activity", "scroll", "pgup",
                      "pgdn", "mouse wheel", "keybindings", "tab completion",
-                     "command history", "/image"],
+                     "command history", "/image", "/attach", "multi-line",
+                     "bracketed paste", "shift+enter"],
         "examples": [
             "pedacito tui .",
             "pedacito tui ~/code/anki --apply",
@@ -522,8 +529,13 @@ CLI_COMMANDS = [
             "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /verify on|off|status, "
-            "/skills, /memory, /procs, /diff, /undo, /image, /update, /reset, "
-            "/sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/skills, /memory, /procs, /diff, /undo, /image, /attach, "
+            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/attach [PATH | list | clear] (or @image.png) stages "
+            "PNG/JPEG/WebP/GIF images for the next task (max 4, 10 MB each)",
+            "Multi-line input: Shift+Enter, Alt+Enter, Ctrl+J or a trailing "
+            "\\ then Enter insert a newline; bracketed paste (?2004h) keeps "
+            "a multi-line paste as one block; Enter submits",
             "/lang [en|es] switches the interface language; F3 toggles "
             "EN/ES",
             "/auto GOAL nudges single-pass edits: when the goal looks like a "
@@ -1506,6 +1518,28 @@ CLI_COMMANDS = [
 
 GUI_TOPICS = [
     {
+        "id": "image-input",
+        "title": "Send an image with your task (multimodal input)",
+        "summary": "Attach PNG/JPEG/WebP/GIF images (max 4, 10 MB each) to a "
+                   "task for a vision-capable model: paste, drag and drop or "
+                   "use 📎 Attach in the GUI, /attach in the TUI, --image "
+                   "PATH on the CLI.",
+        "steps": [
+            "GUI: paste with Ctrl+V / Cmd+V, drag and drop onto the "
+            "composer, or click 📎 Attach",
+            "TUI: /attach [PATH | list | clear] or @image.png in the prompt",
+            "CLI: --image PATH (repeatable) on ask, auto, chat or new",
+            "Use a vision-capable model; images over 10 MB or beyond four "
+            "are refused",
+        ],
+        "keywords": ["image", "attach", "attachment", "screenshot", "paste "
+                     "image", "drag and drop", "multimodal", "vision",
+                     "image input", "send image", "upload", "picture",
+                     "/attach", "--image"],
+        "settings": [],
+        "cli": ["ask", "new", "tui"],
+    },
+    {
         "id": "switch-model",
         "title": "Switch the active model or profile",
         "summary": "Pick another profile in the topbar and click Switch; the "
@@ -1964,11 +1998,20 @@ GUI_TOPICS = [
             "as ***REDACTED***, and saving the mask unchanged keeps the stored "
             "value (a mask for a key the file does not have is refused)",
             "Set json_mode = object for hosted APIs that reject json_schema",
+            "api.anthropic.com uses the native /v1/messages transport by "
+            "default (anthropic_native = true): explicit cache_control "
+            "breakpoints with a 5m/1h prompt_cache_ttl, "
+            "cache_read_input_tokens / cache_creation_input_tokens usage, "
+            "native extended thinking, tools and images; set "
+            "anthropic_native = false for the OpenAI-compatible layer",
         ],
         "keywords": ["api key", "hosted", "openai", "deepseek", "anthropic",
-                     "server url", "base_url", "api_key_env", "authentication"],
+                     "server url", "base_url", "api_key_env", "authentication",
+                     "anthropic_native", "claude", "cache_control",
+                     "messages api", "cache_read_input_tokens"],
         "settings": ["base_url", "api_key", "api_key_env", "model",
-                     "json_mode", "tier"],
+                     "json_mode", "tier", "anthropic_native",
+                     "prompt_cache", "prompt_cache_ttl"],
         "cli": ["config", "models scan", "calibrate"],
     },
     {
@@ -2974,6 +3017,8 @@ _SETTING_KEYWORDS = {
     "keep_backups": ["retention", "old backups", "prune backups"],
     "keep_sessions": ["retention", "old sessions", "prune sessions"],
     "prompt_cache": ["prompt cache", "caching", "cache control"],
+    "anthropic_native": ["anthropic", "claude", "messages api",
+                         "native transport", "cache_control"],
     "enable_prompt_cache": ["cache_prompt", "kv cache", "local server "
                             "cache", "llama.cpp cache", "faster local"],
     "enable_prompt_lookup": ["prompt lookup", "n-gram", "speculative "

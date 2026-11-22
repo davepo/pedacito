@@ -203,6 +203,14 @@ reuses it across steps automatically. A provider table matches on the host of
 | `api.anthropic.com` | Explicit opt-in (native) | native `/v1/messages` with `cache_control` markers (up to 4 breakpoints, `5m`/`1h` TTLs), `json_mode = "schema"`; temperature below 1 is omitted (Claude 4.7+). See `anthropic_native` to fall back to the OpenAI-compatible shim |
 | Moonshot, Gemini, xAI, Groq | Automatic / implicit | nothing extra; hits are counted when returned |
 
+With `anthropic_native = true` (the default) Anthropic's own API uses the native
+`/v1/messages` transport instead of the OpenAI-compatible shim. Pedacito places
+explicit `cache_control` breakpoints on the stable prefix (up to 4), honours the
+`5m` / `1h` `prompt_cache_ttl`, and reports `cache_read_input_tokens` and
+`cache_creation_input_tokens` from the response as cache hits and writes.
+Extended thinking, tool calls and image inputs also use the native wire format.
+Set `anthropic_native = false` to fall back to the OpenAI-compatible layer.
+
 Set `prompt_cache` to override the table per profile:
 
 ```toml

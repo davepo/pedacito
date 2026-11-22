@@ -868,6 +868,15 @@ la captura SGR opcional de la rueda, y `/mouse off` restaura la selección nativ
 final en vivo. Una vista desplazada hacia atrás muestra `[ ↑ Scrolled back N lines ... ]` y
 permanece fija mientras llegan nuevas líneas de registro.
 
+**Entrada multilínea:** `Shift+Enter`, `Alt+Enter` o `Ctrl+J` añaden un salto de línea, igual
+que una `\` final seguida de `Enter`; el pegado entre corchetes (`?2004h`) mantiene un pegado
+de varias líneas en el prompt como un solo bloque. `Enter` envía.
+
+**Imágenes:** `/attach [RUTA | list | clear]` o `@image.png` prepara archivos
+PNG/JPEG/WebP/GIF para la siguiente tarea. Lo mismo vale en otros sitios: `--image RUTA` en la
+CLI (repetible), y en la GUI pegar con `Ctrl+V` / `Cmd+V`, arrastrar y soltar o `📎 Attach`.
+Límites: 4 imágenes, 10 MB cada una.
+
 Escribe una tarea como de costumbre, o usa `/help`, `/keys`, `/status`, `/auto GOAL`
 (las ediciones de una sola pasada reciben primero una sugerencia de modo Task; `/auto! GOAL` fuerza el
 ciclo de varios pasos), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,

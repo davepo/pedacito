@@ -47,6 +47,10 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 | **Advanced system profiling & auto-tune** | `pedacito profile` shows a vendor-neutral RAM/VRAM snapshot with a source per number (Linux sysfs, NVIDIA `nvidia-smi`, macOS `vm_stat`, Windows `winapi`), a cached prefill/generation probe and the active profile's tuning. `auto_tune = true` (opt-in) fits context, retrieval budgets and timeout to free memory; missing telemetry makes it abstain, and existing configs do not change. | [System profiling and auto-tune](docs/CONFIG.md#advanced-system-profiling-and-auto-tune) |
 | **Context-aware auto-update** | A quiet, opt-out release check: one anonymous PyPI GET at startup (2 s timeout, cached 24 h), a dismissible GUI banner with a streamed upgrade and Restart, `pdc update --run`, and the TUI `/update`. The command matches your install method (pipx, venv, pip --user, or git for editable checkouts). `check_for_updates = false` keeps Pedacito fully offline. | [Upgrading](docs/INSTALLATION.md#upgrading) |
 
+| **Local image generation** | `pedacito image` and the GUI/TUI `/image` generate images on a local Lemonade Server, with calibration for image models. | [Local image generation](docs/USAGE.md#local-image-generation) |
+| **Multimodal image input** | Send PNG/JPEG/WebP/GIF to a vision model: `--image PATH`, GUI paste/drag-drop/`📎 Attach`, TUI `/attach` (4 images, 10 MB each). | [Multimodal chat input](docs/USAGE.md#multimodal-chat-input) |
+| **Native Anthropic prompt caching** | `anthropic_native = true` (default) uses `/v1/messages` with explicit `cache_control` breakpoints, `5m`/`1h` TTLs, native thinking, tools and images. | [Hosted prompt caching](docs/CONFIG.md#hosted-prompt-caching) |
+| **TUI multi-line composer** | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` or a trailing `\` add newlines; bracketed paste keeps pasted blocks intact. | [`tui`](docs/USAGE.md#tui-split-screen-terminal-session) |
 
 ## What's new in v0.3.0
 

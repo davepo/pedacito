@@ -868,6 +868,15 @@ optional SGR wheel capture, and `/mouse off` restores native selection.
 live bottom. A scrolled-back view shows `[ ↑ Scrolled back N lines ... ]` and
 stays stationary as new log lines arrive.
 
+**Multi-line input:** `Shift+Enter`, `Alt+Enter` or `Ctrl+J` add a newline, as
+does a trailing `\` then `Enter`; bracketed paste (`?2004h`) keeps a multi-line
+paste in the prompt as one block. `Enter` submits.
+
+**Images:** `/attach [PATH | list | clear]` or `@image.png` stages PNG/JPEG/WebP/GIF
+files for the next task. The same works elsewhere: `--image PATH` on the CLI
+(repeatable), and in the GUI `Ctrl+V` / `Cmd+V` paste, drag-and-drop or
+`📎 Attach`. Limits: 4 images, 10 MB each.
+
 Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`
 (single-pass edits get a Task-mode suggestion first; `/auto! GOAL` forces the
 multi-step loop), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,

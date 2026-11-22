@@ -203,6 +203,14 @@ lo reutiliza entre pasos automáticamente. Una tabla de proveedores coincide con
 | `api.anthropic.com` | Explícita optativa (nativa) | `/v1/messages` nativo con marcadores `cache_control` (hasta 4 puntos de corte, TTLs `5m`/`1h`), `json_mode = "schema"`; la temperatura por debajo de 1 se omite (Claude 4.7+). Consulta `anthropic_native` para volver a la capa compatible con OpenAI |
 | Moonshot, Gemini, xAI, Groq | Automática / implícita | nada extra; los aciertos se cuentan cuando se devuelven |
 
+Con `anthropic_native = true` (el valor por defecto) la propia API de Anthropic usa el
+transporte nativo `/v1/messages` en lugar de la capa compatible con OpenAI. Pedacito coloca
+marcadores `cache_control` explícitos en el prefijo estable (hasta 4), respeta el TTL
+`5m` / `1h` de `prompt_cache_ttl` e informa `cache_read_input_tokens` y
+`cache_creation_input_tokens` de la respuesta como lecturas y escrituras de caché.
+El razonamiento extendido, las llamadas a herramientas y las imágenes también usan el
+formato nativo. Define `anthropic_native = false` para volver a la capa compatible con OpenAI.
+
 Define `prompt_cache` para anular la tabla por perfil:
 
 ```toml

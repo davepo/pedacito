@@ -254,6 +254,15 @@ Comandos de inspección gratuitos (no se necesita modelo):
   (`--tps` define tus tokens/segundo).
 - `pedacito map PROJ`, imprime el índice (`--tier auto|flat|cards|dirs|ranked`).
 
+### Entrada multimodal en el chat
+
+Envía imágenes junto con una tarea a un modelo con visión: hasta **4 imágenes, 10 MB cada
+una**, en PNG, JPEG, WebP o GIF.
+
+- **CLI**: `--image RUTA` (repetible), p. ej. `pedacito ask . -t "replica esta maqueta" --image mock.png`; `new` también lo acepta.
+- **GUI**: pega con `Ctrl+V` / `Cmd+V`, arrastra y suelta sobre el compositor, o pulsa `📎 Attach`.
+- **TUI**: `/attach [RUTA | list | clear]` o `@image.png`.
+
 ### `ask`
 
 Reúne el código fuente que la tarea necesita y luego propone ediciones. **Por defecto es una simulación**:
@@ -585,6 +594,16 @@ comandos slash y nombres de perfil, y `Esc`/`End` saltan de vuelta al final en v
 Una transcripción desplazada hacia atrás ([ ↑ Scrolled back N lines ... ]) permanece fija
 mientras llegan líneas de registro en segundo plano. Los repintados usan la salida sincronizada DEC y
 colocan el cursor de hardware dentro de `pdc tui (profile) > ...`.
+
+**Entrada multilínea.** `Shift+Enter`, `Alt+Enter` y `Ctrl+J` insertan un salto de línea en
+el prompt; una `\` final seguida de `Enter` hace lo mismo en terminales que no distinguen
+`Shift+Enter`. El texto pegado llega mediante pegado entre corchetes (`?2004h`), así que un
+pegado de varias líneas queda en el prompt como un solo bloque y no se ejecuta línea por
+línea. `Enter` solo envía.
+
+**Imágenes adjuntas.** `/attach [RUTA | list | clear]` (o `@image.png` en el prompt) prepara
+imágenes PNG/JPEG/WebP/GIF para la siguiente tarea; `list` muestra lo preparado y `clear` lo
+descarta. Consulta [Entrada multimodal](#entrada-multimodal-en-el-chat).
 
 El pie se actualiza después de cada llamada al modelo y evento: un
 **Context Meter** verde/ámbar/rojo (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), el
