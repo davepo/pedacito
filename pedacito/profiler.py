@@ -384,6 +384,7 @@ def snapshot(*, meminfo_path=None, drm_root=None, platform: str | None = None,
     returned a total. Results are memoized for ``SNAPSHOT_TTL`` seconds;
     ``use_cache=False`` recomputes, and :func:`clear_snapshot_cache` drops it.
     """
+    explicit_platform = platform is not None
     platform = sys.platform if platform is None else str(platform)
     find = which or _which
     runner = run or _run_argv
@@ -442,7 +443,7 @@ def snapshot(*, meminfo_path=None, drm_root=None, platform: str | None = None,
             readers.append("vm_stat")
 
     # Windows: kernel32, no vendor-specific path.
-    elif platform.startswith("win") or os.name == "nt":
+    elif platform.startswith("win") or (not explicit_platform and os.name == "nt"):
         win = None
         try:
             win = _read_windows_memory(kernel32=kernel32)

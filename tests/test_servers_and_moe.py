@@ -921,6 +921,8 @@ def test_gui_pin_endpoint_updates_telemetry(gui, monkeypatch):
 
 
 def test_gui_load_endpoint_returns_telemetry(gui, monkeypatch):
+    monkeypatch.setattr(profiler_mod, "snapshot",
+                        lambda *a, **k: _fake_memory())
     monkeypatch.setattr(servers, "get_hardware_memory",
                         lambda *a, **k: _fake_memory())
     monkeypatch.setattr(servers, "list_server_states",

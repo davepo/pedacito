@@ -43,7 +43,12 @@ def test_credential_names_are_scrubbed_from_the_child_env(name):
 
 
 @pytest.mark.parametrize("name", ["PATH", "HOME", "LANG"])
-def test_allowlisted_names_survive_the_child_env(name):
+def test_allowlisted_names_survive_the_child_env(name, monkeypatch):
+    # Windows runners do not export HOME or LANG by default; set a value so the
+    # test verifies that allow-listed variables survive scrubbing on every OS.
+    if name != "PATH":
+        monkeypatch.setenv(name, "/tmp/pedacito-home" if name == "HOME"
+                           else "en_US.UTF-8")
     assert name in runner._child_env()
 
 

@@ -1186,6 +1186,7 @@ def test_bwrap_secret_mounts_come_after_extra_rw(tmp_path, monkeypatch):
     (home / ".ssh").mkdir(parents=True)
     (home / ".netrc").write_text("machine x\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     root = (tmp_path / "proj").resolve()
     root.mkdir()
     extra = (tmp_path / "extra").resolve()
@@ -1213,7 +1214,7 @@ def test_seatbelt_profile_denies_writes_to_guarded_paths_that_do_not_exist(tmp_p
     prof = sandbox.seatbelt_profile(root, False, [])
     for name in sandbox.GUARDED:
         g = root / name
-        assert f'(deny file-write* (subpath "{g}"))' in prof
+        assert f"(deny file-write* (subpath {sandbox._sbpl(str(g))}))" in prof
 
 
 def test_exec_fields_cover_web_and_outbound_toggles():
