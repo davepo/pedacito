@@ -1019,6 +1019,7 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .tag { font-size: 10.5px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line2);
   color: var(--muted); flex: none; }
 .tag.act { color: var(--success); border-color: var(--success); }
+.tag.warn { color: var(--warning); border-color: var(--warning); }
 .form { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px 10px;
   align-items: center; }
 .form > label { color: var(--muted); font-size: 12.5px; }
@@ -1038,6 +1039,20 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .note-box { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--surface-alt); font-size: 12.5px; margin-bottom: 10px; }
 .note-box.err { border-color: var(--danger); color: var(--danger); white-space: pre-wrap; }
+/* Collapsible Dual-GPU / Scout + Architect pairing card (Profiles tab).
+   Collapsed by default so the profile editor stays above the fold. */
+.pair-box { padding: 0; overflow: hidden; }
+.pair-head { display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; border: none; border-radius: 0; background: transparent;
+  color: var(--text); font: inherit; text-align: left; }
+.pair-head:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.pair-head b { font-size: 12.5px; }
+.pair-caret { color: var(--muted); width: 12px; flex: none; text-align: center; }
+.pair-status { max-width: 55%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.pair-body { padding: 2px 10px 10px; border-top: 1px solid var(--border); }
+.pair-body > .small-text { margin: 8px 0 0; }
+.auth-hint { color: var(--warning); }
 /* Hosted-provider dialog: connect & verify live, then import model-named
    profiles. Replaces the old inline quick-add card — the dialog is opened by
    the "+ Add Hosted Provider…" buttons in Model discovery and Profiles. */
@@ -1072,6 +1087,12 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .scan-table th:nth-child(2), .scan-table td:nth-child(2) { width: 1%; text-align: center; }
 .scan-table tr.scan-server td { background: var(--surface-alt); color: var(--muted);
   font-family: var(--mono); font-size: 11.5px; }
+/* server header: fold + URL row, and (only for a key-protected server) the
+   inline key field covering every model in that group */
+.sg-wrap { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+.sg-auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-family: var(--font); }
+.sg-auth .scan-key { width: 210px; height: 24px; font-size: 11.5px; }
 /* per-server bulk-pick controls sit flush right in the group header row */
 .scan-table tr.scan-server .sg-group { flex-wrap: nowrap; gap: 6px; }
 .scan-table tr.scan-server .sg-group button { flex: none; font-size: 10.5px; padding: 1px 7px; }

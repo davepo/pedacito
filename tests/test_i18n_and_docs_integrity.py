@@ -102,6 +102,45 @@ def test_locale_placeholders_match_per_key():
     assert not mismatches, f"placeholder mismatch: {mismatches}"
 
 
+# The Profiles/Discovery polish (collapsible pairing, Strata onboarding,
+# hosted-model context/pricing columns, Servers auth hint) ships its strings
+# in both languages rather than falling back to English in the Spanish UI.
+_POLISH_KEYS = {
+    "settings.pair.title", "settings.pair.paired",
+    "settings.pair.not_configured", "settings.pair.configure",
+    "settings.pair.hide", "settings.pair.toggle_title",
+    "settings.pair.description", "settings.pair.architect",
+    "settings.pair.scout", "settings.pair.create_starter",
+    "settings.pair.starter_name", "settings.pair.base_url",
+    "settings.pair.model_id", "settings.pair.model_ph",
+    "settings.pair.vram", "settings.pair.tier",
+    "settings.pair.starter_hint", "settings.pair.save",
+    "settings.pair.saving", "settings.pair.pick_error",
+    "settings.pair.saved", "settings.pair.user_only",
+    "settings.scan.hint", "settings.scan.api_key_required",
+    "settings.scan.api_key_placeholder", "settings.scan.api_key_hint",
+    "settings.hosted.title", "settings.hosted.refresh_catalog",
+    "settings.hosted.refreshing", "settings.hosted.refreshed",
+    "settings.hosted.refresh_failed", "settings.hosted.refresh_catalog_title",
+    "settings.hosted.col_ctx", "settings.hosted.col_price",
+    "settings.hosted.price_title",
+    "gui.servers.auth_required", "gui.servers.auth_hint",
+}
+
+
+def test_profiles_polish_keys_are_translated_in_both_catalogs():
+    en = _read_json("en.json")
+    es = _read_json("es.json")
+    for name, catalog in (("en.json", en), ("es.json", es)):
+        missing = sorted(_POLISH_KEYS - set(catalog))
+        assert not missing, f"{name} is missing the polish keys: {missing}"
+    # The onboarding promise is explicit in both languages.
+    assert "Strata" in en["settings.scan.hint"]
+    assert "Strata" in es["settings.scan.hint"]
+    assert "STRATA_API_KEY" in en["gui.servers.auth_hint"]
+    assert "STRATA_API_KEY" in es["gui.servers.auth_hint"]
+
+
 # ----------------------------------------------------- GFM slug / link audit --
 
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")

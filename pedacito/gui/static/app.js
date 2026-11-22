@@ -151,6 +151,9 @@ PDC.FALLBACK_PROVIDER_CATALOG = [
     base_url: 'https://openrouter.ai/api/v1', api_key_env: 'OPENROUTER_API_KEY',
     suggest: 'openrouter', context_tokens: 200000,
     models: ['deepseek/deepseek-chat', 'qwen/qwen3-coder', 'anthropic/claude-sonnet-4-5', 'google/gemini-2.5-pro'] },
+  { id: 'strata', label: 'Strata / Avalon (Local MoE)', provider: 'strata',
+    base_url: 'http://127.0.0.1:8080/v1', api_key_env: 'STRATA_API_KEY',
+    suggest: 'strata', context_tokens: 131072, models: [] },
 ];
 
 // ------------------------------------------------------------------- modal ---
@@ -3601,9 +3604,15 @@ function serversDialog() {
           h('b', { text: serverTitle(s) }),
           h('span', { class: 'tag' + (s.online ? ' act' : ''), text: s.online ? 'online' : 'offline' }),
           h('span', { class: 'tag', text: s.kind || 'custom' }),
+          s.auth_required === true ? h('span', {
+            class: 'tag warn',
+            text: PDC.t('gui.servers.auth_required', null, 'API key required') }) : null,
           h('span', { class: 'grow' }),
           unloadBtn),
         h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
+        s.auth_required === true ? h('div', {
+          class: 'small-text auth-hint', style: 'margin-top:2px',
+          text: PDC.t('gui.servers.auth_hint', null, 'Set api_key or STRATA_API_KEY in Settings -> Profiles to load/unload models') }) : null,
         (s.profiles && s.profiles.length) ? h('div', {
           class: 'muted small-text', style: 'margin-top:2px',
           title: s.profiles.join(', '),
