@@ -39,6 +39,18 @@ Primero inicia un servidor de modelos (LM Studio, Ollama, Lemonade o llama.cpp).
 > ¿Prefieres español? Usa el selector `EN | ES` en la barra superior de la GUI, presiona `F3` en la TUI o ejecuta
 > `pdc --lang es gui`. Consulta [Idioma y localización](docs/es/CONFIG.md#idioma-y-localización-language-llm_reply_language).
 
+## Novedades de la v0.3.2
+
+| Función | Qué obtienes | Más información |
+|---|---|---|
+| **Ejecución intercalada** | `execution_mode` elige `two_phase`, `interleaved` o `auto`. Las ejecuciones intercaladas mantienen una sola conversación agéntica con herramientas nativas (leer, editar, prueba acotada, traza, editar), y las ejecuciones en seco se preparan en un espacio de trabajo en sombra. Defínelo por ejecución con `--execution-mode`, o en vivo con `/mode` en la TUI. | [Configuración](docs/es/CONFIG.md) |
+| **Gemini y OpenAI Responses nativos** | `gemini_native` (activado por defecto) usa `generateContent` de Google; `openai_responses` usa `/v1/responses` para los modelos de razonamiento o3, o4 y GPT-5. | [Configuración](docs/es/CONFIG.md) |
+| **Catálogo de tres niveles y llavero** | Los metadatos del proveedor, una caché de 24 h de `models.dev` y una tabla integrada proporcionan ventanas de contexto y precios. `pedacito models refresh` fuerza una actualización. `api_key_keyring` lee tu llavero del sistema cuando está instalado `pedacito[keyring]`. | [Configuración](docs/es/CONFIG.md) |
+| **Onboarding de Strata / Avalon** | Un preset de un solo paso en el puerto 8080, un campo de clave API en el escaneo, respaldo con `STRATA_API_KEY`, una insignia **API key required** y auto-evict de Lemonade. | [Configuración del servidor de modelos](docs/es/INSTALLATION.md#configuración-del-servidor-de-modelos) |
+| **Insignia RAM/VRAM en vivo y panel de emparejamiento** | La insignia de hardware de la GUI se actualiza cada 3 segundos y se envía en vivo. El panel Dual-GPU / Scout + Architect Pairing empieza plegado. | [Espacio de trabajo de la GUI](docs/es/USAGE.md) |
+| **Revisión por bloque y reglas de shell por proyecto** | Acepta bloques individuales en el panel Changes. **Permitir en este proyecto** guarda una regla de shell estrecha (`shell_allowlist_by_project`) solo para el proyecto actual. | [Página de revisión](docs/es/USAGE.md#página-de-revisión) |
+| **Temperaturas calibradas y oscilación creativa** | Una tarjeta de modelo calibrada reemplaza solo las temperaturas por defecto, nunca los valores que definiste. `creative_temperature_delta` ajusta la oscilación del modo Creativo/diseño. | [Configuración](docs/es/CONFIG.md) |
+
 ## Novedades de la v0.3.1
 
 | Función | Qué obtienes | Más información |

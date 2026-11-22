@@ -147,10 +147,7 @@ def _add_execution_mode(p):
     """--execution-mode: the task engine for this run (ask/auto/new/eval)."""
     p.add_argument("--execution-mode", dest="execution_mode",
                    choices=("two_phase", "interleaved", "auto"), default=None,
-                   help="execution engine for this run: two_phase (gather "
-                        "then answer), interleaved (one agentic read/edit/"
-                        "test conversation) or auto (pick by model class); "
-                        "overrides execution_mode in the config")
+                   help=i18n.t("cli.opt.execution_mode"))
 
 
 def _load_cli_images(args) -> list[dict]:

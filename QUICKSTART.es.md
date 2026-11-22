@@ -185,7 +185,7 @@ explica cuándo ayuda cada ajuste.
    rechazar todo el conjunto, desmarcar archivos individuales o hacer clic en **Edit updated** para
    cambiar la versión nueva a mano antes de aceptar. Cada archivo muestra insignias de cláusula
    (`R1`, `R2`, ...) para las partes de tu petición a las que sirve; si aceptas
-   solo algunos archivos, se señala cualquier cláusula que quede sin aceptar.
+   solo algunos archivos, se señala cualquier cláusula que quede sin aceptar. Cada bloque de cambio dentro de un archivo es un bloque numerado que puedes aceptar por separado en el panel Changes.
 
 Pedacito respalda cada archivo antes de escribir. Si un archivo cambió en disco después de
 la vista previa, la escritura se rechaza, así que tus propias ediciones nunca se sobrescriben.

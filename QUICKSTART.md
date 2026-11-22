@@ -185,7 +185,8 @@ explains when each setting helps.
    reject the whole set, untick individual files, or click **Edit updated** to
    change the new version by hand before accepting. Each file shows clause
    badges (`R1`, `R2`, ...) for the parts of your request it serves; accepting
-   only some files flags any clause left unaccepted.
+   only some files flags any clause left unaccepted. Each change block inside a
+   file is a numbered hunk you can accept on its own in the Changes pane.
 
 Pedacito backs up each file before it writes. If a file changed on disk after
 the preview, the write is refused, so your own edits are never overwritten.

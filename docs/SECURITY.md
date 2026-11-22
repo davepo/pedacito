@@ -397,6 +397,7 @@ prompt (TUI) or JSON event (RPC) shows the category, the exact target and the re
 | **Allow Once** | Approves this request only. |
 | **Allow for This Run** | Approves that kind of request until the run ends. |
 | **Always Allow** | Approves it from now on. Sets `enable_web` for web access, or `allow_shell` for shell commands, and saves the choice to your config. |
+| **Allow '<pattern>' in this project** | Shell commands only: saves one narrow rule to `shell_allowlist_by_project` for this project root. Matching commands skip the prompt in that project only. Package installs, shells and chained commands are never covered. |
 | **Deny & Redirect** | Refuses the request. The model is told to continue with local project files only. |
 
 A request you do not answer, because the dialog times out or you press Stop, is
