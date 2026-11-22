@@ -1286,7 +1286,7 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
         str(getattr(cfg, "base_url", "") or ""))
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
-    arch = None if hosted else arch_defaults.match_arch(cfg.model)
+    arch = None if hosted else arch_defaults.match_arch(cfg.model, info=info)
     local_moe = not hosted and is_local_moe(cfg)
     arch_ctx = 0
     if arch is not None:

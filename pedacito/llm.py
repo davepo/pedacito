@@ -5061,6 +5061,25 @@ class LLMClient:
                                 or m.get("max_context_window"))
         if max_ctx:
             got["max_context_length"] = max_ctx
+        # Runtime/GGUF architecture hints for fine-tunes whose model id does
+        # not name their base family (LM Studio `arch`, llama-server `meta`,
+        # Lemonade `checkpoint`). Generic wrappers like "llamacpp" are skipped.
+        meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+        arch = (m.get("arch") or m.get("architecture")
+                or meta.get("general.architecture") or "")
+        if arch and str(arch).strip().lower() not in ("llamacpp", "llama.cpp"):
+            got["architecture"] = str(arch).strip()
+        for src_k, dst_k in (("general.base_model.0.name", "base_model"),
+                             ("general.basename", "basename")):
+            val = meta.get(src_k) or m.get(dst_k)
+            if val:
+                got[dst_k] = str(val).strip()
+        ckpt = m.get("checkpoint")
+        if ckpt:
+            got["checkpoint"] = str(ckpt).strip()
+        mpath = m.get("model_path") or m.get("path")
+        if mpath and str(mpath).strip().lower().endswith(".gguf"):
+            got["model_path"] = str(mpath).strip()
         if got:
             if str(m.get("owned_by", "")).lower() == "lemonade" \
                     or m.get("recipe"):
@@ -5229,6 +5248,25 @@ class LLMClient:
                     details = d.get("details") or {}
                     if not got.get("size_bytes") and details.get("parameter_size"):
                         got["parameter_size"] = details["parameter_size"]
+                    arch = info.get("general.architecture")
+                    if arch and str(arch).strip().lower() not in (
+                            "llamacpp", "llama.cpp"):
+                        got["architecture"] = str(arch).strip()
+                    if info.get("general.base_model.0.name"):
+                        got["base_model"] = str(
+                            info["general.base_model.0.name"]).strip()
+                    if info.get("general.basename"):
+                        got["basename"] = str(info["general.basename"]).strip()
+                    fam = details.get("family")
+                    if fam and str(fam).strip().lower() not in (
+                            "llamacpp", "llama.cpp"):
+                        got["family"] = str(fam).strip()
+                    fams = [str(x).strip()
+                            for x in (details.get("families") or ())
+                            if x and str(x).strip().lower() not in (
+                                "llamacpp", "llama.cpp")]
+                    if fams:
+                        got["families"] = fams
                     if got:
                         got["source"] = "ollama"
                     merge(got)
@@ -5260,7 +5298,9 @@ class LLMClient:
                     out.setdefault("source", "strata")
 
         if not (out.get("size_bytes") or out.get("context_length")
-                or out.get("max_context_length")):
+                or out.get("max_context_length") or out.get("architecture")
+                or out.get("family") or out.get("checkpoint")
+                or out.get("model_path")):
             return None
         return out
 

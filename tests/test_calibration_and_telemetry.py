@@ -469,6 +469,94 @@ def test_calibrate_local_deepseek_and_unlisted_finetune_get_temperatures(
     assert card_ft["choices"]["temperature_answer"] == 0.3
 
 
+def _write_fake_gguf(path: Path, kv: dict[str, object]) -> None:
+    """Build a minimal valid GGUF v3 header containing string, int, and array
+    KV entries so `read_gguf_metadata` can be tested with zero external deps."""
+    import struct
+
+    def pack_str(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+
+    buf = bytearray(b"GGUF")
+    buf += struct.pack("<IQQ", 3, 0, len(kv))
+    for k, v in kv.items():
+        buf += pack_str(k)
+        if isinstance(v, str):
+            buf += struct.pack("<I", 8) + pack_str(v)
+        elif isinstance(v, int):
+            buf += struct.pack("<II", 4, v)
+        elif isinstance(v, list):
+            # array of uint32 (type 4)
+            buf += struct.pack("<IIQ", 9, 4, len(v))
+            for item in v:
+                buf += struct.pack("<I", int(item))
+    path.write_bytes(bytes(buf))
+
+
+def test_gguf_header_and_runtime_metadata_match_finetune_family(
+        tmp_path, monkeypatch):
+    """A custom fine-tune like DaisyRose-27B whose model id omits 'qwen'
+    resolves to qwen3.5 via Ollama/LM Studio metadata OR its local GGUF
+    header (via HF_HUB_CACHE / Lemonade checkpoint)."""
+    # 1. Runtime API metadata (Ollama / LM Studio / llama-server)
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"architecture": "qwen35"})["family"] == "qwen3.5"
+    assert arch_defaults.match_arch(
+        "CustomModel-12B",
+        info={"family": "gemma4"})["family"] == "gemma"
+    # Generic runtime wrapper ("llamacpp") must never false-match "llama"
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"architecture": "llamacpp", "family": "llamacpp"}) is None
+
+    # 2. Local GGUF header via HF_HUB_CACHE + Lemonade checkpoint
+    snap = (tmp_path / "models--RadixArk--DaisyRose-27B-GGUF"
+            / "snapshots" / "abc123")
+    snap.mkdir(parents=True)
+    # mmproj must be skipped in favor of the main model GGUF
+    _write_fake_gguf(snap / "mmproj-DaisyRose-27B-BF16.gguf",
+                     {"general.architecture": "clip"})
+    _write_fake_gguf(snap / "DaisyRose-27B-Q4_K_XL.gguf", {
+        "dummy.count": 42,
+        "dummy.array": [1, 2, 3],
+        "general.architecture": "qwen35",
+        "general.base_model.0.name": "Qwen/Qwen3.5-27B",
+    })
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    found = arch_defaults.locate_gguf_for_checkpoint(
+        "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL")
+    assert found is not None and found.name == "DaisyRose-27B-Q4_K_XL.gguf"
+    assert arch_defaults.read_gguf_metadata(found) == {
+        "general.architecture": "qwen35",
+        "general.base_model.0.name": "Qwen/Qwen3.5-27B",
+    }
+    entry = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"})
+    assert entry is not None and entry["family"] == "qwen3.5"
+
+    # Corrupt / non-GGUF files fail silently with {}
+    bad = tmp_path / "corrupt.gguf"
+    bad.write_bytes(b"NOT_GGUF_DATA")
+    assert arch_defaults.read_gguf_metadata(bad) == {}
+
+    # 3. End-to-end calibration uses model_info() -> match_arch() -> qwen3.5
+    class _GGUFClient(_ArchProbeClient):
+        def model_info(self, model=None):
+            return {
+                "context_length": 262144,
+                "checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL",
+            }
+
+    cfg = Config(base_url="http://127.0.0.1:11434/v1",
+                 model="DaisyRose-27B-GGUF-Q4_K_XL")
+    card = modelcard.calibrate(_GGUFClient(), cfg, verbose=False, quick=True)
+    assert card["choices"]["arch_family"] == "qwen3.5"
+    assert card["choices"]["sampler"] == {"top_p": 0.95, "top_k": 20}
+
+
 def test_needle_step_down_ladder():
     assert arch_defaults.needle_step_down(131072) == 65536
     assert arch_defaults.needle_step_down(65536) == 32768
