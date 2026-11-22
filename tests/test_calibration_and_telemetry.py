@@ -284,19 +284,29 @@ def test_models_scan_never_calibrates_hosted(tmp_path, monkeypatch, capsys):
     ("qwen2_5_coder_14b", "qwen2.5-coder"),
     ("Qwen3-Coder-30B", "qwen2.5-coder"),
     ("Qwen3-8B", "qwen3"),
-    ("qwen3.5-32b", "qwen3"),
+    ("qwen3.5-32b", "qwen3.5"),
+    ("Qwen3.8-27B-GSQ-RCO-GGUF", "qwen3.5"),
+    ("Qwen4-32B", "qwen3.5"),
     ("deepseek-coder-v2-lite", "deepseek-coder"),
-    ("DeepSeek-R1-Distill-Qwen-14B", "deepseek-r1"),
-    ("QwQ-32B", "deepseek-r1"),
+    ("DeepSeek-R1-Distill-Qwen-14B", "deepseek"),
+    ("DeepSeek-V3-0324", "deepseek"),
+    ("deepseek-v4.1-flash", "deepseek"),
+    ("QwQ-32B", "deepseek"),
     ("nemotron-4-340b", "nemotron"),
     ("gemma-3-27b-it", "gemma"),
     ("gemma-4-12b", "gemma"),
+    ("glm-4-9b", "glm"),
+    ("glm-5-14b", "glm"),
+    ("gpt-oss-120b", "gpt-oss"),
     ("codestral-22b", "mistral"),
     ("devstral-small", "mistral"),
+    ("ministral-8b", "mistral"),
     ("Mistral-7B-Instruct-v0.3", "mistral"),
     ("granite-3.3-8b-instruct", "granite"),
     ("phi-4-mini", "phi-4"),
-    ("Llama-3.1-8B-Instruct", "llama-3"),
+    ("Llama-3.1-8B-Instruct", "llama"),
+    ("Llama-4-Scout-17B", "llama"),
+    ("lfm-2-3b", "lfm"),
     ("mystery-model-7b", None),
 ])
 def test_match_arch_families(model, family):
@@ -311,13 +321,20 @@ def test_arch_library_values():
     lib = {e["family"]: e for e in arch_defaults.ARCH_LIBRARY}
     q = lib["qwen2.5-coder"]
     assert (q["temperature"], q["temperature_answer"]) == (0.3, 0.3)
+    assert (q["thinking_temperature"], q["thinking_temperature_answer"]) == \
+        (0.5, 0.5)
     assert q["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert q["context_tokens"] == 32768
     assert set(q["specialties"]) == {"coding", "testing_qa"}
-    r1 = lib["deepseek-r1"]
-    assert (r1["temperature"], r1["temperature_answer"]) == (0.6, 0.4)
-    assert r1["specialties"] == ("math_algorithms",)
+    d = lib["deepseek"]
+    assert (d["temperature"], d["temperature_answer"]) == (0.3, 0.3)
+    assert (d["thinking_temperature"], d["thinking_temperature_answer"]) == \
+        (0.6, 0.6)
+    assert d["specialties"] == ("math_algorithms",)
     g = lib["gemma"]
+    assert (g["temperature"], g["temperature_answer"]) == (0.6, 0.6)
+    assert (g["thinking_temperature"], g["thinking_temperature_answer"]) == \
+        (0.7, 0.7)
     assert g["sampler"] == {"top_p": 0.95, "top_k": 64}
     assert set(g["specialties"]) == {"general", "frontend_ui",
                                      "3d_graphics_svg", "translation_i18n"}
@@ -325,7 +342,32 @@ def test_arch_library_values():
     assert lib["phi-4"]["context_tokens"] == 16384
     assert lib["mistral"]["temperature"] == 0.3
     assert lib["nemotron"]["specialties"] == ("general",)
-    assert lib["llama-3"]["context_tokens"] == 32768
+    assert lib["llama"]["context_tokens"] == 32768
+    # modern 2025-2026 families
+    assert lib["qwen3.5"]["sampler"] == {"top_p": 0.95, "top_k": 20}
+    assert lib["gpt-oss"]["temperature"] == 0.4
+    assert lib["glm"]["sampler"] == {"top_p": 0.95}
+    assert lib["lfm"]["patterns"] == ("lfm",)
+
+
+def test_recommended_temperatures_selects_thinking_and_caps_small_tier():
+    q = arch_defaults.match_arch("qwen2.5-coder-32b")
+    # thinking on: the family's thinking pair
+    assert arch_defaults.recommended_temperatures(q, thinking_enabled=True) == \
+        (0.5, 0.5, {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05})
+    # thinking off: the non-thinking pair
+    assert arch_defaults.recommended_temperatures(q) == \
+        (0.3, 0.3, {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05})
+    # a tiny/small tier caps the gather temperature at <= 0.3 for strict JSON
+    # reliability, while the answer keeps its family warmth
+    g = arch_defaults.match_arch("gemma-3-12b")
+    temp, answer, _sampler = arch_defaults.recommended_temperatures(g,
+                                                                    tier="small")
+    assert temp == 0.3 and answer == 0.6
+    # thinking on keeps the small tier's warmth untouched
+    temp, answer, _sampler = arch_defaults.recommended_temperatures(
+        g, thinking_enabled=True, tier="small")
+    assert temp == 0.7 and answer == 0.7
 
 
 def test_arch_context_capped_by_server_and_vram():
@@ -402,8 +444,10 @@ def test_calibrate_records_arch_choices_local_only(home):
     card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
     ch = card["choices"]
     assert ch["arch_family"] == "qwen2.5-coder"
-    assert ch["temperature"] == 0.3
-    assert ch["temperature_answer"] == 0.3
+    # the scripted client keeps thinking on (both A/B arms usable), so the
+    # card records the family's THINKING temperatures.
+    assert ch["temperature"] == 0.5
+    assert ch["temperature_answer"] == 0.5
     assert ch["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert ch["context_tokens"] == 32768
     assert "translation_i18n" in ch["specialties"]
@@ -419,6 +463,39 @@ def test_calibrate_records_arch_choices_local_only(home):
     assert "temperature" not in hcard["choices"]
 
 
+def test_calibrate_records_non_thinking_pair_when_thinking_off(home):
+    cfg = _cfg(model="Qwen2.5-Coder-14B")
+    client = _ArchProbeClient()
+
+    # Force the card's thinking A/B verdict to disable thinking: then the
+    # card records the NON-thinking pair (0.3/0.3).
+    orig = modelcard._t_thinking
+    modelcard._t_thinking = lambda c, cfg: (False, True, [])
+    try:
+        card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
+    finally:
+        modelcard._t_thinking = orig
+    ch = card["choices"]
+    assert ch["disable_thinking"] is True
+    assert ch["temperature"] == 0.3
+    assert ch["temperature_answer"] == 0.3
+
+
+def test_calibrate_records_thinking_baseline_for_unnamed_local_moe(home):
+    from pedacito.config import is_local_moe
+    cfg = _cfg(model="mystery-moe-server")
+    cfg.provider = "strata"          # a local tiered-MoE runtime
+    assert is_local_moe(cfg)
+    client = _ArchProbeClient()
+    card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
+    ch = card["choices"]
+    # no named architecture family, but a local MoE with thinking on gets the
+    # safe thinking baseline so Creative Mode sways from 0.6, not 0.2.
+    assert "arch_family" not in ch
+    assert ch["temperature"] == 0.6
+    assert ch["temperature_answer"] == 0.6
+
+
 def test_apply_fills_arch_settings_only_when_unset(home):
     cfg = _cfg(model="Qwen2.5-Coder-14B")
     card = modelcard.calibrate(_ArchProbeClient(), cfg, verbose=False,
@@ -427,19 +504,31 @@ def test_apply_fills_arch_settings_only_when_unset(home):
 
     fresh = _cfg(model="Qwen2.5-Coder-14B")
     modelcard.apply(fresh)
-    assert fresh.temperature == 0.3
-    assert fresh.temperature_answer == 0.3
+    assert fresh.temperature == 0.5
+    assert fresh.temperature_answer == 0.5
     assert fresh.sampler == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert fresh.context_tokens == 32768
-    assert fresh.sources["temperature"] == "model card"
+    assert fresh.sources["temperature"] == "model card (qwen2.5-coder)"
     assert fresh.sources["context_tokens"] == "model card"
 
-    # explicit user values always win
+    # a universal-level default ([universal] temperature = 0.2, no profile
+    # key) is still a default: the calibrated card replaces it.
+    universal = _cfg(model="Qwen2.5-Coder-14B")
+    universal.temperature = 0.2
+    universal.sources["temperature"] = "user config (/path)"
+    universal.temperature_answer = 0.3
+    universal.sources["temperature_answer"] = "user config (/path)"
+    modelcard.apply(universal)
+    assert universal.temperature == 0.5
+    assert universal.temperature_answer == 0.5
+
+    # an explicit per-profile value always wins
     tuned = _cfg(model="Qwen2.5-Coder-14B")
     tuned.temperature = 0.7
-    tuned.sources["temperature"] = "user config"
+    tuned.sources["temperature"] = "profile 'coder' (via --profile; explicit)"
     tuned.temperature_answer = 0.4
-    tuned.sources["temperature_answer"] = "user config"
+    tuned.sources["temperature_answer"] = \
+        "profile 'coder' (via --profile; explicit)"
     tuned.sampler = {"top_p": 0.5}
     tuned.sources["sampler"] = "user config"
     tuned.context_tokens = 4096
@@ -449,6 +538,13 @@ def test_apply_fills_arch_settings_only_when_unset(home):
     assert tuned.temperature_answer == 0.4
     assert tuned.sampler == {"top_p": 0.5}
     assert tuned.context_tokens == 4096
+
+    # an env var always wins too
+    env = _cfg(model="Qwen2.5-Coder-14B")
+    env.temperature = 0.55
+    env.sources["temperature"] = "env PEDACITO_TEMPERATURE"
+    modelcard.apply(env)
+    assert env.temperature == 0.55
 
     # an auto-fit window is a machine fallback, not a user choice: it yields
     autofit = _cfg(model="Qwen2.5-Coder-14B")

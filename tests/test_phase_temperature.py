@@ -189,6 +189,20 @@ def test_a_continuation_after_a_deferral_is_an_answer(tmp_path):
     assert client.log[0] == ("repair", 0.0)       # the completion round
 
 
+# ------------------------------------------- creative sway is relative (B1)
+def test_creative_answer_sways_relative_not_a_static_floor(tmp_path):
+    agent, client, _cfg = _setup(tmp_path, replies=[GOOD], temperature_answer=0.6)
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert _temps(client, "answer") == [0.9]
+
+
+def test_creative_small_tier_sways_gently(tmp_path):
+    agent, client, _cfg = _setup(tmp_path, replies=[GOOD], temperature_answer=0.3,
+                                 tier="small")
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert _temps(client, "answer") == [0.5]
+
+
 # ------------------------------------------------------------------- best_of
 def _best_of_setup(tmp_path, **cfg_attrs):
     return _setup(tmp_path, replies=[GOOD, GOOD, GOOD], best_of=3, **cfg_attrs)

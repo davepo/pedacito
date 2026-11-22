@@ -45,6 +45,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+from . import config as config_mod
 from . import diagnostics as diagnostics_mod
 from . import events as events_mod
 from . import fileio
@@ -1559,9 +1560,11 @@ class Agent:
         A no-op when the setting is None (the global temperature applies),
         when the client cannot override (replay), or when an outer override is
         already active (best_of's higher temperature for its extra candidates
-        must not be reset to the answer value). A creative/design answer runs
-        warm (>= 0.6) on local servers; hosted endpoints tune their own
-        sampling and receive no temperature key at all (see llm.py)."""
+        must not be reset to the answer value). A creative/design answer sways
+        RELATIVE to its calibrated baseline (see
+        config.effective_creative_temperature) on local servers; hosted
+        endpoints tune their own sampling and receive no temperature key at
+        all (see llm.py)."""
         client = self.client if client is None else client
         cfg = getattr(client, "cfg", None) or self.cfg
         value = getattr(cfg, setting, None)
@@ -1570,7 +1573,7 @@ class Agent:
                 and _is_local_server(cfg):
             base = float(value) if value is not None \
                 else float(getattr(cfg, "temperature", 0.3))
-            value = max(base, 0.6)
+            value = config_mod.effective_creative_temperature(cfg, base)
         if value is None or not hasattr(client, "temperature") \
                 or getattr(client, "_temp_override", None) is not None:
             return contextlib.nullcontext()

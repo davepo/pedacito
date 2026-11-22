@@ -577,6 +577,14 @@ class Config:
     # false (with creative_mode false) to keep the surgical edit discipline
     # for every task (/creative off).
     creative_auto: bool = True
+    # Extra temperature added to the answer baseline in Creative/design mode:
+    # the sway is RELATIVE to the profile's calibrated baseline, not a static
+    # floor. None = automatic by tier (+0.20 for tiny/small, +0.30 otherwise);
+    # an explicit float in [0.0, 0.8] overrides it. The sway is capped at 0.95
+    # (1.0 for an explicit delta) and never lowers the answer below its
+    # baseline, so a calibrated 0.6 Gemma becomes 0.9 while a 0.2 tiny model
+    # only nudges to 0.4.
+    creative_temperature_delta: float | None = None
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit
@@ -1113,6 +1121,7 @@ _OPTIONAL_TYPES = {
     "temperature_answer": float,
     "temperature_repair": float,
     "hosted_temperature": float,
+    "creative_temperature_delta": float,
 }
 _NONE_WORDS = ("", "auto", "none", "default", "card")
 
@@ -2835,6 +2844,35 @@ def apply_local_moe_defaults(cfg) -> bool:
     return True
 
 
+def effective_tier(cfg) -> str:
+    """The tier a run actually uses: the active profile's preset tier (or a
+    top-level `tier`), falling back to the raw `tier` field. Empty when none."""
+    return str(getattr(cfg, "active_tier", "") or getattr(cfg, "tier", "") or "")
+
+
+def effective_creative_temperature(cfg, base_temp: float) -> float:
+    """The answer temperature for a Creative/design task on a LOCAL server.
+
+    Sways RELATIVE to the profile's calibrated baseline (`base_temp`) instead
+    of a static 0.6 floor: a calibrated 0.6 Gemma becomes 0.9, while a 0.2
+    tiny model only nudges to 0.4. The delta is `creative_temperature_delta`
+    when set, else automatic by tier (+0.20 for tiny/small, +0.30 otherwise).
+    The sway is capped at 0.95 (1.0 for an explicit delta) and never lowers
+    the answer below its baseline."""
+    base = float(base_temp)
+    explicit = getattr(cfg, "creative_temperature_delta", None) \
+        if cfg is not None else None
+    if explicit is not None:
+        delta = float(explicit)
+    else:
+        delta = 0.2 if effective_tier(cfg) in ("tiny", "small") else 0.3
+    delta = min(max(delta, 0.0), 0.8)
+    value = round(base + delta, 2)
+    cap = 1.0 if explicit is not None else 0.95
+    value = min(value, cap, 1.0)
+    return max(value, base)
+
+
 def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
     """Return (settings, tier) for a profile, with its tier preset underneath.
 
@@ -3156,7 +3194,7 @@ json_mode = "schema"
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
 # tool_mode = "grammar"     # "native" = the model's tool-call channel
-temperature = 0.2
+# temperature = 0.2
 # temperature_answer = 0.3  # answer phase; 0 = greedy, unset = temperature
 # Hosted APIs (non-local base_url) get NO sampling keys by default -- the
 # provider applies the defaults it tuned for the model. Opt back in with
