@@ -79,11 +79,11 @@ def test_settings_api_scan_servers(monkeypatch):
     from pedacito import discovery
     from pedacito.gui import settings_api
     monkeypatch.setattr(discovery, "discover_servers",
-                        lambda timeout=1.5: [
+                        lambda timeout=1.5, **kw: [
                             ("LM Studio", "http://localhost:1234/v1", ["m"])])
     monkeypatch.setattr(discovery, "describe_models",
-                        lambda base_url: [{"id": "m", "base_url": base_url,
-                                           "loaded": True}])
+                        lambda base_url, **kw: [{"id": "m", "base_url": base_url,
+                                                 "loaded": True}])
     out = settings_api.scan_servers()
     assert out["servers"][0]["label"] == "LM Studio"
     assert out["servers"][0]["models"][0]["id"] == "m"

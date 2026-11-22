@@ -156,7 +156,13 @@ identifies a server by its replies, so two servers can coexist on one host
 (for example Lemonade on 11434 next to LM Studio on 1234).
 
 Strata and Avalon are tiered mixture-of-experts servers: they keep most of the
-GPU's VRAM resident and reason before answering. Give the profile
+GPU's VRAM resident and reason before answering. They normally require the
+server's own API key on `/v1/*` (their public `/health` stays open). Store it
+in the profile as `api_key`, name an environment variable in `api_key_env`
+(`STRATA_API_KEY` / `AVALON_API_KEY` are also read directly), or add the
+server once with **Add Hosted Provider** so the key is saved. Scans reuse that
+profile key, and identify the server from `/health`, so its model is listed
+even when the unauthenticated `/v1/models` probe answers 401. Give the profile
 `provider = "strata"` (or `"avalon"`), or a name containing `strata`/`avalon`,
 and Pedacito applies the `local-moe` execution tier: larger reply budgets, a
 timeout of at least 600 seconds for weight loading, and exactly one concurrent

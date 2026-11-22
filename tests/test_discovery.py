@@ -16,8 +16,12 @@ from pedacito import discovery
 from pedacito.local_server import LocalHTTPServer
 
 
-def _serve(routes, port=0):
-    """Run a fake server; `routes` maps a path to (status_code, payload)."""
+def _serve(routes, port=0, auth=None, protected=()):
+    """Run a fake server; `routes` maps a path to (status_code, payload).
+
+    With `auth`, the paths in `protected` answer 401 unless the request's
+    Authorization header matches that value -- the shape a Strata server uses
+    for `/v1/models`."""
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -25,12 +29,18 @@ def _serve(routes, port=0):
 
         def do_GET(self):
             path = self.path.split("?")[0]
-            hit = routes.get(path)
-            if hit is None:
-                self.send_response(404)
-                self.end_headers()
-                return
-            code, payload = hit
+            if auth and path in protected \
+                    and self.headers.get("Authorization") != auth:
+                code, payload = 401, {"error": {
+                    "type": "authentication_error",
+                    "message": "missing or wrong API key"}}
+            else:
+                hit = routes.get(path)
+                if hit is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                code, payload = hit
             body = json.dumps(payload).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -49,8 +59,8 @@ def fake(monkeypatch):
     monkeypatch.delenv("PEDACITO_DISCOVERY_URLS", raising=False)
     servers = []
 
-    def start(routes, port=0):
-        srv = _serve(routes, port)
+    def start(routes, port=0, **kw):
+        srv = _serve(routes, port, **kw)
         servers.append(srv)
         return f"http://127.0.0.1:{srv.server_address[1]}"
 
@@ -130,6 +140,54 @@ def test_llamacpp_is_fingerprinted(fake):
     url = fake(_llamacpp())
     found = discovery.discover_servers(urls=[url], ports=())
     assert found[0][0] == "llama.cpp"
+
+
+def _strata():
+    return {
+        "/health": (200, {"status": "ok", "service": "strata",
+                          "model": "qwen3.8-flash", "max_context": 131072,
+                          "loaded": True, "api_key": True}),
+        "/v1/models": (200, {"data": [{"id": "qwen3.8-flash"}]}),
+    }
+
+
+def test_strata_is_fingerprinted_and_lists_from_public_health(fake):
+    """A Strata server's /v1/models can be behind an API key, but its public
+    /health names the service, the model and the context window. Discovery
+    must find it (and its model) without credentials."""
+    url = fake(_strata(), auth="Bearer secret", protected={"/v1/models"})
+    found = discovery.discover_servers(urls=[url], ports=())
+    assert found == [("Strata", url + "/v1", ["qwen3.8-flash"])]
+
+
+def test_auth_mapping_unlocks_a_key_protected_listing(fake):
+    """Per-server credentials from configured profiles are sent to that
+    server only; without them the OpenAI listing answers 401 and the server
+    is not discoverable."""
+    url = fake(_openai(), auth="Bearer secret", protected={"/v1/models"})
+    assert discovery.discover_servers(urls=[url], ports=()) == []
+    found = discovery.discover_servers(
+        urls=[url], ports=(),
+        auth={url + "/v1": {"Authorization": "Bearer secret"}})
+    assert found == [("OpenAI-compatible", url + "/v1", ["gpt-x"])]
+
+
+def test_auth_headers_match_normalized_spellings_and_never_leak():
+    auth = {"http://127.0.0.1:9000/v1": {"Authorization": "Bearer secret"}}
+    assert discovery._auth_headers("http://localhost:9000", auth) == \
+        {"Authorization": "Bearer secret"}
+    assert discovery._auth_headers("http://127.0.0.1:9001", auth) == {}
+
+
+def test_describe_models_uses_the_listing_context_and_loaded_status(fake):
+    url = fake({
+        "/v1/models": (200, {"data": [{
+            "id": "qwen3.8-flash", "context_length": 131072,
+            "status": {"value": "loaded"}}]}),
+    })
+    rows = discovery.describe_models(url + "/v1", vram_gb=0)
+    assert rows == [{"id": "qwen3.8-flash", "base_url": url + "/v1",
+                     "context_length": 131072, "loaded": True}]
 
 
 def test_lemonade_on_a_shared_port_is_not_mislabelled(fake):

@@ -156,7 +156,12 @@ identifica un servidor por sus respuestas, así que dos servidores pueden coexis
 (por ejemplo Lemonade en 11434 junto a LM Studio en 1234).
 
 Strata y Avalon son servidores de mezcla de expertos por niveles: mantienen residente la mayor parte de la
-VRAM de la GPU y razonan antes de responder. Dale al perfil
+VRAM de la GPU y razonan antes de responder. Normalmente exigen la clave API del servidor en
+`/v1/*` (su `/health` público queda abierto). Guárdala en el perfil como `api_key`, indica
+una variable de entorno en `api_key_env` (también se leen `STRATA_API_KEY` y
+`AVALON_API_KEY`), o añade el servidor una vez con **Add Hosted Provider** para guardar la
+clave. Los escaneos reutilizan la clave del perfil y reconocen el servidor por `/health`,
+así que su modelo aparece aunque `/v1/models` responda 401 sin autenticar. Dale al perfil
 `provider = "strata"` (o `"avalon"`), o un nombre que contenga `strata`/`avalon`,
 y Pedacito aplica el nivel de ejecución `local-moe`: presupuestos de respuesta mayores, un
 tiempo límite de al menos 600 segundos para la carga de pesos y exactamente un stream

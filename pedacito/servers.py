@@ -65,6 +65,10 @@ DEFAULT_EVICT_WAIT = 10.0
 
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 _LEMONADE_ENV_KEYS = ("LEMONADE_API_KEY", "LEMONADE_KEY")
+# Strata and Avalon read their key from these variables; accepting them means
+# a GUI started from the same shell can drive an already-running server
+# without copying the secret into config.toml.
+_STRATA_ENV_KEYS = ("STRATA_API_KEY", "AVALON_API_KEY")
 
 
 # --- small helpers ------------------------------------------------------------
@@ -160,6 +164,9 @@ def _headers_for(server, *, internal: bool = False) -> dict:
         env_names = _LEMONADE_ENV_KEYS + (
             ("LEMONADE_ADMIN_API_KEY",) if internal else ())
         for env_name in env_names:
+            key = os.environ.get(env_name, "") or key
+    elif kind in ("strata", "avalon", "local-moe", "local_moe", "localmoe"):
+        for env_name in _STRATA_ENV_KEYS:
             key = os.environ.get(env_name, "") or key
     return {"Authorization": f"Bearer {key}"} if key else {}
 
@@ -421,6 +428,11 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         return [], [], []
     entries = []
     explicit_loaded: list[str] = []
+    # A single-model payload (`/health`, `/props`) may name its model while
+    # reporting `loaded: false` (Strata does when its idle timer unloaded it):
+    # that id belongs in the listing, never in the resident set.
+    named_ids: list[str] = []
+    named_not_loaded: set[str] = set()
     if isinstance(payload, list):
         entries = [m for m in payload if isinstance(m, dict)]
     elif isinstance(payload, dict):
@@ -443,12 +455,21 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         else:
             for key in ("model", "id", "name"):
                 if payload.get(key):
-                    explicit_loaded.append(str(payload[key]))
+                    named = str(payload[key])
+                    if payload.get("loaded") is False:
+                        named_ids.append(named)
+                        named_not_loaded.add(named)
+                    else:
+                        explicit_loaded.append(named)
                     break
     ids: list[str] = []
     loaded: list[str] = list(dict.fromkeys(explicit_loaded))
     loading: list[str] = []
-    for mid in loaded:
+    # A model the server explicitly reports as not resident. The single-model
+    # fallback below must not override that signal (Strata lists its idle
+    # model as `status: {"value": "unloaded"}` or `loaded: false`).
+    not_loaded: set[str] = set(named_not_loaded)
+    for mid in [*explicit_loaded, *named_ids]:
         if mid not in ids:
             ids.append(mid)
     for entry in entries:
@@ -464,7 +485,12 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
             if key in entry:
                 marker = bool(entry.get(key))
                 break
-        state = str(entry.get("state") or entry.get("status") or "").lower()
+        raw_status = entry.get("status")
+        if isinstance(raw_status, dict):
+            # Strata/Avalon (and llama.cpp's router) nest the marker:
+            # {"status": {"value": "loaded" | "unloaded" | "loading"}}.
+            raw_status = raw_status.get("value") or raw_status.get("state") or ""
+        state = str(entry.get("state") or raw_status or "").lower()
         if state in ("loading", "loading_in_memory", "loading_weights"):
             marker = False
             if mid not in loading:
@@ -474,6 +500,8 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         elif marker is None and state in ("unloaded", "idle", "not_loaded",
                                           "not-loaded"):
             marker = False
+        if marker is not None and not marker:
+            not_loaded.add(mid)
         if marker:
             if mid not in loaded:
                 loaded.append(mid)
@@ -484,7 +512,8 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
     if not loaded and ids and (len(ids) == 1 or kind in
                                ("llama-server", "strata", "avalon",
                                 "local-moe")):
-        loaded = [m for m in ids if m not in loading]
+        loaded = [m for m in ids
+                  if m not in loading and m not in not_loaded]
     return ids, loaded, loading
 
 
@@ -604,6 +633,23 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
                 loaded.extend(m for m in got_loaded if m not in loaded)
                 loading.extend(m for m in got_loading if m not in loading)
                 break
+    if online and kind in ("custom", "local"):
+        # A profile created through a generic flow may not carry a provider
+        # label. Strata/Avalon name their service on the public /health
+        # endpoint, so upgrade the kind for the UI and lifecycle routing.
+        if left() > 0:
+            try:
+                resp = requests.get(root + "/health", headers=headers,
+                                    timeout=left())
+            except Exception:
+                resp = None
+            if getattr(resp, "status_code", 0) == 200:
+                try:
+                    service = str((resp.json() or {}).get("service") or "")
+                except Exception:
+                    service = ""
+                if service.lower() in ("strata", "avalon"):
+                    kind = service.lower()
     pinned = (_lemonade_pinned_models(root, headers, left)
               if online and kind in ("lemonade", "lemond") else [])
     out = dict(server)
@@ -782,7 +828,15 @@ def _llama_action(server: dict, action: str,
 
 def _generic_action(server: dict, action: str,
                     model: str) -> tuple[bool, str, str]:
-    """Strata/Avalon/custom: try the OpenAI-ish lifecycle endpoints first."""
+    """Strata/Avalon/custom: try the OpenAI-ish lifecycle endpoints first.
+
+    The alternate spelling is tried only when the server gave no answer at all
+    (404, connection failure or timeout), exactly like the Lemonade and
+    llama.cpp paths. A real answer -- notably Strata's 401 when the profile
+    has no API key -- is returned as-is instead of being flattened into "no
+    lifecycle endpoint answered", and a side-effecting load is never fired
+    twice after an error.
+    """
     root = _root(str(server.get("base_url") or ""))
     headers = _headers_for(server)
     candidates = []
@@ -792,14 +846,26 @@ def _generic_action(server: dict, action: str,
     else:
         candidates = [("/v1/load", {"model": model} if model else {}),
                       ("/models/load", {"model": model} if model else {})]
+    method, detail = "generic", "no lifecycle endpoint answered"
     for path, payload in candidates:
         url = root + path
-        ok, detail, _resp = _post_json(
+        ok, answer, resp = _post_json(
             url, headers, payload,
             timeout=LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT)
         if ok:
-            return True, f"POST {url}", detail
-    return False, "generic", "no lifecycle endpoint answered"
+            return True, f"POST {url}", answer
+        code = int(getattr(resp, "status_code", 0) or 0)
+        method = f"POST {url}"
+        detail = f"{code}: {answer}" if code and str(answer) else answer
+        lowered = str(detail or "").lower()
+        if "401" in lowered or "authentication" in lowered \
+                or "api key" in lowered:
+            detail = (f"{detail}; this server requires an API key -- set "
+                      "api_key (or api_key_env) in the profile")
+            break
+        if not _retry_next_spelling(resp, answer):
+            break
+    return False, method, detail
 
 
 def _server_action(server, action: str, model: str, config) -> dict:

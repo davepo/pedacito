@@ -179,6 +179,93 @@ def test_load_and_strata_hook_payload(monkeypatch, tmp_path):
     assert marker.read_text(encoding="utf-8") == "qwen3.8-flash"
 
 
+def test_strata_load_401_is_reported_and_not_retried(monkeypatch):
+    """A reachable server's 401 is the actionable answer (the profile has no
+    key); the generic path must not hide it behind "no lifecycle endpoint
+    answered" nor fire the side-effecting load a second time."""
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(
+            status_code=401,
+            text='{"error": {"type": "authentication_error", '
+                 '"message": "missing or wrong API key"}}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    result = servers.load_server_model("strata", "qwen3.8-flash", cfg)
+    assert result["ok"] is False
+    assert calls == ["http://127.0.0.1:8001/v1/load"]
+    assert "401" in result["detail"]
+    assert "api_key" in result["detail"]
+
+
+def test_strata_load_404_tries_the_alternate_spelling(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/v1/load"):
+            return SimpleNamespace(status_code=404, text="not found")
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    result = servers.load_server_model("strata", "qwen3.8-flash", cfg)
+    assert result["ok"] is True
+    assert calls == ["http://127.0.0.1:8001/v1/load",
+                     "http://127.0.0.1:8001/models/load"]
+
+
+def test_strata_key_comes_from_the_environment(monkeypatch):
+    seen = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.update(headers or {})
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    monkeypatch.setenv("STRATA_API_KEY", "secret-strata")
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    assert servers.load_server_model("strata", "qwen3.8-flash", cfg)["ok"]
+    assert seen["Authorization"] == "Bearer secret-strata"
+
+
+def test_probe_upgrades_a_keyless_strata_profile_to_its_runtime(monkeypatch):
+    """A profile imported through the generic provider dialog may have no
+    provider label. The public /health identifies Strata, so the Servers
+    dialog labels it and routes its lifecycle instead of calling it custom."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "qwen3.8-flash", "status": {"value": "loaded"}}]})
+        if url.endswith("/health"):
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "service": "strata", "model": "qwen3.8-flash",
+                "loaded": True})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "qwen3_8-flash": {"base_url": "http://127.0.0.1:8001/v1",
+                          "model": "qwen3.8-flash"},
+    }, active="qwen3_8-flash")
+    state = servers.list_server_states(cfg)[0]
+    assert state["kind"] == "strata"
+    assert state["online"] is True
+    assert state["models"] == ["qwen3.8-flash"]
+
+
 def _lemonade_cfg():
     return _cfg_with({
         "lemonade": {"base_url": "http://127.0.0.1:8000/v1",
@@ -676,6 +763,50 @@ def test_list_server_states_detects_resident_models(monkeypatch):
     assert state["online"] is True and state["kind"] == "strata"
     assert state["models"] == ["qwen3.8-flash", "gemma-3-27b"]
     assert state["loaded_models"] == ["qwen3.8-flash"]
+
+
+def test_models_from_payload_honors_a_health_loaded_flag():
+    """Strata's public /health names the model and says whether it is
+    resident. `loaded: false` must keep the id visible but out of the resident
+    set, so the UI offers Load instead of Eject."""
+    ids, loaded, loading = servers._models_from_payload(
+        {"model": "qwen3.8-flash", "loaded": False}, "strata")
+    assert ids == ["qwen3.8-flash"] and loaded == [] and loading == []
+    ids, loaded, _ = servers._models_from_payload(
+        {"model": "qwen3.8-flash", "loaded": True}, "strata")
+    assert ids == ["qwen3.8-flash"] and loaded == ["qwen3.8-flash"]
+
+
+def test_list_server_states_reads_strata_nested_status(monkeypatch):
+    """Strata lists its one model with `status: {"value": ...}`. An unloaded
+    model must not be treated as resident by the single-model runtime
+    fallback: the Servers dialog would otherwise disable Load."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "qwen3.8-flash", "status": {"value": "unloaded"}}]})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    state = servers.list_server_states(cfg)[0]
+    assert state["models"] == ["qwen3.8-flash"]
+    assert state["loaded_models"] == [] and state["loaded"] is False
+
+    # The loaded marker is read the same way.
+    fake_get = (lambda url, headers=None, timeout=None:
+                SimpleNamespace(status_code=200, json=lambda: {"data": [
+                    {"id": "qwen3.8-flash",
+                     "status": {"value": "loaded"}}]})
+                if url.endswith("/v1/models")
+                else SimpleNamespace(status_code=404, json=lambda: {}))
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    state = servers.list_server_states(cfg)[0]
+    assert state["loaded_models"] == ["qwen3.8-flash"]
+    assert state["loaded"] is True
 
 
 def test_list_server_states_surfaces_loading_models(monkeypatch):

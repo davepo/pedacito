@@ -117,6 +117,25 @@ def _data(resp) -> dict | list | None:
         return None
 
 
+def _auth_headers(root: str, auth) -> dict:
+    """The Authorization (or other) headers for one candidate root.
+
+    `auth` is a mapping of server URL -> header dict, one entry per configured
+    profile. Keys are normalized before comparing, so `localhost` and
+    `127.0.0.1` spellings (and a `/v1` suffix) still match. A callable is
+    accepted too, for callers that resolve credentials themselves.
+    """
+    if not auth:
+        return {}
+    if callable(auth):
+        return dict(auth(root) or {})
+    want = normalize_url(root)
+    for url, headers in auth.items():
+        if normalize_url(url) == want:
+            return dict(headers or {})
+    return {}
+
+
 def _entries_from(data) -> list[dict] | None:
     """The model-entry list from an OpenAI-shape (`data`) or Ollama-shape
     (`models`) payload, or None when the payload carries no list."""
@@ -148,9 +167,57 @@ def _is_lemonade(entries: list[dict]) -> bool:
     return any(str(m.get("owned_by", "")).lower() == "lemonade" for m in entries)
 
 
+def _strata_health(root: str, timeout: float, headers=None,
+                   deadline=None) -> dict | None:
+    """The public `/health` body when `root` is a Strata/Avalon server.
+
+    Both answer `/health` without credentials and name their service:
+    `{"service": "strata", "model": ..., "max_context": ..., "loaded": ...}`.
+    Other OpenAI-compatible servers may also answer `/health` with a generic
+    `{"status": "ok"}`; only the `service` marker identifies these two.
+    """
+    resp = _get(root + "/health", timeout, headers, deadline)
+    data = _data(resp) if resp else None
+    if isinstance(data, dict) and str(data.get("service") or "").lower() in (
+            "strata", "avalon"):
+        return data
+    return None
+
+
+def _strata_entries(root: str, timeout: float, headers=None,
+                    deadline=None) -> list[dict] | None:
+    """The model listing from Strata/Avalon's public `/health`.
+
+    Their OpenAI listing (`/v1/models`) requires the configured API key, but
+    `/health` names the one resident model and its context window without
+    credentials. That is enough for discovery to report the server and model
+    even before a profile carrying its key exists; `describe_models` keeps the
+    `max_context` value the listing could not fetch.
+    """
+    data = _strata_health(root, timeout, headers, deadline)
+    mid = data.get("model") if data else None
+    if not mid:
+        return None
+    entry: dict = {"id": str(mid)}
+    ctx = data.get("max_context") or data.get("context_length")
+    try:
+        if ctx:
+            entry["context_length"] = int(ctx)
+    except (TypeError, ValueError):
+        pass
+    if "loaded" in data:
+        entry["loaded"] = bool(data["loaded"])
+    return [entry]
+
+
 def _fingerprint(root: str, timeout: float, headers=None, deadline=None) -> str:
     """Label a server at `root` from its native endpoints; "" when none of the
     server-specific endpoints answer (a bare OpenAI-compatible server)."""
+    # Strata/Avalon name their service on the public /health endpoint; this
+    # works even when /v1/models is behind an API key (a 401 probe).
+    strata = _strata_health(root, timeout, headers, deadline)
+    if strata:
+        return str(strata["service"]).title()
     # Lemonade owns /api/v1/health, so it wins even on a port another server
     # historically used (e.g. Lemonade on 11434 must not read "Ollama").
     if _get(root + "/api/v1/health", timeout, headers, deadline):
@@ -230,6 +297,12 @@ def _probe_root(root: str, timeout: float, headers=None, deadline=None):
             entries = _list_entries(root + "/api/v0/models", timeout, headers,
                                     deadline)
             base_url = root + "/v1"
+        elif label in ("Strata", "Avalon"):
+            # The key-protected /v1/models answered 401; /health still names
+            # the resident model, so the server is discoverable before its
+            # key is imported.
+            entries = _strata_entries(root, timeout, headers, deadline)
+            base_url = root + "/v1"
 
     if entries is None and label == "":
         return None
@@ -272,7 +345,7 @@ def _candidate_roots(urls, profile_urls, ports) -> list[str]:
 
 def discover_servers(timeout: float = 2.0, urls=(), ports=None,
                      profile_urls=(), headers=None, budget=None,
-                     deadline=None) -> list[tuple[str, str, list[str]]]:
+                     deadline=None, auth=None) -> list[tuple[str, str, list[str]]]:
     """Probe candidates for local model servers.
 
     Returns `[(label, base_url, [model ids])]` for each server that answers,
@@ -285,7 +358,14 @@ def discover_servers(timeout: float = 2.0, urls=(), ports=None,
     loop stops and returns the servers found so far (partial results beat a
     GUI request that hangs on a slow remote URL). `deadline`, when given, is
     an already-computed monotonic timestamp shared with a caller's wider
-    budget (it wins over `budget`)."""
+    budget (it wins over `budget`).
+
+    `headers` applies to every candidate (one explicit URL, one key).
+    `auth` is a mapping of server URL -> header dict for per-server
+    credentials: a configured profile's own key is sent only to that profile's
+    endpoint, so a scan can list an API-key-protected local server (Strata)
+    without leaking one server's key to another. Merge order is `headers`
+    first, then `auth` for the matching root."""
     if deadline is None and budget is not None:
         deadline = time.monotonic() + max(0.0, float(budget))
     roots = _candidate_roots(urls, profile_urls,
@@ -298,7 +378,8 @@ def discover_servers(timeout: float = 2.0, urls=(), ports=None,
         key = normalize_url(root)
         if key in seen:
             continue
-        result = _probe_root(root, timeout, headers, deadline)
+        request_headers = {**(headers or {}), **_auth_headers(root, auth)}
+        result = _probe_root(root, timeout, request_headers or None, deadline)
         if result is not None:
             seen.add(key)
             found.append(result)
@@ -328,7 +409,7 @@ def list_models(base_url: str, timeout: float = 5.0, headers=None) -> list[str]:
 
 
 def describe_models(base_url: str, timeout: float = 5.0, headers=None,
-                    vram_gb: int = 0, deadline=None) -> list[dict]:
+                    vram_gb: int = 0, deadline=None, auth=None) -> list[dict]:
     """The scan's per-model view of one server.
 
     Lists the server's models, attaches the metadata the scan needs
@@ -340,11 +421,15 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
 
     `deadline` (a monotonic timestamp) bounds the listing probes and stops the
     per-model metadata walk once the shared scan budget is spent, returning
-    the models described so far."""
+    the models described so far. `auth` resolves the per-server credentials
+    from `discover_servers`' mapping (or `headers` can carry them directly);
+    the key is also given to the metadata client, so a key-protected Strata's
+    `loaded` state and context window are not lost to a 401."""
     from .config import Config
     from .llm import LLMClient
 
     root = _root(base_url)
+    headers = {**(headers or {}), **_auth_headers(base_url, auth)} or None
     entries = None
     for prefix in ("/v1", "/api/v1"):
         got = _list_entries(root + prefix + "/models", timeout, headers,
@@ -359,10 +444,17 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
         elif label == "LM Studio":
             entries = _list_entries(root + "/api/v0/models", timeout, headers,
                                     deadline)
+        elif label in ("Strata", "Avalon"):
+            entries = _strata_entries(root, timeout, headers, deadline)
     entries = entries or []
 
     cfg = Config()
     cfg.base_url = base_url
+    # The metadata walk (loaded state, /props context) goes through LLMClient,
+    # which reads the key from cfg rather than this function's headers.
+    auth_header = str((headers or {}).get("Authorization") or "")
+    if auth_header.lower().startswith("bearer "):
+        cfg.api_key = auth_header[7:].strip()
     client = LLMClient(cfg)
     states = client.loaded_models() or {}
 
@@ -379,8 +471,18 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
         except Exception:
             info = {}
         rec: dict = {"id": mid, "base_url": base_url}
+        status = entry.get("status")
+        status = (str(status.get("value") or "").lower()
+                  if isinstance(status, dict) else "")
         if mid in states:
             rec["loaded"] = states[mid] == "loaded"
+        elif status in ("loaded", "unloaded"):
+            # llama-server's router and Strata/Avalon use the same shape.
+            rec["loaded"] = status == "loaded"
+        elif "loaded" in entry:
+            # Strata/Avalon's /health marker, when the authenticated listing
+            # (and therefore `states`) was unavailable.
+            rec["loaded"] = bool(entry["loaded"])
         else:
             rec["loaded"] = None
         # Preserve the server metadata that classifies a model's modality:
@@ -396,8 +498,13 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
             rec["recipe"] = str(recipe)
         if info.get("size_bytes"):
             rec["size_bytes"] = int(info["size_bytes"])
-        if info.get("context_length"):
-            rec["context_length"] = int(info["context_length"])
+        ctx = info.get("context_length") or entry.get("context_length") \
+            or entry.get("max_context_length") or entry.get("max_model_len")
+        if ctx:
+            try:
+                rec["context_length"] = int(ctx)
+            except (TypeError, ValueError):
+                pass
         quant = _quant_of(entry)
         if quant:
             rec["quant"] = quant

@@ -203,6 +203,74 @@ def test_scan_reads_profiles_from_the_gui_config_not_the_cli_global(
     assert seen["profile_urls"] == [base]      # the stray server is not probed
 
 
+def test_scan_sends_each_profiles_key_to_its_own_server(gui, monkeypatch):
+    """A Strata server rejects an unauthenticated /v1/models. The scan must
+    carry the key stored in its profile, and only to that profile's origin."""
+    from pedacito import discovery
+    from pedacito.gui import settings_api
+    _write(gui, '''\
+default_profile = "strata"
+[universal]
+vram_gb = 24
+
+[profiles.strata]
+base_url = "http://127.0.0.1:8090/v1"
+model = "qwen3.8-flash"
+provider = "strata"
+api_key = "sk-strata"
+
+[profiles.other]
+base_url = "http://127.0.0.1:9000/v1"
+model = "other-model"
+api_key = "sk-other"
+''')
+    seen = {}
+
+    def spy(*a, **k):
+        seen.update(k)
+        return []
+
+    monkeypatch.setattr(discovery, "discover_servers", spy)
+    settings_api.scan_models(urls=[])
+    auth = seen["auth"]
+    assert auth[discovery.normalize_url("http://127.0.0.1:8090/v1")] == \
+        {"Authorization": "Bearer sk-strata"}
+    assert auth[discovery.normalize_url("http://127.0.0.1:9000/v1")] == \
+        {"Authorization": "Bearer sk-other"}
+    assert seen["profile_urls"] == ["http://127.0.0.1:8090/v1",
+                                    "http://127.0.0.1:9000/v1"]
+
+
+def test_scan_passes_the_keys_to_describe_models(gui, monkeypatch):
+    """Listing is only half the scan: the metadata walk needs the same key or
+    Strata's /props answers 401 and the context/size columns stay empty."""
+    from pedacito import discovery
+    from pedacito.gui import settings_api
+    _write(gui, '''\
+[profiles.strata]
+base_url = "http://127.0.0.1:8090/v1"
+model = "qwen3.8-flash"
+provider = "strata"
+api_key = "sk-strata"
+''')
+    seen = {}
+
+    def fake_discover(*a, **k):
+        return [("Strata", "http://127.0.0.1:8090/v1", ["qwen3.8-flash"])]
+
+    def fake_describe(base_url, *a, **k):
+        seen.update(k)
+        return [{"id": "qwen3.8-flash", "base_url": base_url, "loaded": True,
+                 "context_length": 131072}]
+
+    monkeypatch.setattr(discovery, "discover_servers", fake_discover)
+    monkeypatch.setattr(discovery, "describe_models", fake_describe)
+    out = settings_api.scan_models(urls=[])
+    assert [m["model_id"] for m in out["models"]] == ["qwen3.8-flash"]
+    assert seen["auth"][discovery.normalize_url(
+        "http://127.0.0.1:8090/v1")] == {"Authorization": "Bearer sk-strata"}
+
+
 def test_scan_dedups_even_when_discovery_repeats_a_server(gui, fake_local,
                                                           monkeypatch):
     """Belt and braces at the display layer: if discovery ever hands the same

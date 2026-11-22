@@ -395,6 +395,57 @@ def probe_server(base_url: str, api_key: str, which: str = "user",
     return {"ok": True, "models": ids}
 
 
+def _endpoint_auth(flat: dict, profiles: dict) -> dict:
+    """Per-server Authorization headers for a discovery scan.
+
+    A profile's own `api_key`/`api_key_env` is attached to that profile's
+    endpoint only; a profile that points at the universal endpoint may inherit
+    `[universal]`'s key. Keys never cross origins, so scanning several local
+    servers cannot leak one server's credential to another. Strata/Avalon also
+    accept their conventional environment variables when the profile labels
+    itself as one of those runtimes. Returns `{normalized_url: headers}` for
+    `discovery.discover_servers(auth=...)` and `describe_models(auth=...)`.
+    """
+    from .. import discovery
+
+    flat_url = str(flat.get("base_url") or "")
+
+    def key_for(body: dict, fallback: bool) -> str:
+        key = str(body.get("api_key") or "")
+        env = str(body.get("api_key_env") or "")
+        if env:
+            key = os.environ.get(env, "") or key
+        if not key and str(body.get("provider") or "").lower() in (
+                "strata", "avalon", "local-moe", "local_moe", "localmoe"):
+            for env in ("STRATA_API_KEY", "AVALON_API_KEY"):
+                key = os.environ.get(env, "") or key
+        if not key and fallback:
+            key = str(flat.get("api_key") or "")
+            env = str(flat.get("api_key_env") or "")
+            if env:
+                key = os.environ.get(env, "") or key
+        return key
+
+    auth: dict[str, dict] = {}
+    for body in (profiles or {}).values():
+        if not isinstance(body, dict):
+            continue
+        base = str(body.get("base_url") or flat_url or "")
+        if not base:
+            continue
+        same_origin = bool(flat_url) and _url_origin(base) == _url_origin(flat_url)
+        key = key_for(body, same_origin)
+        if key:
+            auth[discovery.normalize_url(base)] = {
+                "Authorization": f"Bearer {key}"}
+    if flat_url:
+        key = key_for(flat, False)
+        if key:
+            auth.setdefault(discovery.normalize_url(flat_url),
+                            {"Authorization": f"Bearer {key}"})
+    return auth
+
+
 def list_profiles() -> dict:
     """The profiles table (identity + measured scores + recommendations) for
     the settings page, from the same renderer the CLI uses."""
@@ -404,19 +455,44 @@ def list_profiles() -> dict:
     return {"profiles": rows, "recommendations": profiles_mod.recommend(rows)}
 
 
+def _user_scan_config() -> tuple[dict, dict]:
+    """The user config's flat settings and profile bodies for a scan."""
+    try:
+        return settings.validate_text(_read_text(config_path("user")))
+    except ConfigError:
+        return {}, {}
+
+
+def _scan_profile_urls(flat: dict, profiles: dict) -> list[str]:
+    """Every server URL the user config already names, deduplicated."""
+    urls = [flat.get("base_url")] if flat.get("base_url") else []
+    urls += [body.get("base_url") for body in (profiles or {}).values()
+             if isinstance(body, dict) and body.get("base_url")]
+    return list(dict.fromkeys(str(u) for u in urls if u))
+
+
 def scan_servers() -> dict:
     """Discover servers and list each one's models with metadata (loaded,
-    size, context, embedding/too-big already dropped)."""
+    size, context, embedding/too-big already dropped).
+
+    Existing profiles are probed too, with their own API key: a Strata server
+    behind a key is not invisible just because it listens on a custom port or
+    its OpenAI listing rejects an unauthenticated probe."""
     from .. import discovery
+    flat, profiles = _user_scan_config()
+    auth = _endpoint_auth(flat, profiles)
     servers = []
     seen: set[str] = set()
-    for label, base_url, _ids in discovery.discover_servers(timeout=1.5):
+    for label, base_url, _ids in discovery.discover_servers(
+            timeout=1.5, profile_urls=_scan_profile_urls(flat, profiles),
+            auth=auth):
         key = _norm_url(base_url)
         if key in seen:
             continue          # the same server spelled two ways: probe once
         seen.add(key)
         servers.append({"label": label, "base_url": base_url,
-                        "models": discovery.describe_models(base_url)})
+                        "models": discovery.describe_models(base_url,
+                                                            auth=auth)})
     return {"servers": servers}
 
 
@@ -1209,22 +1285,17 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
         vram = int(vram_gb or 0)
     except (TypeError, ValueError):
         vram = 0
-    try:
-        flat, existing = settings.validate_text(_read_text(config_path("user")))
-    except ConfigError:
-        flat, existing = {}, {}
+    flat, existing = _user_scan_config()
     # Re-find servers on custom ports from the same config the import reads:
-    # one source of truth, not the CLI's own config global.
-    profile_urls = []
-    if flat.get("base_url"):
-        profile_urls.append(flat["base_url"])
-    for body in existing.values():
-        if body.get("base_url"):
-            profile_urls.append(body["base_url"])
-    profile_urls = list(dict.fromkeys(profile_urls))
+    # one source of truth, not the CLI's own config global. The profiles'
+    # API keys travel with their URLs, so a key-protected local server
+    # (Strata/Avalon) is listed instead of answering 401 and disappearing.
+    profile_urls = _scan_profile_urls(flat, existing)
+    auth = _endpoint_auth(flat, existing)
     found = discovery.discover_servers(timeout=2.0, urls=explicit,
                                        profile_urls=profile_urls,
-                                       deadline=discovery_deadline)
+                                       deadline=discovery_deadline,
+                                       auth=auth)
     imported = {(_norm_url(b.get("base_url", flat.get("base_url", ""))),
                  str(b.get("model") or "")) for b in existing.values()}
     taken = set(existing)
@@ -1240,7 +1311,7 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
         seen_servers.add(skey)
         try:
             recs = discovery.describe_models(base_url, vram_gb=vram,
-                                             deadline=deadline)
+                                             deadline=deadline, auth=auth)
         except Exception:
             recs = []
         rows = []
