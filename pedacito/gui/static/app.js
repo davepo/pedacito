@@ -931,6 +931,16 @@ function connect(seq) {
     if (e && e.message) PDC.toast(e.message);
     refreshState();
   });
+  on('interleaved', (e) => {
+    // Live tool-call cards from the interleaved engine. Append locally so
+    // the Activity pane moves without a /api/state round trip; the poll
+    // snapshot remains authoritative after a reconnect.
+    const eng = S.status && S.status.engine;
+    if (eng && e && e.kind) {
+      eng.interleaved = (eng.interleaved || []).concat([e]).slice(-120);
+      emit();
+    }
+  });
   // Auto-update: the check's notice and the upgrade run's start/end resync
   // state; per-line subprocess output appends locally (like 'stream' does).
   on('update', () => refreshState());
@@ -5390,6 +5400,95 @@ function actParts(a) {                 // "app.py L12-40" -> file + line badges
   return [html`<span key="f" class="tx">${d}</span>`];
 }
 
+function ilvBrief(args) {
+  if (!args || typeof args !== 'object') return '';
+  const v = args.file || args.path || args.pattern || args.command || args.query || '';
+  return String(v).slice(0, 80);
+}
+
+// Live tool-call cards for an interleaved run: one compact collapsible card
+// per tool call (paired with its result by id), plus edit, gate-error and
+// finish cards. <details> keeps them collapsed by default; the CSS uses the
+// same theme variables as the rest of the Activity pane.
+function InterleavedFeed({ items }) {
+  const cards = [];
+  const byId = {};
+  for (const e of items) {
+    if (e.kind === 'tool_call') {
+      const c = { kind: 'tool', name: e.name, id: e.id, args: e.args,
+                  turn: e.turn, pending: true };
+      if (e.id) byId[e.id] = c;
+      cards.push(c);
+    } else if (e.kind === 'tool_result') {
+      const c = e.id && byId[e.id];
+      if (c) Object.assign(c, { ok: e.ok, preview: e.preview, chars: e.chars,
+                                gate_errors: e.gate_errors, pending: false });
+      else cards.push({ kind: 'tool', name: e.name, id: e.id, ok: e.ok,
+                        preview: e.preview, chars: e.chars,
+                        gate_errors: e.gate_errors, turn: e.turn, pending: false });
+    } else if (e.kind === 'edit_staged' || e.kind === 'gate_error'
+               || e.kind === 'finish' || e.kind === 'interleaved_turn') {
+      cards.push({ ...e, kind: e.kind === 'edit_staged' ? 'edit'
+                   : e.kind === 'gate_error' ? 'gate'
+                   : e.kind === 'interleaved_turn' ? 'turn' : 'finish' });
+    }
+  }
+  if (!cards.length) return null;
+  return html`
+    <div class="eng-sec ilv-sec">
+      <b>${PDC.t('gui.activity.interleaved', null, 'Interleaved run')}</b>
+      <div class="ilv">
+        ${cards.map((c, i) => {
+          if (c.kind === 'turn') {
+            const names = Array.isArray(c.calls) ? c.calls : [];
+            return html`<div key=${i} class="ilv-turn">
+              ${PDC.t('gui.activity.turn', null, 'turn')} ${c.turn}
+              ${names.length ? ' \u00B7 ' + names.join(', ') : ''}
+              ${c.note ? html`<span class="ilv-note">${c.note}</span>` : null}</div>`;
+          }
+          if (c.kind === 'tool') return html`
+            <details key=${i} class=${'ilv-card' + (c.pending ? ' pending' : (c.ok === false ? ' bad' : ' ok'))}>
+              <summary>
+                <span class="ilv-name">${c.name}</span>
+                <span class="ilv-args">${ilvBrief(c.args)}</span>
+                <span class=${'ilv-state' + (c.pending ? ' pending' : (c.ok === false ? ' bad' : ''))}>
+                  ${c.pending ? '\u2026' : (c.ok === false ? '\u2717' : '\u2713')}</span>
+              </summary>
+              ${c.preview ? html`<pre class="ilv-pre">${c.preview}</pre>` : null}
+              ${c.gate_errors ? html`<div class="ilv-gates">${c.gate_errors} ${PDC.t('gui.activity.gate_errors', null, 'gate error(s)')}</div>` : null}
+            </details>`;
+          if (c.kind === 'edit') return html`
+            <details key=${i} class=${'ilv-card edit' + (c.applied ? ' ok' : '')}>
+              <summary>
+                <span class="ilv-name">${c.deleted ? PDC.t('gui.activity.delete', null, 'delete') : PDC.t('gui.activity.edit', null, 'edit')}</span>
+                <span class="ilv-args">${c.file}</span>
+                <span class="ilv-diffstat">+${c.added || 0} \u2212${c.removed || 0}</span>
+                <span class="ilv-state">${c.applied ? PDC.t('gui.activity.applied', null, 'applied') : PDC.t('gui.activity.staged', null, 'staged')}</span>
+              </summary>
+              ${c.message ? html`<div class="ilv-msg">${c.message}</div>` : null}
+              ${c.diff ? html`<pre class="ilv-pre diff">${c.diff}</pre>` : null}
+            </details>`;
+          if (c.kind === 'gate') return html`
+            <details key=${i} class="ilv-card bad" open>
+              <summary>
+                <span class="ilv-name">${PDC.t('gui.activity.gate_error', null, 'gate error')}</span>
+                <span class="ilv-args">${c.file}</span>
+              </summary>
+              <div class="ilv-msg">${c.gate ? c.gate + ': ' : ''}${c.message}${c.rolled_back ? ' (' + PDC.t('gui.activity.rolled_back', null, 'rolled back') + ')' : ''}</div>
+            </details>`;
+          if (c.kind === 'finish') return html`
+            <div key=${i} class=${'ilv-card finish ' + (c.ok ? 'ok' : 'bad')}>
+              <b>${c.ok ? PDC.t('gui.activity.finish_ok', null, 'Finished') : PDC.t('gui.activity.finish_bad', null, 'Stopped')} \u00B7 ${c.stop_reason}</b>
+              ${c.summary ? html`<div class="ilv-msg">${c.summary}</div>` : null}
+              <div class="ilv-meta">${c.turns || 0} ${PDC.t('gui.activity.turns', null, 'turns')} \u00B7 ${c.tool_calls || 0} ${PDC.t('gui.activity.tool_calls', null, 'tool calls')}${c.changed_files && c.changed_files.length ? ' \u00B7 ' + c.changed_files.join(', ') : ''}</div>
+              ${c.error ? html`<div class="ilv-msg bad">${c.error}</div>` : null}
+            </div>`;
+          return null;
+        })}
+      </div>
+    </div>`;
+}
+
 function ActivityPane() {
   const s = S.status, j = s.job, eng = s.engine || {};
   const lastActivity = useMemo(() => {
@@ -5440,6 +5539,7 @@ function ActivityPane() {
               + (eng.specialist.specialty || '?') + '\''}>${PDC.t('gui.activity.specialist', null, 'specialist')}
               <b>${eng.specialist.profile}</b></span>` : null}
         </div>
+        <${InterleavedFeed} items=${(eng.interleaved || []).slice(-40)} />
         ${reqs.length ? html`
           <div class="eng-sec"><b>${PDC.t('gui.activity.req_ledger', null, 'Requirement ledger')}</b><ol class="reqs">
             ${reqs.map((rq, i) => html`

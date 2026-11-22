@@ -231,6 +231,28 @@ class _Feed:
         if kind == "step":
             self.activity(f"{f.get('n', '?')}. {f.get('action', '')} "
                           f"{f.get('detail', '')}".rstrip())
+        elif kind == "interleaved_turn":
+            self.activity(f"turn {f.get('turn', '?')}: "
+                          f"{len(f.get('calls') or [])} tool call(s)")
+        elif kind == "tool_call":
+            self.activity(f"-> {f.get('name', '?')}")
+        elif kind == "tool_result":
+            self.activity(f"<- {f.get('name', '?')} "
+                          f"({'ok' if f.get('ok') else 'FAILED'}, "
+                          f"{f.get('chars', 0)} chars)")
+        elif kind == "edit_staged":
+            verb = "applied" if f.get("applied") else "staged"
+            self.activity(f"edit {verb}: {f.get('file', '?')} "
+                          f"(+{f.get('added', 0)}/-{f.get('removed', 0)})")
+        elif kind == "gate_error":
+            self.activity(f"gate error ({f.get('gate', '?')}): "
+                          f"{f.get('file', '?')} -- {f.get('message', '')}")
+        elif kind == "finish":
+            self.activity(f"interleaved finish: "
+                          f"{'ok' if f.get('ok') else 'not ok'} "
+                          f"({f.get('stop_reason', '')}, "
+                          f"{f.get('turns', 0)} turns, "
+                          f"{f.get('tool_calls', 0)} tool calls)")
         elif kind == "recovery":
             self.activity(f"recovery: {f.get('signal', '')}")
         elif kind == "steer":

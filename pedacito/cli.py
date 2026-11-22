@@ -143,6 +143,16 @@ def _add_common(p, paths_nargs="+", dest="paths"):
                    help=i18n.t("cli.opt.lang"))
 
 
+def _add_execution_mode(p):
+    """--execution-mode: the task engine for this run (ask/auto/new/eval)."""
+    p.add_argument("--execution-mode", dest="execution_mode",
+                   choices=("two_phase", "interleaved", "auto"), default=None,
+                   help="execution engine for this run: two_phase (gather "
+                        "then answer), interleaved (one agentic read/edit/"
+                        "test conversation) or auto (pick by model class); "
+                        "overrides execution_mode in the config")
+
+
 def _load_cli_images(args) -> list[dict]:
     """Load and validate any --image paths passed on the CLI."""
     paths = list(getattr(args, "image", None) or ())
@@ -307,6 +317,9 @@ def _config(args) -> Config:
     if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
+    if getattr(args, "execution_mode", None):
+        cfg.execution_mode = str(args.execution_mode).strip().lower()
+        cfg.sources["execution_mode"] = "--execution-mode"
     if getattr(args, "max_tokens_budget", None) is not None:
         cfg.max_total_tokens = args.max_tokens_budget
         cfg.sources["max_total_tokens"] = "--max-tokens-budget"
@@ -3539,6 +3552,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                             ".pedacito/trajectories/ (redacted, local only) "
                             "for SFT/GRPO dataset filtering; same as "
                             "record_trajectories = true for this run only")
+    _add_execution_mode(p_ask)
 
     p_explain = sub.add_parser(
         "explain", help=t("cli.cmd.explain"))
@@ -3615,6 +3629,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                        help="expand the project description into a concrete, "
                             "sectioned spec (with interface contracts) before "
                             "planning")
+    _add_execution_mode(p_new)
 
     p_auto = sub.add_parser(
         "auto", help="autonomous loop: plan a goal, then implement its tasks "
@@ -3673,6 +3688,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_auto.add_argument("-y", "--yes", action="store_true",
                         help="assume yes: skip interactive confirmations, "
                              "including the Task-vs-Auto nudge")
+    _add_execution_mode(p_auto)
 
     p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
@@ -4040,6 +4056,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     for flag in ("--url", "--model", "--config", "--profile"):
         p_eval.add_argument(flag)
     p_eval.add_argument("--root", default=None)
+    _add_execution_mode(p_eval)
     p_eval.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_bench = sub.add_parser(

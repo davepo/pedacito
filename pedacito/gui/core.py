@@ -58,7 +58,10 @@ RUN_KINDS = ("task", "explain", "auto", "new", "arena")
 EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
                "edit_intents": "edit", "incremental_edit": "edit",
                "verify": "verify", "tests": "verify",
-               "rehydrate": "gather", "fold": "gather"}
+               "rehydrate": "gather", "fold": "gather",
+               "interleaved_turn": "edit", "tool_call": "gather",
+               "tool_result": "gather", "edit_staged": "edit",
+               "gate_error": "verify"}
 # client.site -> phase, while a run is live (the call site is authoritative).
 SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
               "verify": "verify", "repair": "repair"}
@@ -558,6 +561,9 @@ class State:
         self.phase = ""
         self.gather_steps = 0
         self.actions: deque[dict] = deque(maxlen=60)
+        # Interleaved engine feed: the live tool-call cards in the Activity
+        # pane (bounded; /api/state carries the newest tail, SSE the deltas).
+        self.interleaved: deque[dict] = deque(maxlen=120)
         # Specialist routing (#50): the profile/model/tag of the most recent
         # `specialist_routed` event; cleared when a model swap hands the card
         # back to the worker's own model.
@@ -1195,6 +1201,7 @@ class State:
                 self.phase = "gather"
                 self.gather_steps = 0
                 self.actions.clear()
+                self.interleaved.clear()
                 self.folds = 0
                 self.llm_call = {}
             job = self.job
@@ -1297,6 +1304,10 @@ class State:
                 self.llm_call = {}
             self.bus.publish("status")
             return
+        if kind in ("interleaved_turn", "tool_call", "tool_result",
+                    "edit_staged", "gate_error", "finish"):
+            self._note_interleaved(kind, f)
+            return
         action = None
         step_n = None
         if kind == "step":
@@ -1365,6 +1376,61 @@ class State:
                 self.specialist = {}   # the worker got its card back
         if ping:
             self.bus.publish("status")
+
+    def _note_interleaved(self, kind: str, f: dict) -> None:
+        """One interleaved-engine event: keep a bounded feed for the Activity
+        pane's live tool-call cards and push it to SSE listeners. The phase
+        follows EVENT_PHASE like every other harness event; the /api/state
+        poll stays authoritative after a reconnect."""
+        rec: dict = {"kind": kind, "t": time.time(), "turn": f.get("turn", 0)}
+        if kind == "interleaved_turn":
+            rec.update(calls=[str(c) for c in (f.get("calls") or [])[:12]],
+                       tokens=int(f.get("tokens") or 0),
+                       mode=str(f.get("mode") or ""),
+                       text=bool(f.get("text")),
+                       note=str(f.get("note") or "")[:200])
+        elif kind == "tool_call":
+            rec.update(name=str(f.get("name") or ""),
+                       id=str(f.get("id") or ""),
+                       args=f.get("args") or {})
+        elif kind == "tool_result":
+            rec.update(name=str(f.get("name") or ""),
+                       id=str(f.get("id") or ""),
+                       ok=bool(f.get("ok")),
+                       chars=int(f.get("chars") or 0),
+                       preview=str(f.get("preview") or "")[:400],
+                       novel=bool(f.get("novel")),
+                       gate_errors=int(f.get("gate_errors") or 0))
+        elif kind == "edit_staged":
+            rec.update(file=str(f.get("file") or ""),
+                       added=int(f.get("added") or 0),
+                       removed=int(f.get("removed") or 0),
+                       applied=bool(f.get("applied")),
+                       deleted=bool(f.get("deleted")),
+                       fuzzy=bool(f.get("fuzzy")),
+                       message=str(f.get("message") or "")[:200],
+                       diff=str(f.get("diff") or "")[:4000])
+        elif kind == "gate_error":
+            rec.update(file=str(f.get("file") or ""),
+                       gate=str(f.get("gate") or ""),
+                       message=str(f.get("message") or "")[:300],
+                       rolled_back=bool(f.get("rolled_back")))
+        elif kind == "finish":
+            rec.update(ok=bool(f.get("ok")),
+                       stop_reason=str(f.get("stop_reason") or ""),
+                       summary=str(f.get("summary") or "")[:600],
+                       changed_files=[str(x) for x in
+                                      (f.get("changed_files") or [])[:30]],
+                       turns=int(f.get("turns") or 0),
+                       tool_calls=int(f.get("tool_calls") or 0),
+                       applied=bool(f.get("applied")),
+                       error=str(f.get("error") or "")[:300])
+        with self.lock:
+            self.interleaved.append(rec)
+            if kind in EVENT_PHASE:
+                self.phase = EVENT_PHASE[kind]
+        self.bus.publish("interleaved", **rec)
+        self.bus.publish("status")
 
     # --- auto-update notice & upgrade run (pedacito.update) ---------------------
 
@@ -1439,6 +1505,7 @@ class State:
             agent, client = self.agent, self.client
             job = self.job if self.job is not None and self.job.active else None
             actions = [dict(a) for a in self.actions][-12:]
+            interleaved = [dict(r) for r in self.interleaved][-40:]
             steps = self.gather_steps
             specialist = dict(self.specialist)
             stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
@@ -1472,7 +1539,7 @@ class State:
         return {"phase": phase, "steps": steps, "calls": stats.get("calls", 0),
                 "read_spans": read_spans,
                 "requirements": requirements[:8], "actions": actions,
-                "specialist": specialist}
+                "specialist": specialist, "interleaved": interleaved}
 
     # --- live permission broker ----------------------------------------------
 
@@ -1905,6 +1972,12 @@ class State:
                      (workspace.list_backups(root)[:8] if root else [])]
         needs_setup = not USER_CONFIG.exists()
         engine_payload = self.engine()
+        # Resolving "auto" may read the model card from disk: outside the lock.
+        try:
+            resolved_mode = (config_mod.resolve_execution_mode(cfg)
+                             if cfg is not None else "two_phase")
+        except Exception:
+            resolved_mode = "two_phase"
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -2057,6 +2130,10 @@ class State:
                                      if cfg else "default"),
                 "model_class": (config_mod.capability_profile(cfg)
                                 if cfg else ""),
+                "execution_mode": (str(getattr(cfg, "execution_mode",
+                                               "two_phase") or "two_phase")
+                                   if cfg else "two_phase"),
+                "resolved_execution_mode": resolved_mode,
                 "reasoning_capable": bool(cfg) and (
                     config_mod.is_local_moe(cfg)
                     or str(getattr(cfg, "reasoning_effort", "default"))

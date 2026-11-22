@@ -885,6 +885,59 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .atool.k-model-swap { color: var(--cyan); border-color: var(--line2); }
 #engCount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* Interleaved engine: compact collapsible live tool-call cards. Same theme
+   variables as the action feed above; <details> keeps each card collapsed
+   until the user opens it, so a long run stays scannable. */
+.ilv { display: flex; flex-direction: column; gap: 4px;
+  max-height: 260px; overflow-y: auto; font-size: 11.5px; }
+.ilv-turn { font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .6px; padding: 3px 0 1px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.ilv-turn:first-child { border-top: 0; }
+.ilv-note { text-transform: none; letter-spacing: 0; color: var(--warning); }
+.ilv-card { border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-alt); }
+.ilv-card > summary { display: flex; gap: 6px; align-items: baseline;
+  padding: 3px 8px; cursor: pointer; list-style: none;
+  color: var(--muted); }
+.ilv-card > summary::-webkit-details-marker { display: none; }
+.ilv-card > summary::before { content: '\25B8'; flex: none; font-size: 9px;
+  color: var(--muted); }
+.ilv-card[open] > summary::before { content: '\25BE'; }
+.ilv-card.ok { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.ilv-card.bad { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.ilv-card.pending { opacity: .75; }
+.ilv-name { flex: none; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .4px; color: var(--text); font-family: var(--mono); }
+.ilv-card.bad .ilv-name { color: var(--danger); }
+.ilv-card.edit .ilv-name { color: var(--warning); }
+.ilv-args { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-family: var(--mono); }
+.ilv-diffstat { flex: none; font-family: var(--mono); font-size: 10px;
+  color: var(--cyan); }
+.ilv-state { flex: none; font-size: 10px; font-weight: 700; color: var(--success); }
+.ilv-state.bad { color: var(--danger); }
+.ilv-state.pending { color: var(--muted); }
+.ilv-card.edit .ilv-state { color: var(--muted); font-weight: 600; }
+.ilv-card.edit.ok .ilv-state { color: var(--success); }
+.ilv-pre { margin: 0; padding: 5px 8px; border-top: 1px solid var(--border);
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.45;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow-y: auto; }
+.ilv-pre.diff { color: var(--muted); }
+.ilv-msg { padding: 4px 8px; border-top: 1px solid var(--border);
+  color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.ilv-msg.bad { color: var(--danger); }
+.ilv-gates { padding: 3px 8px; border-top: 1px solid var(--border);
+  color: var(--danger); font-size: 10.5px; }
+.ilv-card.finish { padding: 5px 8px; }
+.ilv-card.finish b { font-size: 11px; color: var(--text); }
+.ilv-card.finish.ok b { color: var(--success); }
+.ilv-card.finish.bad b { color: var(--danger); }
+.ilv-card.finish .ilv-msg { border-top: 0; padding: 3px 0 0; }
+.ilv-meta { font-size: 10px; color: var(--muted); padding-top: 2px;
+  font-family: var(--mono); overflow-wrap: anywhere; }
+
 /* ------------------------------------------------------------- workspace pane --
    Bottom-right panel: Files / Backups / Logs, plus 🌐 Preview when the project
    has HTML pages. The #term element and its ANSI classes stay exactly as

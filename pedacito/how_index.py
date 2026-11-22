@@ -309,6 +309,9 @@ CLI_COMMANDS = [
             {"flag": "--no-plan", "help": "never auto-plan this task"},
             {"flag": "--review-plan",
              "help": "show the plan and ask before running it"},
+            {"flag": "--execution-mode MODE",
+             "help": "task engine for this run: two_phase, interleaved or "
+                     "auto (overrides execution_mode in the config)"},
         ],
         "common": True,
     },
@@ -2623,6 +2626,31 @@ GUI_TOPICS = [
         "cli": ["config"],
     },
     {
+        "id": "execution-mode",
+        "title": "Choose the task engine: two_phase, interleaved or auto "
+                 "(execution_mode)",
+        "summary": "two_phase gathers context then answers with edit blocks; "
+                   "interleaved runs one agentic conversation where the model "
+                   "reads, edits, runs tests and fixes until the task is done. "
+                   "auto picks interleaved for hosted APIs, local-MoE servers "
+                   "and calibrated large local models whose card chose native "
+                   "tool calls; tiny/small/medium local models stay two_phase.",
+        "steps": [
+            "⚙ Settings → Profiles → [Select Profile] → Reasoning & Execution "
+            "Overrides → execution_mode",
+            "Or per run: pedacito ask . -t \"...\" --execution-mode interleaved",
+            "In the TUI: /mode interleaved (alias /exec-mode); /status shows "
+            "the active and the resolved mode",
+            "The GUI Activity pane shows live tool-call cards while an "
+            "interleaved run works; review and dry-run use the same sign-off "
+            "page as two_phase",
+        ],
+        "keywords": ["execution mode", "interleaved", "two phase", "agentic",
+                     "agent loop", "engine", "tool loop", "auto mode"],
+        "settings": ["execution_mode", "tool_mode"],
+        "cli": ["ask", "auto"],
+    },
+    {
         "id": "local-acceleration",
         "title": "Speed up local servers: KV prompt cache and n-gram "
                  "speculation (cache_prompt, prompt_lookup_num_tokens)",
@@ -2930,6 +2958,9 @@ _SETTING_GUI = {
                   "Execution Overrides → edit_style",
     "tool_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                  "Execution Overrides → tool_mode",
+    "execution_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
+                      "Execution Overrides → execution_mode (or "
+                      "--execution-mode per run, TUI /mode live)",
     "best_of": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                "Execution Overrides → best_of",
     "fuzzy_match": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
@@ -2949,9 +2980,9 @@ _SETTING_GUI = {
 _REASONING_KEYS = {
     "disable_thinking", "thinking_suffix", "step_reasoning_first",
     "incremental_edit_loop", "edit_plan_brief", "dynamic_tool_pruning",
-    "prompt_pack", "answer_mode", "edit_style", "tool_mode", "best_of",
-    "fuzzy_match", "temperature", "temperature_answer", "max_output_tokens",
-    "context_tokens",
+    "prompt_pack", "answer_mode", "edit_style", "tool_mode", "execution_mode",
+    "best_of", "fuzzy_match", "temperature", "temperature_answer",
+    "max_output_tokens", "context_tokens",
 }
 _CONNECTION_KEYS = {
     "base_url", "api_key", "model", "tier", "vram_gb", "json_mode", "timeout",
@@ -2989,6 +3020,8 @@ _SETTING_KEYWORDS = {
                               "symbol edits"],
     "edit_plan_brief": ["edit plan", "brief before edits"],
     "step_reasoning_first": ["reasoning first", "reason before action"],
+    "execution_mode": ["execution mode", "interleaved", "two phase",
+                       "agentic loop", "agent loop", "task engine"],
     "max_read_tokens": ["read budget", "token budget", "small context"],
     "max_gathered_chars": ["gather budget", "context budget", "small window"],
     "max_total_model_calls": ["call cap", "model call budget"],
