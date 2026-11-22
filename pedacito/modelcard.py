@@ -1286,11 +1286,13 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
     arch = None if hosted else arch_defaults.match_arch(cfg.model)
+    local_moe = not hosted and is_local_moe(cfg)
     arch_ctx = 0
     if arch is not None:
         arch_ctx = arch_defaults.arch_context_tokens(
             arch, info, int(getattr(cfg, "vram_gb", 0) or 0),
-            int(info.get("size_bytes") or 0))
+            int(info.get("size_bytes") or 0),
+            is_local_moe=local_moe)
         say(f"  architecture     {arch['family']} "
             f"(recommended window {arch_ctx:,})")
 

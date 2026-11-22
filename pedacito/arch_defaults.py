@@ -200,14 +200,24 @@ def recommended_temperatures(entry: dict, *, thinking_enabled: bool = False,
 
 
 def arch_context_tokens(entry: dict, info: dict, vram_gb: int = 0,
-                        size_bytes: int = 0) -> int:
+                        size_bytes: int = 0, *,
+                        is_local_moe: bool = False) -> int:
     """The recommended window capped by what the machine can actually hold:
     the server's reported context length and the VRAM KV-cache estimate
-    (the same `auto_fit` window). A missing signal simply does not cap."""
+    (the same `auto_fit` window). A missing signal simply does not cap.
+
+    For tiered `local-moe` servers (Strata/Avalon), weights spill across DDR5
+    and the server explicitly advertises its configured `max_context` (often
+    64k–131k): trust the server's reported window instead of shrinking it down
+    to a dense-GPU 32k architecture preset or GPU-only VRAM cap."""
     from .config import hardware_context_tokens
     ctx = int(entry.get("context_tokens") or 8192)
     server = int((info or {}).get("context_length")
                  or (info or {}).get("max_context_length") or 0)
+    if is_local_moe:
+        if server > 0:
+            return max(1024, server)
+        return max(1024, ctx)
     if server > 0:
         ctx = min(ctx, server)
     if vram_gb and size_bytes:
@@ -219,7 +229,12 @@ def arch_context_tokens(entry: dict, info: dict, vram_gb: int = 0,
 
 def needle_step_down(window: int) -> int | None:
     """The next smaller window to retry the long-context needle at after a
-    miss (>16k -> 16384, then -> 8192); None when there is nothing smaller."""
+    miss (>64k -> 65536, >32k -> 32768, >16k -> 16384, then -> 8192);
+    None when there is nothing smaller."""
+    if window > 65536:
+        return 65536
+    if window > 32768:
+        return 32768
     if window > 16384:
         return 16384
     if window > 8192:

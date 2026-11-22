@@ -391,7 +391,21 @@ def test_arch_context_capped_by_server_and_vram():
         == 32768
 
 
+def test_arch_context_local_moe_keeps_server_window():
+    """Strata/Avalon report their configured max_context (e.g. 131072) across
+    VRAM+DDR5; calibration must not shrink it to a dense-GPU 32k preset."""
+    entry = arch_defaults.match_arch("qwen3.8-flash")
+    assert arch_defaults.arch_context_tokens(
+        entry, {"context_length": 131072}, vram_gb=24,
+        size_bytes=20 * 1024 ** 3, is_local_moe=True) == 131072
+    # without a server-reported window, fall back to the family recommendation
+    assert arch_defaults.arch_context_tokens(
+        entry, {}, is_local_moe=True) == 32768
+
+
 def test_needle_step_down_ladder():
+    assert arch_defaults.needle_step_down(131072) == 65536
+    assert arch_defaults.needle_step_down(65536) == 32768
     assert arch_defaults.needle_step_down(32768) == 16384
     assert arch_defaults.needle_step_down(16384) == 8192
     assert arch_defaults.needle_step_down(8192) is None

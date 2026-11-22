@@ -980,21 +980,49 @@
       PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + (p.model || '') + ') is a hosted provider model and uses provider-table defaults automatically.', true);
       return;
     }
-    var msg = cal.is_image_model
-      ? t('gui.cal.probe_image_confirm', { name: name },
-          'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
-      : 'Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
-          ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
-          : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.');
-    var okLabel = cal.is_image_model ? t('gui.cal.probe_image', null, 'Probe image') : 'Run it';
-    PDC.confirm(msg, okLabel).then(function (ok) {
-      if (!ok) return;
-      PDC.api('/api/models/calibrate', { profile: name, mode: mode }).then(function (j) {
-        if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-        PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
-        PDC.refreshState();
+    if (cal.is_image_model) {
+      var imgMsg = t('gui.cal.probe_image_confirm', { name: name },
+        'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.');
+      PDC.confirm(imgMsg, t('gui.cal.probe_image', null, 'Probe image')).then(function (ok) {
+        if (!ok) return;
+        PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then(function (j) {
+          if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+          PDC.toast('Probing image profile "' + name + '" \u2014 watch the Output tab.');
+          PDC.refreshState();
+        });
       });
-    });
+      return;
+    }
+    var picked = (mode === 'full') ? 'full' : 'quick';
+    var rQuick = h('input', { type: 'radio', name: 'calMode', value: 'quick', checked: picked === 'quick',
+      onchange: function () { if (rQuick.checked) picked = 'quick'; } });
+    var rFull = h('input', { type: 'radio', name: 'calMode', value: 'full', checked: picked === 'full',
+      onchange: function () { if (rFull.checked) picked = 'full'; } });
+    var body = h('div', {},
+      h('p', { style: 'margin:0 0 10px', text: t('gui.cal.choose_mode', { name: name },
+        'Choose calibration depth for \u201c' + name + '\u201d. Progress streams to the Output tab and the tuned model card is saved automatically.') }),
+      h('label', { class: 'chk', style: 'display:flex;align-items:flex-start;gap:8px;margin-bottom:8px' },
+        rQuick,
+        h('span', {},
+          h('b', { text: t('gui.cal.mode_quick', null, 'Quick (recommended)') }),
+          h('div', { class: 'muted small-text', text: t('gui.cal.mode_quick_desc', null,
+            '1 pass per probe (~1\u20132 min). Measures tool calling, edit format, thinking A/B, specialties, temperature, and speed. Ideal for everyday setup and Strata / local-MoE servers.') }))),
+      h('label', { class: 'chk', style: 'display:flex;align-items:flex-start;gap:8px' },
+        rFull,
+        h('span', {},
+          h('b', { text: t('gui.cal.mode_full', null, 'Full suite') }),
+          h('div', { class: 'muted small-text', text: t('gui.cal.mode_full_desc', null,
+            '3 repeats per probe plus long-context needle and capability checks. More thorough, but slower (can take 5\u201315+ min on large or tiered MoE models).') }))));
+    PDC.modal(t('gui.cal.title', { name: name }, 'Calibrate \u201c' + name + '\u201d'), body, [
+      { label: t('gui.cal.cancel', null, 'Cancel') },
+      { label: t('gui.cal.run', null, 'Run calibration'), primary: true, onclick: function () {
+        PDC.api('/api/models/calibrate', { profile: name, mode: picked }).then(function (j) {
+          if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+          PDC.toast('Calibrating "' + name + '" (' + picked + ') \u2014 watch the Output tab.');
+          PDC.refreshState();
+        });
+      } }
+    ], { narrow: true });
   }
   // Calibrate All Local Models: one background job walks every LOCAL profile
   // in turn (hosted ones use provider-table defaults and never calibrate).
@@ -1032,12 +1060,21 @@
         list.appendChild(row);
       });
       var reChk = h('input', { type: 'checkbox' });
+      var modeSel = h('select', { 'aria-label': t('gui.cal.mode_label', null, 'Calibration mode') }, [
+        h('option', { value: 'quick', text: t('gui.cal.mode_quick', null, 'Quick (recommended)') }),
+        h('option', { value: 'full', text: t('gui.cal.mode_full', null, 'Full suite') })
+      ]);
+      modeSel.value = 'quick';
       var progress = h('div', { class: 'calall-progress muted small-text' });
       var body = h('div', {},
         h('p', { style: 'margin:0 0 8px', text: 'This loads each model in turn and may take several minutes. Each card is saved as soon as it finishes; progress streams to the Output tab.' }),
         list,
-        h('label', { class: 'chk', style: 'margin-top:8px' }, reChk,
-          'Re-calibrate models that already have a fresh card'),
+        h('div', { class: 'row', style: 'margin-top:8px;gap:12px;flex-wrap:wrap' },
+          h('label', { class: 'chk' }, reChk,
+            'Re-calibrate models that already have a fresh card'),
+          h('label', { class: 'row', style: 'gap:6px;align-items:center' },
+            h('span', { class: 'small-text muted', text: t('gui.cal.mode_label', null, 'Mode') }),
+            modeSel)),
         hostedCount ? h('div', { class: 'muted small-text', style: 'margin-top:6px',
           text: hostedCount + ' hosted profile(s) excluded \u2014 hosted provider models use provider-table defaults automatically.' }) : null,
         progress);
@@ -1084,7 +1121,7 @@
       function start() {
         if (started) return;
         started = true;
-        PDC.api('/api/calibrate/all', { recalibrate: reChk.checked, mode: 'quick' }).then(function (j) {
+        PDC.api('/api/calibrate/all', { recalibrate: reChk.checked, mode: modeSel.value || 'quick' }).then(function (j) {
           if (!j.ok) {
             PDC.toast(j.detail || 'could not start the calibration', true);
             started = false;
@@ -1093,6 +1130,7 @@
           if (foot) foot.innerHTML = '';
           progress.textContent = 'Starting\u2026';
           reChk.disabled = true;
+          modeSel.disabled = true;
           poll();
         });
       }
