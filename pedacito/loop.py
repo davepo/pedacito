@@ -4186,7 +4186,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
              is_repair: bool = False,
-             pinned: list | None = None) -> TaskResult:
+             pinned: list | None = None,
+             images: list[dict] | None = None) -> TaskResult:
     """`_run_ladder`, plus failure memory: a task that ends without a usable
     edit is remembered (files looked at, why) so a similar later task is warned
     off the same dead end; a success clears the warning. Zero-edit runs are
@@ -4195,6 +4196,7 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
 
     `pinned` is an optional explicit context list (`@file`, `Class.method`);
     the prompt's own @mentions are always parsed by Agent.gather.
+    `images` is an optional list of normalized image attachment dicts.
     """
     from . import memory as memory_mod
     has_saved_pinned = hasattr(cfg, "_pinned_refs")
@@ -4202,6 +4204,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if pinned is not None:
         cfg._pinned_refs = [str(p).lstrip("@").strip()
                             for p in pinned if str(p).strip()]
+    has_saved_images = hasattr(cfg, "_task_images")
+    saved_images = getattr(cfg, "_task_images", None)
+    if images is not None:
+        cfg._task_images = list(images)
     try:
         if _cancel_requested(cfg, client):
             _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
@@ -4332,6 +4338,11 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 cfg._pinned_refs = saved_pinned
             elif hasattr(cfg, "_pinned_refs"):
                 delattr(cfg, "_pinned_refs")
+        if images is not None:
+            if has_saved_images:
+                cfg._task_images = saved_images
+            elif hasattr(cfg, "_task_images"):
+                delattr(cfg, "_task_images")
 
 
 def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,

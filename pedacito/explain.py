@@ -86,7 +86,8 @@ How to answer:
 
 
 def answer(agent, question: str, verbose: bool = True, on_step=None,
-           stream: bool = False) -> str:
+           stream: bool = False,
+           images: list[dict] | None = None) -> str:
     """Answer one question about the indexed project and return the text.
 
     Runs the gather loop with the explanation framing, then answers in prose.
@@ -95,7 +96,8 @@ def answer(agent, question: str, verbose: bool = True, on_step=None,
     the CLI keeps it off and prints the returned text.
     """
     gathered = agent.gather(question, verbose=verbose,
-                            base=EXPLAIN_GATHER_BASE, on_step=on_step)
+                            base=EXPLAIN_GATHER_BASE, on_step=on_step,
+                            images=images)
     # `explain` assembles its answer brief here, so the reply-language
     # directive is appended at the same point the `answer` flow appends it in
     # `prompts.answer_system`. Empty (and therefore byte-identical) for English.
@@ -104,7 +106,8 @@ def answer(agent, question: str, verbose: bool = True, on_step=None,
     if directive:
         system = system.rstrip() + "\n\n" + directive
     reply = agent.answer(question, gathered, system=system,
-                         include_edit_format=False, stream=stream)
+                         include_edit_format=False, stream=stream,
+                         images=images)
     # P1a shadow mode: log prose-grounding findings (citations, ungrounded
     # identifiers, unaddressed requirements), never act on them.
     try:
@@ -116,3 +119,6 @@ def answer(agent, question: str, verbose: bool = True, on_step=None,
     except Exception:
         pass
     return reply
+
+
+explain_task = answer

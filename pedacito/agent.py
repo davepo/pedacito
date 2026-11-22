@@ -51,6 +51,7 @@ from . import fileio
 from . import fold as fold_mod
 from . import gitinfo
 from . import hooks as hooks_mod
+from . import imagegen as imagegen_mod
 from . import instructions as instructions_mod
 from . import mcp as mcp_mod
 from . import memory as memory_mod
@@ -63,7 +64,8 @@ from . import steering as steering_mod
 from . import todo as todo_mod
 from .config import is_hosted
 from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
-from .llm import (CancelledError, LLMError, _is_local_server,
+from .llm import (IMAGE_TOKENS_ESTIMATE, CancelledError, LLMError,
+                  _append_message_text, _is_local_server,
                   estimate_messages, estimate_tokens)
 from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
 
@@ -2346,7 +2348,8 @@ class Agent:
                on_step=None, base: str | None = None,
                backup_dir=None,
                prefix_messages: list[dict] | None = None,
-               is_repair: bool = False) -> str:
+               is_repair: bool = False,
+               images: list[dict] | None = None) -> str:
         """Run the tool-calling loop until the model says `done`, the
         gathered-source budget is exhausted, or cfg.max_steps (0 = no limit)
         is reached.
@@ -2542,9 +2545,13 @@ class Agent:
                 and getattr(self.cfg, "redact_secrets", True):
             print("  [warning: the task text looks like it contains a secret "
                   "and goes to a hosted API]", file=sys.stderr)
+        active_images = (list(images) if images is not None
+                         else list(getattr(self.cfg, "_task_images", None) or ()))
+        self._task_images = active_images
+        user0_content = imagegen_mod.make_multimodal_content(user0, active_images)
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user0},
+            {"role": "user", "content": user0_content},
         ]
         if prefix_messages:
             # Single-slot local server (TECHNIQUES.md #28): fork the parent's
@@ -2626,7 +2633,7 @@ class Agent:
 
         # Nudges ride with the preceding user message: some chat templates
         # reject two user messages in a row.
-        messages[-1]["content"] += "\n\n" + nudge(1)
+        _append_message_text(messages[-1], "\n\n" + nudge(1))
 
         # Step-0 prefetch (opt-in): read the task-named files/symbols before
         # the first model step. Runs through the normal tool path so the read
@@ -2678,7 +2685,7 @@ class Agent:
             user messages in a row break some chat templates, so it rides
             with the last one (as the nudges do)."""
             if messages and messages[-1]["role"] == "user":
-                messages[-1]["content"] += "\n\n" + text
+                _append_message_text(messages[-1], "\n\n" + text)
             else:
                 messages.append({"role": "user", "content": text})
 
@@ -2802,9 +2809,11 @@ class Agent:
             self.steps_log.append(
                 f"{step}. auto-{act} {detail}  (requirement assist)")
             if tail and messages and messages[-1]["role"] == "user":
-                messages[-1]["content"] += (
+                _append_message_text(
+                    messages[-1],
                     f"\n\n[HARNESS {act.upper()} for an unmet requirement]\n"
-                    f"RESULT:\n{obs}")
+                    f"RESULT:\n{obs}",
+                )
             else:
                 messages.append({"role": "assistant",
                                  "content": _compact(payload)})
@@ -2872,9 +2881,11 @@ class Agent:
             # Steering: lines the user typed mid-run join the turn that has
             # not been sent yet, so the cached prefix is untouched.
             for note in steering_mod.drain(getattr(self.cfg, "_steer", None)):
-                messages[-1]["content"] += (
+                _append_message_text(
+                    messages[-1],
                     f"\n\n[The USER says, mid-task: {note}  -- follow this "
-                    "over your earlier plan.]")
+                    "over your earlier plan.]",
+                )
                 self._emit("steer", step=step, chars=len(note))
                 if verbose:
                     print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
@@ -3431,12 +3442,14 @@ class Agent:
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
                     if recover_on and recoveries["errors"] < 1 and budget > 0:
                         recoveries["errors"] += 1
-                        messages[-1]["content"] += (
+                        _append_message_text(
+                            messages[-1],
                             f"\n\n[STUCK: your last {error_streak} actions "
                             "all failed. Re-read the PROJECT MAP for exact "
                             "paths and line ranges; use `find` or `outline` "
                             "to get a valid file name before `read`; never "
-                            "invent a range.]")
+                            "invent a range.]",
+                        )
                         error_streak = 0
                         self._emit("recovery", signal="errors", step=step)
                         if verbose:
@@ -3851,7 +3864,8 @@ class Agent:
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,
                system: str | None = None, max_tokens: int | None = None,
-               include_edit_format: bool = True) -> str:
+               include_edit_format: bool = True,
+               images: list[dict] | None = None) -> str:
         """Ask the model to answer the task, or produce search/replace edits,
         given the project map and whatever source `gather()` collected.
 
@@ -3871,17 +3885,22 @@ class Agent:
         self._creative_task = self._creative_for(task)
         with self._phase_temp("temperature_answer"):
             return self._answer(task, gathered, stream, system, max_tokens,
-                                include_edit_format)
+                                include_edit_format, images=images)
 
     def _answer(self, task: str, gathered: str, stream: bool,
                 system: str | None, max_tokens: int | None,
-                include_edit_format: bool) -> str:
+                include_edit_format: bool,
+                images: list[dict] | None = None) -> str:
         self._set_site("answer")
         if self._task_budget_exceeded("answer"):
             # A clear no-edit verdict, not another 24k-token draft: the
             # outer loop reads the marker as a refusal to edit.
             return ("[No changes: the task budget ran out before the answer "
                     "could be generated; nothing was written.]")
+        active_images = (list(images) if images is not None
+                         else list(getattr(self, "_task_images", None)
+                                   or getattr(self.cfg, "_task_images", None)
+                                   or ()))
         brief = self._answer_brief(system, include_edit_format, task)
         mode = self._answer_mode()
         if mode in ("continue", "auto") and self._can_continue(task, brief,
@@ -3897,7 +3916,8 @@ class Agent:
                 print("  [the continued answer was unusable; rebuilding the "
                       "answer prompt]", file=sys.stderr)
         self.answer_mode_used = "rebuild"
-        reply = self._answer_rebuild(task, gathered, stream, brief, max_tokens)
+        reply = self._answer_rebuild(task, gathered, stream, brief, max_tokens,
+                                     images=active_images)
         self._emit("answer", mode="rebuild", reply_chars=len(reply or ""))
         return reply
 
@@ -5112,7 +5132,8 @@ class Agent:
             return None
 
     def _answer_rebuild(self, task: str, gathered: str, stream: bool,
-                        brief: str, max_tokens: int | None) -> str:
+                        brief: str, max_tokens: int | None,
+                        images: list[dict] | None = None) -> str:
         """A fresh two-message answer conversation. Over budget it DEGRADES
         (drop project notes, shrink the map, drop the oldest whole source
         items with re-read pointers) before it ever refuses."""
@@ -5231,13 +5252,15 @@ class Agent:
             print("[answer prompt over budget; degraded: "
                   + "; ".join(notices) + "]", file=sys.stderr)
             self._emit("degrade", notices=notices)
-        print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
+        img_tokens = len(images or ()) * IMAGE_TOKENS_ESTIMATE
+        print(f"[answer context ~{est(user) + img_tokens} tokens]", file=sys.stderr)
+        user_content = imagegen_mod.make_multimodal_content(user, images)
         return self._chat_needs(
             lambda m: self.client.chat(
                 m, max_tokens=self._answer_max_tokens(max_tokens),
                 stream=stream),
             [{"role": "system", "content": brief},
-             {"role": "user", "content": user}])
+             {"role": "user", "content": user_content}])
 
     # ------------------------------------------------------------------- edits
     def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,

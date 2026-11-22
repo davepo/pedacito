@@ -1282,7 +1282,9 @@ async function securityPreflight(body) {
   try {
     scan = await PDC.api('/api/security/scan', {
       text: body.text || '', mode: body.mode || '',
-      attachments: (body.attachments || []).map((a) => ({ name: a.name, text: a.text }))
+      attachments: (body.attachments || [])
+        .filter((a) => a && a.kind !== 'image')
+        .map((a) => ({ name: a.name, text: a.text }))
     });
   } catch (e) { return { send: true, choice: '' }; }
   if (!scan || !scan.needs_confirmation) return { send: true, choice: '' };
@@ -1410,14 +1412,108 @@ async function send(forceAuto) {
     }
   });
 }
+const MAX_IMAGE_ATTACH_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const ALLOWED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
+function makeImageThumb(dataUrl, maxDim) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+          const w = Math.max(1, Math.round((img.width || maxDim) * scale));
+          const h = Math.max(1, Math.round((img.height || maxDim) * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { resolve(''); return; }
+          ctx.drawImage(img, 0, 0, w, h);
+          const out = canvas.toDataURL('image/webp', 0.72) || canvas.toDataURL('image/jpeg', 0.72);
+          resolve(out && out.length <= 36000 ? out : '');
+        } catch (e) { resolve(''); }
+      };
+      img.onerror = () => resolve('');
+      img.src = dataUrl;
+    } catch (e) { resolve(''); }
+  });
+}
+
 function attachFiles(files) {
-  Array.prototype.forEach.call(files, (f) => {
+  let imgCount = S.attachments.filter((a) => a && a.kind === 'image').length;
+  Array.prototype.forEach.call(files || [], (f) => {
+    const mime = String(f.type || '').toLowerCase();
+    const isImage = ALLOWED_IMAGE_MIMES.has(mime) || /\.(png|jpe?g|webp|gif)$/i.test(f.name || '');
+    if (isImage) {
+      if (imgCount >= MAX_IMAGE_ATTACHMENTS) {
+        PDC.toast(PDC.t('gui.attach.image_limit', { max: MAX_IMAGE_ATTACHMENTS },
+          'Up to ' + MAX_IMAGE_ATTACHMENTS + ' images can be attached at once.'), true);
+        return;
+      }
+      if (f.size > MAX_IMAGE_ATTACH_BYTES) {
+        PDC.toast(PDC.t('gui.attach.image_too_large', { name: f.name || 'image', max: 10 },
+          (f.name || 'image') + ' is larger than 10 MB.'), true);
+        return;
+      }
+      imgCount += 1;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        if (!dataUrl.startsWith('data:')) return;
+        const comma = dataUrl.indexOf(',');
+        const dataB64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
+        const item = {
+          kind: 'image',
+          name: f.name || ('image.' + (mime.split('/')[1] || 'png')),
+          mime: ALLOWED_IMAGE_MIMES.has(mime) ? mime : 'image/png',
+          data_url: dataUrl,
+          data_b64: dataB64,
+          bytes: f.size || 0,
+          thumb: ''
+        };
+        S.attachments.push(item);
+        emit();
+        makeImageThumb(dataUrl, 72).then((thumb) => {
+          if (thumb) { item.thumb = thumb; emit(); }
+        });
+      };
+      reader.readAsDataURL(f);
+      return;
+    }
     if (f.size > 400000) { PDC.toast(f.name + ' is larger than 400 KB.', true); return; }
     f.text().then((t) => {
       if (t.indexOf('\u0000') >= 0) { PDC.toast(f.name + ' looks binary.', true); return; }
       S.attachments.push({ name: f.name, text: t }); emit();
     });
   });
+}
+
+function handlePromptPaste(e) {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const imgs = [];
+  if (cd.items && cd.items.length) {
+    for (let i = 0; i < cd.items.length; i += 1) {
+      const it = cd.items[i];
+      if (it && it.kind === 'file' && ALLOWED_IMAGE_MIMES.has(String(it.type || '').toLowerCase())) {
+        const file = it.getAsFile();
+        if (file) imgs.push(file);
+      }
+    }
+  } else if (cd.files && cd.files.length) {
+    for (let i = 0; i < cd.files.length; i += 1) {
+      const file = cd.files[i];
+      if (file && ALLOWED_IMAGE_MIMES.has(String(file.type || '').toLowerCase())) {
+        imgs.push(file);
+      }
+    }
+  }
+  if (imgs.length) {
+    e.preventDefault();
+    attachFiles(imgs);
+  }
 }
 
 // ---- review (staged diff) ----
@@ -4407,7 +4503,12 @@ function UserMsg(props) {
         ${m.text}
         ${(m.attachments && m.attachments.length) ? html`
           <div class="chiprow">
-            ${m.attachments.map((a, i) => html`<span key=${i} class="fchip">\uD83D\uDCCE ${a.name} (${PDC.fmtInt(a.chars)} chars)</span>`)}
+            ${m.attachments.map((a, i) => a && a.kind === 'image' ? html`
+              <span key=${i} class="fchip fchip-img">
+                ${a.thumb ? html`<img class="attach-thumb" src=${a.thumb} alt=${a.name || 'image'} />` : '\uD83D\uDDBC\uFE0F'}
+                <span>${a.name || 'image'}${a.width && a.height ? ' (' + a.width + '\u00D7' + a.height + ')' : ''}</span>
+              </span>` : html`
+              <span key=${i} class="fchip">\uD83D\uDCCE ${a.name} (${PDC.fmtInt(a.chars || 0)} chars)</span>`)}
           </div>` : null}
       </div>
     </div>`;
@@ -4765,9 +4866,14 @@ function Composer() {
           } })}>${PDC.t('gui.browse', null, 'Browse\u2026')}</button>
       </div>` : null}
       <div id="attachRow">
-        ${S.attachments.map((a, i) => html`
-          <span key=${i} class="attach">\uD83D\uDCCE ${a.name} \u00B7 ${PDC.fmtInt(a.text.length)} chars
-            <button title="remove" onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
+        ${S.attachments.map((a, i) => a && a.kind === 'image' ? html`
+          <span key=${i} class="attach attach-img">
+            <img class="attach-thumb" src=${a.data_url || a.thumb || ''} alt=${a.name || 'image'} />
+            <span class="attach-name">${a.name}</span>
+            <button title=${PDC.t('gui.attach.remove', null, 'remove')} onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
+          </span>` : html`
+          <span key=${i} class="attach">\uD83D\uDCCE ${a.name} \u00B7 ${PDC.fmtInt((a.text || '').length)} chars
+            <button title=${PDC.t('gui.attach.remove', null, 'remove')} onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
           </span>`)}
       </div>
       ${S.pinned.length ? html`
@@ -4784,6 +4890,7 @@ function Composer() {
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
                 placeholder=${isHow ? PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph) : (j ? (steerable ? PDC.t('gui.composer.steer_ph', null, 'Type a note to steer the model (Enter)\u2026') : PDC.t('gui.composer.working_ph', null, 'Working\u2026 press Stop to cancel.')) : PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph))}
                 disabled=${!!j && !steerable && !isHow}
+                onpaste=${handlePromptPaste}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
                   writeDraft(e.target.value);       // F5 must not lose it
                   scheduleModeCheck(e.target.value);
@@ -4855,7 +4962,7 @@ function Composer() {
             <option value="high">${PDC.t('gui.effort.high', null, 'High')}</option>
           </select>
         </label>
-        <button id="attachBtn" title=${PDC.t('gui.composer.attach_title', null, 'attach a text file (or drop one here)')}
+        <button id="attachBtn" title=${PDC.t('gui.composer.attach_title', null, 'Attach text files or images (or drag/paste here)')}
                 hidden=${isHow}
                 disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE ${PDC.t('gui.composer.attach', null, 'Attach')}</button>
         ${hasImageProfile ? html`

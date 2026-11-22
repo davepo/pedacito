@@ -136,9 +136,24 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--max-cost", type=float, default=None, metavar="USD",
                    help="stop before the next call once the estimated spend "
                         "reaches this (needs price_*_per_mtok in config)")
+    p.add_argument("--image", action="append", default=[], metavar="FILE",
+                   help=i18n.t("cli.opt.image"))
     p.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
                    default=argparse.SUPPRESS,
                    help=i18n.t("cli.opt.lang"))
+
+
+def _load_cli_images(args) -> list[dict]:
+    """Load and validate any --image paths passed on the CLI."""
+    paths = list(getattr(args, "image", None) or ())
+    if not paths:
+        return []
+    from . import imagegen
+    if len(paths) > imagegen.MAX_IMAGE_ATTACHMENTS:
+        raise ValueError(
+            f"Too many --image attachments ({len(paths)}; max {imagegen.MAX_IMAGE_ATTACHMENTS})."
+        )
+    return [imagegen.load_image_attachment(p) for p in paths]
 
 
 def _root(args) -> Path:
@@ -1324,7 +1339,7 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     return code
 
 
-def _cmd_explain(args, client, agent) -> int:
+def _cmd_explain(args, client, agent, images: list[dict] | None = None) -> int:
     """`pedacito explain`: answer questions about the indexed project in prose
     (no edits). `main()` has already checked that an index exists."""
     from . import explain
@@ -1333,7 +1348,7 @@ def _cmd_explain(args, client, agent) -> int:
 
     def ask(q: str) -> str:
         print("\n--- looking things up ---", file=sys.stderr)
-        return explain.answer(agent, q)
+        return explain.answer(agent, q, images=images)
 
     if question:
         print(ask(question))
@@ -3379,6 +3394,8 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_new.add_argument("--spec", metavar="FILE", default=None,
                        help="a larger spec document (.md/.txt); may be combined "
                             "with -t, or piped in via stdin")
+    p_new.add_argument("--image", action="append", default=[], metavar="FILE",
+                       help=t("cli.opt.image"))
     p_new.add_argument("--plan-only", dest="plan_only", action="store_true",
                        help="stop after the plan + header skeleton; implement "
                            "later with ordinary `ask --apply` runs")
@@ -4098,6 +4115,11 @@ def _main(argv=None) -> int:
         if args.cmd == "tui":
             from . import tui as tui_mod
             root = _root(args)
+            try:
+                cli_images = _load_cli_images(args)
+            except (OSError, ValueError) as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
             if getattr(args, "no_think", False):
                 cfg.disable_thinking = True
                 cfg.sources["disable_thinking"] = "--no-think"
@@ -4117,11 +4139,13 @@ def _main(argv=None) -> int:
                     root, cfg, headless=headless, stdin=sys.stdin,
                     stdout=sys.stdout, apply=bool(getattr(args, "apply", True)),
                     initial_task=str(getattr(args, "task", "") or ""),
+                    initial_images=cli_images,
                     width=width, height=height,
                     lang=getattr(args, "lang", None))
                 return session.run()
             return tui_mod.run_tui(
                 root, cfg, initial_task=str(getattr(args, "task", "") or ""),
+                initial_images=cli_images,
                 headless=headless, stdin=sys.stdin, stdout=sys.stdout,
                 lang=getattr(args, "lang", None))
 
@@ -4281,6 +4305,11 @@ def _main(argv=None) -> int:
         # exist yet, and the skeleton gets its own in-memory index.
         if args.cmd == "new":
             from . import scaffold
+            try:
+                cli_images = _load_cli_images(args)
+            except (OSError, ValueError) as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
             root = Path(args.project).expanduser().resolve()
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
@@ -4288,6 +4317,8 @@ def _main(argv=None) -> int:
             # One run-scoped collector covers refine + plan + skeleton +
             # implementation, so the closing line aggregates the whole build.
             events_mod.begin_run()
+            if cli_images:
+                cfg._task_images = cli_images
             try:
                 if getattr(args, "refine", False):
                     spec.text = _refine_task_text(cfg, client, root, spec.text,
@@ -4317,6 +4348,8 @@ def _main(argv=None) -> int:
                                       or cfg.auto_install_deps),
                     log_command="command: " + " ".join(sys.argv))
             finally:
+                if cli_images and hasattr(cfg, "_task_images"):
+                    delattr(cfg, "_task_images")
                 run_summary = events_mod.end_run()
             line = events_mod.run_line(run_summary)
             if line:
@@ -4400,8 +4433,14 @@ def _main(argv=None) -> int:
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx,
                       "resume_context": resume_context}
 
+        try:
+            cli_images = _load_cli_images(args)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
         if args.cmd == "explain":
-            return _cmd_explain(args, client, agent)
+            return _cmd_explain(args, client, agent, images=cli_images or None)
 
         def _run_task_inner(task: str, apply=None, refine=None, plan=None):
             """Execute one task end to end through the shared inner loop.
@@ -4426,10 +4465,16 @@ def _main(argv=None) -> int:
             else:
                 want_plan = bool(plan)
             if want_plan and not _wants_review(args, cfg):
-                code = plan_mod.run_planned(
-                    root, cfg, client, idx, task, apply=want_apply,
-                    confirm=_confirm_plan if getattr(args, "review_plan", False)
-                    else None, strict=bool(getattr(args, "strict", False)))
+                if cli_images:
+                    cfg._task_images = list(cli_images)
+                try:
+                    code = plan_mod.run_planned(
+                        root, cfg, client, idx, task, apply=want_apply,
+                        confirm=_confirm_plan if getattr(args, "review_plan", False)
+                        else None, strict=bool(getattr(args, "strict", False)))
+                finally:
+                    if cli_images and hasattr(cfg, "_task_images"):
+                        delattr(cfg, "_task_images")
                 fresh = index_mod.Index.load(root)
                 if fresh is not None:
                     idx = fresh
@@ -4446,7 +4491,8 @@ def _main(argv=None) -> int:
                     return tr
                 return code
             tr = loop.run_task(root, cfg, client, agent, idx, task,
-                               apply=want_apply, review=_wants_review(args, cfg))
+                               apply=want_apply, review=_wants_review(args, cfg),
+                               images=cli_images or None)
             locals_ref["last_result"] = tr
             idx = tr.idx
             agent.index = idx
@@ -4647,9 +4693,13 @@ def _main(argv=None) -> int:
             # One run-scoped collector covers refine + planning + every task
             # + post-run verification; the closing line aggregates the run.
             events_mod.begin_run()
+            if cli_images:
+                cfg._task_images = list(cli_images)
             try:
                 code = _cmd_auto(args, cfg, client, idx, root)
             finally:
+                if cli_images and hasattr(cfg, "_task_images"):
+                    delattr(cfg, "_task_images")
                 run_summary = events_mod.end_run()
             line = events_mod.run_line(run_summary)
             if line:

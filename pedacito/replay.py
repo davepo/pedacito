@@ -37,7 +37,18 @@ def _digest(messages) -> str:
 
 def _preview(messages) -> str:
     last = messages[-1]["content"] if messages else ""
-    if not isinstance(last, str):
+    if isinstance(last, list):
+        from . import imagegen
+        parts = []
+        for part in imagegen.sanitize_multimodal_content(last):
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        last = "\n".join(parts)
+    elif not isinstance(last, str):
         last = str(last)
     return safety.redact(last[-300:])
 

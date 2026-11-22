@@ -160,6 +160,18 @@ _TEMPLATE_HINTS = (
 _LOADING = ("is loading", "loading model", "model is not loaded", "please wait")
 _LOAD_FAILED = ("failed to load model", "error loading model", "no model loaded")
 
+# HTTP 400 bodies indicating the active model/server does not accept image inputs.
+_VISION_UNSUPPORTED_HINTS = (
+    "image_url",
+    "vision",
+    "multimodal",
+    "content must be a string",
+    "does not support image",
+    "images are not supported",
+    "not a multimodal",
+    "unsupported content type",
+)
+
 # Shown on a plain connection failure; the fix differs per server.
 CONNECT_HELP = """\
   Cannot reach the server at {url}.
@@ -1283,14 +1295,58 @@ def repair_truncated_json(text: str) -> str | None:
     return "{" + ",".join(kept) + "}"
 
 
+def _content_parts(content) -> list[dict]:
+    """Normalize str or list content into a shallow-copied list of part dicts."""
+    if isinstance(content, list):
+        return [dict(p) if isinstance(p, dict) else {"type": "text", "text": str(p)}
+                for p in content]
+    text = str(content or "")
+    return [{"type": "text", "text": text}] if text else []
+
+
+def _merge_content(left, right):
+    """Join two message contents with a blank line, preserving multimodal parts."""
+    if isinstance(left, str) and isinstance(right, str):
+        return f"{left}\n\n{right}"
+    if left is None:
+        return right
+    if right is None:
+        return left
+    parts = _content_parts(left)
+    rparts = _content_parts(right)
+    if (parts and rparts
+            and parts[-1].get("type") == "text"
+            and rparts[0].get("type") == "text"):
+        parts[-1] = dict(parts[-1])
+        parts[-1]["text"] = f"{parts[-1].get('text') or ''}\n\n{rparts[0].get('text') or ''}"
+        parts.extend(rparts[1:])
+    else:
+        parts.extend(rparts)
+    return parts
+
+
+def _content_plain_text(content) -> str:
+    """Extract plain text from str or multimodal list content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(p.get("text") or "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content or "")
+
+
 def merge_consecutive(messages: list[dict]) -> list[dict]:
     """Collapse adjacent same-role messages into one; a stray repeat would
     otherwise surface as an opaque Jinja error from the server."""
     out: list[dict] = []
     for m in messages:
         if out and out[-1]["role"] == m["role"]:
-            out[-1] = {"role": m["role"],
-                       "content": f"{out[-1]['content']}\n\n{m['content']}"}
+            merged = dict(out[-1])
+            merged["content"] = _merge_content(out[-1].get("content", ""),
+                                               m.get("content", ""))
+            out[-1] = merged
         else:
             out.append(dict(m))
     return out
@@ -1299,12 +1355,15 @@ def merge_consecutive(messages: list[dict]) -> list[dict]:
 def fold_system(messages: list[dict]) -> list[dict]:
     """Move system content into the first user turn, for templates without a
     system role (Gemma being the common one)."""
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
-    rest = [dict(m) for m in messages if m["role"] != "system"]
+    system = "\n\n".join(
+        _content_plain_text(m.get("content", ""))
+        for m in messages if m.get("role") == "system"
+    )
+    rest = [dict(m) for m in messages if m.get("role") != "system"]
     if not system:
         return rest
-    if rest and rest[0]["role"] == "user":
-        rest[0]["content"] = f"{system}\n\n{rest[0]['content']}"
+    if rest and rest[0].get("role") == "user":
+        rest[0]["content"] = _merge_content(system, rest[0].get("content", ""))
     else:
         rest.insert(0, {"role": "user", "content": system})
     return merge_consecutive(rest)
@@ -1317,6 +1376,8 @@ CHARS_PER_TOKEN = 3.6
 # few for the reply primer. Counting only `len(content)` undercounts a long
 # agent conversation by hundreds of tokens.
 MESSAGE_OVERHEAD_TOKENS = 4
+# Conservative per-image token estimate for context-window budgeting.
+IMAGE_TOKENS_ESTIMATE = 1000
 
 
 def estimate_tokens(text: str) -> int:
@@ -1324,11 +1385,29 @@ def estimate_tokens(text: str) -> int:
     return int(len(text) / CHARS_PER_TOKEN) + 1
 
 
+def _estimate_content(content, est) -> int:
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype == "text":
+                    total += est(str(part.get("text") or ""))
+                elif ptype in ("image_url", "image"):
+                    total += IMAGE_TOKENS_ESTIMATE
+            elif isinstance(part, str):
+                total += est(part)
+        return total
+    return est(str(content or ""))
+
+
 def estimate_messages(messages: list[dict], est=None) -> int:
     """Token estimate for a whole conversation, including per-message framing
-    overhead. `est` is a text estimator (a client's calibrated one)."""
+    overhead and ~1,000 tokens per attached image. `est` is a text estimator
+    (a client's calibrated one)."""
     est = est or estimate_tokens
-    return sum(est(m.get("content") or "") + MESSAGE_OVERHEAD_TOKENS
+    return sum(_estimate_content(m.get("content") or "", est)
+               + MESSAGE_OVERHEAD_TOKENS
                for m in messages) + 3
 
 
@@ -2189,6 +2268,12 @@ class LLMClient:
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
+            if r.status_code == 400 and any(h in low for h in _VISION_UNSUPPORTED_HINTS):
+                raise LLMError(
+                    f"The active model '{self.cfg.model}' does not support image "
+                    "inputs. Switch to a vision-capable model (e.g. Gemma 4, "
+                    "Qwen-VL, Claude, or GPT-4o) and try again.\n"
+                    f"Server detail: {body[:300]}")
             if r.status_code >= 500 and not loading:
                 self._record_failure()
             hint = _oom_hint(body) if r.status_code >= 500 else ""
@@ -3334,6 +3419,13 @@ class LLMClient:
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
+            low = body.lower()
+            if r.status_code == 400 and any(h in low for h in _VISION_UNSUPPORTED_HINTS):
+                raise LLMError(
+                    f"The active model '{self.cfg.model}' does not support image "
+                    "inputs. Switch to a vision-capable model (e.g. Claude, "
+                    "Gemma 4, Qwen-VL, or GPT-4o) and try again.\n"
+                    f"Server detail: {body[:300]}")
             if r.status_code >= 500:
                 self._record_failure()
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")

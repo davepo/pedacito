@@ -224,7 +224,7 @@ def _webp_size(data: bytes) -> tuple[int, int]:
 
 
 def sniff_image_format(data: bytes) -> tuple[str, int, int]:
-    """(format, width, height) for PNG, JPEG or WebP bytes, else
+    """(format, width, height) for PNG, JPEG, WebP or GIF bytes, else
     ("bin", 0, 0). Pure magic-byte + header parsing, no Pillow."""
     data = bytes(data or b"")
     if len(data) < 8:
@@ -240,7 +240,183 @@ def sniff_image_format(data: bytes) -> tuple[str, int, int]:
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         w, h = _webp_size(data)
         return "webp", w, h
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        if len(data) >= 10:
+            w = int.from_bytes(data[6:8], "little")
+            h = int.from_bytes(data[8:10], "little")
+            return "gif", w, h
+        return "gif", 0, 0
     return "bin", 0, 0
+
+
+# ------------------------------------------------------ multimodal attachments
+MAX_IMAGE_ATTACH_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_ATTACHMENTS = 4
+ALLOWED_IMAGE_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+_FORMAT_TO_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
+
+
+def _build_image_attachment(raw: bytes, name: str) -> dict:
+    """Validate raw image bytes via magic-byte sniffing and size ceiling."""
+    if not raw:
+        raise ValueError("Image attachment is empty.")
+    if len(raw) > MAX_IMAGE_ATTACH_BYTES:
+        mb = len(raw) / (1024 * 1024)
+        max_mb = MAX_IMAGE_ATTACH_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"Image '{name}' is too large ({mb:.1f} MB; max {max_mb} MB)."
+        )
+    fmt, width, height = sniff_image_format(raw)
+    mime = _FORMAT_TO_MIME.get(fmt)
+    if not mime or mime not in ALLOWED_IMAGE_MIMES:
+        raise ValueError(
+            f"Image '{name}' is not a supported PNG, JPEG, WebP, or GIF image."
+        )
+    return {
+        "name": str(name or f"image.{fmt}").strip() or f"image.{fmt}",
+        "kind": "image",
+        "mime": mime,
+        "data_b64": base64.b64encode(raw).decode("ascii"),
+        "width": int(width),
+        "height": int(height),
+        "bytes": len(raw),
+    }
+
+
+def load_image_attachment(path: Path | str) -> dict:
+    """Read, validate, and base64-encode a local image file for multimodal input.
+
+    Raises FileNotFoundError if missing, ValueError if not a regular file,
+    larger than MAX_IMAGE_ATTACH_BYTES, or invalid/unsupported magic bytes.
+    """
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Image file not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"Image path is not a file: {p}")
+    size = p.stat().st_size
+    if size > MAX_IMAGE_ATTACH_BYTES:
+        mb = size / (1024 * 1024)
+        max_mb = MAX_IMAGE_ATTACH_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"Image '{p.name}' is too large ({mb:.1f} MB; max {max_mb} MB)."
+        )
+    raw = p.read_bytes()
+    return _build_image_attachment(raw, p.name)
+
+
+def normalize_image_attachment(item: dict) -> dict:
+    """Validate and normalize an image attachment dict (from GUI/API/TUI).
+
+    Accepts dicts with `data_b64`, `data_url`, `url` (data: URI), or `path`.
+    Enforces magic bytes via `sniff_image_format()` and `MAX_IMAGE_ATTACH_BYTES`.
+    """
+    if not isinstance(item, dict):
+        raise ValueError("Image attachment must be a JSON object.")
+    name = str(item.get("name") or "").strip()
+    b64_raw = item.get("data_b64")
+    if not b64_raw:
+        data_url = item.get("data_url") or item.get("url")
+        if isinstance(data_url, str) and data_url.startswith("data:"):
+            b64_raw = data_url
+    if not b64_raw and item.get("path"):
+        out = load_image_attachment(item["path"])
+        if name:
+            out["name"] = name
+        return out
+    if not isinstance(b64_raw, str) or not b64_raw.strip():
+        raise ValueError(f"Image attachment '{name or 'image'}' has no image data.")
+    payload = b64_raw.strip()
+    if payload.startswith("data:"):
+        header, sep, body = payload.partition(",")
+        if not sep or ";base64" not in header.lower():
+            raise ValueError(f"Image attachment '{name or 'image'}' is not a base64 data URL.")
+        payload = body.strip()
+    # Quick upper-bound check before allocating decoded bytes (~4/3 expansion).
+    if len(payload) > (MAX_IMAGE_ATTACH_BYTES * 4 // 3) + 64:
+        max_mb = MAX_IMAGE_ATTACH_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"Image '{name or 'image'}' exceeds the {max_mb} MB attachment limit."
+        )
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Image '{name or 'image'}' contains invalid base64 data."
+        ) from e
+    return _build_image_attachment(raw, name or "image")
+
+
+def normalize_image_attachments(items) -> list[dict]:
+    """Validate a sequence of image attachment dicts and enforce MAX_IMAGE_ATTACHMENTS."""
+    if not items:
+        return []
+    if not isinstance(items, (list, tuple)):
+        raise ValueError("Image attachments must be a list.")
+    if len(items) > MAX_IMAGE_ATTACHMENTS:
+        raise ValueError(
+            f"Too many image attachments ({len(items)}; max {MAX_IMAGE_ATTACHMENTS})."
+        )
+    return [normalize_image_attachment(item) for item in items]
+
+
+def make_multimodal_content(text: str, images: list[dict] | None) -> str | list[dict]:
+    """Return plain `text` when `images` is empty (byte-identical for text-only
+    tasks), or an OpenAI-compatible multimodal content array when non-empty."""
+    if not images:
+        return text
+    parts: list[dict] = [{"type": "text", "text": text}]
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        mime = str(img.get("mime") or "image/png").strip()
+        b64 = str(img.get("data_b64") or "").strip()
+        if not b64:
+            continue
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    return parts if len(parts) > 1 else text
+
+
+def image_part_mime(part: dict) -> str:
+    """Extract the MIME type from an OpenAI `image_url` or Anthropic `image` part."""
+    if not isinstance(part, dict):
+        return "image/unknown"
+    ptype = part.get("type")
+    if ptype == "image_url":
+        url = str((part.get("image_url") or {}).get("url") or "")
+        if url.startswith("data:"):
+            head = url[5:].split(";", 1)[0].strip()
+            if head:
+                return head
+        return "image/unknown"
+    if ptype == "image":
+        src = part.get("source") or {}
+        if isinstance(src, dict) and src.get("media_type"):
+            return str(src["media_type"])
+    return "image/unknown"
+
+
+def sanitize_multimodal_content(content):
+    """Replace embedded base64 image parts with lightweight `[image: <mime>]`
+    placeholders for logs, trajectories, and previews. Plain strings pass through."""
+    if not isinstance(content, list):
+        return content
+    out: list = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+            mime = image_part_mime(part)
+            out.append({"type": "text", "text": f"[image: {mime}]"})
+        else:
+            out.append(part)
+    return out
 
 
 def images_endpoint(base_url: str) -> str:

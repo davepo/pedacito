@@ -42,7 +42,7 @@ from .core import (STATE, install_permission_broker, install_runner,
                    uninstall_runner, uninstall_tee)
 
 STATIC = Path(__file__).parent / "static"
-MAX_BODY = 12 * 1024 * 1024
+MAX_BODY = 60 * 1024 * 1024
 MAX_VIEW_BYTES = 600_000
 MAX_PREVIEW_ASSET_BYTES = 25 * 1024 * 1024
 MAX_SCAN_FILES = 4000          # workspace scan cap for the Files tab
@@ -2045,6 +2045,47 @@ def _check_model(q, body):
     return _busy_reply(jobs.spawn("check", "checking model", jobs.check_model))
 
 
+def _split_attachments(body: dict) -> tuple[list[dict], list[dict]]:
+    """Separate text attachments from image attachments and validate all images.
+
+    Accepts image items inside `attachments` (with `kind == "image"`,
+    `mime` starting with `"image/"`, or `data_b64`/`data_url`) as well as a
+    top-level `images` list. Raises ValueError/OSError on invalid/oversize/excess
+    images so the route can return HTTP 400.
+    """
+    from .. import imagegen as imagegen_mod
+
+    text_items: list[dict] = []
+    raw_images: list[dict] = []
+    for item in body.get("attachments") or []:
+        if not isinstance(item, dict):
+            continue
+        is_img = (
+            item.get("kind") == "image"
+            or str(item.get("mime") or "").lower().startswith("image/")
+            or (bool(item.get("data_b64") or item.get("data_url"))
+                and "text" not in item)
+        )
+        if is_img:
+            raw_images.append(item)
+        else:
+            text_items.append(item)
+    extra_images = body.get("images") or []
+    if extra_images:
+        if not isinstance(extra_images, list):
+            raise ValueError("`images` must be a list.")
+        raw_images.extend(extra_images)
+    normalized = imagegen_mod.normalize_image_attachments(raw_images)
+    # Preserve optional lightweight UI thumbnail (capped at 40 KB) on each item
+    # for echo_submission without ever saving full raw base64 into history.
+    for norm, raw in zip(normalized, raw_images):
+        if isinstance(raw, dict):
+            thumb = raw.get("thumb")
+            if isinstance(thumb, str) and thumb.startswith("data:image/") and len(thumb) <= 40_000:
+                norm["thumb"] = thumb
+    return text_items, normalized
+
+
 @post("/api/run")
 def _run(q, body):
     mode = body.get("mode", "")
@@ -2054,16 +2095,22 @@ def _run(q, body):
            "new": (jobs.run_new, "creating project")}
     if mode not in fns:
         return 400, {"ok": False, "detail": f"unknown mode {mode!r}"}
+    try:
+        text_attachments, images = _split_attachments(body)
+    except (ValueError, OSError) as exc:
+        return 400, {"ok": False, "detail": str(exc)}
     fn, title = fns[mode]
-    opts = {**body, "_echoed": True}
+    opts = {**body, "attachments": text_attachments, "images": images,
+            "_echoed": True}
     if mode == "auto":
         # Auto applies by default (like `pedacito auto --apply`); only an
         # explicit "Plan only" request keeps it read-only.
         opts["plan_only"] = jobs.auto_plan_only(opts)
         opts["apply"] = not opts["plan_only"]
+    echo_body = {**body, "attachments": text_attachments, "images": images}
     return _busy_reply(jobs.spawn(
         mode, title, lambda job: fn(job, opts),
-        echo=lambda: jobs.echo_submission(mode, body)))
+        echo=lambda: jobs.echo_submission(mode, echo_body)))
 
 
 # Named aliases for the Ask, Auto and New modes, for API clients that address

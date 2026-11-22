@@ -132,13 +132,14 @@ _TAB_PREFIX = {
     "/ar": "/arena ",
     "/la": "/lang ",
     "/im": "/image ",
+    "/at": "/attach ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
     "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
-    "/theme", "/lang", "/image",
+    "/theme", "/lang", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/update",
@@ -223,6 +224,9 @@ Pedacito TUI commands
   /lang [en|es]             switch interface language (F3 toggles EN/ES)
   /image PROMPT [--out FILE] [--size WxH]
                             generate an image with the configured image profile
+  /attach [PATH|list|clear] attach an image (PNG/JPEG/WebP/GIF, <=10 MB, max 4)
+                            to the next task, list staged images, or clear them
+                            (also auto-detects @path/to/image.png in prompts)
   /apply [on|off]           write edits to disk, or preview them
   /verify [on|off|status]   post-edit verification: on detects the project's
                             test command, off clears it, status shows the
@@ -318,6 +322,9 @@ Comandos de Pedacito TUI
   /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
   /image PROMPT [--out ARCHIVO] [--size WxH]
                             generar una imagen con el perfil de imagen configurado
+  /attach [RUTA|list|clear] adjuntar una imagen (PNG/JPEG/WebP/GIF, <=10 MB, máx 4)
+                            a la próxima tarea, listar adjuntas o limpiarlas
+                            (también detecta @ruta/imagen.png en el prompt)
   /apply [on|off]           escribir cambios en disco o solo previsualizar
   /verify [on|off|status]   verificación posterior a la edición
   /skills [list|show|draft] listar, inspeccionar o redactar habilidades
@@ -623,6 +630,7 @@ class TuiSession:
                  agent=None, idx=None,
                  apply: bool = True, headless: bool | None = None,
                  stdin=None, stdout=None, initial_task: str = "",
+                 initial_images: list[dict] | None = None,
                  width: int | None = None, height: int | None = None,
                  color: bool | None = None, sidebar: bool = True,
                  lang: str | None = None):
@@ -691,6 +699,7 @@ class TuiSession:
         # and Auto prompt through cfg._pinned_refs, independently of the
         # prompt's own @file/@symbol mentions.
         self.pins: list[str] = []
+        self.pending_images: list[dict] = list(initial_images or ())
         self.last_telemetry: dict = {}
         self._event_prompt = 0
         self._event_completion = 0
@@ -1036,6 +1045,12 @@ class TuiSession:
         line1 = (f"{brand}{sep} {self._style(project, 'text')} "
                  f"{sep} {line1_profile}: {profile_text} {sep} {line1_model}: {model_text} "
                  f"{sep} {badge_text}")
+        img_badge = ""
+        if self.pending_images:
+            img_label = i18n.t("tui.header.images",
+                               lang=self.lang,
+                               n=len(self.pending_images))
+            img_badge = f" {sep} {self._style(img_label, 'accent')}"
         line2 = (f" {self._style(line2_auto_route + ':', 'muted')} "
                  f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
                  f"{sep} {self._style(line2_scout + ':', 'muted')} "
@@ -1045,7 +1060,8 @@ class TuiSession:
                  f"{sep} {self._style(line2_sidebar + ':', 'muted')} "
                  f"{self._style(sidebar, 'text')} "
                  f"{sep} {self._style(lang_label + ':', 'muted')} "
-                 f"{self._style(lang_pill, 'accent')}")
+                 f"{self._style(lang_pill, 'accent')}"
+                 f"{img_badge}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -2858,14 +2874,118 @@ class TuiSession:
         self._append(f"Theme: {self.theme_name} (saved)", "receipt")
         self._dirty = True
 
+    _PROMPT_IMAGE_REF_RE = re.compile(
+        r"(?<!\S)@([^\s,;:!?\"'()]+?\.(?:png|jpe?g|webp|gif))(?=$|[\s,;:!?\"'()])",
+        re.IGNORECASE,
+    )
+
+    def _resolve_attach_image_path(self, raw_path: str) -> Path:
+        """Resolve an image path for /attach or @image.png: relative paths stay
+        inside project root via `security.resolve_safe_path`; an explicitly
+        typed existing absolute path is allowed directly."""
+        cleaned = str(raw_path or "").strip().strip('"').strip("'")
+        if not cleaned:
+            raise ValueError(i18n.t("tui.attach.usage", lang=self.lang))
+        expanded = Path(cleaned).expanduser()
+        if expanded.is_absolute():
+            if not expanded.exists():
+                raise FileNotFoundError(f"Image file not found: {expanded}")
+            return expanded.resolve()
+        return security.resolve_safe_path(self.root, cleaned)
+
+    def _attach_command(self, arg: str) -> None:
+        """`/attach [PATH | list | clear]` — stage images for the next task."""
+        from . import imagegen
+
+        sub = str(arg or "").strip()
+        low = sub.lower()
+        if not sub or low == "list":
+            if not self.pending_images:
+                self._append(i18n.t("tui.attach.empty", lang=self.lang), "system")
+                return
+            lines = [i18n.t("tui.attach.list_header", lang=self.lang,
+                            n=len(self.pending_images))]
+            for idx_i, img in enumerate(self.pending_images, 1):
+                dims = (f"{img.get('width', 0)}x{img.get('height', 0)}"
+                        if img.get("width") and img.get("height") else "?")
+                kb = max(1, int(img.get("bytes", 0)) // 1024)
+                lines.append(
+                    f"  {idx_i}. {img.get('name', 'image')} "
+                    f"({img.get('mime', '')}, {dims}, {kb} KB)"
+                )
+            self._append("\n".join(lines), "system")
+            return
+        if low == "clear":
+            n = len(self.pending_images)
+            self.pending_images.clear()
+            self._append(i18n.t("tui.attach.cleared", lang=self.lang, n=n),
+                         "receipt")
+            self._dirty = True
+            return
+        if len(self.pending_images) >= imagegen.MAX_IMAGE_ATTACHMENTS:
+            self._append(
+                i18n.t("tui.attach.limit", lang=self.lang,
+                       max=imagegen.MAX_IMAGE_ATTACHMENTS),
+                "error",
+            )
+            return
+        try:
+            path = self._resolve_attach_image_path(sub)
+            item = imagegen.load_image_attachment(path)
+        except (OSError, ValueError, security.SecurityError) as exc:
+            self._append(f"ERROR: {exc}", "error")
+            return
+        self.pending_images.append(item)
+        dims = (f"{item['width']}x{item['height']}"
+                if item.get("width") and item.get("height") else "?")
+        self._append(
+            i18n.t("tui.attach.added", lang=self.lang,
+                   name=item["name"], dims=dims,
+                   n=len(self.pending_images)),
+            "receipt",
+        )
+        self._dirty = True
+
+    def _collect_task_images(self, task: str) -> list[dict]:
+        """Combine staged `pending_images` with any `@path/to/image.<ext>`
+        references found in `task`."""
+        from . import imagegen
+
+        images = list(self.pending_images)
+        seen = {(img.get("name"), img.get("bytes")) for img in images}
+        for match in self._PROMPT_IMAGE_REF_RE.finditer(task or ""):
+            if len(images) >= imagegen.MAX_IMAGE_ATTACHMENTS:
+                break
+            ref = match.group(1)
+            try:
+                path = self._resolve_attach_image_path(ref)
+                item = imagegen.load_image_attachment(path)
+            except (OSError, ValueError, security.SecurityError):
+                continue
+            key = (item.get("name"), item.get("bytes"))
+            if key not in seen:
+                seen.add(key)
+                images.append(item)
+        return images
+
     def run_task(self, task: str) -> None:
         """Run one plain-text coding task, keeping the UI live while it runs."""
         self._context_override = None
         self._event_active = ""
-        self._append(f"\u00bb {task}", "user")
+        run_images = self._collect_task_images(task)
+        if run_images:
+            names = ", ".join(img.get("name", "image") for img in run_images)
+            self._append(f"\u00bb {task}  [\U0001f5bc {len(run_images)} img: {names}]",
+                         "user")
+        else:
+            self._append(f"\u00bb {task}", "user")
         if not self._security_outbound_guard(task):
             self._redraw(force=True)
             return
+        # Clear staged images once the task is accepted for dispatch.
+        if self.pending_images:
+            self.pending_images.clear()
+            self._dirty = True
         self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
@@ -2880,7 +3000,8 @@ class TuiSession:
 
         def work():
             return loop.run_task(self.root, cfg, client, agent, idx, task,
-                                 apply=self.apply)
+                                 apply=self.apply,
+                                 images=run_images or None)
 
         holder = self._run_in_worker(work)
         error = holder.get("error")
@@ -3186,6 +3307,9 @@ class TuiSession:
             return
         if cmd == "image":
             self._image_command(arg)
+            return
+        if cmd == "attach":
+            self._attach_command(arg)
             return
         if cmd == "scroll":
             self._scroll_command(arg)
@@ -4856,6 +4980,7 @@ class TuiSession:
 
 
 def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
+            initial_images: list[dict] | None = None,
             headless: bool = False, stdin=None, stdout=None,
             client=None, apply: bool = True, lang: str | None = None) -> int:
     """Entry point for `pedacito tui`; returns the process exit code.
@@ -4866,5 +4991,6 @@ def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
     """
     session = TuiSession(root, cfg, client=client, apply=apply,
                          headless=headless, stdin=stdin, stdout=stdout,
-                         initial_task=initial_task, lang=lang)
+                         initial_task=initial_task,
+                         initial_images=initial_images, lang=lang)
     return session.run()

@@ -431,10 +431,54 @@ def _prose(reply: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _is_image_item(a) -> bool:
+    if not isinstance(a, dict):
+        return False
+    return (
+        a.get("kind") == "image"
+        or str(a.get("mime") or "").lower().startswith("image/")
+        or (bool(a.get("data_b64") or a.get("data_url")) and "text" not in a)
+    )
+
+
+def _attachment_summary(a: dict) -> dict:
+    """Lightweight attachment metadata for saved chat history (never raw base64)."""
+    if _is_image_item(a):
+        out: dict = {
+            "name": str(a.get("name") or "image"),
+            "kind": "image",
+            "mime": str(a.get("mime") or "image/png"),
+            "width": int(a.get("width") or 0),
+            "height": int(a.get("height") or 0),
+            "bytes": int(a.get("bytes") or 0),
+        }
+        thumb = a.get("thumb")
+        if isinstance(thumb, str) and thumb.startswith("data:image/") and len(thumb) <= 40_000:
+            out["thumb"] = thumb
+        return out
+    return {"name": str(a.get("name", "")), "chars": len(str(a.get("text", "")))}
+
+
+def _extract_images(opts: dict) -> list[dict]:
+    """Return validated image attachments from `opts['images']` (or fallback from
+    `opts['attachments']` if called directly without server pre-splitting)."""
+    from .. import imagegen as imagegen_mod
+
+    imgs = list(opts.get("images") or ())
+    if imgs:
+        return imgs
+    raw = [a for a in (opts.get("attachments") or ()) if _is_image_item(a)]
+    if not raw:
+        return []
+    return imagegen_mod.normalize_image_attachments(raw)
+
+
 def compose(text: str, attachments: list | None) -> str:
-    """The typed text plus any attached files, capped to a sane size."""
+    """The typed text plus any attached text files, capped to a sane size."""
     parts = [(text or "").strip()]
     for a in attachments or []:
+        if _is_image_item(a):
+            continue
         name = str(a.get("name") or "attachment")
         body = str(a.get("text") or "").strip()
         if body:
@@ -448,13 +492,13 @@ def compose(text: str, attachments: list | None) -> str:
 
 
 def _echo_user(mode: str, text: str, attachments: list | None,
-               opts: dict | None = None) -> None:
+               opts: dict | None = None, images: list | None = None) -> None:
     if opts is not None and opts.get("_echoed"):
         return                      # already recorded synchronously by spawn
     shown = text if len(text) <= 4000 else text[:4000] + "\n[...]"
+    combined = list(attachments or ()) + list(images or ())
     STATE.add_message("user", shown, mode=mode, attachments=[
-        {"name": str(a.get("name", "")), "chars": len(str(a.get("text", "")))}
-        for a in attachments or []])
+        _attachment_summary(a) for a in combined if isinstance(a, dict)])
 
 
 def echo_submission(mode: str, body: dict) -> None:
@@ -465,13 +509,14 @@ def echo_submission(mode: str, body: dict) -> None:
     even while the model is still warming up."""
     text = str(body.get("text") or "")
     attachments = body.get("attachments") or []
+    images = body.get("images") or []
     plan_file = str(body.get("plan_file") or "").strip()
-    if not text.strip() and not attachments and not (
+    if not text.strip() and not attachments and not images and not (
             mode == "auto" and plan_file):
         return
     shown = text or (f"plan: {plan_file}" if mode == "auto" and plan_file
                      else "")
-    _echo_user(mode, shown, attachments)
+    _echo_user(mode, shown, attachments, images=images)
 
 
 # --- project ------------------------------------------------------------------
@@ -1015,11 +1060,14 @@ def run_task(job: Job, opts: dict) -> None:
     in the page) or "apply" (write now, backups first)."""
     _ensure_index(job)
     p = _project()
+    images = _extract_images(opts)
     task = compose(opts.get("text", ""), opts.get("attachments"))
+    if not task and images:
+        task = "Inspect the attached image(s)."
     if not task:
         raise ConfigError("Describe the change you want first.")
     _echo_user("task", opts.get("text", "") or task, opts.get("attachments"),
-               opts)
+               opts, images=images)
     write = opts.get("write", "review")
     reviewing, apply = write == "review", write == "apply"
     plan_pref = opts.get("plan", "auto")
@@ -1053,8 +1101,14 @@ def run_task(job: Job, opts: dict) -> None:
                     with STATE.lock:
                         STATE.plan_path = Path(path)
 
-                code = plan_mod.run_planned(root, cfg, client, idx, task,
-                                            apply=apply, on_plan=_bind_plan)
+                if images:
+                    cfg._task_images = list(images)
+                try:
+                    code = plan_mod.run_planned(root, cfg, client, idx, task,
+                                                apply=apply, on_plan=_bind_plan)
+                finally:
+                    if images and hasattr(cfg, "_task_images"):
+                        delattr(cfg, "_task_images")
                 _note_plan_dir(root, started)
                 if apply:
                     _refresh_index(p)
@@ -1067,7 +1121,8 @@ def run_task(job: Job, opts: dict) -> None:
                     plan=True, stats=_usage_stats(client))
                 return
             tr = loop.run_task(root, cfg, client, p.agent, idx, task,
-                               apply=apply, review=reviewing)
+                               apply=apply, review=reviewing,
+                               images=images or None)
             _swap_index(tr.idx)
             if apply:
                 # Pick up anything the run created beyond its edit results
@@ -1153,7 +1208,12 @@ def run_explain(job: Job, opts: dict) -> None:
     With no project open this becomes the standalone Ask: answer the prompt
     directly with the selected global profile instead of refusing. The state
     payload marks the session as the scratchpad until a project is opened."""
+    from .. import imagegen as imagegen_mod
+
+    images = _extract_images(opts)
     question = compose(opts.get("text", ""), opts.get("attachments"))
+    if not question and images:
+        question = "Describe the attached image(s)."
     if not question:
         raise ConfigError("Ask a question first.")
     with STATE.lock:
@@ -1163,19 +1223,20 @@ def run_explain(job: Job, opts: dict) -> None:
     else:
         p = _project()
     _echo_user("explain", opts.get("text", "") or question,
-               opts.get("attachments"), opts)
+               opts.get("attachments"), opts, images=images)
     _set_pinned_refs(p.cfg, opts)
     _evict_other_servers(p.cfg)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
         if p.agent is not None:
             answer = explain_mod.answer(p.agent, question, verbose=True,
-                                        stream=True)
+                                        stream=True, images=images or None)
         else:
             p.client.site = "answer"
+            user_content = imagegen_mod.make_multimodal_content(question, images)
             answer = p.client.chat(
                 [{"role": "system", "content": SCRATCH_SYSTEM},
-                 {"role": "user", "content": question}],
+                 {"role": "user", "content": user_content}],
                 max_tokens=p.cfg.max_tokens_answer, stream=True)
     text = (answer or "").strip()
     if not text and feed.stream_mid:
@@ -1249,6 +1310,7 @@ def run_auto(job: Job, opts: dict) -> None:
     Plan-only keeps the user's real settings."""
     _ensure_index(job)
     p = _project()
+    images = _extract_images(opts)
     goal = compose(opts.get("text", ""), opts.get("attachments"))
     plan_file = (opts.get("plan_file") or "").strip()
     if not goal and not plan_file:
@@ -1310,12 +1372,16 @@ def run_auto(job: Job, opts: dict) -> None:
         cfg.backup = True
         for name in auto_optins:
             setattr(cfg, name, True)
+    if images:
+        cfg._task_images = list(images)
     try:
         with session(p, job, interactive=False, lock=apply) as feed:
             client.warmup()
             code = cli_mod._cmd_auto(ns, cfg, client, STATE.idx, root)
             feed.end_stream()
     finally:
+        if images and hasattr(cfg, "_task_images"):
+            delattr(cfg, "_task_images")
         cfg.creative_mode = saved_creative
         if apply:
             cfg.backup = saved_backup
@@ -1377,6 +1443,7 @@ def run_new(job: Job, opts: dict) -> None:
     every progress event and streamed token lands in the new project's
     session while it is being built. A preview writes nothing, stays unbound,
     and keeps the old workspace."""
+    images = _extract_images(opts)
     spec_text = compose(opts.get("text", ""), opts.get("attachments"))
     project = (opts.get("project") or "").strip()
     if not project:
@@ -1385,7 +1452,7 @@ def run_new(job: Job, opts: dict) -> None:
         raise ConfigError("Describe the project (or attach a spec file).")
     target = Path(project).expanduser().resolve()
     _echo_user("new", opts.get("text", "") or spec_text,
-               opts.get("attachments"), opts)
+               opts.get("attachments"), opts, images=images)
     mode = opts.get("build", "build")         # build | preview | plan | review
     # The composer's profile picker wins for a no-project New; fall back to
     # the topbar's remembered selection when the request omits it.
@@ -1439,18 +1506,24 @@ def run_new(job: Job, opts: dict) -> None:
     p = SimpleNamespace(cfg=cfg, client=client, root=target)
     with session(p, job, interactive=False, lock=False) as feed:
         client.warmup()
-        code = scaffold.run_new(
-            target, cfg, client, spec,
-            apply=mode in ("build",), review=mode == "review",
-            plan_only=mode == "plan", force=bool(opts.get("force")),
-            verbose=True, complex=bool(opts.get("complex")),
-            verify=opts.get("verify") or cfg.auto_verify,
-            repair_rounds=_int_or(opts.get("repair"), cfg.auto_repair_rounds),
-            max_tasks=_int_or(opts.get("max_tasks"), cfg.auto_max_tasks),
-            max_minutes=_int_or(opts.get("max_minutes"), cfg.auto_max_minutes),
-            keep_going=bool(opts.get("keep_going")),
-            auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps),
-            log_command="" if mode == "preview" else "command: gui new")
+        if images:
+            cfg._task_images = list(images)
+        try:
+            code = scaffold.run_new(
+                target, cfg, client, spec,
+                apply=mode in ("build",), review=mode == "review",
+                plan_only=mode == "plan", force=bool(opts.get("force")),
+                verbose=True, complex=bool(opts.get("complex")),
+                verify=opts.get("verify") or cfg.auto_verify,
+                repair_rounds=_int_or(opts.get("repair"), cfg.auto_repair_rounds),
+                max_tasks=_int_or(opts.get("max_tasks"), cfg.auto_max_tasks),
+                max_minutes=_int_or(opts.get("max_minutes"), cfg.auto_max_minutes),
+                keep_going=bool(opts.get("keep_going")),
+                auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps),
+                log_command="" if mode == "preview" else "command: gui new")
+        finally:
+            if images and hasattr(cfg, "_task_images"):
+                delattr(cfg, "_task_images")
         feed.end_stream()
     if mode == "preview":
         STATE.add_message(

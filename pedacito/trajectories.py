@@ -34,7 +34,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import events, fileio, safety, security
+from . import events, fileio, imagegen, safety, security
 
 TRAJECTORY_DIR = "trajectories"
 _MASK = "[REDACTED]"
@@ -121,7 +121,9 @@ def _message(value) -> dict:
     if not isinstance(value, dict):
         return {"role": "user", "content": str(value)}
     content = value.get("content", "")
-    if content is not None and not isinstance(content, (str, list)):
+    if isinstance(content, list):
+        content = imagegen.sanitize_multimodal_content(content)
+    elif content is not None and not isinstance(content, str):
         content = str(content)
     out = {"role": str(value.get("role") or "user"), "content": content}
     for key in ("name", "tool_calls", "tool_call_id", "function_call"):
