@@ -1565,6 +1565,18 @@ CLOUD_PROVIDERS: tuple[dict, ...] = (
         "models": ["deepseek/deepseek-chat", "qwen/qwen3-coder",
                    "anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"],
     },
+    {
+        # A local MoE runtime is still an OpenAI-compatible server, so it gets
+        # the same one-click path as the clouds. The key is optional (Strata/
+        # Avalon only require it when their /health says so); the curated list
+        # is empty on purpose: the live /v1/models answer is the catalog.
+        "id": "strata", "label": "Strata / Avalon (Local MoE)",
+        "provider": "strata",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_key_env": "STRATA_API_KEY", "suggest": "strata",
+        "context_tokens": 131072,
+        "models": [],
+    },
 )
 
 # Generous gather reads for cloud windows (the `hosted` tier's own budgets are
@@ -1635,7 +1647,13 @@ def add_provider_preset(body: dict) -> dict:
     `deepseek_chat`, `gemini_2_5_flash`..."""
     body = body or {}
     preset = _preset_by_id(body.get("preset_id"))
-    model = str(body.get("model") or "").strip() or preset["models"][0]
+    model = str(body.get("model") or "").strip()
+    if not model and preset.get("models"):
+        model = preset["models"][0]
+    if not model:
+        raise ConfigError(
+            "This preset needs an explicit model id; connect once to read "
+            "the server's live catalog.")
     raw_name = str(body.get("profile_name") or "").strip()
     name = _sanitize_profile_name(
         raw_name or _preset_profile_suggestion(preset, model))

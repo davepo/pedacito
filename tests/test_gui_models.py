@@ -480,6 +480,24 @@ def test_import_stores_per_model_api_key_env(gui):
     assert "api_key" not in body
 
 
+def test_scanner_ui_makes_strata_effortless_to_import():
+    """The scan card names Strata/Lemonade, offers one key field per
+    key-protected server group, and forwards both the provider label and the
+    non-empty key with the selected rows."""
+    js = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+          / "settings.js").read_text(encoding="utf-8")
+    scan = js[js.index("function scanner()"):js.index("function doScan()")]
+    imp = js[js.index("function doImport()"):js.index("function calibrate(")]
+    assert ("probes LM Studio, Ollama, Lemonade, Strata, llama.cpp and your "
+            "existing profiles") in scan
+    assert "API key required" in scan
+    assert "API key (or STRATA_API_KEY)" in scan
+    assert "The STRATA_API_KEY environment variable also works." in scan
+    assert "grp.some(function (x) { return !!x.requires_api_key; })" in scan
+    assert "provider: r.provider || ''" in imp
+    assert "if (key) item.api_key = key;" in imp
+
+
 def test_import_hosted_models_detects_a_local_strata(gui):
     """Aiming the hosted-provider dialog at a local Strata must not force
     tier="hosted"/json_mode="object": /health names the runtime and context."""
