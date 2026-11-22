@@ -557,6 +557,55 @@ def test_gguf_header_and_runtime_metadata_match_finetune_family(
     assert card["choices"]["sampler"] == {"top_p": 0.95, "top_k": 20}
 
 
+def test_remote_lan_checkpoint_resolves_via_cached_hf_metadata(
+        tmp_path, monkeypatch):
+    """When pedacito runs on another machine (e.g. Windows laptop talking to a
+    LAN Lemonade server), no local .gguf exists: match_arch falls back to a
+    cached anonymous HuggingFace Hub metadata lookup when allow_hf_lookup=True."""
+    monkeypatch.setattr(arch_defaults, "locate_gguf_for_checkpoint",
+                        lambda ckpt, **kw: None)
+    cache_file = tmp_path / "hf_arch_cache.json"
+    monkeypatch.setattr(arch_defaults, "_hf_cache_path", lambda: cache_file)
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "gguf": {"architecture": "qwen35", "context_length": 262144},
+                "cardData": {"base_model": "RadixArk/DaisyRose-27B"},
+            },
+        )
+
+    import requests as req_mod
+    monkeypatch.setattr(req_mod, "get", fake_get)
+
+    # Air-gapped / opt-out (allow_hf_lookup=False): zero HTTP calls
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=False) is None
+    assert calls == []
+
+    # Opt-in (default during calibration): resolves to qwen3.5 and caches
+    entry = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=True)
+    assert entry is not None and entry["family"] == "qwen3.5"
+    assert len(calls) == 1
+    assert calls[0].endswith("/api/models/RadixArk/DaisyRose-27B-GGUF")
+
+    # Second lookup hits the local disk cache — zero extra HTTP calls
+    entry2 = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=True)
+    assert entry2 is not None and entry2["family"] == "qwen3.5"
+    assert len(calls) == 1
+
+
 def test_needle_step_down_ladder():
     assert arch_defaults.needle_step_down(131072) == 65536
     assert arch_defaults.needle_step_down(65536) == 32768

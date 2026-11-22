@@ -22,8 +22,11 @@ specific-first: the coder variants precede the base family they contain.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import struct
+import time
 from pathlib import Path
 
 # Each entry: the id fragments that select it, the recommended sampler and
@@ -459,7 +462,86 @@ def locate_gguf_for_checkpoint(checkpoint: str, *,
     return candidates[0]
 
 
-def match_arch(model_id: str, info: dict | None = None) -> dict | None:
+_HF_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_HF_CACHE_TTL = 30 * 24 * 3600.0
+
+
+def _hf_cache_path() -> Path | None:
+    try:
+        from . import config as config_mod
+        return config_mod.user_config_dir() / "hf_arch_cache.json"
+    except Exception:
+        return None
+
+
+def fetch_hf_gguf_arch(checkpoint: str, *,
+                       timeout: float = 3.0) -> dict[str, str]:
+    """Best-effort anonymous HuggingFace Hub metadata lookup for a GGUF repo
+    such as ``RadixArk/DaisyRose-27B-GGUF:Q4_K_XL``.
+
+    Used only during calibration when a remote/LAN server (e.g. Lemonade on
+    another machine) reports a HuggingFace checkpoint whose `.gguf` file is
+    not on the client's local disk. Results are cached for 30 days under the
+    user config directory; any network/offline error returns ``{}`` silently."""
+    raw = str(checkpoint or "").strip()
+    repo = raw.partition(":")[0].strip().strip("/")
+    if not _HF_REPO_RE.fullmatch(repo):
+        return {}
+
+    now = time.time()
+    cache_file = _hf_cache_path()
+    store: dict = {}
+    if cache_file is not None:
+        try:
+            if cache_file.is_file():
+                loaded = json.loads(cache_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    store = loaded
+                    entry = store.get(repo)
+                    if (isinstance(entry, dict)
+                            and now - float(entry.get("ts") or 0) < _HF_CACHE_TTL
+                            and isinstance(entry.get("meta"), dict)):
+                        return dict(entry["meta"])
+        except Exception:
+            store = {}
+
+    try:
+        import requests
+        r = requests.get(f"https://huggingface.co/api/models/{repo}",
+                         headers={"Accept": "application/json"},
+                         timeout=timeout)
+        if getattr(r, "status_code", 0) != 200:
+            return {}
+        data = r.json()
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    meta: dict[str, str] = {}
+    gguf = data.get("gguf")
+    if isinstance(gguf, dict) and gguf.get("architecture"):
+        meta["general.architecture"] = str(gguf["architecture"]).strip()
+    card = data.get("cardData")
+    if isinstance(card, dict):
+        bm = card.get("base_model")
+        if isinstance(bm, list) and bm:
+            bm = bm[0]
+        if isinstance(bm, str) and bm.strip():
+            meta["general.base_model.0.name"] = bm.strip()
+
+    if cache_file is not None and meta:
+        try:
+            store[repo] = {"ts": now, "meta": meta}
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return meta
+
+
+def match_arch(model_id: str, info: dict | None = None, *,
+               allow_hf_lookup: bool = False) -> dict | None:
     """The library entry matching `model_id` (or GGUF/runtime metadata in
     `info`), or None.
 
@@ -470,6 +552,9 @@ def match_arch(model_id: str, info: dict | None = None) -> dict | None:
          LM Studio `arch`, and llama-server `meta`.
       3. Local GGUF header metadata from `info["model_path"]` or a local cache
          hit for `info["checkpoint"]` (Lemonade fine-tunes like DaisyRose-27B).
+      4. When `allow_hf_lookup=True` and no local `.gguf` exists (e.g. a
+         Windows laptop talking to a LAN Lemonade server), a cached anonymous
+         HuggingFace Hub metadata lookup for `info["checkpoint"]`.
     """
     hit = _match_text(model_id)
     if hit is not None:
@@ -490,7 +575,7 @@ def match_arch(model_id: str, info: dict | None = None) -> dict | None:
         if hit is not None:
             return hit
 
-    # Last resort: read GGUF header metadata from a local path or checkpoint.
+    # Local GGUF header metadata from a local path or checkpoint cache.
     gguf_path: Path | None = None
     raw_path = str(info.get("model_path") or "").strip()
     if raw_path:
@@ -503,6 +588,17 @@ def match_arch(model_id: str, info: dict | None = None) -> dict | None:
         meta = read_gguf_metadata(gguf_path)
         for key in ("general.base_model.0.name", "general.basename",
                     "general.name", "general.architecture"):
+            val = meta.get(key)
+            if val:
+                hit = _match_text(val)
+                if hit is not None:
+                    return hit
+
+    # Remote/LAN server fallback: resolve GGUF architecture from HuggingFace
+    # Hub metadata when the client has no local copy of the GGUF file.
+    if allow_hf_lookup and info.get("checkpoint"):
+        meta = fetch_hf_gguf_arch(str(info["checkpoint"]))
+        for key in ("general.base_model.0.name", "general.architecture"):
             val = meta.get(key)
             if val:
                 hit = _match_text(val)
