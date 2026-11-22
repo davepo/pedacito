@@ -1754,7 +1754,10 @@ def _servers_load(q, body):
     config = _servers_config()
     target = _server_target(body)
     model = str(body.get("model") or "").strip()
-    result = servers.load_server_model(target, model, config)
+    evict_others = bool(body.get("evict_others", True))
+    kind = str(body.get("kind") or "").strip()
+    result = servers.load_server_model(
+        target, model, config, evict_others=evict_others, kind=kind)
     payload = _server_payload(config)
     payload.update(result)
     return (200 if result.get("ok") else 502), payload
@@ -1768,8 +1771,9 @@ def _servers_unload(q, body):
     config = _servers_config()
     target = _server_target(body)
     model = str(body.get("model") or "").strip()
+    kind = str(body.get("kind") or "").strip()
     if target:
-        result = servers.unload_server_model(target, model, config)
+        result = servers.unload_server_model(target, model, config, kind=kind)
         results = [result]
     else:
         results = servers.unload_all_local_servers(config)
@@ -2591,7 +2595,12 @@ def _models(q, body):
 @post("/api/settings/discover")
 def _discover(q, body):
     from ..discovery import discover_servers
-    found = discover_servers(timeout=1.5)
+    flat, profiles = settings_api._user_scan_config()
+    auth = settings_api._endpoint_auth(flat, profiles)
+    found = discover_servers(
+        timeout=1.5,
+        profile_urls=settings_api._scan_profile_urls(flat, profiles),
+        auth=auth)
     return 200, {"servers": [{"label": a, "base_url": b, "models": c}
                              for a, b, c in found]}
 

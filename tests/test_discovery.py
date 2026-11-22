@@ -160,6 +160,51 @@ def test_strata_is_fingerprinted_and_lists_from_public_health(fake):
     assert found == [("Strata", url + "/v1", ["qwen3.8-flash"])]
 
 
+def test_strata_entries_preserve_requires_api_key_and_provider(fake):
+    """The public /health names the runtime and whether an API key is needed;
+    `_strata_entries` must carry both so a key-protected Strata is still
+    described (and importable) without its credential."""
+    url = fake({
+        "/health": (200, {"service": "avalon", "model": "qwen3.8-flash",
+                          "max_context": 131072, "loaded": True,
+                          "api_key": True}),
+    })
+    entries = discovery._strata_entries(url, 1.0)
+    assert entries == [{
+        "id": "qwen3.8-flash",
+        "context_length": 131072,
+        "loaded": True,
+        "requires_api_key": True,
+        "provider": "avalon",
+    }]
+
+
+def test_strata_entries_report_no_key_when_health_omits_api_key(fake):
+    url = fake({
+        "/health": (200, {"service": "strata", "model": "qwen3.8-flash",
+                          "max_context": 32768, "loaded": False}),
+    })
+    entries = discovery._strata_entries(url, 1.0)
+    assert entries == [{
+        "id": "qwen3.8-flash",
+        "context_length": 32768,
+        "loaded": False,
+        "requires_api_key": False,
+        "provider": "strata",
+    }]
+
+
+def test_describe_models_carries_requires_api_key_from_health(fake):
+    """A Strata whose /v1/models answers 401 but whose /health answers 200 is
+    still described; `requires_api_key` rides the record so the GUI scan can
+    import it with an api_key/api_key_env."""
+    url = fake(_strata(), auth="Bearer secret", protected={"/v1/models"})
+    rows = discovery.describe_models(url + "/v1")
+    assert rows == [{"id": "qwen3.8-flash", "base_url": url + "/v1",
+                     "requires_api_key": True, "context_length": 131072,
+                     "loaded": True}]
+
+
 def test_auth_mapping_unlocks_a_key_protected_listing(fake):
     """Per-server credentials from configured profiles are sent to that
     server only; without them the OpenAI listing answers 401 and the server

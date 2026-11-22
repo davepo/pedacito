@@ -1839,6 +1839,75 @@ def _profile_base_urls() -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _scan_auth() -> dict:
+    """Per-server Authorization headers for `models scan`, from the user
+    config's profiles plus STRATA_API_KEY/AVALON_API_KEY for Strata/Avalon
+    runtimes. Mirrors `settings_api._endpoint_auth` so the CLI and GUI scans
+    agree, and a key never crosses origins."""
+    from urllib.parse import urlparse
+
+    try:
+        text = USER_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        flat, profiles = config_editor.validate_text(text)
+    except ConfigError:
+        return {}
+
+    def origin(url):
+        try:
+            p = urlparse(str(url or "").strip())
+        except ValueError:
+            return None
+        scheme = (p.scheme or "").lower()
+        if scheme not in ("http", "https") or not p.hostname:
+            return None
+        try:
+            port = p.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return None
+        return (scheme, p.hostname.lower(), port)
+
+    flat_url = str(flat.get("base_url") or "")
+    flat_origin = origin(flat_url)
+
+    def key_for(body, fallback):
+        key = str(body.get("api_key") or "")
+        env = str(body.get("api_key_env") or "")
+        if env:
+            key = os.environ.get(env, "") or key
+        if not key and str(body.get("provider") or "").lower() in (
+                "strata", "avalon", "local-moe", "local_moe", "localmoe"):
+            for name in ("STRATA_API_KEY", "AVALON_API_KEY"):
+                key = os.environ.get(name, "") or key
+        if not key and fallback:
+            key = str(flat.get("api_key") or "")
+            env = str(flat.get("api_key_env") or "")
+            if env:
+                key = os.environ.get(env, "") or key
+        return key
+
+    auth: dict[str, dict] = {}
+    for body in (profiles or {}).values():
+        if not isinstance(body, dict):
+            continue
+        base = str(body.get("base_url") or flat_url or "")
+        if not base:
+            continue
+        same = bool(flat_origin) and origin(base) == flat_origin
+        key = key_for(body, same)
+        if key:
+            auth[discovery.normalize_url(base)] = {
+                "Authorization": f"Bearer {key}"}
+    if flat_url:
+        key = key_for(flat, False)
+        if key:
+            auth.setdefault(discovery.normalize_url(flat_url),
+                            {"Authorization": f"Bearer {key}"})
+    return auth
+
+
 def _ask_vram(label: str, base_url: str, args) -> int:
     """The VRAM of the machine running this server, asked once per server."""
     if getattr(args, "vram_gb", None):
@@ -2040,6 +2109,7 @@ def _to_scan_entry(m: dict) -> dict:
     entry: dict = {"model": m["id"], "base_url": m["base_url"],
                    "modality": "image" if is_img else None,
                    "server_label": m.get("server_label", ""),
+                   "provider": m.get("provider"),
                    "tier": m.get("tier") or "",
                    "vram_gb": m.get("vram_gb"),
                    "quant": m.get("quant"),
@@ -2060,22 +2130,30 @@ def _cmd_models_scan(args) -> int:
     local_urls = [u for u in urls if not _is_hosted_url(u)]
     hosted_urls = [u for u in urls if _is_hosted_url(u)]
 
+    auth = _scan_auth()
     servers = discovery.discover_servers(timeout=2.0, urls=local_urls,
-                                         profile_urls=_profile_base_urls())
+                                         profile_urls=_profile_base_urls(),
+                                         auth=auth)
     selected: list[dict] = []
     if servers:
         for label, base_url, _ids in servers:
             vram = _ask_vram(label, base_url, args)
-            models = discovery.describe_models(base_url, vram_gb=vram)
+            models = discovery.describe_models(base_url, vram_gb=vram, auth=auth)
             picked = _scan_filter(models, args)
             chosen = picked if getattr(args, "yes", False) \
                 else _interactive_pick(label, base_url, picked)
             for m in chosen:
                 m["server_label"] = label
                 m["vram_gb"] = vram
+                # The local-MoE/Lemonade runtimes are written as `provider` so
+                # the profile classifies (and routes) as its real daemon, not
+                # as a generic "custom" server.
+                if label in ("Strata", "Avalon", "Lemonade"):
+                    m["provider"] = label.lower()
                 if not m.get("tier"):
                     m["tier"] = _guess_tier(
-                        m["id"], {"model": m["id"], "base_url": base_url}) or ""
+                        m["id"], {"model": m["id"], "base_url": base_url,
+                                  "provider": m.get("provider", "")}) or ""
             selected.extend(chosen)
     elif not hosted_urls:
         print("No local model servers answered.", file=sys.stderr)

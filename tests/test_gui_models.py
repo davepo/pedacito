@@ -425,3 +425,104 @@ def test_calibrate_runs_in_the_background_and_saves_a_card(gui, monkeypatch):
     assert saved.exists()
     assert json.loads(saved.read_text(encoding="utf-8"))  # keyed by server+model
     assert cards and cards[0]["measured"]["overall"] == 0.83
+
+
+# ------------------------------------------- Strata/Avalon import fidelity
+
+def test_scan_includes_requires_api_key_for_a_key_protected_strata(gui):
+    """A Strata whose /v1/models answers 401 is still listed via /health, and
+    the row carries requires_api_key so the UI can offer an api_key field."""
+    srv = _serve({
+        "/health": (200, {"service": "strata", "model": "qwen3.8-flash",
+                          "max_context": 131072, "loaded": True,
+                          "api_key": True}),
+        "/v1/models": (401, {"error": {"type": "authentication_error"}}),
+    })
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        status, j = gui.post("/api/models/scan", {"urls": [base + "/v1"]})
+        assert status == 200 and j["ok"]
+        rows = [m for m in j["models"] if m["server_url"] == base + "/v1"]
+        assert rows and rows[0]["requires_api_key"] is True
+        assert rows[0]["provider"] == "Strata"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_import_normalizes_strata_label_to_provider_and_tier(gui):
+    """Selecting a Strata scan row imports provider="strata" (and therefore
+    tier="local-moe"), not a generic custom profile; a per-model key rides."""
+    from pedacito import config_editor
+    status, j = gui.post("/api/models/import", {"models": [
+        {"profile_name": "strata", "base_url": "http://127.0.0.1:8090/v1",
+         "model": "some-model-7b", "provider": "Strata",
+         "api_key": "sk-strata", "vram_gb": 24}]})
+    assert status == 200 and "strata" in j["imported"]
+    body = config_editor.profile_body(gui.cfg_path.read_text(encoding="utf-8"),
+                                      "strata")
+    assert body["provider"] == "strata"
+    assert body["tier"] == "local-moe"
+    assert body["api_key"] == "sk-strata"
+
+
+def test_import_stores_per_model_api_key_env(gui):
+    from pedacito import config_editor
+    status, j = gui.post("/api/models/import", {"models": [
+        {"profile_name": "avalon", "base_url": "http://127.0.0.1:8091/v1",
+         "model": "some-model-7b", "provider": "Avalon",
+         "api_key_env": "AVALON_API_KEY"}]})
+    assert status == 200 and "avalon" in j["imported"]
+    body = config_editor.profile_body(gui.cfg_path.read_text(encoding="utf-8"),
+                                      "avalon")
+    assert body["provider"] == "avalon"
+    assert body["api_key_env"] == "AVALON_API_KEY"
+    assert "api_key" not in body
+
+
+def test_import_hosted_models_detects_a_local_strata(gui):
+    """Aiming the hosted-provider dialog at a local Strata must not force
+    tier="hosted"/json_mode="object": /health names the runtime and context."""
+    from pedacito import config_editor
+    srv = _serve({"/health": (200, {"service": "strata",
+                                    "max_context": 131072})})
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        status, j = gui.post("/api/providers/import", {
+            "preset_id": "custom", "base_url": base,
+            "models": [{"model": "qwen3.8-flash"}]})
+        assert status == 200 and j["imported"]
+        body = config_editor.profile_body(
+            gui.cfg_path.read_text(encoding="utf-8"), j["imported"][0])
+        assert body["provider"] == "strata"
+        assert body["tier"] == "local-moe"
+        assert body["context_tokens"] == 131072
+        assert body.get("json_mode") is None
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_discover_endpoint_passes_profile_urls_and_auth(gui, monkeypatch):
+    """`POST /api/settings/discover` carries the user config's profile URLs and
+    per-origin keys, so a key-protected Strata on a custom port is still found."""
+    from pedacito import discovery
+    _write(gui, '''\
+[profiles.strata]
+base_url = "http://127.0.0.1:8090/v1"
+model = "qwen3.8-flash"
+provider = "strata"
+api_key = "sk-strata"
+''')
+    seen = {}
+
+    def spy(*a, **k):
+        seen.update(k)
+        return []
+
+    monkeypatch.setattr(discovery, "discover_servers", spy)
+    status, j = gui.post("/api/settings/discover", {})
+    assert status == 200
+    assert seen["profile_urls"] == ["http://127.0.0.1:8090/v1"]
+    assert seen["auth"][discovery.normalize_url(
+        "http://127.0.0.1:8090/v1")] == {"Authorization": "Bearer sk-strata"}

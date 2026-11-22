@@ -122,7 +122,7 @@ def test_dialog_titles_the_server_and_load_routes_by_registry_name(
                         lambda *a, **k: [_lemonade_state()])
     calls = []
 
-    def fake_load(target, model="", config=None):
+    def fake_load(target, model="", config=None, evict_others=False, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "load", "server": target,
                 "model": model, "detail": "loaded"}
