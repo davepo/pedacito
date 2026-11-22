@@ -479,6 +479,7 @@
     var list = sel.map(function (m) {
       return { model: m.id,
                profile_name: HC.name[m.id] || m.suggested_profile_name || '',
+               context_tokens: m.context_tokens || 0,
                set_default: HC.def === m.id };
     });
     var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
