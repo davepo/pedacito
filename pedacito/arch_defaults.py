@@ -133,6 +133,15 @@ ARCH_LIBRARY: tuple[dict, ...] = (
         "specialties": ("general",),
     },
     {
+        "family": "starcoder",
+        "patterns": ("starcoder", "dolphincoder"),
+        "temperature": 0.3, "temperature_answer": 0.3,
+        "thinking_temperature": 0.5, "thinking_temperature_answer": 0.5,
+        "sampler": {"top_p": 0.95},
+        "context_tokens": 16384,
+        "specialties": ("coding",),
+    },
+    {
         "family": "granite",
         "patterns": ("granite",),
         "temperature": 0.3, "temperature_answer": 0.3,

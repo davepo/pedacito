@@ -1264,14 +1264,16 @@ def test_mcp_env_is_redacted_on_read_and_preserved_on_save(gui):
 
 
 def test_settings_js_shows_calibrated_temperature_over_global():
-    """Settings -> Profiles must surface calibrated model-card choices (such as
-    arch_family temperature / temperature_answer) in placeholders and inherit
-    labels instead of displaying stale `(global)` values from [universal]."""
+    """Settings -> Profiles and All settings (profile target) must surface
+    calibrated model-card choices (such as arch_family temperature /
+    temperature_answer) instead of displaying stale `(global)` values."""
     js = (Path(__file__).resolve().parents[1]
           / "pedacito" / "gui" / "static" / "settings.js").read_text(
               encoding="utf-8")
     assert "function calibratedChoice(name)" in js
+    assert "X.tab === 'all' ? X.target : ''" in js
     assert "cal.card_choices" in js
     assert "name === 'temperature' || name === 'temperature_answer'" in js
     assert "var cal = calibratedChoice(item.name);" in js
+    assert "Calibrated card active" in js
 

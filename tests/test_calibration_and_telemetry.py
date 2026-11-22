@@ -386,6 +386,8 @@ def test_arch_library_values():
     assert arch_defaults.match_arch(
         "lfm3-1_7b-gguf-modelscope-q8-0")["family"] == "lfm3"
     assert arch_defaults.match_arch("lfm2-7b")["family"] == "lfm"
+    assert arch_defaults.match_arch(
+        "dolphincoder-starcoder2-7b")["family"] == "starcoder"
 
 
 def test_recommended_temperatures_selects_thinking_and_caps_small_tier():
@@ -439,6 +441,32 @@ def test_arch_context_local_moe_keeps_server_window():
     # without a server-reported window, fall back to the family recommendation
     assert arch_defaults.arch_context_tokens(
         entry, {}, is_local_moe=True) == 32768
+
+
+def test_calibrate_local_deepseek_and_unlisted_finetune_get_temperatures(
+        tmp_path, monkeypatch):
+    """A local DeepSeek GGUF on 127.0.0.1 must not be treated as hosted
+    during calibration, and an unlisted custom fine-tune (like DaisyRose-27B)
+    still gets calibrated baseline temperatures instead of falling back to
+    [universal] 0.2 / 0.0."""
+    cfg_ds = Config(
+        base_url="http://127.0.0.1:11434/v1",
+        model="DeepSeek-Coder-V2-Lite-Instruct-GGUF-Q8_0",
+        json_mode="object", _hosted_server=True)
+    card_ds = modelcard.calibrate(_ArchProbeClient(), cfg_ds, verbose=False,
+                                  quick=True)
+    assert card_ds["choices"]["arch_family"] == "deepseek-coder"
+    assert card_ds["choices"]["temperature"] in (0.3, 0.5)
+    assert card_ds["choices"]["temperature_answer"] in (0.3, 0.5)
+
+    cfg_ft = Config(
+        base_url="http://127.0.0.1:11434/v1",
+        model="DaisyRose-27B-GGUF-Q4_K_XL")
+    card_ft = modelcard.calibrate(_ArchProbeClient(), cfg_ft, verbose=False,
+                                  quick=True)
+    assert "arch_family" not in card_ft["choices"]
+    assert card_ft["choices"]["temperature"] == 0.3
+    assert card_ft["choices"]["temperature_answer"] == 0.3
 
 
 def test_needle_step_down_ladder():

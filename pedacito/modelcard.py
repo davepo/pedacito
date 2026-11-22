@@ -1251,7 +1251,7 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     Each skill probe runs `repeats` times (default 3, or 1 for `quick`) so the
     card records a mean and spread instead of one noisy sample; `choose()`
     reads the means."""
-    from .config import is_hosted, is_local_moe
+    from .config import _endpoint_is_local, is_hosted, is_local_moe
 
     # An image-generator profile has no chat/edit surface: run the image probe
     # instead of the text-LLM suite (the `client` is never used).
@@ -1282,7 +1282,8 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
         info = client.model_info() or {}
     except Exception:
         info = {}
-    hosted = is_hosted(cfg)
+    hosted = is_hosted(cfg) and not _endpoint_is_local(
+        str(getattr(cfg, "base_url", "") or ""))
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
     arch = None if hosted else arch_defaults.match_arch(cfg.model)
@@ -1438,13 +1439,24 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
                 tier=str(getattr(cfg, "active_tier", "")
                          or getattr(cfg, "tier", "") or ""))
         choices["context_tokens"] = final_ctx
-    elif not hosted and not choices.get("disable_thinking", False) \
-            and is_local_moe(cfg):
-        # A local tiered-MoE server with no named family still reasons before
-        # it answers: record a safe thinking baseline so Creative Mode sways
-        # from 0.6 instead of the tiny-tier 0.2 default.
-        choices["temperature"] = 0.6
-        choices["temperature_answer"] = 0.6
+    elif not hosted:
+        # Unlisted local fine-tunes (e.g. custom GGUF merges not in
+        # ARCH_LIBRARY) still deserve calibrated temperatures rather than
+        # falling back to a stale `[universal]` 0.2 / 0.0 greedy default.
+        thinking_on = (
+            not bool(choices.get("disable_thinking", False))
+            and (local_moe or measured.get("thinking_on_ok", 0.0) >= 0.5
+                 and measured.get("thinking_off_ok", 1.0) < 0.5)
+        )
+        if local_moe and not bool(choices.get("disable_thinking", False)):
+            choices["temperature"] = 0.6
+            choices["temperature_answer"] = 0.6
+        elif thinking_on:
+            choices["temperature"] = 0.6
+            choices["temperature_answer"] = 0.6
+        else:
+            choices["temperature"] = 0.3
+            choices["temperature_answer"] = 0.3
     card = {"version": CARD_VERSION, "key": card_key(cfg), "ts": time.time(),
             "model": cfg.model, "url": cfg.base_url, "measured": measured,
             "choices": choices, "notes": notes[:12], "repeats": repeats,

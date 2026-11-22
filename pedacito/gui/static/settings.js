@@ -208,8 +208,10 @@
   // (only an explicit per-profile key beats them); other card choices apply
   // when `[universal]` leaves the key unset.
   function calibratedChoice(name) {
-    if (X.tab !== 'profiles' || !X.profile) return null;
-    var cal = ((X.data && X.data.calibration) || {})[X.profile];
+    var prof = (X.tab === 'profiles') ? X.profile
+      : (X.tab === 'all' ? X.target : '');
+    if (!prof) return null;
+    var cal = ((X.data && X.data.calibration) || {})[prof];
     if (!cal || !cal.calibrated || cal.is_hosted || cal.is_image_model) return null;
     var ch = cal.card_choices || {};
     if (!(name in ch) || ch[name] === undefined || ch[name] === null) return null;
@@ -1408,11 +1410,24 @@
     }
     var mkDefault = h('button', { text: 'Make default', onclick: function () {
       save({ file: X.which, profile: null, changes: { default_profile: name } }, '/api/settings/set', '"' + name + '" is now the default profile.'); } });
+    var cal = ((X.data && X.data.calibration) || {})[name] || {};
+    var calCh = (cal.calibrated && !cal.is_hosted && !cal.is_image_model) ? (cal.card_choices || {}) : null;
+    var calBanner = null;
+    if (calCh && (calCh.temperature !== undefined || calCh.temperature_answer !== undefined)) {
+      var parts = [];
+      if (calCh.temperature !== undefined) parts.push('temperature ' + calCh.temperature);
+      if (calCh.temperature_answer !== undefined) parts.push('temperature_answer ' + calCh.temperature_answer);
+      if (calCh.context_tokens) parts.push('context ' + PDC.fmtInt(calCh.context_tokens));
+      var famTag = calCh.arch_family ? ' (' + calCh.arch_family + ')' : '';
+      calBanner = h('div', { class: 'muted small-text', style: 'margin:0 0 8px',
+        text: 'Calibrated card active' + famTag + ': ' + parts.join(' \u00b7 ') + ' \u2014 leave blank below to use these calibrated values, or type a number to override.' });
+    }
     return h('div', {},
       h('div', { class: 'ovr-group' },
         h('div', { class: 'ovr-head' },
           h('b', { text: 'Reasoning & Execution Overrides' }),
-          h('span', { class: 'muted small-text', text: 'how this model thinks and lands edits \u2014 each box offers \u201c(inherit \u2014 universal: \u2026)\u201d to drop the override again' })),
+          h('span', { class: 'muted small-text', text: 'how this model thinks and lands edits \u2014 blank fields use the calibrated card (if present), else universal defaults' })),
+        calBanner,
         ovr),
       h('div', { class: 'ovr-group' },
         h('div', { class: 'ovr-head' }, h('b', { text: 'Connection & Capabilities' })),
@@ -1916,7 +1931,10 @@
         groups[g].forEach(function (it) {
           var set = cur[it.name];
           var res = X.data.resolved[it.name] || {};
-          var src = set !== undefined ? 'set here' : ((res.source || 'default').replace(/\s*\(.*$/, '') || 'default');
+          var cal = X.target ? calibratedChoice(it.name) : null;
+          var src = set !== undefined ? 'set here'
+            : (cal ? cal.label
+               : ((res.source || 'default').replace(/\s*\(.*$/, '') || 'default'));
           var row = h('div', { class: 'set-row' });
           row.appendChild(h('span', { class: 'name', text: it.name, title: it.help }));
           var pending = pendingFor(it.name);
