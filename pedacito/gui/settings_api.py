@@ -532,6 +532,7 @@ def save_theme(name: str) -> dict:
         if STATE._global_cfg is not None:
             STATE._global_cfg.gui_theme = name
         STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
         STATE._global_cfg_stamp = None
     return {"gui_theme": name, "themes": themes, "persisted": True,
             "created": created}
@@ -560,6 +561,7 @@ def save_language(lang: str) -> dict:
         if STATE._global_cfg is not None:
             STATE._global_cfg.language = code
         STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
         STATE._global_cfg_stamp = None
     return {"language": code, "supported": langs,
             "persisted": bool(res.get("persisted", True)),

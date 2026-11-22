@@ -19,6 +19,7 @@ import re
 import sys
 import threading
 import time
+import tomllib
 import uuid
 from collections import deque
 from datetime import datetime
@@ -29,7 +30,7 @@ from .. import config as config_mod
 from .. import fileio
 from .. import i18n
 from .. import review as review_mod
-from .. import security, workspace
+from .. import security, themes as themes_mod, workspace
 from .. import update as update_mod
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
@@ -456,6 +457,7 @@ class State:
         # by (mtime, size) so a polling /api/state does not re-read the file.
         self._user_cfg = None
         self._user_cfg_stamp = None
+        self._user_raw_prefs = None
         # The full global config for a project-less session (profiles, model,
         # toggles). Separate from `_user_cfg` because that one is cosmetic and
         # may be a partial load; this is what /api/state reports and what a
@@ -627,8 +629,49 @@ class State:
         with self.lock:
             self.index_meta = meta
 
+    def _raw_user_prefs(self, stamp: tuple) -> dict[str, str]:
+        """Fault-tolerant TOML read of cosmetic user preferences (`gui_theme`,
+        `language`) when full `config_mod.load()` fails (for example, a stale
+        `default_profile` pointing at a deleted profile). Cached by `stamp` so
+        polling never re-parses disk."""
+        with self.lock:
+            cached = self._user_raw_prefs
+            if cached is not None and cached[0] == stamp:
+                return dict(cached[1])
+        prefs: dict[str, str] = {}
+        try:
+            data = tomllib.loads(USER_CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            for key in ("gui_theme", "language"):
+                for container in (data.get("universal"), data):
+                    if isinstance(container, dict):
+                        val = container.get(key)
+                        if isinstance(val, str) and val.strip():
+                            prefs[key] = val.strip().lower()
+                            break
+        with self.lock:
+            self._user_raw_prefs = (stamp, prefs)
+        return dict(prefs)
+
+    def _themes_json_css_scheme(self) -> str:
+        """Built-in CSS scheme active in `themes.json` (or project pin), or ''
+        when the active theme is a custom palette or unavailable."""
+        try:
+            active = str(
+                themes_mod.get_active_theme_name(self.root) or ""
+            ).strip().lower()
+        except Exception:
+            return ""
+        if active in config_mod._ENUM_FIELDS["gui_theme"]:
+            return active
+        return ""
+
     def user_theme(self) -> str:
-        """The saved `gui_theme`, even with no project open.
+        """The saved `gui_theme`, even with no project open or when an
+        unrelated error (such as a deleted `default_profile`) prevents full
+        config loading.
 
         A project-less GUI has no cfg until something loads one, and the
         topbar picker used to reset to the built-in default on every reload.
@@ -636,19 +679,35 @@ class State:
         upgrade write) and cache it by (mtime, size); `gui_theme` is purely
         cosmetic, so this never touches STATE.cfg or a running job.
         """
+        valid_schemes = config_mod._ENUM_FIELDS["gui_theme"]
         with self.lock:
             cfg = self.cfg
         if cfg is not None:
-            return str(getattr(cfg, "gui_theme", "") or "slate")
+            theme = str(getattr(cfg, "gui_theme", "") or "slate")
+            src = (getattr(cfg, "sources", None) or {}).get("gui_theme", "")
+            if theme != "slate" or (src and src != "default"):
+                return theme
+            return self._themes_json_css_scheme() or "slate"
         try:
             st = USER_CONFIG.stat()
             stamp = (st.st_mtime_ns, st.st_size)
         except OSError:
-            return "slate"
+            return self._themes_json_css_scheme() or "slate"
         with self.lock:
-            if self._user_cfg is not None and self._user_cfg_stamp == stamp:
-                return str(getattr(self._user_cfg, "gui_theme",
-                                   "") or "slate")
+            cached_hit = self._user_cfg_stamp == stamp
+            cached_cfg = self._user_cfg if cached_hit else None
+        if cached_hit:
+            if cached_cfg is not None:
+                theme = str(getattr(cached_cfg, "gui_theme", "") or "slate")
+                src = (getattr(cached_cfg, "sources", None) or {}).get(
+                    "gui_theme", "")
+                if theme != "slate" or (src and src != "default"):
+                    return theme
+                return self._themes_json_css_scheme() or "slate"
+            raw = self._raw_user_prefs(stamp).get("gui_theme", "")
+            if raw in valid_schemes:
+                return raw
+            return self._themes_json_css_scheme() or "slate"
         try:
             cfg = config_mod.load(root=None, require_hardware=False,
                                   warn_budgets=False,
@@ -658,11 +717,20 @@ class State:
         with self.lock:
             self._user_cfg = cfg
             self._user_cfg_stamp = stamp
-        return str(getattr(cfg, "gui_theme", "") or "slate") if cfg \
-            else "slate"
+        if cfg is not None:
+            theme = str(getattr(cfg, "gui_theme", "") or "slate")
+            src = (getattr(cfg, "sources", None) or {}).get("gui_theme", "")
+            if theme != "slate" or (src and src != "default"):
+                return theme
+            return self._themes_json_css_scheme() or "slate"
+        raw = self._raw_user_prefs(stamp).get("gui_theme", "")
+        if raw in valid_schemes:
+            return raw
+        return self._themes_json_css_scheme() or "slate"
 
     def user_language(self) -> str:
-        """The saved `language`, even with no project open.
+        """The saved `language`, even with no project open or when full
+        config loading hits an unrelated ConfigError.
 
         Mirrors `user_theme()`: reads `STATE.cfg` when loaded, otherwise
         caches USER_CONFIG by (mtime, size) without hardware probes so a
@@ -678,9 +746,14 @@ class State:
         except OSError:
             return i18n.detect_lang()
         with self.lock:
-            if self._user_cfg is not None and self._user_cfg_stamp == stamp:
+            cached_hit = self._user_cfg_stamp == stamp
+            cached_cfg = self._user_cfg if cached_hit else None
+        if cached_hit:
+            if cached_cfg is not None:
                 return i18n.normalize_lang(
-                    getattr(self._user_cfg, "language", "") or "en")
+                    getattr(cached_cfg, "language", "") or "en")
+            raw = self._raw_user_prefs(stamp).get("language", "")
+            return i18n.normalize_lang(raw) if raw else i18n.detect_lang()
         try:
             cfg = config_mod.load(root=None, require_hardware=False,
                                   warn_budgets=False,
@@ -690,8 +763,10 @@ class State:
         with self.lock:
             self._user_cfg = cfg
             self._user_cfg_stamp = stamp
-        return i18n.normalize_lang(getattr(cfg, "language", "") or "en") \
-            if cfg else i18n.detect_lang()
+        if cfg is not None:
+            return i18n.normalize_lang(getattr(cfg, "language", "") or "en")
+        raw = self._raw_user_prefs(stamp).get("language", "")
+        return i18n.normalize_lang(raw) if raw else i18n.detect_lang()
 
     def set_profile(self, name: str | None) -> None:
         """Remember the profile picked in the topbar for a project-less GUI.

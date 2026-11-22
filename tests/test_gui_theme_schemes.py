@@ -97,6 +97,68 @@ def test_themes_payload_offers_the_css_schemes(gui, tmp_path, monkeypatch):
     assert body["css_schemes"] == ENUM
 
 
+def test_gui_theme_survives_unrelated_config_error(gui, tmp_path, monkeypatch):
+    """A broken `default_profile` (deleted profile) makes `config.load()` raise
+    `ConfigError`, which previously caused `user_theme()` to fall back to
+    `slate` and reset the GUI theme on every poll/reload."""
+    from pedacito.gui import core as gui_core
+
+    cfg_path = tmp_path / "broken_user_config.toml"
+    cfg_path.write_text(
+        '[universal]\n'
+        'default_profile = "deleted-profile-name"\n'
+        'gui_theme = "jazz_solo"\n'
+        'language = "es"\n'
+        '\n'
+        '[profiles.real]\n'
+        'model = "qwen3-8b"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    monkeypatch.setattr(gui_core, "USER_CONFIG", cfg_path)
+    monkeypatch.setattr(themes, "THEMES_FILE", tmp_path / "themes.json")
+    with gui_core.STATE.lock:
+        gui_core.STATE.cfg = None
+        gui_core.STATE._user_cfg = None
+        gui_core.STATE._user_cfg_stamp = None
+        gui_core.STATE._user_raw_prefs = None
+
+    assert gui_core.STATE.user_theme() == "jazz_solo"
+    assert gui_core.STATE.user_language() == "es"
+    status, state = gui.get("/api/state")
+    assert status == 200
+    assert state["gui_theme"] == "jazz_solo"
+    html = server.index_html(b'<!doctype html><html lang="en"></html>').decode("utf-8")
+    assert 'data-theme="jazz_solo"' in html
+
+
+def test_gui_theme_falls_back_to_themes_json_builtin_when_unset(
+        gui, tmp_path, monkeypatch):
+    """If `config.toml` has no explicit `gui_theme`, a built-in scheme saved in
+    `themes.json` (e.g. via TUI `/theme jazz_solo`) is honored instead of
+    resetting to `slate`."""
+    from pedacito.gui import core as gui_core
+
+    cfg_path = tmp_path / "no_theme_config.toml"
+    cfg_path.write_text(
+        '[universal]\nvram_gb = 16\n\n[profiles.default]\nmodel = "qwen3-8b"\n',
+        encoding="utf-8",
+    )
+    tfile = tmp_path / "themes.json"
+    tfile.write_text(json.dumps({"active_theme": "jazz_solo", "custom_themes": {}}),
+                     encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    monkeypatch.setattr(gui_core, "USER_CONFIG", cfg_path)
+    monkeypatch.setattr(themes, "THEMES_FILE", tfile)
+    with gui_core.STATE.lock:
+        gui_core.STATE.cfg = None
+        gui_core.STATE._user_cfg = None
+        gui_core.STATE._user_cfg_stamp = None
+        gui_core.STATE._user_raw_prefs = None
+
+    assert gui_core.STATE.user_theme() == "jazz_solo"
+
+
 # ------------------------------------------------------- live browser pins ----
 
 requires_pw = pytest.mark.skipif(
