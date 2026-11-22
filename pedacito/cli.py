@@ -1790,18 +1790,24 @@ def _calibrate_all(args) -> int:
             print("Cancelled.")
             return 0
     done = 0
+    failed: list[str] = []
     try:
         for n, cfg in todo:
             if imagegen.profile_is_image_model(cfg):
                 print(f"\n=== probing image profile '{n}' ({cfg.model}) [image] ===",
                       file=sys.stderr)
-                card = modelcard.calibrate_image_model(cfg, verbose=True)
-                path = modelcard.save_card(card)
-                done += 1
-                m = card.get("measured") or {}
-                status = (f"verified ({m.get('latency_s', '?')}s)"
-                          if m.get("image_ok") else "probe failed")
-                print(f"Saved image card for '{n}' ({status}) to {path}")
+                try:
+                    card = modelcard.calibrate_image_model(cfg, verbose=True)
+                    path = modelcard.save_card(card)
+                    done += 1
+                    m = card.get("measured") or {}
+                    status = (f"verified ({m.get('latency_s', '?')}s)"
+                              if m.get("image_ok") else "probe failed")
+                    print(f"Saved image card for '{n}' ({status}) to {path}")
+                except Exception as e:
+                    failed.append(n)
+                    print(f"Image probe of '{n}' failed ({e}); skipping.",
+                          file=sys.stderr)
                 continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
@@ -1818,15 +1824,19 @@ def _calibrate_all(args) -> int:
                 print(f"Saved card for '{n}'"
                       + (f" (score {score:.2f})" if score is not None else "")
                       + f" to {path}")
+            except LLMError as e:
+                failed.append(n)
+                print(f"Calibration of '{n}' failed: {e}\n"
+                      "  Skipping and continuing with remaining profiles.",
+                      file=sys.stderr)
             finally:
                 llm_mod.unload_model(client)
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
-    except LLMError as e:
-        print(f"\nCalibration stopped: {e}", file=sys.stderr)
-        return 1
-    print(f"\nCalibrated {done} of {len(todo)} local profile(s).")
-    return 0
+    fail_note = (f" ({len(failed)} failed: {', '.join(failed)})"
+                 if failed else "")
+    print(f"\nCalibrated {done} of {len(todo)} local profile(s){fail_note}.")
+    return 0 if done > 0 or not failed else 1
 
 
 def _profile_base_urls() -> list[str]:

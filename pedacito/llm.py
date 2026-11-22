@@ -2620,7 +2620,7 @@ class LLMClient:
                     total = estimate_messages(messages, self.estimate_tokens)
                     cap = min(cap, max(256, window - total - 32))
                 cap = max(cap, max_tokens)
-                nxt = min(max_tokens * 2, cap)
+                nxt = min(max(max_tokens * 2, 512), cap)
                 if nxt > max_tokens:
                     max_tokens = nxt
                     how = (f" with a larger budget (max_tokens={max_tokens}; "
@@ -5318,9 +5318,16 @@ class LLMClient:
         # is discovered HERE, before the first real turn -- a mid-run flip
         # would rewrite the head of the conversation and break the server's
         # prompt cache at the worst moment.
+        # Always-reasoning models (LFM2.5-24B-A2B, GPT-OSS) and tiered
+        # local-MoE servers emit a reasoning block before "ok": a 5-token cap
+        # starves reasoning and triggers a false model-fit failure during
+        # warmup even though the model works fine. Non-thinking models still
+        # stop immediately on EOS after "ok".
+        warmup_tokens = (512 if (_always_thinks(_model_name(self.cfg))
+                                 or self.local_moe) else 32)
         self.chat([{"role": "system", "content": "You are a terse assistant."},
                    {"role": "user", "content": "Reply with the single word: ok"}],
-                  max_tokens=5)
+                  max_tokens=warmup_tokens)
         took = time.time() - t0
         if took > 5:
             print(f"[model ready after {took:.0f}s]", file=sys.stderr)

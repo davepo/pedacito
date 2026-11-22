@@ -220,6 +220,38 @@ def test_calibrate_all_unloads_between_models(tmp_path, monkeypatch):
     assert unloaded == ["qwen2.5-coder-14b", "gemma-3-12b-it"]
 
 
+def test_calibrate_all_continues_when_one_profile_fails(tmp_path, monkeypatch,
+                                                      capsys):
+    """One failing profile (e.g. an always-thinking or OCR/audio model) must
+    unload cleanly, log the error, and let the rest of the batch finish."""
+    cfgfile = tmp_path / "config.toml"
+    _write_cfg(cfgfile, MIXED_CFG)
+    calls: list[str] = []
+    unloaded: list[str] = []
+
+    class FlakyClient(_FakeClient):
+        def warmup(self):
+            if self.cfg.model == "qwen2.5-coder-14b":
+                raise llm_mod.LLMError("model always reasons")
+
+    monkeypatch.setattr(cli, "LLMClient", FlakyClient)
+    monkeypatch.setattr(llm_mod, "unload_model",
+                        lambda client: unloaded.append(client.cfg.model) or "")
+
+    def fake_cal(client, cfg, verbose=True, quick=False, repeats=None):
+        calls.append(cfg.model)
+        return _card(cfg.model)
+
+    monkeypatch.setattr(modelcard, "calibrate", fake_cal)
+    rc = cli.main(["calibrate", "--all", "-y", "--config", str(cfgfile)])
+    assert rc == 0
+    assert calls == ["gemma-3-12b-it"]
+    assert unloaded == ["qwen2.5-coder-14b", "gemma-3-12b-it"]
+    out = capsys.readouterr()
+    assert "failed" in out.err.lower()
+    assert "1 of 2" in out.out
+
+
 def test_gui_calibrate_refuses_hosted(gui):
     _write_cfg(gui.cfg_path, MIXED_CFG)
     for path in ("/api/models/calibrate", "/api/calibrate"):
@@ -347,7 +379,13 @@ def test_arch_library_values():
     assert lib["qwen3.5"]["sampler"] == {"top_p": 0.95, "top_k": 20}
     assert lib["gpt-oss"]["temperature"] == 0.4
     assert lib["glm"]["sampler"] == {"top_p": 0.95}
-    assert lib["lfm"]["patterns"] == ("lfm",)
+    assert "lfm" in lib["lfm"]["patterns"]
+    assert arch_defaults.match_arch(
+        "LFM2.5-24B-A2B-Turbo-Brilliance-50X-NEO-MAX-Imatrix-GGUF")[
+            "family"] == "lfm2.5-24b-a2b"
+    assert arch_defaults.match_arch(
+        "lfm3-1_7b-gguf-modelscope-q8-0")["family"] == "lfm3"
+    assert arch_defaults.match_arch("lfm2-7b")["family"] == "lfm"
 
 
 def test_recommended_temperatures_selects_thinking_and_caps_small_tier():
