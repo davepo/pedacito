@@ -1261,3 +1261,17 @@ def test_mcp_env_is_redacted_on_read_and_preserved_on_save(gui):
         "env": {"NEW_SECRET_TOKEN": "***REDACTED***"},
     })
     assert status == 400 and bad["ok"] is False
+
+
+def test_settings_js_shows_calibrated_temperature_over_global():
+    """Settings -> Profiles must surface calibrated model-card choices (such as
+    arch_family temperature / temperature_answer) in placeholders and inherit
+    labels instead of displaying stale `(global)` values from [universal]."""
+    js = (Path(__file__).resolve().parents[1]
+          / "pedacito" / "gui" / "static" / "settings.js").read_text(
+              encoding="utf-8")
+    assert "function calibratedChoice(name)" in js
+    assert "cal.card_choices" in js
+    assert "name === 'temperature' || name === 'temperature_answer'" in js
+    assert "var cal = calibratedChoice(item.name);" in js
+

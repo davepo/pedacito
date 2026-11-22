@@ -202,10 +202,32 @@
     });
     return el;
   }
+  // Card choice active for the currently selected profile when left unset in
+  // `[profiles.<name>]`, matching `modelcard.apply()`'s runtime precedence:
+  // `temperature` and `temperature_answer` override even a `[universal]` value
+  // (only an explicit per-profile key beats them); other card choices apply
+  // when `[universal]` leaves the key unset.
+  function calibratedChoice(name) {
+    if (X.tab !== 'profiles' || !X.profile) return null;
+    var cal = ((X.data && X.data.calibration) || {})[X.profile];
+    if (!cal || !cal.calibrated || cal.is_hosted || cal.is_image_model) return null;
+    var ch = cal.card_choices || {};
+    if (!(name in ch) || ch[name] === undefined || ch[name] === null) return null;
+    var overridesGlobal = (name === 'temperature' || name === 'temperature_answer');
+    var g = (file().settings || {})[name];
+    if (!overridesGlobal && g !== undefined) return null;
+    var fam = ch.arch_family ? ': ' + ch.arch_family : '';
+    return { value: ch[name], label: 'calibrated' + fam };
+  }
   function placeholderFor(item) {
     if (item.secret) {
       var body = (file().profiles || {})[X.profile] || {};
       return (body._secret_set || []).indexOf(item.name) >= 0 ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '';
+    }
+    var cal = calibratedChoice(item.name);
+    if (cal) {
+      var cv = Array.isArray(cal.value) ? cal.value.join(', ') : String(cal.value);
+      return cv + '  (' + cal.label + ')';
     }
     // what applies when this layer says nothing: the file's global value,
     // else the open project's resolved value, else the built-in default
@@ -228,8 +250,14 @@
     return item.default === null ? undefined : item.default;
   }
   // What the profile picker shows for the inherit option, so the user can
-  // see which universal value the profile takes when left unset.
+  // see which calibrated or universal value the profile takes when left unset.
   function inheritLabel(item) {
+    var cal = calibratedChoice(item.name);
+    if (cal) {
+      var cv = item.type === 'bool' ? (cal.value ? 'on' : 'off')
+        : (Array.isArray(cal.value) ? cal.value.join(', ') : String(cal.value));
+      return '(inherit \u2014 ' + cal.label + ': ' + cv + ')';
+    }
     var v = universalValue(item);
     if (item.type === 'bool') v = v ? 'on' : 'off';
     else if (v === undefined || v === null) v = '';
