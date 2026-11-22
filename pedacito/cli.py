@@ -1561,6 +1561,28 @@ def _disable_auto_tune_opt_in(args, cfg=None) -> str:
     return config_editor.disable_auto_tune_opt_in(path, profile)
 
 
+def _cmd_models_refresh(args) -> int:
+    """`pedacito models refresh`: refresh the cached models.dev provider catalog."""
+    from . import model_catalog
+    try:
+        cfg = _light_config(args)
+    except ConfigError:
+        cfg = None
+    res = model_catalog.refresh_catalog(force=True, cfg=cfg)
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=1, default=str))
+        return 0 if res.get("ok") else 1
+    if res.get("ok"):
+        print(f"Refreshed model catalog ({res.get('count', 0)} models) -> {res.get('path', '')}")
+        return 0
+    print(
+        f"Failed to refresh model catalog: "
+        f"{res.get('error') or res.get('detail') or 'unknown error'}",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _cmd_models_show(args) -> int:
     """`pedacito models` (no action): tuned numbers for the active profile."""
     from . import profiler
@@ -3652,10 +3674,12 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_models.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
                           default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_models.add_argument("action", nargs="?", default="show",
-                          choices=["scan", "show"],
+                          choices=["scan", "show", "refresh"],
                           help="'scan' finds local servers and sets up "
-                               "profiles; 'show' (default) prints the active "
-                               "profile's snapshot and auto-tuned numbers")
+                               "profiles; 'refresh' updates the cached "
+                               "hosted model catalog; 'show' (default) prints "
+                               "the active profile's snapshot and auto-tuned "
+                               "numbers")
     p_models.add_argument("--json", action="store_true",
                           help="with show: print structured JSON")
     p_models.add_argument("--url", action="append", default=[], metavar="URL",
@@ -4087,8 +4111,11 @@ def _main(argv=None) -> int:
     # `models` and `profile` read hardware/measurement state and must work on
     # a machine with no valid config (they only inspect the active profile).
     if args.cmd == "models":
-        if getattr(args, "action", "show") == "scan":
+        action = getattr(args, "action", "show")
+        if action == "scan":
             return _cmd_models_scan(args)
+        if action == "refresh":
+            return _cmd_models_refresh(args)
         return _cmd_models_show(args)
     if args.cmd == "profile":
         return _cmd_profile(args)

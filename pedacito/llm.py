@@ -243,13 +243,24 @@ def _server_root(base_url: str) -> str:
 
 
 def _api_key(cfg) -> str:
-    """The API key for a request: `api_key_env` (the name of an environment
-    variable) beats the plain `api_key` string, so a secret never has to be
-    written to the config file."""
+    """The API key for a request: ``api_key_env`` (the name of an environment
+    variable) beats ``api_key_keyring`` and ``api_key`` (including
+    ``keyring:<service>/<account>``), so a secret never has to be written to
+    the config file."""
     env = getattr(cfg, "api_key_env", "") or ""
     if env:
         return os.environ.get(env, "")
-    return getattr(cfg, "api_key", "") or ""
+    kr_ref = getattr(cfg, "api_key_keyring", "") or ""
+    raw_key = getattr(cfg, "api_key", "") or ""
+    if kr_ref or (isinstance(raw_key, str)
+                  and raw_key.strip().lower().startswith("keyring:")):
+        from . import secrets_store
+        return secrets_store.resolve_api_key(
+            api_key=raw_key,
+            api_key_env="",
+            api_key_keyring=kr_ref,
+        )
+    return raw_key
 
 
 # --------------------------------------------------------------- thinking off
@@ -1735,6 +1746,11 @@ class LLMClient:
         self.partial_text = ""
         # Temporary sampling temperature (best-of-N candidates); None = config.
         self._temp_override: float | None = None
+        # OpenAI Responses API multi-turn state (last response id & encrypted
+        # reasoning items preserved across tool loops).
+        self.last_response_id: str = ""
+        self.last_reasoning_items: list[dict] = []
+        self._responses_reasoning_by_text: dict[str, list[dict]] = {}
         # Worked step examples built from the real project (set by the agent):
         # shown instead of one dummy object when the server has no grammar.
         self.fewshot: list[dict] = []
@@ -2745,13 +2761,25 @@ class LLMClient:
         if self._token_set(external_cancel):
             raise RunCancelledError(
                 "Cancelled before the request left; nothing was sent.")
-        # Native Anthropic transport: /v1/messages, with prompt caching,
-        # streaming usage, thinking, tools and images. The outbound secret
-        # guard, replay digest, telemetry and cost accounting still run on the
-        # OpenAI-shaped messages before they are translated.
-        from . import transport_anthropic
+        # Native provider transports: OpenAI /v1/responses, Anthropic
+        # /v1/messages, and Google Gemini /v1beta generateContent. The outbound
+        # secret guard, replay digest, telemetry and cost accounting still run
+        # on the OpenAI-shaped messages before they are translated.
+        from . import transport_anthropic, transport_gemini, transport_openai
+        if transport_openai.is_openai_responses(self.cfg):
+            return self._chat_once_openai_responses(
+                messages, max_tokens, schema=schema, stream=stream,
+                disable_thinking=disable_thinking, json_schema=json_schema,
+                cancel_event=cancel_event, on_stream=on_stream,
+                _count_call=_count_call)
         if transport_anthropic.is_anthropic_native(self.cfg):
             return self._chat_once_anthropic(
+                messages, max_tokens, schema=schema, stream=stream,
+                disable_thinking=disable_thinking, json_schema=json_schema,
+                cancel_event=cancel_event, on_stream=on_stream,
+                _count_call=_count_call)
+        if transport_gemini.is_gemini_native(self.cfg):
+            return self._chat_once_gemini(
                 messages, max_tokens, schema=schema, stream=stream,
                 disable_thinking=disable_thinking, json_schema=json_schema,
                 cancel_event=cancel_event, on_stream=on_stream,
@@ -3734,6 +3762,515 @@ class LLMClient:
         text = self._anthropic_text(parsed, native)
         if native and self._native_ok is None and text:
             self._native_ok = True
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        return text
+
+    # ------------------------------------------------------------------- Gemini
+    # Native /v1beta generateContent transport.
+
+    def _native_http_post(self, url: str, payload: dict, headers: dict,
+                          *, stream: bool = False,
+                          auth_hint: str = "",
+                          transient_statuses: tuple[int, ...] = (429, 503)):
+        """Shared HTTP POST + error taxonomy for native provider transports."""
+        self._check_circuit()
+        try:
+            try:
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            except requests.exceptions.ConnectionError:
+                with self._session_lock:
+                    used = self._session_used
+                if not used:
+                    raise
+                self._reset_session()
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            with self._session_lock:
+                self._session_used = True
+        except requests.exceptions.ConnectionError as e:
+            self._record_failure()
+            raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        except requests.exceptions.Timeout as e:
+            self._record_failure()
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
+                "local model may need a larger timeout; a hosted API may be "
+                "overloaded.") from e
+        except requests.exceptions.RequestException as e:
+            self._record_failure()
+            raise LLMError(
+                f"Request to {self.cfg.base_url} failed: "
+                f"{type(e).__name__}: {str(e)[:200]}") from e
+        r.encoding = "utf-8"
+        if r.status_code >= 400:
+            try:
+                body = r.text[:800]
+                retry_after = _retry_after(r)
+            finally:
+                _close(r)
+            if r.status_code in (401, 403) and auth_hint:
+                raise LLMError(
+                    f"{auth_hint} ({r.status_code}): {body[:300]}")
+            if r.status_code in transient_statuses:
+                raise _Transient(
+                    f"{r.status_code}: {body[:200]}",
+                    retry_after=retry_after, rate_limited=True)
+            if self._context_too_long(body):
+                raise ContextOverflowError(
+                    f"Server says the request exceeds its context window: "
+                    f"{body[:300]}")
+            low = body.lower()
+            if r.status_code == 400 and any(h in low for h in _VISION_UNSUPPORTED_HINTS):
+                raise LLMError(
+                    f"The active model '{self.cfg.model}' does not support image "
+                    "inputs. Switch to a vision-capable model (e.g. Claude, "
+                    "Gemini, Gemma 4, Qwen-VL, or GPT-4o) and try again.\n"
+                    f"Server detail: {body[:300]}")
+            if r.status_code >= 500:
+                self._record_failure()
+            raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+        self._record_success()
+        return r
+
+    def _run_native_stream(self, r, *, parse_stream_fn, stream_cancelled_cls,
+                           stream_error_cls, on_json_fallback, native: bool,
+                           prompt_est: int, t0: float, external_cancel,
+                           on_stream, provider_name: str,
+                           on_parsed_extra=None) -> str:
+        """Shared streaming loop for native transports (Gemini / OpenAI Responses)."""
+        sink = self.stream_callback
+        out_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        chunks = 0
+        started = time.monotonic()
+        last_emit = started
+        cancelled = False
+
+        def emit(final: bool = False) -> None:
+            nonlocal pending_reasoning, pending_content, chunks, last_emit
+            rtext = "".join(pending_reasoning)
+            ctext = "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            elapsed = max(now - (self.first_token_at or started), 0.001)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            tokens = int((len(rtext) + len(ctext)) / cpt) if not final else \
+                int(self.last_completion_tokens or 0)
+            if not tokens:
+                tokens = 1
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext else (self.stream_phase or "content"))
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = tokens / elapsed if tokens else 0.0
+            pending_reasoning, pending_content = [], []
+            chunks = 0
+            last_emit = now
+            self._emit_stream_event({
+                "kind": "llm_stream", "phase": phase,
+                "delta_reasoning": rtext, "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(self.last_stream_tok_per_s, 1),
+                "elapsed_s": round(now - started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }, callback=on_stream)
+
+        def on_text(delta: str) -> None:
+            nonlocal chunks
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            out_parts.append(delta)
+            pending_content.append(delta)
+            if sink is not None:
+                try:
+                    sink(delta)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def on_reasoning(delta: str) -> None:
+            nonlocal chunks
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            reasoning_parts.append(delta)
+            pending_reasoning.append(delta)
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def cancel_check() -> bool:
+            return self._cancel_requested(external_cancel)
+
+        with self._active_response_lock:
+            self._active_response = r
+        try:
+            if self._response_is_json(r):
+                try:
+                    return on_json_fallback(r.json())
+                finally:
+                    _close(r)
+            parsed = parse_stream_fn(
+                r, on_text=on_text, on_reasoning=on_reasoning,
+                cancel_check=cancel_check)
+        except stream_cancelled_cls:
+            cancelled = True
+            parsed = {"text": "".join(out_parts),
+                      "reasoning": "".join(reasoning_parts),
+                      "tool_calls": [], "finish_reason": "", "usage": {}}
+        except stream_error_cls as e:
+            low = (getattr(e, "err_type", "") or str(e)).lower()
+            if any(w in low for w in ("overload", "rate_limit",
+                                      "resource_exhausted", "unavailable")):
+                raise _Transient(f"{provider_name} stream error: {e}",
+                                 retry_after=None, rate_limited=True) from e
+            raise LLMError(f"{provider_name} stream error: {e}") from e
+        finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
+            _close(r)
+
+        if cancelled:
+            self.partial_text = parsed["text"]
+            self.last_reasoning_chars = len(parsed["reasoning"])
+            self.last_stream_content = parsed["text"][-_STREAM_LIVE_BUFFER:]
+            self.last_stream_reasoning = parsed["reasoning"][-_STREAM_LIVE_BUFFER:]
+            raise RunCancelledError(
+                "Stopped by user; the partial reply is kept in "
+                "client.partial_text.")
+
+        text = parsed["text"]
+        reasoning_text = parsed["reasoning"]
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        self.last_reasoning_chars = len(reasoning_text)
+        self.partial_text = text
+        if native and parsed.get("tool_calls"):
+            text = parsed["tool_calls"][0]["arguments_json"]
+            if self._native_ok is None and text:
+                self._native_ok = True
+        if on_parsed_extra is not None:
+            on_parsed_extra(parsed, text)
+
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
+
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        emit(final=True)
+        self.last_stream_content = text
+        self.last_stream_reasoning = reasoning_text[-_STREAM_LIVE_BUFFER:]
+        self.last_stream_tokens = int(self.last_completion_tokens or 0)
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        return text
+
+    def _begin_native_call(self, stream: bool, prompt_est: int) -> float:
+        start_cb = self.on_start
+        if start_cb is not None:
+            try:
+                start_cb({"provider": self.provider_label(),
+                          "model": self.cfg.model,
+                          "phase": self.site or "call",
+                          "stream": bool(stream)})
+            except Exception:
+                pass
+        t0 = time.time()
+        self.request_started_at = time.monotonic()
+        self.stream_truncated = False
+        self.partial_text = ""
+        self.stream_repetition = False
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
+        return t0
+
+    def _chat_once_gemini(self, messages: list[dict], max_tokens: int,
+                          schema: dict | None = None, stream: bool = False,
+                          disable_thinking: bool | None = None,
+                          json_schema: dict | None = None,
+                          cancel_event=None, on_stream=None,
+                          _count_call: bool = True) -> str:
+        """One native Google Gemini ``/v1beta`` request."""
+        from . import transport_gemini
+
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        fmt_schema = json_schema if json_schema is not None else schema
+        msgs = [dict(m) for m in messages]
+        want_off = (disable_thinking if disable_thinking is not None
+                    else self.cfg.disable_thinking)
+
+        native = self._native_for(schema, stream)
+        openai_tools = None
+        openai_tool_choice = None
+        resp_mime = None
+        resp_schema = None
+        if native:
+            openai_tools = [{"type": "function", "function": {
+                "name": "step",
+                "description": "Choose the next action for the task.",
+                "parameters": fmt_schema}}]
+            openai_tool_choice = {"type": "function", "function": {"name": "step"}}
+        elif fmt_schema is not None:
+            resp_mime = "application/json"
+            if self.cfg.json_mode != "object":
+                resp_schema = fmt_schema
+
+        msgs = self._apply_outbound_guard({"messages": msgs}).get("messages", msgs)
+
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        omit_temp = _omit_hosted_temp(self.cfg, hosted, pinned_temp)
+        temp = (pinned_temp if pinned_temp is not None
+                else self._temp_override if self._temp_override is not None
+                else self.cfg.temperature)
+        if omit_temp:
+            temp = None
+
+        payload = transport_gemini.build_request(
+            self.cfg, msgs, max_tokens, stream=stream, disable_thinking=want_off,
+            tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
+            response_mime_type=resp_mime, response_schema=resp_schema)
+        headers = transport_gemini.build_headers(_api_key(self.cfg))
+        url = transport_gemini.endpoint(self.cfg.base_url, self.cfg.model,
+                                        stream=stream)
+
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
+        prompt_est = estimate_messages(msgs, self.estimate_tokens)
+        t0 = self._begin_native_call(stream, prompt_est)
+        auth_hint = (
+            "Google Gemini rejected the credentials\n"
+            "  - Set your key via GEMINI_API_KEY (or api_key_env), or api_key / "
+            "api_key_keyring in the profile; it is sent as x-goog-api-key.")
+
+        if not stream:
+            r = self._native_http_post(url, payload, headers, stream=False,
+                                       auth_hint=auth_hint)
+            try:
+                with self._active_response_lock:
+                    self._active_response = r
+                if self._response_is_sse(r):
+                    return self._run_native_stream(
+                        r,
+                        parse_stream_fn=transport_gemini.parse_sse_stream,
+                        stream_cancelled_cls=transport_gemini.StreamCancelled,
+                        stream_error_cls=transport_gemini.StreamError,
+                        on_json_fallback=lambda d: self._consume_gemini_data(
+                            d, native=native, prompt_est=prompt_est, t0=t0),
+                        native=native, prompt_est=prompt_est, t0=t0,
+                        external_cancel=external_cancel, on_stream=on_stream,
+                        provider_name="Gemini")
+                data = r.json()
+            finally:
+                with self._active_response_lock:
+                    if self._active_response is r:
+                        self._active_response = None
+                _close(r)
+            return self._consume_gemini_data(
+                data, native=native, prompt_est=prompt_est, t0=t0)
+
+        r = self._native_http_post(url, payload, headers, stream=True,
+                                   auth_hint=auth_hint)
+        return self._run_native_stream(
+            r,
+            parse_stream_fn=transport_gemini.parse_sse_stream,
+            stream_cancelled_cls=transport_gemini.StreamCancelled,
+            stream_error_cls=transport_gemini.StreamError,
+            on_json_fallback=lambda d: self._consume_gemini_data(
+                d, native=native, prompt_est=prompt_est, t0=t0),
+            native=native, prompt_est=prompt_est, t0=t0,
+            external_cancel=external_cancel, on_stream=on_stream,
+            provider_name="Gemini")
+
+    def _consume_gemini_data(self, data: dict, *, native: bool,
+                             prompt_est: int, t0: float) -> str:
+        from . import transport_gemini
+        parsed = transport_gemini.parse_response(data)
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        self.last_reasoning_chars = len(parsed.get("reasoning") or "")
+        text = self._anthropic_text(parsed, native)
+        if native and self._native_ok is None and text:
+            self._native_ok = True
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        return text
+
+    # --------------------------------------------------------- OpenAI Responses
+    # Opt-in /v1/responses transport for o3 / o4 / gpt-5 reasoning models.
+
+    def _attach_cached_reasoning_items(self, msgs: list[dict]) -> list[dict]:
+        if not self._responses_reasoning_by_text:
+            return msgs
+        out: list[dict] = []
+        for msg in msgs:
+            if (isinstance(msg, dict) and msg.get("role") == "assistant"
+                    and not msg.get("reasoning_items")
+                    and not msg.get("encrypted_reasoning")):
+                key = _content_plain_text(msg.get("content") or "")
+                if key and key in self._responses_reasoning_by_text:
+                    copy_msg = dict(msg)
+                    copy_msg["reasoning_items"] = list(
+                        self._responses_reasoning_by_text[key])
+                    out.append(copy_msg)
+                    continue
+            out.append(msg)
+        return out
+
+    def _record_responses_state(self, parsed: dict, text: str) -> None:
+        self.last_response_id = str(parsed.get("id") or "")
+        items = list(parsed.get("reasoning_items") or [])
+        self.last_reasoning_items = items
+        if items and text:
+            self._responses_reasoning_by_text[text] = items
+            if len(self._responses_reasoning_by_text) > 32:
+                oldest = next(iter(self._responses_reasoning_by_text))
+                self._responses_reasoning_by_text.pop(oldest, None)
+
+    def _chat_once_openai_responses(
+        self, messages: list[dict], max_tokens: int,
+        schema: dict | None = None, stream: bool = False,
+        disable_thinking: bool | None = None,
+        json_schema: dict | None = None,
+        cancel_event=None, on_stream=None,
+        _count_call: bool = True,
+    ) -> str:
+        """One OpenAI ``/v1/responses`` request."""
+        from . import transport_openai
+        from .providers import cache_key
+
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        fmt_schema = json_schema if json_schema is not None else schema
+        msgs = self._attach_cached_reasoning_items([dict(m) for m in messages])
+        want_off = (disable_thinking if disable_thinking is not None
+                    else self.cfg.disable_thinking)
+
+        native = self._native_for(schema, stream)
+        openai_tools = None
+        openai_tool_choice = None
+        resp_schema = None
+        if native:
+            openai_tools = [{"type": "function", "function": {
+                "name": "step",
+                "description": "Choose the next action for the task.",
+                "parameters": fmt_schema}}]
+            openai_tool_choice = {"type": "function", "function": {"name": "step"}}
+        elif fmt_schema is not None and self.cfg.json_mode != "object":
+            resp_schema = fmt_schema
+
+        msgs = self._apply_outbound_guard({"messages": msgs}).get("messages", msgs)
+
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        omit_temp = _omit_hosted_temp(self.cfg, hosted, pinned_temp)
+        temp = (pinned_temp if pinned_temp is not None
+                else self._temp_override if self._temp_override is not None
+                else self.cfg.temperature)
+        if omit_temp:
+            temp = None
+
+        pkey = ""
+        if getattr(self.cfg, "prompt_cache_key", "") and _is_remote(self.cfg.base_url):
+            pkey = cache_key(self.cfg)
+
+        payload = transport_openai.build_request(
+            self.cfg, msgs, max_tokens, stream=stream, disable_thinking=want_off,
+            tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
+            prompt_cache_key=pkey, json_schema=resp_schema)
+        headers = transport_openai.build_headers(_api_key(self.cfg))
+        url = transport_openai.responses_endpoint(self.cfg.base_url)
+
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
+        prompt_est = estimate_messages(msgs, self.estimate_tokens)
+        t0 = self._begin_native_call(stream, prompt_est)
+        auth_hint = (
+            "OpenAI rejected the credentials\n"
+            "  - Set your key via OPENAI_API_KEY (or api_key_env), or api_key / "
+            "api_key_keyring in the profile.")
+
+        if not stream:
+            r = self._native_http_post(url, payload, headers, stream=False,
+                                       auth_hint=auth_hint)
+            try:
+                with self._active_response_lock:
+                    self._active_response = r
+                if self._response_is_sse(r):
+                    return self._run_native_stream(
+                        r,
+                        parse_stream_fn=transport_openai.parse_sse_stream,
+                        stream_cancelled_cls=transport_openai.StreamCancelled,
+                        stream_error_cls=transport_openai.StreamError,
+                        on_json_fallback=lambda d: self._consume_openai_responses_data(
+                            d, native=native, prompt_est=prompt_est, t0=t0),
+                        native=native, prompt_est=prompt_est, t0=t0,
+                        external_cancel=external_cancel, on_stream=on_stream,
+                        provider_name="OpenAI Responses",
+                        on_parsed_extra=self._record_responses_state)
+                data = r.json()
+            finally:
+                with self._active_response_lock:
+                    if self._active_response is r:
+                        self._active_response = None
+                _close(r)
+            return self._consume_openai_responses_data(
+                data, native=native, prompt_est=prompt_est, t0=t0)
+
+        r = self._native_http_post(url, payload, headers, stream=True,
+                                   auth_hint=auth_hint)
+        return self._run_native_stream(
+            r,
+            parse_stream_fn=transport_openai.parse_sse_stream,
+            stream_cancelled_cls=transport_openai.StreamCancelled,
+            stream_error_cls=transport_openai.StreamError,
+            on_json_fallback=lambda d: self._consume_openai_responses_data(
+                d, native=native, prompt_est=prompt_est, t0=t0),
+            native=native, prompt_est=prompt_est, t0=t0,
+            external_cancel=external_cancel, on_stream=on_stream,
+            provider_name="OpenAI Responses",
+            on_parsed_extra=self._record_responses_state)
+
+    def _consume_openai_responses_data(self, data: dict, *, native: bool,
+                                       prompt_est: int, t0: float) -> str:
+        from . import transport_openai
+        parsed = transport_openai.parse_response(data)
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        self.last_reasoning_chars = len(parsed.get("reasoning") or "")
+        text = self._anthropic_text(parsed, native)
+        if native and self._native_ok is None and text:
+            self._native_ok = True
+        self._record_responses_state(parsed, text)
         self._account(parsed.get("usage") or {}, None, time.time() - t0,
                       prompt_est, text)
         return text
@@ -4855,13 +5392,21 @@ class LLMClient:
     def check(self, warn: bool = True) -> str:
         """Verify the server is reachable and return its comma-joined model ids;
         with `warn`, print a warning if the configured model is not listed."""
-        from . import transport_anthropic
-        native = transport_anthropic.is_anthropic_native(self.cfg)
-        if native:
+        from . import transport_anthropic, transport_gemini, transport_openai
+        native_anth = transport_anthropic.is_anthropic_native(self.cfg)
+        native_gem = transport_gemini.is_gemini_native(self.cfg)
+        native_resp = transport_openai.is_openai_responses(self.cfg)
+        if native_anth:
             # Anthropic lists models at <origin>/v1/models with x-api-key.
             ep = transport_anthropic.messages_endpoint(self.cfg.base_url)
             url = ep[: -len("/messages")] + "/models"
             headers = transport_anthropic.build_headers(_api_key(self.cfg))
+        elif native_gem:
+            url = transport_gemini.models_endpoint(self.cfg.base_url)
+            headers = transport_gemini.build_headers(_api_key(self.cfg))
+        elif native_resp:
+            url = transport_openai.models_endpoint(self.cfg.base_url)
+            headers = self.headers
         else:
             url = self.cfg.base_url.rstrip("/") + "/models"
             headers = self.headers
@@ -4869,7 +5414,19 @@ class LLMClient:
         try:
             r = requests.get(url, headers=headers, timeout=15)
             r.raise_for_status()
-            ids = [m.get("id", "?") for m in r.json().get("data", [])]
+            payload = r.json()
+            if native_gem and isinstance(payload, dict) and "models" in payload:
+                ids = []
+                for m in payload.get("models") or []:
+                    if not isinstance(m, dict):
+                        continue
+                    mid = str(m.get("id") or m.get("name") or "")
+                    if mid.startswith("models/"):
+                        mid = mid[len("models/"):]
+                    if mid:
+                        ids.append(mid)
+            else:
+                ids = [m.get("id", "?") for m in payload.get("data", [])]
         except requests.exceptions.HTTPError as e:
             # BUG-007: the server WAS reached and answered with an error.
             # Name the status (as _post does) instead of sending the user to
@@ -4882,12 +5439,17 @@ class LLMClient:
                 body = ""
             hint = ""
             if status in (401, 403):
-                hint = (("\n  - Anthropic rejected the credentials: set "
-                         "ANTHROPIC_API_KEY (or api_key_env), or api_key in "
-                         "the profile; it is sent as the x-api-key header.")
-                        if native else
-                        ("\n  - The server rejected the credentials: check "
-                         "api_key in your config (`pedacito config --check`)."))
+                if native_anth:
+                    hint = ("\n  - Anthropic rejected the credentials: set "
+                            "ANTHROPIC_API_KEY (or api_key_env), or api_key in "
+                            "the profile; it is sent as the x-api-key header.")
+                elif native_gem:
+                    hint = ("\n  - Gemini rejected the credentials: set "
+                            "GEMINI_API_KEY (or api_key_env), or api_key in "
+                            "the profile; it is sent as x-goog-api-key.")
+                else:
+                    hint = ("\n  - The server rejected the credentials: check "
+                            "api_key in your config (`pedacito config --check`).")
             raise LLMError(f"Server returned {status}: {body}{hint}") from e
         except requests.exceptions.Timeout as e:
             raise LLMError(

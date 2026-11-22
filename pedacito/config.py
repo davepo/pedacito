@@ -130,6 +130,10 @@ class Config:
     # Storing the variable name instead of the secret keeps the key out of the
     # config file; `llm.py` reads it at request time.
     api_key_env: str = ""
+    # Optional OS keychain reference `<service>/<account>` (or `<account>`,
+    # defaulting the service to `pedacito`), resolved lazily via the optional
+    # `pedacito[keyring]` package. Alternative to `api_key = "keyring:..."`.
+    api_key_keyring: str = ""
     # Runtime/provider label for this server: "lemonade", "llama-server",
     # "strata", "avalon", "local-moe", "lmstudio", "ollama", ... It selects
     # the server-control endpoints in servers.py and the execution profile
@@ -141,6 +145,16 @@ class Config:
     # surface that supports prompt caching, streaming usage, extended thinking,
     # tools and images. false falls back to the OpenAI-compatible shim.
     anthropic_native: bool = True
+    # Route Google Gemini (generativelanguage.googleapis.com without /openai,
+    # or provider = "gemini") through the native /v1beta generateContent
+    # transport (thought parts, inline images, function declarations, thinking
+    # budgets, and cachedContent). false falls back to the OpenAI-compatible shim.
+    gemini_native: bool = True
+    # Opt-in OpenAI Responses API (/v1/responses) transport for o3/o4/GPT-5
+    # reasoning models, preserving encrypted reasoning state across multi-turn
+    # tool loops, prompt_cache_key, and reasoning/cached token accounting. Also
+    # active when provider = "openai-responses".
+    openai_responses: bool = False
     # Optional commands that start/stop a single-model local daemon when the
     # server has no HTTP load/unload endpoint. Run with shlex.split and
     # shell=False; {model} is replaced by the model id. Use them only for a
@@ -853,6 +867,11 @@ class Config:
     # Cache-write tokens (explicit prompt caching) are billed separately from
     # cache reads on Anthropic/DashScope-style providers.
     price_cache_write_per_mtok: float = 0.0
+    # Quietly refresh the local models.dev provider catalog cache
+    # (`model_catalog.json`, 24 h TTL) when probing or refreshing hosted
+    # providers so context windows and pricing stay current. Never blocks
+    # startup and never runs for local-only installs; false = offline only.
+    auto_refresh_model_catalog: bool = True
 
     # --- Context management ---------------------------------------------------
     # Prompt wording density: "tiny" | "small" | "full"; "" = chosen from the
@@ -1504,7 +1523,7 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
-               "base_url", "api_key", "api_key_env",
+               "base_url", "api_key", "api_key_env", "api_key_keyring",
                "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
@@ -3224,6 +3243,11 @@ check_for_updates = true
 # update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
 # includes them (PEDACITO_UPDATE_CHANNEL overrides).
 update_channel = "stable"
+# Hosted native transports and provider catalog sync:
+# gemini_native = true
+# openai_responses = false
+# auto_refresh_model_catalog = true
+# api_key_keyring = ""          # e.g. "pedacito/openai" (requires pedacito[keyring])
 # language: interface language, "en" or "es". Menus, messages and the GUI/TUI
 # chrome localise from pedacito/locales/<code>.json; the CLI flag, PEDACITO_LANG
 # (alias PEDACITO_LANGUAGE) and this key feed i18n.detect_lang.

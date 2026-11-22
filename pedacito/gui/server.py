@@ -2727,6 +2727,13 @@ def _provider_import(q, body):
         return 400, {"ok": False, "detail": str(e)}
 
 
+@post("/api/providers/refresh")
+def _provider_refresh(q, body):
+    """Force-refresh the cached models.dev provider catalog (model_catalog.json)."""
+    res = settings_api.refresh_provider_catalog(body or {})
+    return (200 if res.get("ok") else 502), res
+
+
 # --- built-in model benchmarks -------------------------------------------------
 
 @get("/api/benchmarks")

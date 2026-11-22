@@ -3019,6 +3019,14 @@ _SETTING_KEYWORDS = {
     "prompt_cache": ["prompt cache", "caching", "cache control"],
     "anthropic_native": ["anthropic", "claude", "messages api",
                          "native transport", "cache_control"],
+    "gemini_native": ["gemini", "google", "generateContent",
+                      "native transport", "x-goog-api-key"],
+    "openai_responses": ["openai", "responses api", "o3", "o4", "gpt-5",
+                         "reasoning", "previous_response_id"],
+    "auto_refresh_model_catalog": ["model catalog", "models.dev", "pricing",
+                                   "context window", "provider refresh"],
+    "api_key_keyring": ["keyring", "keychain", "credential", "secret",
+                        "api key", "password"],
     "enable_prompt_cache": ["cache_prompt", "kv cache", "local server "
                             "cache", "llama.cpp cache", "faster local"],
     "enable_prompt_lookup": ["prompt lookup", "n-gram", "speculative "

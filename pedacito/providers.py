@@ -59,9 +59,15 @@ _PROVIDERS: dict[str, Provider] = {
         json_mode="schema", omit_temperature=True, native_tool_choice=True),
     # Reported as automatic/implicit by the providers and gateway docs.
     "api.moonshot.cn": Provider(cache_mode="implicit"),
-    "generativelanguage.googleapis.com": Provider(cache_mode="implicit"),
+    "generativelanguage.googleapis.com": Provider(
+        cache_mode="implicit",
+        usage_read=("cachedContentTokenCount", "cached_tokens")),
     "api.x.ai": Provider(cache_mode="implicit"),
     "api.groq.com": Provider(cache_mode="implicit"),
+    "openrouter.ai": Provider(cache_mode="implicit"),
+    "api.together.xyz": Provider(cache_mode="implicit"),
+    "api.mistral.ai": Provider(cache_mode="implicit"),
+    "api.cerebras.ai": Provider(cache_mode="implicit"),
 }
 
 
@@ -94,6 +100,10 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "generativelanguage.googleapis.com": "Google Gemini",
     "api.x.ai": "xAI",
     "api.groq.com": "Groq",
+    "openrouter.ai": "OpenRouter",
+    "api.together.xyz": "Together",
+    "api.mistral.ai": "Mistral",
+    "api.cerebras.ai": "Cerebras",
 }
 
 
@@ -144,12 +154,54 @@ def cache_key(cfg) -> str:
 
 # Approximate USD list prices per million tokens: (input, cache read, output).
 # Matched by substring on the lower-cased model name, most specific first;
-# these are defaults for cost reporting / --max-cost, never a bill -- an
-# explicit price_* setting always wins.
+# these are Tier 3 zero-network defaults for cost reporting / --max-cost, never
+# a bill -- cached models.dev entries (Tier 2), provider /models metadata
+# (Tier 1), and explicit price_* settings always win.
 _MODEL_PRICES: tuple[tuple[str, float, float, float], ...] = (
+    # Anthropic Claude 4.5 / 4.6 / 5.5
+    ("claude-opus-5", 15.00, 1.50, 75.00),
+    ("claude-sonnet-5", 3.00, 0.30, 15.00),
+    ("claude-haiku-4-5", 1.00, 0.10, 5.00),
+    ("claude-haiku-4", 0.80, 0.08, 4.00),
+    ("claude-opus-4-6", 5.00, 0.50, 25.00),
+    ("claude-opus-4-5", 5.00, 0.50, 25.00),
+    ("claude-opus-4", 15.00, 1.50, 75.00),
+    ("claude-sonnet-4-6", 3.00, 0.30, 15.00),
+    ("claude-sonnet-4-5", 3.00, 0.30, 15.00),
+    ("claude-sonnet-4", 3.00, 0.30, 15.00),
+    # Google Gemini 2.5 / 3 / 4
+    ("gemini-4-flash", 0.15, 0.0375, 0.60),
+    ("gemini-4-pro", 1.25, 0.31, 10.00),
+    ("gemini-3-flash", 0.15, 0.0375, 0.60),
+    ("gemini-3-pro", 1.25, 0.31, 10.00),
+    ("gemini-2.5-flash", 0.15, 0.0375, 0.60),
+    ("gemini-2.5-pro", 1.25, 0.31, 10.00),
+    # DeepSeek V4 / Flash / Reasoner / Chat
+    ("deepseek-v4-flash", 0.14, 0.035, 0.55),
+    ("deepseek-v4", 0.27, 0.07, 1.10),
     ("deepseek-reasoner", 0.55, 0.14, 2.19),
     ("deepseek-chat", 0.27, 0.07, 1.10),
+    # Qwen 3.8 / 4 / Coder
+    ("qwen3-coder-plus", 1.00, 0.20, 4.00),
+    ("qwen3-coder", 0.50, 0.10, 2.00),
+    ("qwen3.8", 0.80, 0.16, 3.20),
+    ("qwen-3.8", 0.80, 0.16, 3.20),
+    ("qwen-4", 1.60, 0.32, 6.40),
+    ("qwen4", 1.60, 0.32, 6.40),
     ("qwen-max", 2.40, 0.48, 9.60),
+    ("qwen-plus", 0.40, 0.08, 1.20),
+    ("qwen-flash", 0.05, 0.01, 0.20),
+    # OpenAI GPT-5 / o3 / o4 / 4.1 / 4o
+    ("gpt-5.4-mini", 0.40, 0.10, 1.60),
+    ("gpt-5.4", 2.50, 0.625, 10.00),
+    ("gpt-5-mini", 0.25, 0.025, 2.00),
+    ("gpt-5", 1.25, 0.125, 10.00),
+    ("o4-mini", 1.10, 0.275, 4.40),
+    ("o3-mini", 1.10, 0.55, 4.40),
+    ("o3", 2.00, 0.50, 8.00),
+    ("gpt-4.1-mini", 0.40, 0.10, 1.60),
+    ("gpt-4.1", 2.00, 0.50, 8.00),
+    ("gpt-4o-mini", 0.15, 0.075, 0.60),
     ("gpt-4o", 2.50, 1.25, 10.00),
 )
 
@@ -159,12 +211,37 @@ _HOST_PRICES: dict[str, tuple[float, float, float]] = {
     "api.deepseek.com": (0.27, 0.07, 1.10),
     "dashscope": (2.40, 0.48, 9.60),
     "api.openai.com": (2.50, 1.25, 10.00),
+    "api.anthropic.com": (3.00, 0.30, 15.00),
+    "generativelanguage.googleapis.com": (1.25, 0.31, 10.00),
 }
 
 
-def default_prices(base_url: str, model: str = "") -> dict:
-    """Approximate price_* defaults for a hosted endpoint, keyed by the config
-    field names; {} when nothing is known (local servers stay at 0)."""
+def default_prices_with_source(base_url: str, model: str = "") -> tuple[dict, str]:
+    """Return ``(prices_dict, source)`` where ``source`` is ``"catalog"``
+    (Tier 2 on-disk cache), ``"builtin"`` (Tier 3 static fallback), or ``""``.
+
+    Read-only on the hot path: never performs network I/O.
+    """
+    try:
+        from . import model_catalog
+        meta = model_catalog.lookup_model_meta(base_url, model, allow_fetch=False)
+    except Exception:
+        meta = {}
+    if meta:
+        p_in = float(meta.get("price_input_per_mtok") or 0.0)
+        p_out = float(meta.get("price_output_per_mtok") or 0.0)
+        p_cached = float(meta.get("price_cached_per_mtok") or 0.0)
+        p_write = float(meta.get("price_cache_write_per_mtok") or 0.0)
+        if p_in > 0 or p_out > 0 or p_cached > 0:
+            out = {
+                "price_input_per_mtok": p_in,
+                "price_cached_per_mtok": p_cached,
+                "price_output_per_mtok": p_out,
+            }
+            if p_write > 0:
+                out["price_cache_write_per_mtok"] = p_write
+            return out, "catalog"
+
     m = (model or "").lower()
     prices = None
     for needle, p_in, p_cached, p_out in _MODEL_PRICES:
@@ -178,11 +255,20 @@ def default_prices(base_url: str, model: str = "") -> dict:
                 prices = fallback
                 break
     if prices is None:
-        return {}
+        return {}, ""
     p_in, p_cached, p_out = prices
-    return {"price_input_per_mtok": p_in,
-            "price_cached_per_mtok": p_cached,
-            "price_output_per_mtok": p_out}
+    return {
+        "price_input_per_mtok": p_in,
+        "price_cached_per_mtok": p_cached,
+        "price_output_per_mtok": p_out,
+    }, "builtin"
+
+
+def default_prices(base_url: str, model: str = "") -> dict:
+    """Approximate price_* defaults for a hosted endpoint, keyed by the config
+    field names; {} when nothing is known (local servers stay at 0)."""
+    prices, _source = default_prices_with_source(base_url, model)
+    return prices
 
 
 def profile_overrides(base_url: str, model: str = "") -> dict:

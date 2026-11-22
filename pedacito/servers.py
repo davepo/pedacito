@@ -156,10 +156,18 @@ def _headers_for(server, *, internal: bool = False) -> dict:
     kind = str(_mapping_get(server, "kind", "") or
                _mapping_get(server, "provider", "") or
                _mapping_get(server, "type", "")).lower()
-    key = str(_mapping_get(server, "api_key", "") or "")
+    raw_key = str(_mapping_get(server, "api_key", "") or "")
+    kr_ref = str(_mapping_get(server, "api_key_keyring", "") or "")
     env_name = str(_mapping_get(server, "api_key_env", "") or "")
+    key = ""
     if env_name:
-        key = os.environ.get(env_name, "") or key
+        key = os.environ.get(env_name, "")
+    if not key and (kr_ref or raw_key.strip().lower().startswith("keyring:")):
+        from . import secrets_store
+        key = secrets_store.resolve_api_key(
+            api_key=raw_key, api_key_env="", api_key_keyring=kr_ref)
+    if not key:
+        key = raw_key
     if kind in ("lemonade", "lemond"):
         env_names = _LEMONADE_ENV_KEYS + (
             ("LEMONADE_ADMIN_API_KEY",) if internal else ())
@@ -351,6 +359,7 @@ def configured_local_servers(config) -> list[dict]:
                 "base_url": base,
                 "api_key": str(_mapping_get(body, "api_key", "") or ""),
                 "api_key_env": str(_mapping_get(body, "api_key_env", "") or ""),
+                "api_key_keyring": str(_mapping_get(body, "api_key_keyring", "") or ""),
                 "load_cmd": str(_mapping_get(body, "load_cmd", "") or ""),
                 "unload_cmd": str(_mapping_get(body, "unload_cmd", "") or ""),
                 "models": [],
@@ -372,6 +381,9 @@ def configured_local_servers(config) -> list[dict]:
         if not rec.get("api_key_env"):
             rec["api_key_env"] = str(
                 _mapping_get(body, "api_key_env", "") or "")
+        if not rec.get("api_key_keyring"):
+            rec["api_key_keyring"] = str(
+                _mapping_get(body, "api_key_keyring", "") or "")
         if active:
             rec["active"] = True
             if not rec.get("load_cmd"):
