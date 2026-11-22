@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from . import config as config_mod
 from . import fileio, webcheck
 from .chunker import DEF_NODES, _docline, _signature
 
@@ -3032,14 +3033,19 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         try:
-            # Refinement is ALWAYS creative sampling -- temperature 0.6 on a
-            # local server, the provider's native sampling on a hosted API
-            # (which omits the key) -- regardless of the creative-mode
-            # toggle. An already-pinned override (best-of-N) is left alone.
+            # Refinement is ALWAYS creative sampling -- relative to the
+            # profile's calibrated answer baseline on a local server, the
+            # provider's native sampling on a hosted API (which omits the key)
+            # -- regardless of the creative-mode toggle. An already-pinned
+            # override (best-of-N) is left alone.
             import contextlib
             if hasattr(llm_client, "temperature") \
                     and getattr(llm_client, "_temp_override", None) is None:
-                temp_cm = llm_client.temperature(0.6)
+                base = _get(cfg, "temperature_answer", None)
+                if base is None:
+                    base = _get(cfg, "temperature", 0.3)
+                temp_cm = llm_client.temperature(
+                    config_mod.effective_creative_temperature(cfg, float(base)))
             else:
                 temp_cm = contextlib.nullcontext()
             with temp_cm:

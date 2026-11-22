@@ -269,6 +269,53 @@ def test_creative_warmth_is_local_only(tmp_path):
     assert [t for s, t in client.log if s == "answer"] == [0.3]  # ... no warmth
 
 
+# ============================================ D2: relative creative sway
+# Creative Mode sways RELATIVE to the calibrated baseline instead of a static
+# 0.6 floor: a calibrated 0.6 Gemma becomes 0.9, a default 0.3 profile becomes
+# 0.6, and a tiny/small tier sways gently (+0.20) instead of +0.30.
+
+def test_effective_creative_temperature_sways_relative():
+    from pedacito import config as config_mod
+    cfg = Config()
+    # no tier -> +0.30
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.6
+    # calibrated Gemma 4 baseline (0.6) -> 0.9, no longer stuck at 0.6
+    assert config_mod.effective_creative_temperature(cfg, 0.6) == 0.9
+    # tiny/small tier -> +0.20
+    cfg.tier = "small"
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.5
+    # explicit delta overrides the automatic tier delta
+    cfg.tier = ""
+    cfg.creative_temperature_delta = 0.15
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.45
+    # an explicit delta may push past the 0.95 auto cap, up to 1.0
+    cfg.creative_temperature_delta = 0.3
+    assert config_mod.effective_creative_temperature(cfg, 0.8) == 1.0
+    # the sway never lowers the answer below its baseline
+    cfg.creative_temperature_delta = None
+    cfg.tier = ""
+    assert config_mod.effective_creative_temperature(cfg, 0.98) == 0.98
+
+
+def test_calibrated_gemma_sways_to_nine_in_creative_mode(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.6)
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.9]
+
+
+def test_small_tier_sways_gently_in_creative_mode(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.3, tier="small")
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.5]
+
+
+def test_explicit_creative_delta_overrides_auto_delta(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.3,
+                                 creative_temperature_delta=0.15)
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.45]
+
+
 def test_gather_marks_the_task_creative(tmp_path):
     agent, _client, _cfg = _agent(tmp_path, steps=[{"action": "done"}])
     agent.gather("redesign the landing page", verbose=False)
