@@ -1453,6 +1453,9 @@ def test_mcp_http_blocks_metadata_redirects_cross_origin_auth_and_oversized():
             pass
 
         def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 0:
+                self.rfile.read(n)
             seen_auth.append(self.headers.get("Authorization", "") or
                              self.headers.get("X-API-Key", ""))
             body = json.dumps({"jsonrpc": "2.0", "id": 1,
@@ -1468,6 +1471,11 @@ def test_mcp_http_blocks_metadata_redirects_cross_origin_auth_and_oversized():
             pass
 
         def do_POST(self):
+            # Drain the POST body before replying so closing the socket never
+            # triggers a kernel TCP RST (Errno 104) on unread request bytes.
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 0:
+                self.rfile.read(n)
             if mode["kind"] == "redirect_metadata":
                 self.send_response(302)
                 self.send_header("Location",
@@ -1483,7 +1491,10 @@ def test_mcp_http_blocks_metadata_redirects_cross_origin_auth_and_oversized():
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    self.wfile.write(payload)
+                except OSError:
+                    pass
 
     srv = LocalHTTPServer(("127.0.0.1", 0), Handler)
     target_srv = LocalHTTPServer(("127.0.0.1", 0), TargetHandler)

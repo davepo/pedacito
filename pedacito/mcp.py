@@ -891,6 +891,15 @@ def _validate_mcp_host(host: str, allow: tuple[str, ...]) -> list[str]:
 
 
 def _read_bounded(resp, limit: int = _MAX_HTTP_BYTES) -> bytes:
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        raw_cl = headers.get("Content-Length")
+        if raw_cl is not None:
+            try:
+                if int(str(raw_cl).strip()) > limit:
+                    raise MCPError(f"HTTP MCP reply exceeded {limit} bytes")
+            except ValueError:
+                pass
     try:
         data = resp.read(limit)
         if len(data) >= limit and resp.read(1):

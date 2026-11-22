@@ -252,8 +252,19 @@ def test_lsp_didopen_once_then_didchange_with_incrementing_versions(tmp_path):
         diag = lsp.result(root, cfg, "diagnostics", "a.py", 1, 1)
         assert "v3-diag" in diag or "v2-diag" in diag
         import json as _json
-        events = [_json.loads(ln) for ln in
-                  log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        import time as _time
+        # `diagnostics` may return immediately from the cached v2 diagnostics
+        # while the child LSP process is still reading/logging the async
+        # didChange (v3) notification; wait briefly for the 3rd log entry.
+        deadline = _time.monotonic() + 3.0
+        events = []
+        while _time.monotonic() < deadline:
+            events = [_json.loads(ln) for ln in
+                      log_path.read_text(encoding="utf-8").splitlines()
+                      if ln.strip()]
+            if len(events) >= 3:
+                break
+            _time.sleep(0.02)
         assert events == [
             {"method": "textDocument/didOpen", "version": 1},
             {"method": "textDocument/didChange", "version": 2},
