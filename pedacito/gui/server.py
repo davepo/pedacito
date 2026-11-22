@@ -1705,13 +1705,18 @@ def _profile_availability(config, states) -> dict:
     return out
 
 
-def _server_payload(config, memory=None) -> dict:
+def _server_payload(config, memory=None, fresh_memory=False) -> dict:
     from .. import profiler
     from .. import servers
     # snapshot() is a superset of get_hardware_memory(): same RAM/VRAM shape,
     # plus nvidia-smi / vm_stat / winapi numbers and a source per number.
     # That is what fills the NVIDIA and macOS/Windows live telemetry bar.
-    snap = memory if memory is not None else profiler.snapshot()
+    if fresh_memory:
+        # Post-action telemetry (load/unload/pin): the burst memo may still
+        # hold the pre-action reading, so drop it and measure again.
+        profiler.clear_snapshot_cache()
+    snap = (memory if memory is not None
+            else profiler.snapshot(use_cache=not fresh_memory))
     out = servers.server_summary(config, memory=snap)
     out["memory"] = snap
     out["hardware"] = snap
@@ -1741,6 +1746,21 @@ def _servers_get(q, body=None):
                      "servers": []}
 
 
+@get("/api/hardware")
+def _hardware_get(q, body=None):
+    """Live RAM/VRAM only: a fresh profiler snapshot, no server probes.
+
+    The topbar chip polls this every few seconds, so it must never contact a
+    model server -- a sleeping or loading one would stall the numbers behind
+    sequential HTTP probes. `use_cache=False` bypasses the snapshot TTL memo
+    so each answer reflects the memory right now."""
+    from .. import profiler, servers
+    snap = profiler.snapshot(use_cache=False)
+    return 200, {"ok": True, "memory": snap, "hardware": snap,
+                 "vram": snap["vram"], "ram": snap["ram"],
+                 "badge": servers.memory_badge(snap)}
+
+
 def _server_target(body):
     return (body.get("server") or body.get("name")
             or body.get("profile") or body.get("base_url") or "")
@@ -1758,7 +1778,7 @@ def _servers_load(q, body):
     kind = str(body.get("kind") or "").strip()
     result = servers.load_server_model(
         target, model, config, evict_others=evict_others, kind=kind)
-    payload = _server_payload(config)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     return (200 if result.get("ok") else 502), payload
 
@@ -1781,7 +1801,7 @@ def _servers_unload(q, body):
                   "action": "unload", "server": "all",
                   "detail": f"{sum(1 for r in results if r.get('ok'))} of "
                             f"{len(results)} server(s) acknowledged"}
-    payload = _server_payload(config)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     payload["results"] = results
     return (200 if result.get("ok") or not results else 502), payload
@@ -1797,7 +1817,7 @@ def _servers_pin(q, body):
     pinned = bool(body.get("pinned", True))
     kind = str(body.get("kind") or "").strip()
     result = servers.pin_server_model(target, model, pinned, config, kind=kind)
-    payload = _server_payload(config)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     return (200 if result.get("ok") else 502), payload
 

@@ -415,6 +415,7 @@ const savedCreative = (() => {
 const S = {
   status: {},
   profile_availability: {},               // profile -> available|unavailable|offline|unknown
+  memory: null,                           // live RAM/VRAM snapshot (topbar chip + dialog)
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
   review: null, diff: null, diffRel: '', sel: {}, editing: false,
@@ -470,6 +471,10 @@ function setBusy(on) {
   emit();
 }
 PDC.setBusy = setBusy;
+
+// One reactive memory store for every consumer (topbar chip, Servers dialog,
+// SSE pushes): a fresh snapshot replaces the old one and repaints the page.
+PDC.setMemory = (mem) => { if (mem) { S.memory = mem; emit(); } };
 
 // ----------------------------------------------------------- ANSI terminal ----
 function Term(el) {
@@ -906,6 +911,9 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
+  // Live RAM/VRAM pushed after evictions and finished jobs: the topbar chip
+  // follows model switches without waiting for its next poll.
+  on('hardware', (ev) => PDC.setMemory(ev.memory));
   on('stream', (e) => {
     // Live token deltas from the model. Append locally so the drawer moves
     // several times a second without a /api/state round trip; the poll
@@ -3462,7 +3470,9 @@ PDC.consolidateSession = consolidateSession;
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
 // Background servers, model-server lifecycle, and live VRAM/RAM telemetry.
-// The badge polls slowly (15 s); the modal refreshes after every action.
+// The chip reads the shared S.memory store: a fast hardware-only poll (3 s),
+// SSE pushes during runs, and the dialog's actions all feed it -- no manual
+// page refresh needed. The slow 15 s registry poll keeps profile availability.
 function _gb(n) { return Number(n || 0).toFixed(1); }
 function _gbShort(n) { return String(Math.round(Number(n || 0))); }
 function _memText(mem) {
@@ -3477,22 +3487,49 @@ function _memCompact(mem) {
 }
 
 function HardwareBadge() {
-  const [mem, setMem] = useState(null);
   useEffect(() => {
     let alive = true;
-    const load = () => PDC.api('/api/servers').then((j) => {
-      if (!alive || !j) return;
-      if (j.memory) setMem(j.memory);
-      // The same 15 s cycle refreshes the profile picker's disabled states.
-      if (j.profile_availability) {
-        S.profile_availability = j.profile_availability;
-        emit();
-      }
-    }, () => {});
-    load();
-    const timer = setInterval(load, 15000);
-    return () => { alive = false; clearInterval(timer); };
+    let hwInFlight = false;
+    // Fast hardware-only poll: fresh RAM/VRAM every 3 s without touching any
+    // model server. The in-flight guard keeps a slow answer from stacking
+    // requests, and a hidden tab pauses polling entirely.
+    const loadHw = () => {
+      if (!alive || hwInFlight || document.hidden) return;
+      hwInFlight = true;
+      PDC.api('/api/hardware').then((j) => {
+        hwInFlight = false;
+        if (alive && j) PDC.setMemory(j.memory);
+      }, () => { hwInFlight = false; });
+    };
+    // The slower registry poll refreshes the profile picker's disabled
+    // states; its memory reading feeds the same store.
+    const loadServers = () => {
+      if (!alive || document.hidden) return;
+      PDC.api('/api/servers').then((j) => {
+        if (!alive || !j) return;
+        PDC.setMemory(j.memory);
+        if (j.profile_availability) {
+          S.profile_availability = j.profile_availability;
+          emit();
+        }
+      }, () => {});
+    };
+    // Coming back to the tab: show the current memory immediately instead
+    // of waiting out the rest of the poll interval.
+    const onVisibility = () => { if (!document.hidden) loadHw(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    loadHw();
+    loadServers();
+    const hwTimer = setInterval(loadHw, 3000);
+    const srvTimer = setInterval(loadServers, 15000);
+    return () => {
+      alive = false;
+      clearInterval(hwTimer);
+      clearInterval(srvTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
+  const mem = S.memory;
   if (!mem) return null;
   const v = mem.vram || {}, r = mem.ram || {};
   const src = mem.sources || {};
@@ -3545,6 +3582,7 @@ function serversDialog() {
   function act(path, payload) {
     status.textContent = 'Working\u2026';
     PDC.api(path, payload).then((j) => {
+      PDC.setMemory(j.memory);
       if (j.skipped) {
         status.textContent = j.detail || 'nothing to do';
       } else if (!j.ok) {
@@ -3556,6 +3594,14 @@ function serversDialog() {
         status.textContent = verb
           + (payload.model || payload.server || 'model')
           + ' \u00B7 ' + _memText(j.memory || {});
+        // ROCm/CUDA/OS memory reclamation can lag the load/unload ack: one
+        // delayed hardware read shows it without a manual page refresh.
+        if (path === '/api/servers/load' || path === '/api/servers/unload') {
+          setTimeout(() => {
+            PDC.api('/api/hardware').then((h) => PDC.setMemory(h && h.memory),
+              () => {});
+          }, 1500);
+        }
       }
       paint(j);
     }, () => { status.textContent = 'The GUI server did not answer.'; });
@@ -3567,6 +3613,7 @@ function serversDialog() {
       status.textContent = 'Could not read the server registry.';
       return;
     }
+    PDC.setMemory(j.memory);
     if (!j.ok) {
       status.textContent = j.detail || 'Could not read the server registry.';
       // A refused load/unload/pin still answers 502 WITH fresh telemetry:
@@ -3594,11 +3641,13 @@ function serversDialog() {
         String(s.kind || '').toLowerCase()) >= 0;
       const loadBtn = h('button', { class: 'small primary', text: 'Load',
         disabled: !available.length,
-        onclick: () => act('/api/servers/load', { server: s.name, model: sel.value }) });
+        onclick: () => act('/api/servers/load',
+          { server: s.name, kind: s.kind, model: sel.value }) });
       const unloadBtn = h('button', { class: 'small danger', text: loaded.length > 1 ? 'Eject all' : 'Unload / Eject',
         disabled: !loaded.length,
         onclick: () => act('/api/servers/unload',
-          { server: s.name, model: loaded.length === 1 ? loaded[0] : '' }) });
+          { server: s.name, kind: s.kind,
+            model: loaded.length === 1 ? loaded[0] : '' }) });
       list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
         h('div', { class: 'row' },
           h('b', { text: serverTitle(s) }),

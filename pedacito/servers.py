@@ -45,6 +45,7 @@ import re
 import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -715,13 +716,22 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
 
 
 def list_server_states(config, timeout: float = PROBE_TIMEOUT) -> list[dict]:
-    """Probe every configured local server in turn.
+    """Probe every configured local server and report its live state.
 
     Each row carries its name/kind/base_url, `online`, the model ids it
     advertises, and `loaded_models` (the resident set). Hosted endpoints and
-    duplicate spellings of one server are not listed."""
-    return [_probe_server(s, timeout=timeout)
-            for s in configured_local_servers(config)]
+    duplicate spellings of one server are not listed.
+
+    With more than one server the probes run concurrently (a small thread
+    pool), so an offline or still-loading server never stalls the rest; the
+    results keep the configured order either way."""
+    configured = configured_local_servers(config)
+    if len(configured) <= 1:
+        return [_probe_server(s, timeout=timeout) for s in configured]
+    with ThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
+        # executor.map yields results in submission order, not finish order.
+        return list(pool.map(lambda s: _probe_server(s, timeout=timeout),
+                             configured))
 
 
 # --- lifecycle actions --------------------------------------------------------
