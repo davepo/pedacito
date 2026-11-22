@@ -4182,6 +4182,212 @@ def _hybrid_finish(root, cfg, client, hybrid: dict, tr: TaskResult) -> None:
         pass
 
 
+# The interleaved engine spends one model call per turn -- reads, edits and
+# test runs all ride the same conversation -- so the gather-era default of
+# 30 calls is far too tight for it. When the user left max_total_model_calls
+# at a fallback value, interleaved runs get this generous floor; an explicit
+# user cap (file/profile/env/CLI) is always respected.
+_INTERLEAVED_CALL_FLOOR = 120
+
+_INTERLEAVED_LIVE_TOOLS = ("run", "run_test", "browser", "screenshot")
+
+
+def _interleaved_steps(res) -> list[str]:
+    """A lookup-style action log synthesized from the interleaved transcript,
+    so session files, the failure-memory tail and the GUI keep their familiar
+    numbered step lines ("1. read pedacito/loop.py"). Handles both the native
+    tool-call channel and the JSON text protocol."""
+    import json
+    steps: list[str] = []
+    for m in getattr(res, "transcript", None) or []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        calls: list[tuple[str, dict]] = []
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            fn = fn if isinstance(fn, dict) else {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            calls.append((str(fn.get("name") or ""),
+                          args if isinstance(args, dict) else {}))
+        if not calls and isinstance(m.get("content"), str):
+            try:
+                body = json.loads(m["content"])
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                if isinstance(body.get("tool"), str):
+                    args = body.get("arguments")
+                    calls.append((body["tool"],
+                                  args if isinstance(args, dict) else {}))
+                for tc in body.get("tool_calls") or []:
+                    if isinstance(tc, dict) and isinstance(tc.get("tool"), str):
+                        args = tc.get("arguments")
+                        calls.append((tc["tool"],
+                                      args if isinstance(args, dict) else {}))
+        for name, args in calls:
+            if not name:
+                continue
+            target = str(args.get("file") or args.get("path")
+                         or args.get("pattern") or args.get("command")
+                         or args.get("query") or "")
+            steps.append(f"{len(steps) + 1}. {name}"
+                         + (f" {target[:120]}" if target else ""))
+    return steps
+
+
+def _run_interleaved_task(root: Path, cfg, client, agent, idx, task: str, *,
+                          apply: bool = True, review: bool = False,
+                          capture=None) -> TaskResult:
+    """Run ONE task through the interleaved engine and adapt its result to
+    the TaskResult contract run_loop, the CLI and the GUI already consume.
+
+    run_task took the pre-run checkpoint already (checkpoint=None here);
+    review/dry-run hand the staged edits to the SAME `_review` page the
+    two_phase ladder uses, so sign-off, the GUI Review pane and the undo
+    baseline behave identically. Events flow through `agent.events` (the
+    JSONL log and the GUI feed both listen there); `on_event` stays None so
+    nothing is emitted twice."""
+    from . import config as config_mod
+    from . import interleaved as interleaved_mod
+    when = workspace.stamp()
+    wants_write = apply or review
+    backup_dir = (workspace.new_backup_dir(root, when, unique=True)
+                  if wants_write and cfg.backup else None)
+    t_started = time.time()
+    usage0 = _snapshot_stats(client)
+    workspace.log_event(root, f"task (interleaved): {safe_text(task, cfg)}")
+    todo_mod.clear(root)          # a fresh checklist per task, like two_phase
+    _fire(cfg, root, "pre_task", task=task[:500])
+    try:
+        if getattr(agent, "events", None) is None:
+            agent.events = events_mod.get(root, cfg)
+    except Exception:
+        pass
+    # Live evidence (run/run_test/browser/screenshot observations) comes from
+    # the tool_result events; a temporary listener keeps the verdict without
+    # parsing result text.
+    live_kinds: list[str] = []
+
+    def _live_note(kind, fields):
+        if (kind == "tool_result" and fields.get("ok")
+                and fields.get("name") in _INTERLEAVED_LIVE_TOOLS
+                and fields["name"] not in live_kinds):
+            live_kinds.append(fields["name"])
+
+    elog = getattr(agent, "events", None)
+    if elog is not None:
+        elog.listeners.append(_live_note)
+    # A generous call floor for fallback-valued caps; explicit caps stand.
+    saved_calls = int(getattr(cfg, "max_total_model_calls", 0) or 0)
+    sources = getattr(cfg, "sources", None)
+    source = str(sources.get("max_total_model_calls", "default")) \
+        if isinstance(sources, dict) else "default"
+    raised = (not config_mod._is_explicit_limit(source)
+              and saved_calls < _INTERLEAVED_CALL_FLOOR)
+    if raised:
+        cfg.max_total_model_calls = _INTERLEAVED_CALL_FLOOR
+        if isinstance(sources, dict):
+            sources["max_total_model_calls"] = "interleaved default"
+    cancel_event = (getattr(cfg, "_cancel_event", None)
+                    or getattr(client, "cancel_event", None))
+    print("\n--- interleaved run ---", file=sys.stderr)
+    try:
+        res = interleaved_mod.run_interleaved(
+            agent, task, apply=apply, review=review, checkpoint=None,
+            cancel_event=cancel_event, on_event=None, backup_dir=backup_dir)
+    finally:
+        if elog is not None:
+            try:
+                elog.listeners.remove(_live_note)
+            except ValueError:
+                pass
+        if raised:
+            cfg.max_total_model_calls = saved_calls
+            if isinstance(sources, dict):
+                sources["max_total_model_calls"] = source
+    if capture is not None:
+        # _ClientProxy intercepts chat/chat_stream, not chat_tools: record the
+        # whole conversation as one trajectory entry instead.
+        try:
+            capture.note("interleaved", res.transcript, res.summary)
+        except Exception:
+            pass
+    results = list(res.edit_results or [])
+    reply = (res.summary or "").strip()
+    if res.error:
+        reply = (reply + "\n\n" if reply else "") + f"[{res.error}]"
+    applied = False
+    if review:
+        results = _review(root, results, task, cfg, backup_dir, when)
+        applied = any(r.ok and "applied" in r.message for r in results)
+    else:
+        _report(results, dry_run=not apply)
+        applied = bool(apply and any(r.ok for r in results))
+        if apply and results and not applied:
+            print(f"\n[NOTHING APPLIED: all {len(results)} edit target(s) "
+                  "failed; zero files were changed]", file=sys.stderr)
+            workspace.log_event(
+                root, f"NOTHING APPLIED: all {len(results)} edit target(s) "
+                      "failed", "ERROR")
+    changed: list[str] = []
+    if applied:
+        for r in results:
+            if not r.ok or str(r.message).startswith("not written"):
+                continue
+            if getattr(r, "deleted", False):
+                try:
+                    idx.forget(r.file)
+                except Exception:
+                    pass
+                continue
+            try:
+                idx = index_mod.reindex_file(idx, r.file, cfg)
+                changed.append(r.file)
+            except Exception:
+                pass               # a moved file re-indexes on next refresh
+        agent.index = idx
+    steps_log = _interleaved_steps(res)
+    session = None
+    if cfg.log_sessions:
+        session = workspace.write_session(root, safe_text(task, cfg),
+                                          steps_log, safe_text(reply, cfg),
+                                          results, backup_dir, when)
+        print(f"[session: {session.relative_to(root)}]", file=sys.stderr)
+    stats = _task_stats(client, usage0, t_started)
+    ok_n = sum(1 for r in results if r.ok)
+    events_mod.get(root, cfg).emit(
+        "task", task=task[:200], steps=len(steps_log), applied=applied,
+        edits_ok=ok_n, edits_failed=len(results) - ok_n, changed=changed,
+        findings=[], answer_mode="interleaved", folds=res.folds, **stats)
+    events_mod.get(root, cfg).emit(
+        "result", _full=True, task=task[:200], reply=reply, applied=applied,
+        edits=[{"file": r.file, "ok": r.ok, "message": r.message,
+                "diff": r.diff, "clauses": []} for r in results],
+        clause_texts={}, unaccepted=[])
+    try:
+        security_mod.emit_post_run_notice(root, cfg, files=changed)
+    except Exception:
+        pass
+    if stats.get("calls"):
+        print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
+              f"in / {stats['completion_tokens']:,} out tokens, cache hit "
+              f"{stats['cache_hit']:.0%}"
+              + (f", {stats['cache_write_tokens']:,} written to cache"
+                 if stats.get("cache_write_tokens") else "")
+              + (f", ${stats['cost']:.4f}" if stats.get("cost") else "")
+              + f", {stats['seconds']:.0f}s]", file=sys.stderr)
+    _fire(cfg, root, "post_task", task=task[:300], applied=applied,
+          files=changed, ok=ok_n, failed=len(results) - ok_n)
+    return TaskResult(results, reply, applied, changed, idx, session,
+                      steps_log, backup_dir=backup_dir,
+                      live_ok=bool(live_kinds) if live_kinds else None,
+                      live_kinds=tuple(live_kinds) if live_kinds else None,
+                      stats=stats, tests_ok=res.tests_green)
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
@@ -4250,9 +4456,14 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 pass
         # Split-stage hybrid: the architect plans before the editor runs. Repair
         # rounds and scaffold/answer_system tasks keep their single-model path.
+        # The interleaved engine plans and edits in one conversation, so it
+        # skips the hybrid handoff entirely.
+        from . import config as config_mod
+        interleaved = (answer_system is None
+                       and config_mod.resolve_execution_mode(cfg) == "interleaved")
         hybrid = None
         if ((apply or review) and not is_repair and answer_system is None
-                and hybrid_active(cfg)):
+                and not interleaved and hybrid_active(cfg)):
             hybrid = _hybrid_stage1(root, cfg, client, agent, idx, task)
         saved_mode = getattr(cfg, "answer_mode", "")
         if hybrid is not None:
@@ -4275,9 +4486,14 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             cfg._hybrid_blueprint = hybrid["blueprint"]
             cfg.answer_mode = "rebuild"
         try:
-            tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
-                             review=review, answer_system=answer_system,
-                             is_repair=is_repair)
+            if interleaved:
+                tr = _run_interleaved_task(root, cfg, client, agent, idx, task,
+                                           apply=apply, review=review,
+                                           capture=capture)
+            else:
+                tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
+                                 review=review, answer_system=answer_system,
+                                 is_repair=is_repair)
         except BaseException:
             # A cancelled or failed run still leaves the exchanged messages that
             # did happen; write them before propagating the original exception.
@@ -4289,10 +4505,13 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 cfg._hybrid_blueprint = ""
         if hybrid is not None:
             _hybrid_finish(root, cfg, client, hybrid, tr)
-        tr = _specialist_zero_edit_fallback(
-            root, cfg, client, idx, task, tr,
-            dict(apply=apply, review=review, answer_system=answer_system,
-                 is_repair=is_repair))
+        if not interleaved:
+            # The zero-edit fallback re-runs _run_ladder on another model; the
+            # interleaved engine already owns its own retries and escalation.
+            tr = _specialist_zero_edit_fallback(
+                root, cfg, client, idx, task, tr,
+                dict(apply=apply, review=review, answer_system=answer_system,
+                     is_repair=is_repair))
         if answer_system is not None or review or not getattr(cfg, "use_memory", True):
             if writes:
                 _checkpoint_task(root, cfg, task, "post")

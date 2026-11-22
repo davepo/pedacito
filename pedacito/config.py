@@ -206,6 +206,15 @@ class Config:
     # trained on tool calling). `pedacito calibrate` measures both on your model
     # and the card picks; set it here to force one.
     tool_mode: str = "grammar"
+    # Which execution engine runs a task:
+    #   "two_phase" -- the classic gather-then-answer ladder. The default,
+    #     and the right engine for tiny/small/medium local models.
+    #   "interleaved" -- the agentic loop: one conversation where the model
+    #     reads, edits, runs tests and fixes until the task is done.
+    #   "auto" -- interleaved for hosted APIs, local-MoE servers and
+    #     calibrated large local models whose card chose native tool calls;
+    #     two_phase for everything else.
+    execution_mode: str = "two_phase"
     # Engine-level constrained JSON. On (the default), every schema
     # request -- the gather tool loop and plan calls -- is sent as
     # response_format {"type": "json_schema", "strict": true} so OpenAI-compatible
@@ -1211,6 +1220,7 @@ _ENUM_FIELDS = {
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
     "reasoning_effort": ("default", "low", "medium", "high"),
+    "execution_mode": ("two_phase", "interleaved", "auto"),
     "update_channel": ("stable", "any"),
     "language": ("en", "es"),
     "llm_reply_language": ("match_ui", "auto", "en", "es"),
@@ -2796,6 +2806,59 @@ detect_local_moe = is_local_moe
 local_moe = is_local_moe
 
 
+def resolve_execution_mode(cfg) -> str:
+    """The execution engine a config actually runs: "two_phase" or
+    "interleaved". Explicit modes pass through unchanged; "auto" picks
+    interleaved for hosted APIs, local-MoE servers and calibrated large
+    local models whose card chose native tool calls, and two_phase for
+    tiny/small/medium local models and anything uncalibrated or
+    unclassifiable (the safe default)."""
+    mode = str(getattr(cfg, "execution_mode", "two_phase")
+               or "two_phase").strip().lower()
+    if mode in ("two_phase", "interleaved"):
+        return mode
+    if mode != "auto":
+        return "two_phase"
+    try:
+        if is_hosted(cfg) or is_local_moe(cfg):
+            return "interleaved"
+    except Exception:
+        return "two_phase"
+    tier = str(getattr(cfg, "active_tier", "") or "")
+    if not tier:
+        name = str(getattr(cfg, "active_profile", "") or "")
+        profiles = getattr(cfg, "profiles", None) or {}
+        body = dict(profiles.get(name) or {}) if isinstance(profiles, dict) else {}
+        body.setdefault("model", getattr(cfg, "model", "") or "")
+        body.setdefault("base_url", getattr(cfg, "base_url", "") or "")
+        body.setdefault("provider", getattr(cfg, "provider", "") or "")
+        tier = _guess_tier(name, body) or ""
+    if tier != "large":
+        return "two_phase"
+    # A large local model only interleaves when calibration says its native
+    # tool-call channel works; an uncalibrated one stays on two_phase.
+    card = getattr(cfg, "_card", None)
+    if not isinstance(card, dict):
+        try:
+            from . import modelcard
+            card = modelcard.load(cfg)
+        except Exception:
+            card = None
+    if not isinstance(card, dict) or card.get("_needs_recalibrate"):
+        return "two_phase"
+    choices = card.get("choices") or {}
+    if choices.get("tool_mode") != "native":
+        return "two_phase"
+    measured = card.get("measured") or {}
+    native = measured.get("tool_choice_native")
+    try:
+        if native is not None and float(native) < 0.85:
+            return "two_phase"
+    except (TypeError, ValueError):
+        return "two_phase"
+    return "interleaved"
+
+
 def local_moe_output_budget(complex_plan: bool = False) -> int:
     """The default output budget for a local-MoE reply: 8192 tokens so a
     reasoning block is never cut mid-thought, 16384 for a complex/auto plan."""
@@ -3213,6 +3276,9 @@ json_mode = "schema"
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
 # tool_mode = "grammar"     # "native" = the model's tool-call channel
+# execution_mode = "two_phase"  # "interleaved" = agentic read/edit/test loop;
+#                               # "auto" picks by model class: hosted, local-MoE
+#                               # and calibrated large -> interleaved, else two_phase
 # temperature = 0.2
 # temperature_answer = 0.3  # answer phase; 0 = greedy, unset = temperature
 # Hosted APIs (non-local base_url) get NO sampling keys by default -- the
