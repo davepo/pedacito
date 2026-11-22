@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -907,6 +909,68 @@ def test_list_server_states_detects_resident_models(monkeypatch):
     assert state["online"] is True and state["kind"] == "strata"
     assert state["models"] == ["qwen3.8-flash", "gemma-3-27b"]
     assert state["loaded_models"] == ["qwen3.8-flash"]
+
+
+def test_list_server_states_probes_concurrently_and_preserves_order(
+        monkeypatch):
+    """An offline or still-loading server must not stall the rest: with
+    several configured servers the probes overlap on a small thread pool,
+    and the rows keep the configured order even when they finish shuffled."""
+    cfg = _cfg_with({
+        "slow": {"base_url": "http://127.0.0.1:8001/v1",
+                 "model": "m", "provider": "strata"},
+        "fast-a": {"base_url": "http://127.0.0.1:8002/v1",
+                   "model": "m", "provider": "lemonade"},
+        "fast-b": {"base_url": "http://127.0.0.1:8003/v1",
+                   "model": "m", "provider": "strata"},
+    }, active="slow")
+    delays = {"slow": 0.25, "fast-a": 0.02, "fast-b": 0.02}
+    spans = {}
+    lock = threading.Lock()
+
+    def fake_probe(server, timeout=servers.PROBE_TIMEOUT):
+        name = server["name"]
+        start = time.monotonic()
+        time.sleep(delays[name])
+        end = time.monotonic()
+        with lock:
+            spans[name] = (start, end, threading.current_thread().name)
+        return {**server, "online": True, "status": "online",
+                "models": [], "loaded_models": []}
+
+    monkeypatch.setattr(servers, "_probe_server", fake_probe)
+    started = time.monotonic()
+    states = servers.list_server_states(cfg)
+    elapsed = time.monotonic() - started
+    # Configured order survives the shuffled completion order.
+    assert [s["name"] for s in states] == ["slow", "fast-a", "fast-b"]
+    # Both fast probes started (and finished) while the slow one was still
+    # in flight, on pool workers rather than the calling thread.
+    assert spans["fast-a"][1] < spans["slow"][1]
+    assert spans["fast-b"][1] < spans["slow"][1]
+    assert len({span[2] for span in spans.values()}) > 1
+    # One slow probe's wall time, not the sum of all three.
+    assert elapsed < sum(delays.values())
+
+
+def test_list_server_states_single_server_still_probes(monkeypatch):
+    """The one-server path skips the pool but keeps the same row shape."""
+    cfg = _cfg_with({
+        "solo": {"base_url": "http://127.0.0.1:8001/v1",
+                 "model": "m", "provider": "strata"},
+    }, active="solo")
+    seen = []
+
+    def fake_probe(server, timeout=servers.PROBE_TIMEOUT):
+        seen.append((server["name"], threading.current_thread().name))
+        return {**server, "online": False, "status": "offline",
+                "models": [], "loaded_models": []}
+
+    monkeypatch.setattr(servers, "_probe_server", fake_probe)
+    states = servers.list_server_states(cfg)
+    assert [s["name"] for s in states] == ["solo"]
+    assert states[0]["online"] is False
+    assert seen == [("solo", threading.current_thread().name)]
 
 
 def test_models_from_payload_honors_a_health_loaded_flag():

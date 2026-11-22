@@ -113,6 +113,9 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
         finally:
             job.telemetry = _uninterruptible(events_mod.end_run)
             _uninterruptible(STATE.end_job, job, err)
+            # The run may have loaded/evicted models: let the topbar chip see
+            # the post-run memory now, not at its next poll.
+            _uninterruptible(_push_hardware)
             # the turn is over: the thread on disk must match what the user
             # just saw, including anything the throttled saves held back
             _uninterruptible(STATE.save_active_thread, force=True)
@@ -375,6 +378,21 @@ def _global_project(profile: str = "") -> SimpleNamespace:
                            client=LLMClient(cfg), idx=None, agent=None)
 
 
+def _push_hardware() -> None:
+    """Push a fresh RAM/VRAM snapshot to the topbar chip over SSE.
+
+    Evictions and finished jobs change memory outside the badge's polling
+    cycle; the lightweight "hardware" event lets the chip follow live during
+    model switches without a page refresh. Best-effort: a failed read must
+    never disturb the job itself."""
+    try:
+        from .. import profiler
+        STATE.bus.publish("hardware",
+                          memory=profiler.snapshot(use_cache=False))
+    except Exception:
+        pass
+
+
 def _evict_other_servers(cfg) -> None:
     """Unload models resident on OTHER local servers before a run.
 
@@ -385,6 +403,8 @@ def _evict_other_servers(cfg) -> None:
         from .. import servers
         result = servers.evict_other_local_servers(
             getattr(cfg, "active_profile", "") or cfg.base_url, cfg)
+        # The freed VRAM/RAM must reach the topbar chip right away.
+        _push_hardware()
     except Exception:
         return
     evicted = [r for r in result.get("evicted", []) if r]
