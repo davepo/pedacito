@@ -20,7 +20,7 @@ Pedacito necesita **Python 3.11 o superior**. No necesita Node.js para el arnés
 
 Requiere Python 3.11+.
 
-Instalación rápida desde PyPI (0.3.1):
+Instalación rápida desde PyPI (0.3.2):
 
 ```bash
 pip install pedacito                     # Windows: py -m pip install pedacito
@@ -51,6 +51,8 @@ Funciones opcionales: `pip install -e ".[full]"` agrega capturas de pantalla (Pi
 navegador headless (playwright). O elige una: `pip install -e ".[vision]"` o
 `pip install -e ".[browser]"`. Tras instalar el extra del navegador, ejecuta
 `python -m playwright install chromium`.
+
+`pip install -e ".[keyring]"` agrega soporte del llavero del sistema: `api_key = "keyring:<servicio>/<cuenta>"` y `api_key_keyring` leen la clave desde tu llavero en lugar de un archivo.
 
 <details>
 <summary>Instalar desde el código fuente (desarrollo)</summary>
@@ -148,7 +150,7 @@ Pedacito su URL base y un nombre de modelo.
 | **LM Studio** | Carga un modelo y luego inicia el servidor (pestaña Developer). Para otra máquina, activa "Serve on Local Network". | `http://localhost:1234/v1` |
 | **Ollama** | `ollama serve` y `ollama pull <model>`. Para otra máquina, define primero `OLLAMA_HOST=0.0.0.0`. | `http://localhost:11434/v1` |
 | **Lemonade** | Inicia el servidor y carga un modelo. | La URL que imprime (termina en `/v1` o `/api/v1`) |
-| **Strata / Avalon** | Inicia el servidor MoE por niveles y carga un modelo, siguiendo su propia documentación. | Su URL compatible con OpenAI, p. ej. `http://127.0.0.1:8000/v1` |
+| **Strata / Avalon** | Inicia el servidor MoE por niveles y carga un modelo, siguiendo su propia documentación. | Su URL compatible con OpenAI, p. ej. `http://127.0.0.1:8080/v1` (el preset en Model discovery) |
 | **API alojada** | Obtén una clave de API. | p. ej. `https://api.deepseek.com/v1` |
 
 Los puertos por defecto de arriba son indicios, no reglas: cualquier puerto funciona, y el escaneo
@@ -166,7 +168,15 @@ así que su modelo aparece aunque `/v1/models` responda 401 sin autenticar. Dale
 y Pedacito aplica el nivel de ejecución `local-moe`: presupuestos de respuesta mayores, un
 tiempo límite de al menos 600 segundos para la carga de pesos y exactamente un stream
 concurrente para que un segundo prefill no pueda expulsar los pesos residentes. Pedacito también maneja su
-ciclo de carga/descarga de modelos entre ejecuciones. Consulta
+ciclo de carga/descarga de modelos entre ejecuciones.
+
+La configuración es un solo paso: **Model discovery** ofrece un preset de Strata / Avalon en
+`http://127.0.0.1:8080/v1` y un campo de clave API junto al escaneo. Cuando un servidor indica que
+se requiere una clave, su fila muestra la insignia **API key required** hasta que definas una clave,
+en el campo, en el perfil o mediante `STRATA_API_KEY` (o `AVALON_API_KEY`) en el entorno. Si Lemonade
+está en la misma máquina, `auto_evict_servers` (activado por defecto) descarga el modelo del otro servidor
+antes de una ejecución, de modo que el servidor de destino tenga la memoria que necesita; define `false`
+para mantener todos los modelos cargados. Consulta
 [Perfiles de ejecución y el nivel local-moe](ARCHITECTURE.md#perfiles-de-ejecución-y-el-nivel-local-moe)
 para ver los presupuestos y un ejemplo de perfil.
 

@@ -8,4 +8,4 @@ of fitting the whole project in context.
 See pedacito/cli.py for the command-line entry point and usage examples.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"

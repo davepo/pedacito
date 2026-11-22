@@ -39,6 +39,18 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 > Prefer Spanish? Use the `EN | ES` switcher in the GUI top bar, press `F3` in the TUI, or run
 > `pdc --lang es gui`. See [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language).
 
+## What's new in v0.3.2
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Interleaved execution** | `execution_mode` picks `two_phase`, `interleaved` or `auto`. Interleaved runs keep one native tool-calling conversation (read, edit, scoped test, traceback, edit), with dry runs staged in a shadow workspace. Set it per run with `--execution-mode`, or live with the TUI `/mode`. | [Configuration](docs/CONFIG.md) |
+| **Native Gemini & OpenAI Responses** | `gemini_native` (on by default) uses Google's `generateContent`; `openai_responses` uses `/v1/responses` for o3, o4 and GPT-5 reasoning models. | [Configuration](docs/CONFIG.md) |
+| **Three-tier model catalog & keychain** | Provider metadata, a 24 h `models.dev` cache and a built-in table supply context windows and prices. `pedacito models refresh` forces an update. `api_key_keyring` reads your OS keychain once `pedacito[keyring]` is installed. | [Configuration](docs/CONFIG.md) |
+| **Strata / Avalon onboarding** | A one-step preset at port 8080, an API key field in the scan, a `STRATA_API_KEY` fallback, an **API key required** badge, and Lemonade auto-evict. | [Model server setup](docs/INSTALLATION.md#model-server-setup) |
+| **Live RAM/VRAM badge & pairing panel** | The GUI hardware badge refreshes every 3 seconds and is pushed live. The Dual-GPU / Scout + Architect Pairing panel starts collapsed. | [GUI workspace](docs/USAGE.md) |
+| **Hunk review & project shell rules** | Accept individual hunks in the Changes pane. **Allow in this project** saves a narrow shell rule (`shell_allowlist_by_project`) for the current project only. | [Review page](docs/USAGE.md#review-page) |
+| **Calibrated temperatures & creative sway** | A calibrated model card replaces only default temperatures, never values you set. `creative_temperature_delta` tunes the Creative/design sway. | [Configuration](docs/CONFIG.md) |
+
 ## What's new in v0.3.1
 
 | Feature | What you get | Read more |

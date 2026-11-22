@@ -270,7 +270,8 @@ Qué esperar:
 - **La GUI muestra qué modelo es el scout.** Mientras está activo, la barra superior muestra
   una insignia `Scout: <profile>`. En **⚙ Settings → All settings**, `scout_profile` es un
   menú desplegable de tus perfiles, con **None (use active profile)** para desactivarlo.
-  **⚙ Settings → Profiles → Dual-GPU / Scout + Architect Pairing** escribe el par
+  **⚙ Settings → Profiles → Dual-GPU / Scout + Architect Pairing** (plegado por
+  defecto; su encabezado indica si hay un par configurado) escribe el par
   en una sola edición que conserva los comentarios (y puede crear un perfil de scout inicial para el
   segundo servidor), y la respuesta dual-GPU de **Auto-Tune** ofrece
   **Create starter Scout & pair…**.

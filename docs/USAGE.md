@@ -69,7 +69,7 @@ Pedacito's interface is available in English and Spanish. Switch it where you wo
 | **Small-model techniques** | A harness-run retrieval loop, a requirement state machine (`UNLOCATED → LOCATED → READ → EDITED → VERIFIED`), symbol-anchored edit microloops, an AST syntax gate before any test runs, traceback repair packets, KV prompt-cache-friendly conversations, and exact-span rehydration | [../TECHNIQUES.md](../TECHNIQUES.md) |
 | **Engine V2 telemetry** | The GUI shows the live phase, the requirement ledger, and recent lookups as a task runs | [../QUICKSTART.md](../QUICKSTART.md#part-a-the-gui) |
 | **Repository memory** | Confirmed commands in `.pedacito/micro_facts.json`, with contradicted facts retired automatically. Unused tool schemas are pruned to save tokens | [../TECHNIQUES.md](../TECHNIQUES.md) §14 and §15 |
-| **Local server scanner** | Finds LM Studio, Ollama, Lemonade, and llama.cpp on any port, then imports only the models you tick | [Model server setup](INSTALLATION.md#model-server-setup) |
+| **Local server scanner** | Finds LM Studio, Ollama, Lemonade, llama.cpp, and Strata / Avalon (preset at port 8080, `STRATA_API_KEY` fallback) on any port, then imports only the models you tick. See [Strata / Avalon onboarding](INSTALLATION.md#model-server-setup) | [Model server setup](INSTALLATION.md#model-server-setup) |
 | **Hosted provider presets** | One-click setup for Claude, ChatGPT, DeepSeek, Qwen, Gemini, and OpenRouter. Keys can come from an environment variable instead of the config file | [Configure](CONFIG.md#configure) |
 | **Role routing** | Send planner, verifier, or escalation work to a different profile, per job or per project | [../MODEL_GUIDE.md](../MODEL_GUIDE.md#hybrid-local--cloud-role-routing) |
 | **Auto-Tune wizard** | Answer four questions about your hardware and codebase, preview the budgets, then apply them | [../QUICKSTART.md](../QUICKSTART.md#part-a-the-gui) |
@@ -147,9 +147,9 @@ dependencies, so it works offline. It runs the same engine as the commands.
 
 #### Profile availability in the picker
 
-The profile picker validates local profiles against the same `/api/servers`
-poll that refreshes the hardware badge, so it updates every 15 seconds without
-a new request or polling interval. A local profile whose server answers but
+The profile picker validates local profiles against the `/api/servers` poll, which runs every
+15 seconds. The hardware badge has its own faster poll of `/api/hardware`, every
+3 seconds and also pushed live over SSE, so RAM and VRAM stay current on their own. A local profile whose server answers but
 whose model is not in the server's model list is marked **· unavailable** and
 cannot be selected; the switch API also refuses it with a 409. The tooltip
 names the model and server. A profile whose server is not reachable is marked
@@ -177,6 +177,7 @@ commands. Run `pedacito <command> --help` for every flag.
 |---|---|
 | `pedacito gui [PROJECT]` | Open the browser control panel |
 | `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
+| `pedacito models refresh` | Refresh the cached models.dev catalog (hosted context windows and prices) now; a failed fetch keeps the old cache |
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
 | `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
@@ -832,7 +833,7 @@ identically.
 |---|---|
 | **Header** | Open a project (type a path, **Browse…** the machine's folders, or pick a recent one), choose its model profile, see the model server's status light and the session's token/cache/cost totals. |
 | **Chat** (left) | Five modes next to the box: **Task/Edit** (edit code; *review* or *write directly*, planning auto/always/never, max lookups), **Ask** (read-only questions, answer streams in), **Auto** (goal → plan → implement; plan-only or implement, verify command, repair rounds, task/minute caps, worktree, keep-going, pip-install; applying Auto accepts the tool trust boundary and enables write/run tools for the run), **New** (start a project from scratch in a folder: preview, build, build-then-review, skeleton only, and *complex* for the autonomous loop), and **How ?** (the built-in CLI/GUI/setting reference with topic chips, copyable commands and *Open in Settings* links; answers stay out of the saved coding thread). **Attach** (or drag in) a text file as the task, question, or spec. **✨ Creative** above the composer forces the Builder persona for Task/Auto/New runs; with it off, design tasks are still auto-detected. While a task runs, type to **steer** the model, answer its clarifying questions inline, or **Stop** it. |
-| **Changes** (middle) | The proposed edits as *Old code \| Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files to accept only some, or **Edit updated** to hand-edit a file before accepting. Files carry clause badges (`R1`, `R2`, ...) showing which part of the task they serve; a partial accept flags clauses left unaccepted. Backups are made first and a file that changed on disk since the preview is refused. |
+| **Changes** (middle) | The proposed edits as *Old code \| Updated code* side by side with word-level highlights. Accept or reject the whole set, untick files or single hunks to accept only some, or **Edit updated** to hand-edit a file before accepting. Files carry clause badges (`R1`, `R2`, ...) showing which part of the task they serve; a partial accept flags clauses left unaccepted. Backups are made first and a file that changed on disk since the preview is refused. |
 | **Activity** and **Plan** (right, top) | Live phase and activity for the running task. The `auto`/plan checklist with progress; click **Edit** to change it, then **Run** to implement it. |
 | **Files**, **Backups**, **Logs** (right, bottom tabs) | Files: a filterable tree of the indexed files, with files in the pending review highlighted. Backups: restorable snapshots. Logs: the terminal, everything pedacito prints, live, with ANSI colours. |
 | **🌐 Preview** (right, bottom tab) | Appears when the project has `.html` pages: a read-only iframe of the selected page (default `index.html`), served from inside the project root. ⟳ Refresh reloads it, ↗ New tab opens it in a full browser tab, and it reloads automatically when a run finishes or changes files. See [Live Preview](#live-preview). |
@@ -1113,3 +1114,8 @@ When the run tracked requirement clauses, each file carries a badge (`R1`,
 text. If you accept only some files, any clause whose files were all rejected
 is flagged as unaccepted in the sign-off detail, so a partial accept cannot
 silently drop half the task.
+
+**Hunk-level sign-off.** In the GUI Changes pane, each change block in a file
+is listed as **Hunk N** with an *accept this hunk only* checkbox. Accepting some
+hunks writes only those; the rest of the file keeps its current text. The
+SHA-256 check still covers the whole file before anything is written.

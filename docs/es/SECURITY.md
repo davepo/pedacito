@@ -397,6 +397,7 @@ el aviso (TUI) o el evento JSON (RPC) muestra la categoría, el objetivo exacto 
 | **Allow Once** | Aprueba solo esta solicitud. |
 | **Allow for This Run** | Aprueba ese tipo de solicitud hasta que termine la ejecución. |
 | **Always Allow** | La aprueba de ahora en adelante. Define `enable_web` para el acceso web, o `allow_shell` para los comandos de shell, y guarda la elección en tu configuración. |
+| **Permitir '<pattern>' en este proyecto** | Solo para comandos de shell: guarda una regla estrecha en `shell_allowlist_by_project` para la raíz de este proyecto. Los comandos que coinciden omiten la solicitud solo en ese proyecto. Nunca cubre instalaciones de paquetes, shells ni comandos encadenados. |
 | **Deny & Redirect** | Rechaza la solicitud. Se le indica al modelo que continúe solo con los archivos locales del proyecto. |
 
 Una solicitud que no respondes, porque el diálogo expira o presionas Stop, se
