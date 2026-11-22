@@ -464,3 +464,91 @@ def test_reset_stops_running_servers_before_deleting_the_registry(tmp_path):
     assert rc == 0
     assert _wait_dead(pid), "reset deleted the registry but left the server up"
     assert not (root / ".pedacito" / "procs").exists()
+
+
+def test_concurrent_start_reserves_unique_names(tmp_path):
+    """Concurrent start() calls with the same base name must not collide
+    during the startup wait loop."""
+    import threading
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    script = _write(root, "slow.py", "import time\ntime.sleep(30)\n")
+    recs: list[dict] = []
+    lock = threading.Lock()
+
+    def launch():
+        r = processes.start(root, _cmd(script), name="api", wait=0.4)
+        with lock:
+            recs.append(r)
+
+    threads = [threading.Thread(target=launch) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    try:
+        names = {r["name"] for r in recs}
+        assert len(names) == 3, names
+        assert names == {"api", "api-2", "api-3"}
+    finally:
+        for r in recs:
+            processes.stop(root, r["name"])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc stat test")
+def test_linux_born_ticks_parses_parens_and_guards_recycled_pid(
+        tmp_path, monkeypatch):
+    """Linux start-time ticks parsing handles spaces/parens in comm, refuses
+    to kill a recycled PID whose start ticks changed, and keeps legacy records
+    without `born` stoppable."""
+    # Parse synthetic /proc/<pid>/stat with spaces and ')' inside comm.
+    stat_fields = ["S"] + ["0"] * 18 + ["987654321"] + ["0"] * 10
+    fake_stat = f"4242 (my (weird) proc) {' '.join(stat_fields)}\n"
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if str(self) == "/proc/4242/stat":
+            return fake_stat
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    assert processes._linux_proc_start_ticks(4242) == 987654321
+
+    # Recycled PID: record says born=111111, live /proc/4242/stat says 987654321
+    # -> _terminate_pid must NOT signal it.
+    signaled: list[tuple] = []
+    monkeypatch.setattr(processes.os, "killpg",
+                        lambda pgid, sig: signaled.append(("killpg", pgid, sig)))
+    monkeypatch.setattr(processes.os, "kill",
+                        lambda pid, sig: signaled.append(("kill", pid, sig)))
+    processes._terminate_pid(4242, born=111111)
+    assert signaled == []
+
+    # Legacy record (born=0) still signals as before.
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+    monkeypatch.setattr(processes, "_group_alive", lambda _pgid: False)
+    monkeypatch.setattr(processes.os, "getpgid", lambda pid: pid)
+    processes._terminate_pid(4242, born=0)
+    assert signaled and signaled[0][0] == "killpg"
+
+
+def test_logs_seeks_from_eof_without_reading_whole_file(tmp_path):
+    """logs() should return only the bounded tail from EOF on large logs."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    log_path = processes._log_path(root, "big")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write > 100 KB of earlier noise followed by a unique tail marker.
+    with log_path.open("wb") as fh:
+        fh.write(b"OLD_NOISE_LINE\n" * 10000)
+        fh.write(b"FINAL_TAIL_MARKER_OK\n")
+    processes._write_record(root, {
+        "name": "big", "command": "echo", "pid": 0,
+        "cwd": str(root), "log": str(log_path), "url": "",
+        "started": time.time(), "status": "exited",
+    })
+    out = processes.logs(root, "big", tail=300)
+    assert "earlier output omitted" in out
+    assert "FINAL_TAIL_MARKER_OK" in out
+    assert len(out) < 1000

@@ -384,3 +384,79 @@ def test_http_named_server_end_to_end(broker):
         server.shutdown()
         server.server_close()
         mcp.close_all()
+
+
+# ----------------------------------------- WP-06 concurrency & EOF regressions
+def test_mcp_session_fails_fast_on_server_eof(tmp_path):
+    """A server that crashes / closes stdout mid-request must fail immediately
+    via the EOF sentinel instead of hanging for the full request timeout."""
+    import time
+
+    script = tmp_path / "crash_mcp.py"
+    script.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif msg.get('method') == 'tools/call':\n"
+        "        sys.exit(1)\n",
+        encoding="utf-8")
+    s = mcp._Session("crash", timeout=15, argv=[sys.executable, str(script)])
+    try:
+        s.initialize()
+        t0 = time.monotonic()
+        with pytest.raises(mcp.MCPError, match="closed stdout"):
+            s.request("tools/call", {"name": "boom"})
+        assert time.monotonic() - t0 < 5.0
+    finally:
+        s.close()
+
+
+def test_mcp_session_enforces_monotonic_deadline_under_notifications(tmp_path):
+    """Periodic notifications from a stalled server must not reset request()'s
+    timeout forever."""
+    import time
+
+    script = tmp_path / "chatty_mcp.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif msg.get('method') == 'tools/call':\n"
+        "        for _ in range(40):\n"
+        "            sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/progress'}) + '\\n')\n"
+        "            sys.stdout.flush()\n"
+        "            time.sleep(0.1)\n",
+        encoding="utf-8")
+    s = mcp._Session("chatty", timeout=1, argv=[sys.executable, str(script)])
+    try:
+        s.initialize()
+        t0 = time.monotonic()
+        with pytest.raises(mcp.MCPError, match="timed out"):
+            s.request("tools/call", {"name": "hang"})
+        elapsed = time.monotonic() - t0
+        assert 0.8 <= elapsed < 3.5, f"unexpected elapsed={elapsed:.2f}s"
+    finally:
+        s.close()
+
+
+def test_probe_named_server_does_not_disturb_active_session(crucible):
+    """probe_named_server() must use an isolated ephemeral session rather than
+    forgetting/killing an active production session of the same name."""
+    descs = mcp.list_mcp_tools(crucible)
+    assert descs
+    active_before = mcp._NAMED_SESSIONS.get("docs")
+    assert active_before is not None and active_before.proc.poll() is None
+
+    probed = mcp.probe_named_server("docs", crucible.mcp_servers["docs"],
+                                    budget=5.0)
+    assert probed["error"] == "" and len(probed["tools"]) == 10
+    # The active production session must remain the exact same live process.
+    active_after = mcp._NAMED_SESSIONS.get("docs")
+    assert active_after is active_before
+    assert active_after.proc.poll() is None

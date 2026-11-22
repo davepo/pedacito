@@ -27,7 +27,7 @@ import re
 import time
 from pathlib import Path
 
-from . import safety
+from . import fileio, safety, security
 
 CATEGORIES = ("commands", "conventions", "landmines", "notes")
 _HEADINGS = {c: c.capitalize() for c in CATEGORIES}
@@ -62,10 +62,24 @@ def _hash(text: str) -> str:
     return hashlib.sha1(_norm(text).encode()).hexdigest()[:10]
 
 
-def _read(path: Path) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {c: [] for c in CATEGORIES}
+def _safe_project_memory_file(root) -> Path | None:
+    if root is None:
+        return None
     try:
-        text = path.read_text(encoding="utf-8")
+        resolved = security.resolve_safe_path(root, ".pedacito/memory.md")
+    except security.SecurityError:
+        return None
+    if security.is_sensitive_path(resolved):
+        return None
+    return resolved
+
+
+def _read(path: Path | None) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {c: [] for c in CATEGORIES}
+    if path is None:
+        return out
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return out
     cat = "notes"
@@ -76,7 +90,9 @@ def _read(path: Path) -> dict[str, list[str]]:
             cat = name if name in out else "notes"
             continue
         if line.startswith("- ") and line[2:].strip():
-            out[cat].append(line[2:].strip())
+            cleaned = safety.strip_control(line[2:]).strip()
+            if cleaned:
+                out[cat].append(cleaned)
     return out
 
 
@@ -88,9 +104,7 @@ def _write(path: Path, data: dict[str, list[str]]) -> None:
             lines += [f"- {x}" for x in data[c]]
             lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, "\n".join(lines).encode("utf-8"))
 
 
 def guess_category(text: str) -> str:
@@ -120,7 +134,12 @@ def remember(root, text: str, category: str = "", scope: str = "project"
                        "not commands")
     line = safety.redact(line)
     cat = category if category in CATEGORIES else guess_category(line)
-    path = global_file() if scope == "global" else project_file(root)
+    if scope == "global":
+        path = global_file()
+    else:
+        path = _safe_project_memory_file(root)
+        if path is None:
+            return False, "refused: unsafe project memory path"
     data = _read(path)
     h = _hash(line)
     if any(_hash(x) == h for lst in data.values() for x in lst):
@@ -135,7 +154,12 @@ def remember(root, text: str, category: str = "", scope: str = "project"
 def forget(root, needle: str, scope: str = "project") -> int:
     """Delete lines containing `needle` (or whose hash equals it); returns
     how many."""
-    path = global_file() if scope == "global" else project_file(root)
+    if scope == "global":
+        path = global_file()
+    else:
+        path = _safe_project_memory_file(root)
+        if path is None:
+            return 0
     data = _read(path)
     n = 0
     low = needle.lower().strip()
@@ -152,7 +176,8 @@ def forget(root, needle: str, scope: str = "project") -> int:
 def entries(root) -> list[tuple[str, str, str]]:
     """[(scope, category, text)] for `pedacito memory --list`."""
     out = []
-    for scope, path in (("global", global_file()), ("project", project_file(root))):
+    for scope, path in (("global", global_file()),
+                        ("project", _safe_project_memory_file(root))):
         for cat, lst in _read(path).items():
             out += [(scope, cat, x) for x in lst]
     return out
@@ -167,7 +192,8 @@ def render(root, cfg=None, limit: int | None = None) -> str:
         return ""
     limit = int(limit or getattr(cfg, "max_memory_chars", 1500) or 1500)
     rows: list[str] = []
-    for scope, path in (("global", global_file()), ("project", project_file(root))):
+    for scope, path in (("global", global_file()),
+                        ("project", _safe_project_memory_file(root))):
         data = _read(path)
         for cat in CATEGORIES:
             for x in data[cat]:
@@ -176,7 +202,7 @@ def render(root, cfg=None, limit: int | None = None) -> str:
                     if files and not any((Path(root) / f).exists()
                                          for f in files):
                         x += " [stale: the file(s) it names were deleted]"
-                rows.append(f"- [{scope}/{cat}] {x}")
+                rows.append(safety.strip_control(f"- [{scope}/{cat}] {x}"))
     if not rows:
         return ""
     head = ("PROJECT MEMORY (hints saved by earlier runs; NOT truth -- verify "
@@ -474,9 +500,7 @@ def consolidate_session(root: Path, cfg, messages: list[dict] | None = None,
         summary = _model_handoff(client, facts, summary)
     path = consolidated_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(summary, encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, summary.encode("utf-8"))
     pinned = 0
     if pin_memory and root is not None and getattr(cfg, "use_memory", True):
         for decision in facts["decisions"][:2]:
@@ -654,10 +678,8 @@ def _read_json(path: Path, default):
 def _write_json(path: Path, data) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True),
-                       encoding="utf-8")
-        tmp.replace(path)
+        fileio.write_bytes(
+            path, json.dumps(data, indent=1, sort_keys=True).encode("utf-8"))
     except OSError:
         pass
 
@@ -1372,22 +1394,38 @@ def rules_for(root, rel: str, max_chars: int = 600) -> list[tuple[str, str]]:
     rules_dir = root / ".pedacito" / "rules"
     if rules_dir.is_dir():
         for p in sorted(rules_dir.glob("*.md")):
+            rule_rel = f".pedacito/rules/{p.name}"
             try:
-                meta, body = _frontmatter(p.read_text(encoding="utf-8"))
+                safe_p = security.resolve_safe_path(root, rule_rel)
+            except security.SecurityError:
+                continue
+            if security.is_sensitive_path(safe_p):
+                continue
+            try:
+                meta, body = _frontmatter(
+                    safe_p.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
             globs = [g.strip() for g in re.split(r"[,\s]+", meta.get("paths", "")) if g.strip()]
             if globs and any(fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(
                     Path(rel).name, g) for g in globs):
-                out.append((f".pedacito/rules/{p.name}", body.strip()[:max_chars]))
+                out.append((rule_rel,
+                            safety.strip_control(body).strip()[:max_chars]))
     d = Path(rel).parent
     while str(d) not in (".", ""):
         for name in ("AGENTS.md", "CLAUDE.md", "PEDACITO.md"):
-            p = root / d / name
-            if p.is_file():
+            cand_rel = f"{d.as_posix()}/{name}"
+            try:
+                safe_p = security.resolve_safe_path(root, cand_rel)
+            except security.SecurityError:
+                continue
+            if security.is_sensitive_path(safe_p):
+                continue
+            if safe_p.is_file():
                 try:
-                    out.append((f"{d.as_posix()}/{name}",
-                                p.read_text(encoding="utf-8").strip()[:max_chars]))
+                    text = safe_p.read_text(encoding="utf-8", errors="replace")
+                    out.append((cand_rel,
+                                safety.strip_control(text).strip()[:max_chars]))
                 except OSError:
                     pass
                 return out

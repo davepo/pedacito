@@ -435,6 +435,6 @@ def test_fileio_write_through_symlink_updates_target(tmp_path):
     target.write_text("v1", encoding="utf-8")
     link = tmp_path / "link.txt"
     link.symlink_to(target)
-    fileio.write(link, "v2")
+    fileio.write(link, "v2", follow_symlinks=True)
     assert target.read_text(encoding="utf-8") == "v2"
     assert link.is_symlink()

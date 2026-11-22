@@ -105,7 +105,27 @@ def terminate(proc: subprocess.Popen) -> None:
             pass
         return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        # Leader may already be gone while orphaned grandchildren remain in its
+        # process group (spawn()/run() make proc.pid the session/group leader).
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    except (PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             proc.kill()
@@ -196,34 +216,49 @@ def run(command, *, cwd, timeout: float | None = None,
     reader.start()
 
     stopped = ""
-    while True:
-        rc = p.poll()
-        if rc is not None:
-            break
-        now = time.monotonic()
-        if timeout and now - started >= timeout:
-            stopped = "timeout"
-            terminate(p)
-            break
-        if idle_timeout and now - state["last"] >= idle_timeout:
-            stopped = "idle"
-            terminate(p)
-            break
-        time.sleep(0.05)
-
     try:
-        rc = p.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        terminate(p)
-        try:
-            rc = p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            rc = None
-    reader.join(timeout=3)
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                break
+            now = time.monotonic()
+            if timeout and now - started >= timeout:
+                stopped = "timeout"
+                terminate(p)
+                break
+            with lock:
+                last_out = state["last"]
+            if idle_timeout and now - last_out >= idle_timeout:
+                stopped = "idle"
+                terminate(p)
+                break
+            time.sleep(0.05)
 
-    text = bytes(buf).decode("utf-8", "replace")
-    if state["overflow"]:
-        tail_text = bytes(tail).decode("utf-8", "replace")
+        try:
+            rc = p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            terminate(p)
+            try:
+                rc = p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rc = None
+        reader.join(timeout=3)
+    finally:
+        if p.stdout is not None:
+            try:
+                p.stdout.close()
+            except OSError:
+                pass
+        if reader.is_alive():
+            reader.join(timeout=1)
+
+    with lock:
+        raw_buf = bytes(buf)
+        overflow = state["overflow"]
+        raw_tail = bytes(tail) if overflow else b""
+    text = raw_buf.decode("utf-8", "replace")
+    if overflow:
+        tail_text = raw_tail.decode("utf-8", "replace")
         text = (text + "\n[... output truncated: middle omitted; kept the "
                 f"first {head_cap} and last {tail_cap} chars ...]\n"
                 + tail_text)

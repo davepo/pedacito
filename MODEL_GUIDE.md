@@ -1,10 +1,14 @@
+🌐 **English** | [Español](MODEL_GUIDE.es.md)
+
 # Pedacito model guide
 
 This guide helps you choose a model for your hardware, set it up in Pedacito,
 and check that it is working. It applies to any OpenAI-compatible server (LM
 Studio, Ollama, Lemonade Server, llama.cpp, vLLM, and others) and to hosted APIs.
 Model names and quantization details change often. Treat the examples as
-starting points, and measure on your own machine.
+starting points, and measure on your own machine. The canonical reference for
+model profiles and every setting is [docs/CONFIG.md](docs/CONFIG.md), and server
+setup is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 Pedacito is not a chat benchmark. It asks a model to do three jobs:
 
@@ -461,6 +465,43 @@ a side-by-side `chat` session if in doubt.
 
 ---
 
+## Lemonade Server model pinning
+
+Lemonade's multi-model mode evicts the least-recently-used model when it needs
+a slot. A pinned model is skipped, which keeps a frequently used model resident
+while other models come and go.
+
+- In the GUI, open **Servers**, select the resident model in a Lemonade row and
+  click **Pin** or **Unpin**.
+- In the TUI, use `/servers pin SERVER [MODEL]` or
+  `/servers unpin SERVER [MODEL]`. The model id is optional when the server
+  holds a single resident model.
+- Pedacito calls Lemonade's `POST /internal/pin` with
+  `{"model_name": "...", "pinned": true|false}`; a build that answers only the
+  older spelling gets `/api/v1/internal/pin` as the fallback. The model must
+  already be loaded.
+
+Pinning is Lemonade-only. llama.cpp, Ollama and generic local servers have no
+equivalent, so Pedacito treats the action as a no-op there.
+
+---
+
+## Image models (`modality = "image"`)
+
+Some servers also serve **image generators**. Lemonade Server exposes Stable Diffusion and Flux models through
+its `sd-cpp` recipes, and any OpenAI-compatible server with `/images/generations` works the same way.
+Pedacito detects them from the server's `labels`/`recipe` metadata or the model id, marks the profile
+`modality = "image"` and badges it **🎨 Image**. Image profiles are not chat models: they serve
+`pedacito image`, `/image`, the GUI dialog and the opt-in `generate_image`
+agent action (see [`image_profile` and `allow_image_gen`](docs/CONFIG.md#local-image-generation-image_profile-allow_image_gen)).
+
+Calibrating an image profile (`pedacito calibrate --profile NAME`, `models scan`, or **Probe image** in the GUI)
+does not run the text probes. It makes **one** quick image request (512×512, 4 steps) into a temporary folder and
+records `image_ok`, the format, the dimensions and the latency on the model card, which is what the
+**🎨 Image · ✓ Verified** badge shows.
+
+---
+
 ## Thinking per profile
 
 Some models reason before they answer, in a separate thinking block. That helps
@@ -494,6 +535,16 @@ competes with the output budget.
 If a model has a prompt switch instead of an API switch, set `thinking_suffix`,
 such as `/no_think` for Qwen3. Leave it empty when the server already honors
 `disable_thinking`.
+
+### Reasoning effort
+
+`reasoning_effort` is a profile setting (also `/effort` in the TUI and the
+**Effort** selector in the GUI) with four values: `default`, `low`, `medium`
+and `high`. `default` is the shipped spelling of the plan's `off`: it sends no
+`reasoning_effort` field at all. The other values are forwarded verbatim on
+local-MoE servers and reasoning-capable hosted models, never on models that do
+not expose the control. The setting never changes sampling, and
+`disable_thinking = true` wins over any effort level.
 
 ### When to turn thinking on
 

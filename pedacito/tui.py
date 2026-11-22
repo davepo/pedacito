@@ -23,9 +23,10 @@ under a lock.
 
 Slash commands mirror `pedacito chat` and add the TUI-specific panes:
 `/help`, `/status` (`/telemetry`), `/auto`, `/plan`, `/consolidate`
-(`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/skills`,
-`/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`, `/clear`, and
-`/quit` (`/exit`).
+(`/compact`), `/profile`, `/auto-route`, `/think`, `/apply`, `/verify`,
+`/skills`, `/skill NAME`, `/memory`, `/procs`, `/diff`, `/checkpoints`, `/undo`, `/checkout`,
+`/run`, `/fix`, `/update`, `/reset`, `/sidebar`, `/clear`, and `/quit`
+(`/exit`).
 """
 
 from __future__ import annotations
@@ -43,17 +44,27 @@ import threading
 import time
 from pathlib import Path
 
+from . import checkpoints as checkpoints_mod
 from . import events as events_mod
 from . import gitinfo
+from . import i18n
 from . import index as index_mod
+from . import llm as llm_mod
 from . import loop
 from . import memory as memory_mod
 from . import modelcard
 from . import processes
 from . import profiles as profiles_mod
+from . import prompts as prompts_mod
 from . import roles as roles_mod
+from . import runner as runner_mod
 from . import security
+from . import select as select_mod
+from . import servers as servers_mod
 from . import skills as skills_mod
+from . import testsel
+from . import themes as themes_mod
+from . import update as update_mod
 from . import workspace
 from .agent import Agent
 from .config import Config
@@ -68,9 +79,12 @@ __all__ = ["TuiSession", "enable_vt_mode", "parse_escape_sequence",
 # left-click-drag selection and the OS copy/paste stay native. ?1000h/?1006h
 # (SGR click capture) stay OFF by default; /mouse on or F2 enables them.
 _ALT_SCREEN_ON = ("\x1b[?1049h\x1b[?1007h\x1b[?1000l\x1b[?1006l"
-                  "\x1b[?25l\x1b[2J\x1b[H")
-_ALT_SCREEN_OFF = ("\x1b[?1007l\x1b[?1000l\x1b[?1006l"
-                   "\x1b[?1049l\x1b[r\x1b[?25h")
+                  "\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H")
+_ALT_SCREEN_OFF = ("\x1b[?2004l\x1b[?2026l\x1b[0m\x1b[r\x1b[?1007l\x1b[?1000l"
+                   "\x1b[?1006l\x1b[?1049l\x1b[?25h")
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+MAX_PROMPT_ROWS = 6
 _MOUSE_SGR_ON = "\x1b[?1007l\x1b[?1000h\x1b[?1006h"
 _MOUSE_SGR_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?1007h"
 _SYNC_ON = "\x1b[?2026h"
@@ -107,42 +121,63 @@ _SWAP_ARROW = "\u2192"
 _TAB_PREFIX = {
     "/con": "/consolidate ",
     "/pro": "/profile ",
+    "/pi": "/pin ",
+    "/ru": "/rules ",
     "/aut": "/auto-route ",
     "/cre": "/creative ",
+    "/eff": "/effort ",
+    "/ser": "/servers",
+    "/unl": "/unload ",
+    "/hy": "/hybrid ",
+    "/ar": "/arena ",
+    "/la": "/lang ",
+    "/im": "/image ",
+    "/at": "/attach ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
-    "/auto-route", "/think", "/creative", "/apply", "/skills", "/memory", "/procs",
-    "/diff", "/undo", "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
+    "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
+    "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
+    "/theme", "/lang", "/image", "/attach",
+    "/pin", "/rules", "/hybrid", "/arena",
+    "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/update",
+    "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
 _KNOWN_KEYS = {
-    "ENTER", "TAB", "BACKSPACE", "DELETE", "INSERT", "ESC",
+    "ENTER", "SHIFT_ENTER", "ALT_ENTER", "CTRL_J",
+    "PASTE_START", "PASTE_END",
+    "TAB", "BACKSPACE", "DELETE", "INSERT", "ESC",
     "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END",
     "PAGE_UP", "PAGE_DOWN", "SHIFT_UP", "SHIFT_DOWN",
     "SHIFT_LEFT", "SHIFT_RIGHT", "ALT_PAGE_UP", "ALT_PAGE_DOWN",
     "WHEEL_UP", "WHEEL_DOWN", "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_L",
-    "CTRL_U", "CTRL_W", "F2", "SHIFT_TAB",
+    "CTRL_U", "CTRL_W", "F2", "F3", "SHIFT_TAB",
 }
 
 # Commands shown by /help and in the prompt bar's hint line.
 KEYS_TEXT = """\
 Pedacito TUI keybindings
   Enter                 send the task or slash command
+  Shift+Enter / Alt+Enter / \\+Enter
+                        insert a newline (Ctrl+J also inserts a newline)
+  Bracketed paste       paste multi-line text into the draft without sending
   PgUp / PgDn           transcript half a page up / down
   Shift+Up / Shift+Down transcript 3 lines up / down
   Ctrl+U / Ctrl+D       half-page scroll when the prompt is empty
   Alt+PgUp / Alt+PgDn   scroll the Activity / Plan sidebar
   Mouse wheel           transcript 3 lines, or the sidebar under pointer
-  Up / Down             command history (or scroll when scrolled back)
+  Up / Down             move across draft lines, or command history / scroll
   Left / Right          move the prompt cursor
-  Home / End            start / end of the prompt (End returns to live)
+  Home / End            start / end of the current line (End returns to live)
   Esc                   jump to the live bottom
   Backspace / Delete    edit the prompt; Ctrl+W deletes a word
-  Ctrl+K / Ctrl+L       kill to end / force a full repaint
+  Ctrl+K / Ctrl+L       kill to end of line / force a full repaint
   Tab                   complete slash commands and profile names
   F2                    toggle SGR mouse mode (native selection default)
+  F3                    toggle interface language (EN <-> ES)
   Ctrl+C                cancel the running task
   /quit or /exit        leave and restore the terminal"""
 
@@ -162,17 +197,66 @@ Pedacito TUI commands
   /plan [GOAL]              show PLAN.md, or generate it from GOAL
   /consolidate /compact     compact the session into a handoff checkpoint
   /profile [NAME]           list profiles, or switch to NAME
+  /profiles                 list all configured profiles
+  /profile show|run|reset   hardware snapshot + last probe + active auto-tune;
+                            run forces a probe, reset drops cached measurements
   /model ID                 switch to a model id directly
   /auto-route [on|off]      specialist auto-routing on/off
+  /hybrid [off | PROVIDER MODEL]
+                            split-stage routing: an architect model plans
+                            (Stage 1), the active editor implements (Stage 2);
+                            off disables it for this session
+  /arena A:B PROMPT         run PROMPT on two contestants (profile names or
+                            provider:model) in isolated sandboxes, compare
+  /arena apply a|b          adopt a winner's changes (checkpointed, undoable)
   /think [on|off]           thinking on/off (off sets disable_thinking)
+  /effort [LEVEL]           reasoning effort: default, low, medium or high
+                            (forwarded to local-moe and reasoning APIs)
+  /servers                  live VRAM/RAM and each local server's status
+  /servers pin|unpin SERVER [MODEL]
+                            pin/unpin a loaded Lemonade model; LRU eviction
+                            skips pinned models (other servers: no-op)
+  /unload [SERVER]          unload models on SERVER, or every idle local server
   /creative [on|off|auto]   design mode: on=every task, auto=detect design tasks,
                             off=surgical edits (warmer sampling + whole-file CSS/HTML)
+  /theme [NAME]             list color themes, or switch to NAME and save it
+                            (shared with the GUI Theme Manager)
+  /lang [en|es]             switch interface language (F3 toggles EN/ES)
+  /image PROMPT [--out FILE] [--size WxH]
+                            generate an image with the configured image profile
+  /attach [PATH|list|clear] attach an image (PNG/JPEG/WebP/GIF, <=10 MB, max 4)
+                            to the next task, list staged images, or clear them
+                            (also auto-detects @path/to/image.png in prompts)
   /apply [on|off]           write edits to disk, or preview them
+  /verify [on|off|status]   post-edit verification: on detects the project's
+                            test command, off clears it, status shows the
+                            gates, repair rounds and ratchet
   /skills [list|show NAME|draft TEXT]
+  /skill NAME               load a skill's full checklist into the next
+                            task through the pinned-context block; /pin
+                            remove skill:NAME or /pin clear unpins it
   /memory [list|add FACT|forget TEXT]
   /procs [list|logs NAME|stop NAME]
+  /pin [list|add REF|remove REF|clear]
+                            explicit context pins for this session; REF is
+                            a file path or indexed symbol (Class.method)
+  /rules [list|set TEXT|clear]
+                            show or edit persistent .pedacito/rules.md
+  /security                 scan and show unacknowledged secrets / .env files
+  /security ack             acknowledge every current secret finding
+  /security gitignore       add .env patterns to .gitignore
   /diff                     git status and working-tree diff
-  /undo                     restore the newest .pedacito/backups snapshot
+  /checkpoints [N]          show the time-travel checkpoint tree
+  /undo                     restore the state before the last run (or the
+                            newest .pedacito/backups snapshot on old projects)
+  /checkout ID              restore the whole workspace from a checkpoint
+                            (a unique id prefix works)
+  /run [CMD]                run the detected entrypoint or CMD, show output
+  /fix                      send the last /run crash traceback into a repair
+                            task
+  /update [run]             check PyPI for a newer Pedacito and offer the
+                            upgrade (run skips the confirmation; editable
+                            installs get git-pull instructions)
   /reset                    wipe .pedacito state (keeps memory and config)
   /sidebar                  toggle the activity / plan pane
   /scroll up|down|top|bottom|N
@@ -183,8 +267,101 @@ Pedacito TUI commands
   /quit  /exit              leave and restore the terminal
 
 Enter: send | PgUp/PgDn/Wheel: scroll | Up/Down: history | Tab: complete
-F2: mouse mode | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
-Plain text is a task: it runs through the normal gather/edit/verify loop."""
+F2: mouse mode | F3: [EN|es] | Esc/End: live bottom | Ctrl+C: cancel | /help | /quit
+Plain text is a task: it runs through the normal gather/edit/verify loop.
+Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
+
+
+KEYS_TEXT_ES = """\
+Atajos de teclado de Pedacito TUI
+  Enter                 enviar la tarea o comando con barra
+  Shift+Enter / Alt+Enter / \\+Enter
+                        insertar nueva línea (Ctrl+J también inserta salto)
+  Pegado delimitado     pegar texto multilínea en el borrador sin enviar
+  PgUp / PgDn           desplazar transcripción media página arriba / abajo
+  Shift+Up / Shift+Down desplazar transcripción 3 líneas arriba / abajo
+  Ctrl+U / Ctrl+D       desplazamiento de media página con el prompt vacío
+  Alt+PgUp / Alt+PgDn   desplazar el panel lateral de Actividad / Plan
+  Rueda del ratón       transcripción 3 líneas, o el panel bajo el puntero
+  Up / Down             mover entre líneas del borrador, historial o desplazar
+  Left / Right          mover el cursor en el prompt
+  Home / End            inicio / final de la línea actual (End vuelve en vivo)
+  Esc                   ir al final en vivo
+  Backspace / Delete    editar el prompt; Ctrl+W borra una palabra
+  Ctrl+K / Ctrl+L       borrar hasta el final de línea / forzar repintado
+  Tab                   completar comandos con barra y nombres de perfiles
+  F2                    alternar modo ratón SGR (selección nativa por defecto)
+  F3                    alternar idioma de la interfaz (EN <-> ES)
+  Ctrl+C                cancelar la tarea en ejecución
+  /quit o /exit         salir y restaurar la terminal"""
+
+HELP_TEXT_ES = """\
+Comandos de Pedacito TUI
+  /help                     esta lista y los atajos de teclado
+  /keys                     atajos de teclado y modos de ratón detallados
+  /status  /telemetry       tabla de telemetría y tokens por etapa
+  /new DIR PROMPT           crear un proyecto nuevo en DIR y cambiar a él
+  /auto OBJETIVO            planificar OBJETIVO y ejecutar cada tarea en vivo
+  /auto! OBJETIVO           forzar el ciclo multi-paso Auto sin sugerencia
+  /plan [OBJETIVO]          mostrar PLAN.md o generarlo desde OBJETIVO
+  /consolidate /compact     compactar la sesión en un punto de entrega
+  /profile [NOMBRE]         listar perfiles o cambiar a NOMBRE
+  /profiles                 listar todos los perfiles configurados
+  /profile show|run|reset   hardware + última sonda + auto-ajuste activo
+  /model ID                 cambiar directamente a un id de modelo
+  /auto-route [on|off]      activar o desactivar el ruteo de especialistas
+  /hybrid [off | PROV MOD]  ruteo híbrido: arquitecto planifica, editor edita
+  /arena A:B PROMPT         comparar dos modelos en entornos aislados
+  /arena apply a|b          aplicar los cambios del modelo ganador
+  /think [on|off]           activar o desactivar el razonamiento del modelo
+  /effort [NIVEL]           esfuerzo de razonamiento: default, low, medium, high
+  /servers                  VRAM/RAM en vivo y estado de servidores locales
+  /unload [SERVIDOR]        descargar modelos del servidor local
+  /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
+  /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
+  /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
+  /image PROMPT [--out ARCHIVO] [--size WxH]
+                            generar una imagen con el perfil de imagen configurado
+  /attach [RUTA|list|clear] adjuntar una imagen (PNG/JPEG/WebP/GIF, <=10 MB, máx 4)
+                            a la próxima tarea, listar adjuntas o limpiarlas
+                            (también detecta @ruta/imagen.png en el prompt)
+  /apply [on|off]           escribir cambios en disco o solo previsualizar
+  /verify [on|off|status]   verificación posterior a la edición
+  /skills [list|show|draft] listar, inspeccionar o redactar habilidades
+  /skill NOMBRE             cargar la lista de verificación de una habilidad
+  /memory [list|add|forget] consultar o actualizar la memoria del proyecto
+  /procs [list|logs|stop]   administrar procesos en segundo plano
+  /pin [list|add|remove|clear] fijar archivos o símbolos al contexto
+  /rules [list|set|clear]   ver o editar .pedacito/rules.md
+  /security [ack|gitignore] escanear secretos o archivos .env expuestos
+  /diff                     estado de git y diff del árbol de trabajo
+  /checkpoints [N]          mostrar el árbol de checkpoints
+  /undo                     restaurar el estado anterior a la última ejecución
+  /checkout ID              restaurar el espacio de trabajo desde un checkpoint
+  /run [CMD]                ejecutar el punto de entrada detectado o CMD
+  /fix                      enviar el último error de /run para repararlo
+  /update [run]             buscar actualizaciones en PyPI y actualizar
+  /reset                    limpiar el estado de .pedacito (conserva memoria)
+  /sidebar                  mostrar u ocultar el panel de actividad / plan
+  /scroll up|down|top|bottom|N  desplazar la transcripción
+  /mouse [on|off]           captura de rueda del ratón SGR (F2)
+  /clear                    limpiar el panel de transcripción
+  /quit  /exit              salir y restaurar la terminal
+
+Enter: enviar | PgUp/PgDn/Rueda: desplazar | Up/Down: historial | Tab: completar
+F2: ratón | F3: [en|ES] | Esc/End: final | Ctrl+C: cancelar | /help | /quit
+El texto normal es una tarea: se ejecuta en el ciclo gather/edit/verify.
+Web: https://www.pedacito.dev · Contact: contact@pedacito.dev"""
+
+
+def help_text(lang: str = "en") -> str:
+    """Localized TUI /help text."""
+    return HELP_TEXT_ES if i18n.normalize_lang(lang) == "es" else HELP_TEXT
+
+
+def keys_text(lang: str = "en") -> str:
+    """Localized TUI /keys text."""
+    return KEYS_TEXT_ES if i18n.normalize_lang(lang) == "es" else KEYS_TEXT
 
 
 def _windows_key_sequence(code: str) -> str:
@@ -194,6 +371,7 @@ def _windows_key_sequence(code: str) -> str:
         "G": "\x1b[H", "O": "\x1b[F", "S": "\x1b[3~",
         "I": "\x1b[5~", "Q": "\x1b[6~",
         "<": "\x1bOQ",           # F2 on the Windows console
+        "=": "\x1bOR",           # F3 on the Windows console
         "R": "\x1b[2~",          # Insert (recognised as UNKNOWN)
     }.get(code, "")
 
@@ -232,6 +410,12 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
             return key, len(seq)
 
     exact = {
+        "\x1b[200~": "PASTE_START",
+        "\x1b[201~": "PASTE_END",
+        "\x1b[13;2u": "SHIFT_ENTER",
+        "\x1b[27;2;13~": "SHIFT_ENTER",
+        "\x1b\r": "ALT_ENTER",
+        "\x1b\n": "ALT_ENTER",
         "\x1b[5~": "PAGE_UP",
         "\x1b[6~": "PAGE_DOWN",
         "\x1b[5;3~": "ALT_PAGE_UP",
@@ -250,6 +434,8 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
         "\x1b[8~": "END",
         "\x1bOQ": "F2",
         "\x1b[12~": "F2",
+        "\x1bOR": "F3",
+        "\x1b[13~": "F3",
         "\x1b[Z": "SHIFT_TAB",
         "\x00I": "PAGE_UP", "\xe0I": "PAGE_UP",
         "\x00Q": "PAGE_DOWN", "\xe0Q": "PAGE_DOWN",
@@ -257,6 +443,7 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
         "\x00O": "END", "\xe0O": "END",
         "\x00S": "DELETE", "\xe0S": "DELETE",
         "\x00<": "F2", "\xe0<": "F2",
+        "\x00=": "F3", "\xe0=": "F3",
     }
     for seq, key in exact.items():
         if buf.startswith(seq):
@@ -284,7 +471,7 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
 
     char = buf[0]
     controls = {
-        "\r": "ENTER", "\n": "ENTER", "\t": "TAB",
+        "\r": "ENTER", "\n": "CTRL_J", "\t": "TAB",
         "\x7f": "BACKSPACE", "\x08": "BACKSPACE",
         "\x01": "HOME", "\x05": "END",
         "\x03": "CTRL_C", "\x04": "CTRL_D",
@@ -403,12 +590,6 @@ def _meter(pct: float, width: int = 16) -> tuple[str, str, str]:
     return bar, "32", "ok"
 
 
-def _paint(text: str, color: str, enabled: bool = True) -> str:
-    if not enabled or not color:
-        return text
-    return f"\x1b[{color}m{text}\x1b[0m"
-
-
 def _active_label(value) -> str:
     """Normalise `active_model_role` (dict or display string) to one line."""
     if value is None:
@@ -449,10 +630,22 @@ class TuiSession:
                  agent=None, idx=None,
                  apply: bool = True, headless: bool | None = None,
                  stdin=None, stdout=None, initial_task: str = "",
+                 initial_images: list[dict] | None = None,
                  width: int | None = None, height: int | None = None,
-                 color: bool | None = None, sidebar: bool = True):
+                 color: bool | None = None, sidebar: bool = True,
+                 lang: str | None = None):
         self.root = Path(str(root)).expanduser().resolve()
         self.cfg = cfg if cfg is not None else Config()
+        self.lang = i18n.detect_lang(lang, self.cfg)
+        i18n.set_current_lang(self.lang)
+        # The active palette is shared with the GUI. Loading is tolerant:
+        # a hand-edited themes.json can never stop the session from opening.
+        try:
+            self.theme_name = themes_mod.get_active_theme_name(self.root)
+            self.theme = themes_mod.get_active_theme(self.root)
+        except Exception:
+            self.theme_name = themes_mod.DEFAULT_THEME
+            self.theme = dict(themes_mod.BUILTIN_THEMES[themes_mod.DEFAULT_THEME])
         self.client = client
         self.agent = agent
         self.idx = idx
@@ -486,6 +679,8 @@ class TuiSession:
         self.mouse_sgr = False
         self._last_mouse_col = 0
         self._prompt_view_start = 0
+        self._prompt_line_offset = 0
+        self._preferred_col: int | None = None
         self._raw_buf = ""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._old_termios = None
@@ -495,6 +690,16 @@ class TuiSession:
         self._scroll_seen_width = 0
         self.folds = 0
         self.resume_context = ""
+        # The last failed /run result, kept so /fix can turn the exact
+        # command, exit code and traceback into a repair task. `last_traceback`
+        # is the same text a scripted caller would display.
+        self.last_run_failure: dict | None = None
+        self.last_traceback = ""
+        # Explicit session pins added with `/pin add`. They ride every Task
+        # and Auto prompt through cfg._pinned_refs, independently of the
+        # prompt's own @file/@symbol mentions.
+        self.pins: list[str] = []
+        self.pending_images: list[dict] = list(initial_images or ())
         self.last_telemetry: dict = {}
         self._event_prompt = 0
         self._event_completion = 0
@@ -506,8 +711,14 @@ class TuiSession:
         self._event_active = ""
         self._context_override: int | None = None
         self._prompt_banner = ""
+        # Compact live stream indicator, updated by `llm_stream` events and
+        # shown before the prompt while a reply is being generated:
+        # "[thinking... 412 tok | 38.4 tok/s]".
+        self._stream_status = ""
+        self._stream_phase = ""
         self._dirty = True
         self._quit = False
+        self._closed = False
         self._running = False
         self._write_lock = threading.RLock()
         self._input_lock = threading.Lock()
@@ -519,6 +730,9 @@ class TuiSession:
         self._last_telemetry_key: tuple = ()
         self._headless_sent = 0
         self._headless_activity_sent = 0
+        # Security notices already printed in this session (fingerprints and
+        # unignored-file keys), so a run does not repeat the same warning.
+        self._security_notified: set[str] = set()
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
         self._git_cache: tuple[float, dict] = (0.0, {})
@@ -537,11 +751,22 @@ class TuiSession:
             pass
         self._init_event_tail()
         self.install_permission_handler()
+        # Quiet release check on a daemon thread (pedacito.update): never
+        # delays startup by a network round-trip; silent when offline or
+        # opted out (check_for_updates = false).
+        self.update_info: dict | None = None
+        self._update_thread = update_mod.check_for_update_async(
+            self.cfg, on_done=self._note_update)
 
     # ---------------------------------------------------------------- state
     @property
     def profile(self) -> str:
         return str(getattr(self.cfg, "active_profile", "") or "default")
+
+    @property
+    def pinned(self) -> list[str]:
+        """Canonical session pin references (the `/pin list` contents)."""
+        return list(self.pins)
 
     @property
     def interactive(self) -> bool:
@@ -557,6 +782,30 @@ class TuiSession:
         """Pin the frame size (tests) or nudge it after a resize event."""
         self.width = max(40, int(width))
         self.height = max(12, int(height))
+        self._dirty = True
+
+    # ---------------------------------------------------------------- theme
+    def _colors_on(self) -> bool:
+        """ANSI styling needs an interactive color terminal and no NO_COLOR."""
+        return bool(self.color) and not os.environ.get("NO_COLOR")
+
+    def _style(self, text: str, token: str | None = None, *,
+               fg: str | None = None, bold: bool = False) -> str:
+        """Paint `text` with one token from the active shared palette."""
+        if not self._colors_on():
+            return text
+        color = fg or self.theme.get(token or "")
+        if not color:
+            return text
+        return themes_mod.style_text(text, fg=color, bold=bold)
+
+    def _reload_theme(self) -> None:
+        try:
+            self.theme_name = themes_mod.get_active_theme_name(self.root)
+            self.theme = themes_mod.get_active_theme(self.root)
+        except Exception:
+            self.theme_name = themes_mod.DEFAULT_THEME
+            self.theme = dict(themes_mod.BUILTIN_THEMES[themes_mod.DEFAULT_THEME])
         self._dirty = True
 
     # ------------------------------------------------------------ telemetry
@@ -681,8 +930,10 @@ class TuiSession:
         width = width or self._size()[0]
         t = self.telemetry()
         pct = t["context_utilization_pct"]
-        bar, color, state = _meter(pct, 16)
-        painted = _paint(bar, color, self.color)
+        bar, _color, state = _meter(pct, 16)
+        meter_token = ("danger" if state == "high"
+                       else "warning" if state == "warn" else "success")
+        painted = self._style(bar, meter_token)
         prompt = t["last_prompt_tokens"]
         completion = t["last_completion_tokens"]
         context = t["context_tokens"]
@@ -694,26 +945,34 @@ class TuiSession:
         cost = t["cost"]
         if cost:
             active += f" (${cost:.4f})"
-        state_note = " !HIGH" if state == "high" else (
-            " !WARN" if state == "warn" else "")
+        state_note = (self._style(" !HIGH", "danger", bold=True)
+                      if state == "high" else
+                      self._style(" !WARN", "warning", bold=True)
+                      if state == "warn" else "")
+        active_text = self._style(active, "accent")
+        label = lambda text: self._style(text, "muted")  # noqa: E731
 
         if width >= 120:
             line1 = (
-                f"Ctx: {painted} {prompt:,} / {context:,} ({pct:.1f}%) | "
-                f"Turn: +{prompt:,} in / +{completion:,} out | "
-                f"Speed: {speed:.1f} tok/s (avg {avg:.1f} tok/s){state_note}")
+                f"{label('Ctx:')} {painted} {prompt:,} / {context:,} "
+                f"({pct:.1f}%) | {label('Turn:')} +{prompt:,} in / "
+                f"+{completion:,} out | {label('Speed:')} {speed:.1f} tok/s "
+                f"(avg {avg:.1f} tok/s){state_note}")
             line2 = (
-                f"Session: {_compact_tokens(t['session_prompt_tokens'])} in / "
+                f"{label('Session:')} "
+                f"{_compact_tokens(t['session_prompt_tokens'])} in / "
                 f"{_compact_tokens(t['session_completion_tokens'])} out | "
-                f"KV Cache: {cache:.0f}% | "
-                f"Folds: {folds} | Active: {active}")
+                f"{label('KV Cache:')} {cache:.0f}% | "
+                f"{label('Folds:')} {folds} | {label('Active:')} "
+                f"{active_text}")
         else:
-            line1 = (f"Ctx: {prompt:,} / {context:,} ({pct:.1f}%) "
+            line1 = (f"{label('Ctx:')} {prompt:,} / {context:,} ({pct:.1f}%) "
                      f"{painted} {speed:.1f} tok/s{state_note}")
-            line2 = (f"Turn: +{prompt:,}/+{completion:,} | "
-                     f"Sess: {_compact_tokens(t['session_prompt_tokens'])}/"
+            line2 = (f"{label('Turn:')} +{prompt:,}/+{completion:,} | "
+                     f"{label('Sess:')} "
+                     f"{_compact_tokens(t['session_prompt_tokens'])}/"
                      f"{_compact_tokens(t['session_completion_tokens'])} | "
-                     f"KV: {cache:.0f}% | {active}")
+                     f"{label('KV:')} {cache:.0f}% | {active_text}")
         return [line1, line2]
 
     # --------------------------------------------------------------- header
@@ -731,6 +990,15 @@ class TuiSession:
         return state
 
     def _calibration_badge(self) -> str:
+        try:
+            from . import imagegen
+            if imagegen.profile_is_image_model(self.cfg):
+                card = modelcard.load(self.cfg)
+                if card and (card.get("measured") or {}).get("image_ok"):
+                    return "\U0001f3a8 Image \u2713"
+                return "\U0001f3a8 Image"
+        except Exception:
+            pass
         try:
             hosted = bool(getattr(self.cfg, "_hosted_server", False))
             if not hosted and hasattr(roles_mod, "profile_is_hosted"):
@@ -756,11 +1024,44 @@ class TuiSession:
                                   False) else "OFF"
         sidebar = "on" if (self.sidebar and width >= 100) else "off"
         project = self.root.name or str(self.root)
-        line1 = (f" pdc tui \u2502 {project} \u2502 profile: {profile} "
-                 f"\u2502 model: {model} \u2502 {badge}")
-        line2 = (f" Auto-Route: {routing} \u2502 Scout: {scout} "
-                 f"\u2502 git: {branch}{'*' if dirty else ''} "
-                 f"\u2502 sidebar: {sidebar}")
+        sep = self._style("\u2502", "muted")
+        brand = self._style(" pdc tui ", "accent", bold=True)
+        profile_text = self._style(profile, "accent")
+        model_text = self._style(model, "text")
+        badge_tone = (
+            "success" if badge.endswith("\u2713")
+            else "accent" if badge.startswith("\U0001f3a8")
+            else "warning" if badge.startswith("\u2601")
+            else "success"
+        )
+        badge_text = self._style(badge, badge_tone)
+        line1_profile = i18n.t("tui.header.profile", lang=self.lang)
+        line1_model = i18n.t("tui.header.model", lang=self.lang)
+        line2_auto_route = i18n.t("tui.header.auto_route", lang=self.lang)
+        line2_scout = i18n.t("tui.header.scout", lang=self.lang)
+        line2_sidebar = i18n.t("tui.header.sidebar", lang=self.lang)
+        lang_label = i18n.t("tui.header.lang", lang=self.lang)
+        lang_pill = "[en|ES]" if self.lang == "es" else "[EN|es]"
+        line1 = (f"{brand}{sep} {self._style(project, 'text')} "
+                 f"{sep} {line1_profile}: {profile_text} {sep} {line1_model}: {model_text} "
+                 f"{sep} {badge_text}")
+        img_badge = ""
+        if self.pending_images:
+            img_label = i18n.t("tui.header.images",
+                               lang=self.lang,
+                               n=len(self.pending_images))
+            img_badge = f" {sep} {self._style(img_label, 'accent')}"
+        line2 = (f" {self._style(line2_auto_route + ':', 'muted')} "
+                 f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
+                 f"{sep} {self._style(line2_scout + ':', 'muted')} "
+                 f"{self._style(scout, 'text')} "
+                 f"{sep} {self._style('git:', 'muted')} "
+                 f"{self._style(branch + ('*' if dirty else ''), 'warning' if dirty else 'text')} "
+                 f"{sep} {self._style(line2_sidebar + ':', 'muted')} "
+                 f"{self._style(sidebar, 'text')} "
+                 f"{sep} {self._style(lang_label + ':', 'muted')} "
+                 f"{self._style(lang_pill, 'accent')}"
+                 f"{img_badge}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -786,7 +1087,7 @@ class TuiSession:
 
     def _all_sidebar_rows(self, width: int) -> list[str]:
         width = max(20, width)
-        rows: list[str] = ["ACTIVITY & PLAN"]
+        rows: list[str] = [i18n.t("tui.sidebar.title", lang=self.lang)]
         items = self.plan_items()
         rows.append(f"PLAN: {self._plan_path().name}")
         if items:
@@ -794,21 +1095,21 @@ class TuiSession:
                 mark = "x" if checked else " "
                 rows.append(f"[{mark}] {text}")
         else:
-            rows.append("[ ] (no PLAN.md tasks yet)")
+            rows.append(i18n.t("tui.sidebar.no_plan", lang=self.lang))
         rows.append("")
-        rows.append("LIVE ACTIVITY / ROUTING")
+        rows.append(i18n.t("tui.sidebar.activity", lang=self.lang))
         if self.activity:
             for row in self.activity:
                 rows.append(row if row.startswith("\u00b7 ") else f"\u00b7 {row}")
         else:
-            rows.append("\u00b7 (waiting for a task)")
+            rows.append(i18n.t("tui.sidebar.waiting", lang=self.lang))
         rows.append("")
-        rows.append("MODIFIED FILES")
+        rows.append(i18n.t("tui.sidebar.modified", lang=self.lang))
         if self.modified:
             for rel in self.modified:
                 rows.append(f"~ {rel}")
         else:
-            rows.append("~ (none yet)")
+            rows.append(i18n.t("tui.sidebar.none_yet", lang=self.lang))
         return rows
 
     def _sidebar_lines(self, width: int, height: int) -> list[str]:
@@ -843,11 +1144,19 @@ class TuiSession:
             return max(1, left_width - 1)
         return max(1, width - 1)
 
+    def _prompt_row_count(self, height: int | None = None) -> int:
+        if "\n" not in self.input_buf:
+            return 1
+        h = height if height is not None else self._size()[1]
+        max_rows = max(1, min(MAX_PROMPT_ROWS, int(h) - 7))
+        return min(max_rows, self.input_buf.count("\n") + 1)
+
     def _body_height(self, height: int | None = None) -> int:
         height = height if height is not None else self._size()[1]
         header = 2
         footer = 2
-        return max(4, height - header - footer - 2)
+        prompt_rows = self._prompt_row_count(height)
+        return max(2, height - header - footer - 1 - prompt_rows)
 
     def _transcript_viewport_height(self, height: int | None = None) -> int:
         return max(1, self._body_height(height) - 1)
@@ -855,22 +1164,41 @@ class TuiSession:
     def _wrap_transcript_line(self, kind: str, text: str,
                              width: int) -> list[str]:
         prefixes = {
+            "banner": "\u25c6 ",
             "user": "\u00bb ",
             "assistant": "\u25c6 ",
             "system": "  ",
             "activity": "  ",
             "receipt": "  ",
+            "success": "  ",
+            "warn": "! ",
             "diff": "  ",
             "error": "! ",
         }
+        tokens = {
+            "banner": "accent", "user": "accent", "assistant": "accent",
+            "receipt": "success", "success": "success",
+            "warn": "warning", "error": "danger",
+        }
         prefix = prefixes.get(kind, "  ")
+        styled_prefix = self._style(prefix, tokens.get(kind), bold=True) \
+            if kind in tokens else prefix
+        whole_line = kind in ("receipt", "success", "warn", "error")
         body = str(text)
         chunks: list[str] = []
         for raw in body.splitlines() or [""]:
+            start = len(chunks)
             chunks.extend(textwrap.wrap(
                 prefix + raw, width=max(1, width),
                 replace_whitespace=False, drop_whitespace=False,
                 break_long_words=True, break_on_hyphens=False) or [prefix])
+            if whole_line:
+                chunks[start:] = [self._style(chunk, tokens.get(kind))
+                                  for chunk in chunks[start:]]
+            elif styled_prefix != prefix and len(chunks) > start:
+                lead = chunks[start]
+                if lead.startswith(prefix):
+                    chunks[start] = styled_prefix + lead[len(prefix):]
             prefix = "  "
         return chunks
 
@@ -878,7 +1206,7 @@ class TuiSession:
         width = width if width is not None else self._transcript_width()
         if not self.transcript:
             source = [
-                ("system", f"Pedacito TUI \u2014 {self.root}"),
+                ("banner", f"Pedacito TUI \u2014 {self.root}"),
                 ("system", "Type a coding task, or /help for commands."),
                 ("system", "PgUp/PgDn or the mouse wheel scrolls the log."),
             ]
@@ -982,7 +1310,10 @@ class TuiSession:
         return visible
 
     def _prompt_prefix(self) -> str:
-        return f"pdc tui ({self.profile}) > "
+        prefix = f"pdc tui ({self.profile}) > "
+        if self._stream_status:
+            return f"{self._stream_status} {prefix}"
+        return prefix
 
     def _prompt_visible(self, width: int) -> tuple[str, int]:
         """Prompt line plus the cursor's 0-based column inside it.
@@ -1006,13 +1337,113 @@ class TuiSession:
         self._prompt_view_start = start
         line = prefix + shown
         col = min(max(0, len(prefix) + (cursor - start)), max(0, width - 1))
+        if self._colors_on():
+            if self._prompt_banner:
+                token = ("danger" if "denied" in prefix.lower()
+                         or "security" in prefix.lower() else "warning")
+                display_prefix = self._style(prefix, token, bold=True)
+            elif self._stream_status:
+                display_prefix = self._style(prefix, "muted")
+            else:
+                display_prefix = self._style(prefix, "accent", bold=True)
+            line = display_prefix + shown
         return line, col
+
+    def _prompt_lines(self, width: int,
+                      max_rows: int = MAX_PROMPT_ROWS
+                      ) -> tuple[list[str], int, int]:
+        """Render the prompt zone (1 to `max_rows` lines) plus cursor pos.
+
+        Returns `(rendered_rows, cursor_row_idx, cursor_col)` where
+        `cursor_row_idx` is 0-based within `rendered_rows` and `cursor_col` is
+        0-based within that rendered row. Single-line drafts delegate directly
+        to `_prompt_visible()` to preserve exact prefix and cursor arithmetic.
+        """
+        if "\n" not in self.input_buf:
+            self._prompt_line_offset = 0
+            line, col = self._prompt_visible(width)
+            return [line], 0, col
+
+        width = max(1, int(width))
+        lines = self.input_buf.split("\n")
+        total_lines = len(lines)
+        cur_line, cur_col, _ = self._cursor_line_col()
+        visible_count = min(max(1, int(max_rows)), total_lines)
+
+        offset = int(self._prompt_line_offset)
+        if cur_line < offset:
+            offset = cur_line
+        elif cur_line >= offset + visible_count:
+            offset = cur_line - visible_count + 1
+        offset = max(0, min(offset, total_lines - visible_count))
+        self._prompt_line_offset = offset
+
+        window = lines[offset:offset + visible_count]
+        cursor_row_idx = cur_line - offset
+        scrolled = total_lines > visible_count
+
+        base_prefix = self._prompt_prefix()
+        if self._prompt_banner:
+            base_prefix = f"{self._prompt_banner} "
+        cont_prefix = "  \u2502 "
+
+        rendered_rows: list[str] = []
+        cursor_col = 0
+        for idx, text_line in enumerate(window):
+            if idx == 0:
+                raw_prefix = (f"[L{cur_line + 1}/{total_lines}] {base_prefix}"
+                              if scrolled else base_prefix)
+            else:
+                raw_prefix = cont_prefix
+            avail = max(1, width - len(raw_prefix))
+            safe_line = text_line.replace("\t", " ")
+            if idx == cursor_row_idx:
+                if len(safe_line) <= avail:
+                    start = 0
+                    shown = safe_line
+                else:
+                    start = max(0, cur_col - avail + 1)
+                    start = min(start, max(0, len(safe_line) - avail))
+                    shown = safe_line[start:start + avail]
+                self._prompt_view_start = start
+                cursor_col = min(
+                    max(0, len(raw_prefix) + (cur_col - start)),
+                    max(0, width - 1))
+            else:
+                shown = safe_line[:avail]
+
+            if self._colors_on():
+                if idx == 0:
+                    if self._prompt_banner:
+                        token = (
+                            "danger" if "denied" in raw_prefix.lower()
+                            or "security" in raw_prefix.lower()
+                            else "warning")
+                        display_prefix = self._style(
+                            raw_prefix, token, bold=True)
+                    elif self._stream_status:
+                        display_prefix = self._style(raw_prefix, "muted")
+                    else:
+                        display_prefix = self._style(
+                            raw_prefix, "accent", bold=True)
+                else:
+                    display_prefix = self._style(raw_prefix, "muted")
+                rendered_rows.append(display_prefix + shown)
+            else:
+                rendered_rows.append(raw_prefix + shown)
+
+        return rendered_rows, cursor_row_idx, cursor_col
 
     def _cursor_screen_position(self, width: int,
                                 height: int) -> tuple[int, int]:
-        _line, col = self._prompt_visible(width)
-        # The prompt is the final frame row; terminal coordinates are 1-based.
-        return max(1, int(height)), max(1, min(int(width), col + 1))
+        max_rows = max(1, min(MAX_PROMPT_ROWS, int(height) - 7))
+        rows, cursor_row_idx, col = self._prompt_lines(width, max_rows=max_rows)
+        # The prompt block occupies the final `len(rows)` rows of the frame;
+        # terminal coordinates are 1-based.
+        prompt_top = max(1, int(height) - len(rows) + 1)
+        screen_row = max(1, min(int(height), prompt_top + cursor_row_idx))
+        screen_col = max(1, min(int(width), col + 1))
+        return screen_row, screen_col
 
     def render_frame(self, width: int | None = None,
                      height: int | None = None,
@@ -1030,15 +1461,19 @@ class TuiSession:
 
         header = self.header_lines(width)
         footer = self.telemetry_lines(width)
-        hint = ("Enter: send | PgUp/PgDn/Wheel: scroll | \u2191/\u2193: history | "
-                "Tab: complete | F2: mouse mode | /help | /quit")
-        prompt_text, _cursor_col = self._prompt_visible(width)
-        body_height = max(4, height - len(header) - len(footer) - 2)
+        hint = i18n.t("tui.hint_bar", lang=self.lang)
+        transcript_heading = i18n.t("tui.transcript", lang=self.lang)
+        max_prompt_rows = max(
+            1, min(MAX_PROMPT_ROWS, height - len(header) - len(footer) - 3))
+        prompt_rows, _cursor_row, _cursor_col = self._prompt_lines(
+            width, max_rows=max_prompt_rows)
+        body_height = max(
+            2, height - len(header) - len(footer) - 1 - len(prompt_rows))
 
         if show_sidebar:
             side_width = min(46, max(32, width // 3))
             left_width = width - side_width - 1
-            left = ["TRANSCRIPT"] + self._transcript_rows(
+            left = [transcript_heading] + self._transcript_rows(
                 left_width - 1, body_height - 1)
             right = self._sidebar_lines(side_width - 1, body_height)
             body: list[str] = []
@@ -1048,7 +1483,7 @@ class TuiSession:
                 body.append(_fit(lt, left_width) + "\u2502"
                             + _fit(rt, side_width))
         else:
-            body = ["TRANSCRIPT"] + self._transcript_rows(
+            body = [transcript_heading] + self._transcript_rows(
                 width - 1, body_height - 1)
             body = [_fit(row, width) for row in body[:body_height]]
             while len(body) < body_height:
@@ -1058,7 +1493,8 @@ class TuiSession:
         lines.extend(body)
         lines.extend(_fit(row, width) for row in footer)
         lines.append(_fit(hint, width))
-        lines.append(_fit(prompt_text, width))
+        for prompt_row in prompt_rows:
+            lines.append(_fit(prompt_row, width))
 
         if len(lines) < height:
             lines.extend(_fit("", width) for _ in range(height - len(lines)))
@@ -1118,26 +1554,34 @@ class TuiSession:
         self._dirty = False
 
     def _append(self, text: str, kind: str = "system") -> None:
-        body = _untrusted_text(text)
-        if len(body) > 12000:
-            body = body[:12000] + "\n[truncated in the transcript view]"
-        lines = body.splitlines() or [""]
-        width = self._transcript_width()
-        added = sum(len(self._wrap_transcript_line(kind, line, width))
-                    for line in lines)
-        if self.scroll_offset > 0:
-            # Keep the line the user is reading stationary: the viewport grew
-            # by exactly this many wrapped rows, so offset grows with it.
-            self.scroll_offset += max(0, added)
-        same_width = self._scroll_seen_width == width
-        for line in lines:
-            self.transcript.append((kind, line))
-        if same_width:
-            self._scroll_seen_total += max(0, added)
-        else:
-            self._scroll_seen_width = width
-            self._scroll_seen_total = len(self._all_transcript_rows(width))
-        self._dirty = True
+        # Background workers (update check, probes) append while the main
+        # thread reads the same transcript for a frame. The write lock keeps
+        # the list/counters consistent, and a worker that arrives after
+        # close() cannot mutate a torn-down session.
+        with self._write_lock:
+            if self._closed:
+                return
+            body = _untrusted_text(text)
+            if len(body) > 12000:
+                body = body[:12000] + "\n[truncated in the transcript view]"
+            lines = body.splitlines() or [""]
+            width = self._transcript_width()
+            added = sum(len(self._wrap_transcript_line(kind, line, width))
+                        for line in lines)
+            if self.scroll_offset > 0:
+                # Keep the line the user is reading stationary: the viewport
+                # grew by exactly this many wrapped rows, so offset grows with
+                # it.
+                self.scroll_offset += max(0, added)
+            same_width = self._scroll_seen_width == width
+            for line in lines:
+                self.transcript.append((kind, line))
+            if same_width:
+                self._scroll_seen_total += max(0, added)
+            else:
+                self._scroll_seen_width = width
+                self._scroll_seen_total = len(self._all_transcript_rows(width))
+            self._dirty = True
 
     def append(self, text: str, kind: str = "system") -> None:
         """Public log append (keeps a scrolled-back viewport stationary)."""
@@ -1201,7 +1645,20 @@ class TuiSession:
         if not self._remember_event(kind, fields, source):
             return
         kind = str(kind or "")
+        if kind == "llm_stream":
+            # Throttled live deltas: keep one compact status line instead of
+            # appending every token to the transcript (which would flood it).
+            phase = str(fields.get("phase") or "")
+            tokens = _as_int(fields.get("tokens_so_far"))
+            speed = _as_float(fields.get("tok_per_sec"))
+            label = "thinking..." if phase == "reasoning" else "generating..."
+            self._stream_phase = phase
+            self._stream_status = f"[{label} {tokens} tok | {speed:.1f} tok/s]"
+            self._dirty = True
+            return
         if kind == "llm_start":
+            self._stream_status = ""
+            self._stream_phase = ""
             provider = str(fields.get("provider") or "")
             model = str(fields.get("model") or "")
             label = (f"{provider}/{model}" if provider and model
@@ -1221,6 +1678,8 @@ class TuiSession:
                 detail = f"{fields['file']} {detail}".strip()
             self.activity.append(f"{action} {detail}".rstrip())
         elif kind == "call":
+            self._stream_status = ""
+            self._stream_phase = ""
             site = str(fields.get("site") or "call")
             pt = _as_int(fields.get("prompt_tokens"))
             ct = _as_int(fields.get("completion_tokens"))
@@ -1256,6 +1715,19 @@ class TuiSession:
                 f"model_swap: {old} {_SWAP_ARROW} {new}")
             if new and new != "?":
                 self._event_active = new
+        elif kind == "hybrid_stage":
+            label = str(fields.get("label") or
+                        f"Hybrid Stage {fields.get('stage', '?')}")
+            self.activity.append(label)
+            self._append(label, "system")
+            model = str(fields.get("model") or "")
+            if model:
+                self._event_active = model
+        elif kind == "arena_stage":
+            label = str(fields.get("label") or "arena")
+            self.activity.append(label)
+            if str(fields.get("phase") or "") in ("arena_start", "start"):
+                self._append(label, "system")
         elif kind == "verify":
             errors = _as_int(fields.get("errors"))
             warnings = _as_int(fields.get("warnings"))
@@ -1432,6 +1904,10 @@ class TuiSession:
             fd = self.stdin.fileno()
             self._old_termios = termios.tcgetattr(fd)
             tty.setcbreak(fd)
+            # Disable ICRNL so Enter arrives as \r and Ctrl+J arrives as \n.
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~termios.ICRNL
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
             self._raw_mode = True
         except (AttributeError, ImportError, OSError, ValueError):
             self._old_termios = None
@@ -1512,8 +1988,30 @@ class TuiSession:
         line = self._readline()
         if line is None:
             return False
-        self._raw_buf += line + "\n"
+        self._raw_buf += line + "\r"
         return True
+
+    def _read_bracketed_paste(self, idle_timeout: float = 0.5,
+                              max_bytes: int = 262144) -> str:
+        """Buffer pasted bytes after PASTE_START until PASTE_END arrives."""
+        deadline = time.monotonic() + max(0.05, float(idle_timeout))
+        while True:
+            end_idx = self._raw_buf.find(_PASTE_END)
+            if end_idx != -1:
+                pasted = self._raw_buf[:end_idx]
+                self._raw_buf = self._raw_buf[end_idx + len(_PASTE_END):]
+                return pasted
+            if len(self._raw_buf) >= max_bytes:
+                pasted = self._raw_buf[:max_bytes]
+                self._raw_buf = self._raw_buf[max_bytes:]
+                return pasted
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                pasted = self._raw_buf
+                self._raw_buf = ""
+                return pasted
+            if self._read_raw_chunk(min(0.05, remaining)):
+                deadline = time.monotonic() + max(0.05, float(idle_timeout))
 
     def read_key_event(self, timeout: float = 0.05) -> str | None:
         """Read one parsed key event, or None when `timeout` expires.
@@ -1561,6 +2059,60 @@ class TuiSession:
                 return None
 
     # ----------------------------------------------------- prompt editing
+    def _line_bounds(self, pos: int | None = None) -> tuple[int, int]:
+        """Return `(start, end)` offsets of the logical line containing `pos`."""
+        buf = self.input_buf
+        p = max(0, min(int(self.cursor_pos if pos is None else pos), len(buf)))
+        start = buf.rfind("\n", 0, p) + 1
+        end = buf.find("\n", p)
+        if end == -1:
+            end = len(buf)
+        return start, end
+
+    def _cursor_line_col(self) -> tuple[int, int, list[str]]:
+        """Return `(line_idx, col, lines)` for the current cursor position."""
+        buf = self.input_buf
+        pos = max(0, min(int(self.cursor_pos), len(buf)))
+        lines = buf.split("\n")
+        before = buf[:pos]
+        line_idx = before.count("\n")
+        last_nl = before.rfind("\n")
+        col = pos - (last_nl + 1)
+        return line_idx, col, lines
+
+    def _offset_for_line_col(self, lines: list[str], line_idx: int,
+                             col: int) -> int:
+        line_idx = max(0, min(int(line_idx), len(lines) - 1))
+        col = max(0, min(int(col), len(lines[line_idx])))
+        return sum(len(ln) + 1 for ln in lines[:line_idx]) + col
+
+    def _has_line_continuation(self) -> int | None:
+        """Return index of a lone trailing `\\` right before cursor, or None.
+
+        Only active in interactive mode so headless scripted inputs are never
+        intercepted.
+        """
+        if self.headless or not self.input_buf:
+            return None
+        pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
+        idx = pos - 1
+        if idx < 0 or self.input_buf[idx] != "\\":
+            return None
+        slashes = 0
+        i = idx
+        while i >= 0 and self.input_buf[i] == "\\":
+            slashes += 1
+            i -= 1
+        return idx if (slashes % 2 == 1) else None
+
+    def handle_paste(self, text: str) -> str:
+        """Insert sanitized bracketed-paste text at cursor without submitting."""
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = _untrusted_text(normalized)
+        if cleaned:
+            self._insert_text(cleaned)
+        return self.input_buf
+
     def _insert_text(self, text: str) -> None:
         pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
         self.input_buf = (self.input_buf[:pos] + text
@@ -1682,9 +2234,13 @@ class TuiSession:
         half = max(1, self._transcript_viewport_height(height) // 2)
         side_half = max(1, self._body_height(height) // 2)
         handled = True
+        if key not in ("UP", "DOWN"):
+            self._preferred_col = None
 
         if key == "F2":
             self._toggle_mouse()
+        elif key == "F3":
+            self._toggle_lang()
         elif key == "PAGE_UP":
             self.scroll_transcript(half)
         elif key == "PAGE_DOWN":
@@ -1706,8 +2262,11 @@ class TuiSession:
                 self.scroll_transcript(delta)
         elif key == "CTRL_U":
             if self.input_buf:
-                self.input_buf = self.input_buf[self.cursor_pos:]
-                self.cursor_pos = 0
+                start, _end = self._line_bounds()
+                if self.cursor_pos > start:
+                    self.input_buf = (self.input_buf[:start]
+                                      + self.input_buf[self.cursor_pos:])
+                    self.cursor_pos = start
                 self._dirty = True
             else:
                 self.scroll_transcript(half)
@@ -1719,7 +2278,13 @@ class TuiSession:
             else:
                 self.scroll_transcript(-half)
         elif key == "CTRL_K":
-            self.input_buf = self.input_buf[:self.cursor_pos]
+            _start, end = self._line_bounds()
+            pos = max(0, min(int(self.cursor_pos), len(self.input_buf)))
+            if pos < end:
+                self.input_buf = self.input_buf[:pos] + self.input_buf[end:]
+            elif pos < len(self.input_buf):
+                # At end of a logical line: join with the following line.
+                self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
             self._dirty = True
         elif key == "CTRL_L":
             self._dirty = True
@@ -1734,8 +2299,19 @@ class TuiSession:
             self.input_buf = self.input_buf[:start] + self.input_buf[pos:]
             self.cursor_pos = start
             self._dirty = True
+        elif key in ("SHIFT_ENTER", "ALT_ENTER", "CTRL_J"):
+            self._insert_text("\n")
         elif key == "ENTER":
-            self._submit_input()
+            cont_idx = self._has_line_continuation()
+            if cont_idx is not None:
+                self.input_buf = (self.input_buf[:cont_idx] + "\n"
+                                  + self.input_buf[cont_idx + 1:])
+                self.cursor_pos = cont_idx + 1
+                self._dirty = True
+            else:
+                self._submit_input()
+        elif key in ("PASTE_START", "PASTE_END"):
+            pass
         elif key == "TAB":
             self._complete()
         elif key == "ESC":
@@ -1745,12 +2321,38 @@ class TuiSession:
                 self.scroll_to_bottom()
                 self.sidebar_scroll_offset = 0
         elif key == "UP":
-            if not self.input_buf and self.scroll_offset > 0:
+            if "\n" in self.input_buf:
+                line_idx, line_col, lines = self._cursor_line_col()
+                if line_idx > 0:
+                    target_col = (self._preferred_col
+                                  if self._preferred_col is not None
+                                  else line_col)
+                    self._preferred_col = target_col
+                    self.cursor_pos = self._offset_for_line_col(
+                        lines, line_idx - 1, target_col)
+                    self._dirty = True
+                else:
+                    self._preferred_col = None
+                    self._history_prev()
+            elif not self.input_buf and self.scroll_offset > 0:
                 self.scroll_transcript(1)
             else:
                 self._history_prev()
         elif key == "DOWN":
-            if not self.input_buf and self.scroll_offset > 0:
+            if "\n" in self.input_buf:
+                line_idx, line_col, lines = self._cursor_line_col()
+                if line_idx < len(lines) - 1:
+                    target_col = (self._preferred_col
+                                  if self._preferred_col is not None
+                                  else line_col)
+                    self._preferred_col = target_col
+                    self.cursor_pos = self._offset_for_line_col(
+                        lines, line_idx + 1, target_col)
+                    self._dirty = True
+                else:
+                    self._preferred_col = None
+                    self._history_next()
+            elif not self.input_buf and self.scroll_offset > 0:
                 self.scroll_transcript(-1)
             else:
                 self._history_next()
@@ -1761,10 +2363,12 @@ class TuiSession:
             self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
             self._dirty = True
         elif key == "HOME":
-            self.cursor_pos = 0
+            start, _end = self._line_bounds()
+            self.cursor_pos = start
             self._dirty = True
         elif key == "END":
-            self.cursor_pos = len(self.input_buf)
+            _start, end = self._line_bounds()
+            self.cursor_pos = end
             self.scroll_offset = 0
             self.sidebar_scroll_offset = 0
             self._dirty = True
@@ -1821,6 +2425,16 @@ class TuiSession:
                     key, used = parse_escape_sequence(raw)
                     if not key or used <= 0:
                         break
+                    if key == "PASTE_START":
+                        rest = raw[used:]
+                        end_idx = rest.find(_PASTE_END)
+                        if end_idx != -1:
+                            self.handle_paste(rest[:end_idx])
+                            raw = rest[end_idx + len(_PASTE_END):]
+                        else:
+                            self.handle_paste(rest)
+                            raw = ""
+                        continue
                     self.handle_key(
                         key, col=(int(mouse.group(2)) if mouse else col))
                     raw = raw[used:]
@@ -1852,6 +2466,17 @@ class TuiSession:
                 if self._dirty:
                     self._redraw()
                 continue
+            if key == "PASTE_START":
+                pasted = self._read_bracketed_paste()
+                if pasted:
+                    cleaned = _untrusted_text(
+                        pasted.replace("\r\n", " ").replace("\r", " ")
+                        .replace("\n", " "))
+                    buf += cleaned
+                    self.input_buf = buf
+                    self.cursor_pos = len(buf)
+                    self._redraw(force=True)
+                continue
             if key == "ENTER":
                 self.input_buf = ""
                 self.cursor_pos = 0
@@ -1872,6 +2497,13 @@ class TuiSession:
     def _ensure_client(self):
         if self.client is None:
             self.client = LLMClient(self.cfg)
+        try:
+            if not getattr(self.cfg, "_root", ""):
+                # The LLM transport uses this to route `llm_stream` events to
+                # the project's EventLog (the TUI status listener reads them).
+                self.cfg._root = str(self.root)
+        except Exception:
+            pass
         try:
             events_mod.attach(self.client, self.elog)
         except Exception:
@@ -1911,6 +2543,15 @@ class TuiSession:
             self.agent.cfg = self.cfg
         if self.idx is not None and self.agent is not None:
             self.agent.index = self.idx
+
+    def _sync_pins(self) -> None:
+        """Publish the session pin list to every phase of the next run."""
+        try:
+            self.cfg._pinned_refs = list(self.pins)
+        except Exception:
+            pass
+        if self.agent is not None:
+            self.agent.cfg = self.cfg
 
     def _refresh_warmup(self, client) -> None:
         check = getattr(client, "check", None)
@@ -1957,6 +2598,8 @@ class TuiSession:
             self._append("cancelled (the session stays open)", "error")
             holder["error"] = KeyboardInterrupt()
         finally:
+            self._stream_status = ""
+            self._stream_phase = ""
             self._poll_events(force=True)
             self._stop_watcher()
             self._sync_telemetry()
@@ -2032,13 +2675,321 @@ class TuiSession:
             self._append("green ratchet: this step was rolled back", "error")
         self._dirty = True
 
+    # ------------------------------------------------------------ security
+    def _security_outbound_guard(self, text: str) -> bool:
+        """Ask before a prompt carrying a secret leaves for a cloud provider.
+
+        Returns False only when the user cancels. Non-interactive sessions
+        choose auto-redaction, exactly like the CLI. Loopback/LAN providers
+        are never inspected.
+        """
+        cfg = self.cfg
+        try:
+            cfg._outbound_acknowledge_secrets = False
+            cfg._outbound_redact_secrets = False
+        except Exception:
+            return True
+        if not llm_mod.is_external_provider(cfg):
+            return True
+        mode = security.outbound_mode(cfg)
+        if mode == "allow":
+            return True
+        if mode == "redact":
+            cfg._outbound_redact_secrets = True
+            return True
+        findings = security.unacknowledged_findings(
+            security.scan_text_for_secrets(str(text or ""), "<prompt>"),
+            self.root)
+        if not findings and self.interactive:
+            return True
+        if not self.interactive:
+            # A headless script must never park on a prompt. Set the run-wide
+            # redact flag so secrets found in gathered context are covered
+            # too, and report the decision without blocking.
+            cfg._outbound_redact_secrets = True
+            for finding in findings:
+                self._append(
+                    f"[security] {security.format_finding(finding)}", "receipt")
+            if findings:
+                self._append(
+                    "[security] non-interactive session: auto-redacting "
+                    "before sending to the external provider", "receipt")
+            return True
+        self._append(
+            "[security] This prompt contains credentials that would be "
+            "sent to an external provider:", "receipt")
+        for finding in findings:
+            self._append(
+                f"[security] {security.format_finding(finding)}", "receipt")
+        question = ("[security] [A]cknowledge & send / [R]edact & send / "
+                    "[C]ancel (default: R):")
+        self._set_banner(question)
+        self._append(question, "activity")
+        self._redraw(force=True)
+        answer = self._read_answer_line()
+        self.input_buf = ""
+        self.cursor_pos = 0
+        self._set_banner("")
+        first = ((answer or "").strip().lower().split() or ["r"])[0]
+        if first in ("c", "cancel", "n", "no"):
+            self._append("[security] cancelled; nothing was sent", "receipt")
+            self._dirty = True
+            return False
+        if first in ("a", "ack", "acknowledge", "y", "yes"):
+            security.acknowledge_findings(
+                self.root, [f.fingerprint for f in findings])
+            cfg._outbound_acknowledge_secrets = True
+            self._append(
+                f"[security] acknowledged {len(findings)} finding(s); "
+                "sending as-is", "receipt")
+        else:
+            cfg._outbound_redact_secrets = True
+            self._append("[security] redacting secrets before sending",
+                         "receipt")
+        self._dirty = True
+        return True
+
+    def _security_notice(self, files=None) -> dict:
+        """Print a non-blocking `[security]` notice after a run."""
+        try:
+            status = security.security_status(
+                self.root, self.cfg, files=files, use_cache=False)
+        except Exception:
+            return {}
+        new_keys: list[str] = []
+        lines: list[str] = []
+        for finding in status.get("findings", []):
+            key = str(finding.get("fingerprint") or "")
+            if not key or key in self._security_notified:
+                continue
+            self._security_notified.add(key)
+            new_keys.append(key)
+            lines.append(
+                "[security] secret at "
+                f"{finding.get('file', '?')}:{finding.get('line', '?')} "
+                f"[{finding.get('kind', '?')}] "
+                f"{finding.get('masked_preview', '***')}")
+        for item in status.get("unignored_sensitive_files", []):
+            rel = str(item.get("file") or "")
+            key = "file:" + rel
+            if not rel or key in self._security_notified:
+                continue
+            self._security_notified.add(key)
+            new_keys.append(key)
+            lines.append(
+                f"[security] {rel} is not ignored by .gitignore")
+        if not new_keys:
+            return status
+        self._append("[security] Security notice (unacknowledged findings):",
+                     "receipt")
+        for line in lines[:12]:
+            self._append(line, "receipt")
+        if len(lines) > 12:
+            self._append(f"[security] ... and {len(lines) - 12} more",
+                         "receipt")
+        self._append(
+            "[security] Non-blocking: nothing was changed. Run /security for "
+            "details, /security ack to ignore secret findings, or "
+            "/security gitignore to add .env patterns.", "receipt")
+        return status
+
+    def _security(self, arg: str) -> None:
+        """`/security`, `/security ack`, `/security gitignore`."""
+        sub = (arg or "").strip().lower().split(" ", 1)[0]
+        status = security.security_status(
+            self.root, self.cfg, use_cache=False)
+        if sub in ("ack", "acknowledge", "ignore"):
+            fingerprints = [f["fingerprint"] for f in
+                            status.get("findings", []) if f.get("fingerprint")]
+            if not fingerprints:
+                self._append("[security] No unacknowledged secrets to "
+                             "acknowledge.", "system")
+                return
+            security.acknowledge_findings(self.root, fingerprints)
+            self._security_notified.clear()
+            self._append(
+                f"[security] Acknowledged {len(fingerprints)} finding(s); "
+                "the same keys will not be reported again.", "system")
+            return
+        if sub in ("gitignore", "ignore-files"):
+            added = security.ensure_gitignore_entries(self.root)
+            if added:
+                self._append(
+                    "[security] Added to .gitignore: " + ", ".join(added),
+                    "system")
+            else:
+                self._append(
+                    "[security] .gitignore already covers .env patterns.",
+                    "system")
+            self._security_notified.clear()
+            return
+        if not status.get("secrets_found") and not status.get("env_unignored"):
+            self._append(
+                "[security] No unacknowledged secrets or unignored .env "
+                "files detected.", "system")
+            return
+        self._append("[security] Workspace scan:", "system")
+        for finding in status.get("findings", []):
+            self._append(
+                "[security] " + security.format_finding(finding), "receipt")
+        for item in status.get("unignored_sensitive_files", []):
+            self._append(
+                f"[security] {item.get('file', '?')} is not ignored by "
+                ".gitignore", "receipt")
+        self._append(
+            "[security] /security ack acknowledges secret findings; "
+            "/security gitignore adds .env patterns.", "system")
+
+    def _theme(self, arg: str) -> None:
+        """`/theme` lists palettes; `/theme NAME` switches and saves."""
+        name = (arg or "").strip()
+        if not name:
+            data = themes_mod.list_themes(self.root)
+            builtin = list(data.get("builtin_names") or [])
+            custom = [n for n in data.get("custom_names") or []
+                      if n not in builtin]
+            names = builtin + sorted(custom)
+            lines = ["Color themes (shared with the GUI):"]
+            for item in names:
+                active = item == data.get("active_theme")
+                marker = "*" if active else " "
+                kind = "built-in" if item in builtin else "custom"
+                line = f" {marker} {item:<20} {kind}"
+                if active:
+                    line += "  <- active"
+                lines.append(line)
+            override = data.get("project_theme")
+            if override:
+                lines.append(f"Project override: {override}")
+            lines.append("Use /theme <name> to switch; the choice is saved.")
+            self._append("\n".join(lines), "system")
+            return
+        try:
+            tokens = themes_mod.set_active_theme(name, self.root)
+        except ValueError as exc:
+            self._append(str(exc), "error")
+            return
+        self.theme = tokens
+        self._reload_theme()
+        self._append(f"Theme: {self.theme_name} (saved)", "receipt")
+        self._dirty = True
+
+    _PROMPT_IMAGE_REF_RE = re.compile(
+        r"(?<!\S)@([^\s,;:!?\"'()]+?\.(?:png|jpe?g|webp|gif))(?=$|[\s,;:!?\"'()])",
+        re.IGNORECASE,
+    )
+
+    def _resolve_attach_image_path(self, raw_path: str) -> Path:
+        """Resolve an image path for /attach or @image.png: relative paths stay
+        inside project root via `security.resolve_safe_path`; an explicitly
+        typed existing absolute path is allowed directly."""
+        cleaned = str(raw_path or "").strip().strip('"').strip("'")
+        if not cleaned:
+            raise ValueError(i18n.t("tui.attach.usage", lang=self.lang))
+        expanded = Path(cleaned).expanduser()
+        if expanded.is_absolute():
+            if not expanded.exists():
+                raise FileNotFoundError(f"Image file not found: {expanded}")
+            return expanded.resolve()
+        return security.resolve_safe_path(self.root, cleaned)
+
+    def _attach_command(self, arg: str) -> None:
+        """`/attach [PATH | list | clear]` — stage images for the next task."""
+        from . import imagegen
+
+        sub = str(arg or "").strip()
+        low = sub.lower()
+        if not sub or low == "list":
+            if not self.pending_images:
+                self._append(i18n.t("tui.attach.empty", lang=self.lang), "system")
+                return
+            lines = [i18n.t("tui.attach.list_header", lang=self.lang,
+                            n=len(self.pending_images))]
+            for idx_i, img in enumerate(self.pending_images, 1):
+                dims = (f"{img.get('width', 0)}x{img.get('height', 0)}"
+                        if img.get("width") and img.get("height") else "?")
+                kb = max(1, int(img.get("bytes", 0)) // 1024)
+                lines.append(
+                    f"  {idx_i}. {img.get('name', 'image')} "
+                    f"({img.get('mime', '')}, {dims}, {kb} KB)"
+                )
+            self._append("\n".join(lines), "system")
+            return
+        if low == "clear":
+            n = len(self.pending_images)
+            self.pending_images.clear()
+            self._append(i18n.t("tui.attach.cleared", lang=self.lang, n=n),
+                         "receipt")
+            self._dirty = True
+            return
+        if len(self.pending_images) >= imagegen.MAX_IMAGE_ATTACHMENTS:
+            self._append(
+                i18n.t("tui.attach.limit", lang=self.lang,
+                       max=imagegen.MAX_IMAGE_ATTACHMENTS),
+                "error",
+            )
+            return
+        try:
+            path = self._resolve_attach_image_path(sub)
+            item = imagegen.load_image_attachment(path)
+        except (OSError, ValueError, security.SecurityError) as exc:
+            self._append(f"ERROR: {exc}", "error")
+            return
+        self.pending_images.append(item)
+        dims = (f"{item['width']}x{item['height']}"
+                if item.get("width") and item.get("height") else "?")
+        self._append(
+            i18n.t("tui.attach.added", lang=self.lang,
+                   name=item["name"], dims=dims,
+                   n=len(self.pending_images)),
+            "receipt",
+        )
+        self._dirty = True
+
+    def _collect_task_images(self, task: str) -> list[dict]:
+        """Combine staged `pending_images` with any `@path/to/image.<ext>`
+        references found in `task`."""
+        from . import imagegen
+
+        images = list(self.pending_images)
+        seen = {(img.get("name"), img.get("bytes")) for img in images}
+        for match in self._PROMPT_IMAGE_REF_RE.finditer(task or ""):
+            if len(images) >= imagegen.MAX_IMAGE_ATTACHMENTS:
+                break
+            ref = match.group(1)
+            try:
+                path = self._resolve_attach_image_path(ref)
+                item = imagegen.load_image_attachment(path)
+            except (OSError, ValueError, security.SecurityError):
+                continue
+            key = (item.get("name"), item.get("bytes"))
+            if key not in seen:
+                seen.add(key)
+                images.append(item)
+        return images
+
     def run_task(self, task: str) -> None:
         """Run one plain-text coding task, keeping the UI live while it runs."""
         self._context_override = None
         self._event_active = ""
-        self._append(f"\u00bb {task}", "user")
+        run_images = self._collect_task_images(task)
+        if run_images:
+            names = ", ".join(img.get("name", "image") for img in run_images)
+            self._append(f"\u00bb {task}  [\U0001f5bc {len(run_images)} img: {names}]",
+                         "user")
+        else:
+            self._append(f"\u00bb {task}", "user")
+        if not self._security_outbound_guard(task):
+            self._redraw(force=True)
+            return
+        # Clear staged images once the task is accepted for dispatch.
+        if self.pending_images:
+            self.pending_images.clear()
+            self._dirty = True
+        self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
+        self._sync_pins()
         if self.resume_context:
             task = self.resume_context + "\n\nNEW TASK\n" + task
             self.resume_context = ""
@@ -2049,22 +3000,29 @@ class TuiSession:
 
         def work():
             return loop.run_task(self.root, cfg, client, agent, idx, task,
-                                 apply=self.apply)
+                                 apply=self.apply,
+                                 images=run_images or None)
 
         holder = self._run_in_worker(work)
         error = holder.get("error")
         if error is not None:
             if isinstance(error, KeyboardInterrupt):
                 pass
+            elif isinstance(error, LLMError) \
+                    and getattr(error, "kind", "") == "cancelled":
+                self._append("stopped by user (the session stays open)",
+                             "system")
             elif isinstance(error, LLMError):
                 self._append(f"ERROR: {error}", "error")
             else:
                 self._append(f"ERROR: {type(error).__name__}: {error}",
                              "error")
+            self._security_notice()
             self._report_run_telemetry(holder)
             self._redraw(force=True)
             return
         self._record_result(task, holder.get("result"))
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._redraw(force=True)
 
@@ -2113,10 +3071,15 @@ class TuiSession:
         if not goal:
             self._append("Usage: /auto <goal>", "error")
             return
+        self._evict_servers()
         client, agent, idx = self._ensure_backend()
         cfg = self.cfg
+        self._sync_pins()
         plan_path = self._plan_path()
         self._append(f"\u00bb /auto {goal}", "user")
+        if not self._security_outbound_guard(goal):
+            self._redraw(force=True)
+            return
         self._refresh_warmup(client)
 
         def work():
@@ -2139,14 +3102,20 @@ class TuiSession:
         holder = self._run_in_worker(work)
         error = holder.get("error")
         if error is not None:
-            if not isinstance(error, KeyboardInterrupt):
+            cancelled = (isinstance(error, LLMError)
+                         and getattr(error, "kind", "") == "cancelled")
+            if not isinstance(error, KeyboardInterrupt) and not cancelled:
                 self._append(f"ERROR: {error}", "error")
+            elif cancelled:
+                self._append("stopped by user (the session stays open)",
+                             "system")
         else:
             result = holder.get("result")
             if isinstance(result, int):
                 self._append(f"auto finished with exit code {result}",
                              "system")
             self._append("auto loop finished", "system")
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._sync_telemetry()
         self._redraw(force=True)
@@ -2168,6 +3137,9 @@ class TuiSession:
             target = self.root / target
         target = target.resolve()
         prompt = " ".join(parts[1].split())
+        if not self._security_outbound_guard(prompt):
+            self._redraw(force=True)
+            return
         if target.is_dir():
             entries = sorted(p.name for p in target.iterdir()
                              if not scaffold.is_harness_owned(p.name))
@@ -2206,6 +3178,7 @@ class TuiSession:
         # rebuilt from disk once the scaffold has landed its files.
         self.agent = None
         self.modified = []
+        self._security_notified.clear()
         self.resume_context = ""
         try:
             workspace.ensure(target, self.cfg.manage_gitignore,
@@ -2227,20 +3200,25 @@ class TuiSession:
             cfg._tests_user_consent = True
 
         def work():
-            workspace.log_event(target, "command: tui new")
             return scaffold.run_new(
                 target, cfg, client, spec, apply=True, verbose=True,
                 complex=False, verify=verify,
                 repair_rounds=cfg.auto_repair_rounds,
                 max_tasks=cfg.auto_max_tasks,
                 max_minutes=cfg.auto_max_minutes,
-                auto_install=cfg.auto_install_deps)
+                auto_install=cfg.auto_install_deps,
+                log_command="command: tui new")
 
         holder = self._run_in_worker(work)
         error = holder.get("error")
         if error is not None:
-            if not isinstance(error, KeyboardInterrupt):
+            cancelled = (isinstance(error, LLMError)
+                         and getattr(error, "kind", "") == "cancelled")
+            if not isinstance(error, KeyboardInterrupt) and not cancelled:
                 self._append(f"ERROR: {error}", "error")
+            elif cancelled:
+                self._append("stopped by user (the session stays open)",
+                             "system")
         else:
             code = holder.get("result")
             if code == 0:
@@ -2263,6 +3241,7 @@ class TuiSession:
         except (SystemExit, Exception):
             pass
         self.agent = None
+        self._security_notice()
         self._report_run_telemetry(holder)
         self._sync_telemetry()
         self._redraw(force=True)
@@ -2318,10 +3297,19 @@ class TuiSession:
             self._append("Goodbye.", "system")
             return
         if cmd in ("help", "h", "?"):
-            self._append(HELP_TEXT, "system")
+            self._append(help_text(self.lang), "system")
             return
         if cmd == "keys":
-            self._append(KEYS_TEXT, "system")
+            self._append(keys_text(self.lang), "system")
+            return
+        if cmd == "lang":
+            self._lang_command(arg)
+            return
+        if cmd == "image":
+            self._image_command(arg)
+            return
+        if cmd == "attach":
+            self._attach_command(arg)
             return
         if cmd == "scroll":
             self._scroll_command(arg)
@@ -2331,6 +3319,12 @@ class TuiSession:
             return
         if cmd in ("status", "telemetry"):
             self._append(self.status_report(), "system")
+            return
+        if cmd == "security":
+            self._security(arg)
+            return
+        if cmd == "theme":
+            self._theme(arg)
             return
         if cmd == "cost":
             self._append(self.status_report(), "system")
@@ -2358,10 +3352,20 @@ class TuiSession:
         if cmd == "plan":
             self.show_plan(arg)
             return
+        if cmd == "pin":
+            self._pin(arg)
+            return
+        if cmd == "rules":
+            self._rules(arg)
+            return
         if cmd in ("consolidate", "compact"):
             self._consolidate()
             return
         if cmd in ("profile", "profiles"):
+            if cmd == "profile" and arg.strip().lower() in (
+                    "show", "run", "reset"):
+                self._profiler_command(arg)
+                return
             self._profiles(arg)
             return
         if cmd == "model":
@@ -2373,14 +3377,35 @@ class TuiSession:
         if cmd == "think":
             self._think(arg)
             return
+        if cmd == "effort":
+            self._effort(arg)
+            return
+        if cmd == "hybrid":
+            self._hybrid(arg)
+            return
+        if cmd == "arena":
+            self._arena(arg)
+            return
+        if cmd == "servers":
+            self._servers(arg)
+            return
+        if cmd == "unload":
+            self._unload(arg)
+            return
         if cmd == "creative":
             self._creative(arg)
             return
         if cmd == "apply":
             self._apply_toggle(arg)
             return
+        if cmd == "verify":
+            self._verify(arg)
+            return
         if cmd == "skills":
             self._skills(arg)
+            return
+        if cmd == "skill":
+            self._skill(arg)
             return
         if cmd == "memory":
             self._memory(arg)
@@ -2391,8 +3416,23 @@ class TuiSession:
         if cmd == "diff":
             self._diff()
             return
+        if cmd == "checkpoints":
+            self._checkpoints(arg)
+            return
+        if cmd == "checkout":
+            self._checkout(arg)
+            return
         if cmd == "undo":
             self._undo()
+            return
+        if cmd == "run":
+            self._run_command(arg)
+            return
+        if cmd == "fix":
+            self._fix_last_crash()
+            return
+        if cmd == "update":
+            self._update(arg)
             return
         if cmd == "reset":
             self._reset()
@@ -2441,6 +3481,9 @@ class TuiSession:
             f"  routing : Auto-Route "
             f"{'ON' if getattr(self.cfg, 'auto_route_specialties', False) else 'OFF'}"
             f", thinking {'off' if getattr(self.cfg, 'disable_thinking', False) else 'on'}",
+            f"  class   : {self._model_class()}"
+            f", effort {getattr(self.cfg, 'reasoning_effort', 'default') or 'default'}"
+            f", streams {getattr(self.cfg, 'max_concurrency', 0) or 'auto'}",
         ]
         card = getattr(self.cfg, "_card", None)
         if not isinstance(card, dict):
@@ -2474,6 +3517,13 @@ class TuiSession:
         else:
             lines.append("    (no model calls yet)")
         return "\n".join(lines)
+
+    def _model_class(self) -> str:
+        try:
+            from . import config as config_mod
+            return config_mod.capability_profile(self.cfg)
+        except Exception:
+            return "?"
 
     def _consolidate(self) -> None:
         messages = getattr(self.agent, "_messages", None) if self.agent else None
@@ -2668,6 +3718,358 @@ class TuiSession:
         self._append("Thinking: "
                      f"{'OFF' if self.cfg.disable_thinking else 'ON'}", "system")
 
+    def _effort(self, arg: str) -> None:
+        """`/effort [default|low|medium|high]`: reasoning effort forwarded to
+        local-MoE runtimes and reasoning-capable hosted APIs."""
+        value = arg.strip().lower()
+        if not value:
+            current = str(getattr(self.cfg, "reasoning_effort", "default")
+                          or "default")
+            self._append(
+                f"Reasoning effort: {current}\n"
+                "Usage: /effort default|low|medium|high", "system")
+            return
+        if value in ("auto", "none", "off"):
+            value = "default"
+        if value not in ("default", "low", "medium", "high"):
+            self._append("Usage: /effort default|low|medium|high", "error")
+            return
+        self.cfg.reasoning_effort = value
+        try:
+            self.cfg.sources["reasoning_effort"] = "tui /effort"
+        except Exception:
+            pass
+        klass = ""
+        try:
+            from . import config as config_mod
+            klass = config_mod.capability_profile(self.cfg)
+        except Exception:
+            pass
+        self._append(
+            f"Reasoning effort: {value}"
+            + (f" ({klass})" if klass else "")
+            + (" \u2014 no field is sent at default"
+               if value == "default" else " \u2014 sent as reasoning_effort"),
+            "system")
+
+    def _hybrid(self, arg: str) -> None:
+        """`/hybrid [off | <architect_provider> <architect_model>]`: arm the
+        split-stage architect/editor pipeline for this session. A single
+        token names a profile (its model comes from the profile body) or a
+        bare model id on the active endpoint."""
+        value = arg.strip()
+        if not value:
+            on = bool(getattr(self.cfg, "hybrid_routing", False))
+            provider = str(getattr(self.cfg, "architect_provider", "") or "")
+            model = str(getattr(self.cfg, "architect_model", "") or "")
+            detail = (f" — architect {provider + '/' if provider else ''}"
+                      f"{model}" if model else "")
+            self._append(
+                f"Hybrid routing: {'ON' if on else 'OFF'}{detail}\n"
+                "Usage: /hybrid off | /hybrid <architect_provider> "
+                "<architect_model>", "system")
+            return
+        if value.lower() in ("off", "false", "no", "0"):
+            self.cfg.hybrid_routing = False
+            try:
+                self.cfg.sources["hybrid_routing"] = "tui /hybrid"
+            except Exception:
+                pass
+            self._append("Hybrid routing: OFF", "system")
+            return
+        parts = value.split()
+        if len(parts) == 1:
+            name = parts[0]
+            body = (self.cfg.profiles or {}).get(name)
+            if body is not None:
+                provider = name
+                model = str((body or {}).get("model") or "").strip()
+                if not model:
+                    self._append(f"Profile '{name}' names no model.", "error")
+                    return
+            else:
+                provider, model = "", name
+        else:
+            provider, model = parts[0], parts[1]
+        if model == str(getattr(self.cfg, "model", "") or ""):
+            self._append("The architect model equals the editor model; "
+                         "hybrid would pay twice for one brain. Pick a "
+                         "different architect.", "error")
+            return
+        self.cfg.hybrid_routing = True
+        self.cfg.architect_provider = provider
+        self.cfg.architect_model = model
+        for key in ("hybrid_routing", "architect_provider", "architect_model"):
+            try:
+                self.cfg.sources[key] = "tui /hybrid"
+            except Exception:
+                pass
+        self._append(
+            f"Hybrid routing: ON — Stage 1 architect "
+            f"{provider + '/' if provider else ''}{model}, Stage 2 editor "
+            f"{self.cfg.model}", "system")
+
+    def _arena_scorecard(self, state: dict) -> str:
+        state = state or {}
+        lines = [f"Arena {state.get('arena_id', '?')} — "
+                 f"{str(state.get('prompt') or '')[:100]}"]
+        for side in ("a", "b"):
+            rec = (state.get("contestants") or {}).get(side) or {}
+            mark = "\u2713" if rec.get("ok") else "\u2717"
+            provider = str(rec.get("provider") or "")
+            lines.append(
+                f"  {side.upper()} {mark} "
+                f"{provider + '/' if provider else ''}{rec.get('model', '?')}"
+                f" — {len(rec.get('files_changed') or [])} file(s), "
+                f"{rec.get('elapsed_sec', 0)}s, "
+                f"{rec.get('tok_per_sec', 0)} tok/s, "
+                f"{int(rec.get('total_tokens', 0) or 0):,} tokens")
+            for rel in (rec.get("files_changed") or [])[:8]:
+                lines.append(f"      {rel}")
+            summary = str(rec.get("summary") or "").strip()
+            if summary:
+                lines.append("      " + summary.splitlines()[0][:120])
+        if state.get("winner"):
+            lines.append(f"  winner applied: {str(state['winner']).upper()}")
+        return "\n".join(lines)
+
+    def _arena(self, arg: str) -> None:
+        """`/arena <provider_a>:<model_a> <provider_b>:<model_b> <prompt>`
+        runs both contestants in isolated sandboxes; `/arena apply a|b`
+        adopts a winner; bare `/arena` shows the last scorecard."""
+        from . import arena as arena_mod
+        value = arg.strip()
+        if not value:
+            state = arena_mod.last_arena(self.root)
+            if state is None:
+                self._append(
+                    "Usage: /arena <provider_a>:<model_a> <provider_b>:<model_b>"
+                    " <prompt>\n       /arena apply a|b", "system")
+                return
+            self._append(self._arena_scorecard(state), "system")
+            return
+        parts = value.split(None, 1)
+        if parts[0].lower() == "apply":
+            self._arena_apply(parts[1].strip() if len(parts) > 1 else "")
+            return
+        tokens = value.split(None, 2)
+        if len(tokens) < 3 or not tokens[2].strip():
+            self._append(
+                "Usage: /arena <provider_a>:<model_a> <provider_b>:<model_b>"
+                " <prompt>", "error")
+            return
+        spec_a, spec_b, prompt = tokens[0], tokens[1], tokens[2].strip()
+        self._evict_servers()
+        self._append(f"arena: {spec_a} vs {spec_b} — both run in isolated "
+                     "sandboxes; the workspace stays untouched ...", "system")
+
+        def work():
+            return arena_mod.run_arena_comparison(self.root, prompt,
+                                                  spec_a, spec_b, self.cfg)
+
+        holder = self._run_in_worker(work)
+        error = holder.get("error")
+        if error is not None:
+            if isinstance(error, KeyboardInterrupt):
+                pass
+            elif isinstance(error, arena_mod.ArenaError):
+                self._append(f"arena: {error}", "error")
+            else:
+                self._append(f"ERROR: {type(error).__name__}: {error}",
+                             "error")
+            self._report_run_telemetry(holder)
+            self._redraw(force=True)
+            return
+        state = holder.get("result") or {}
+        self._last_arena_id = str(state.get("arena_id") or "")
+        self._append(self._arena_scorecard(state), "system")
+        self._append("Apply a winner with /arena apply a  or  /arena apply b",
+                     "system")
+        self._report_run_telemetry(holder)
+        self._redraw(force=True)
+
+    def _arena_apply(self, arg: str) -> None:
+        from . import arena as arena_mod
+        winner = arg.strip().lower()
+        if winner not in ("a", "b"):
+            self._append("Usage: /arena apply a|b", "error")
+            return
+        arena_id = str(getattr(self, "_last_arena_id", "") or "")
+        if not arena_id:
+            state = arena_mod.last_arena(self.root)
+            arena_id = str((state or {}).get("arena_id") or "")
+        if not arena_id:
+            self._append("No arena to apply — run /arena first.", "error")
+            return
+        try:
+            out = arena_mod.apply_arena_winner(self.root, arena_id, winner)
+        except (arena_mod.ArenaError, checkpoints_mod.CheckpointError,
+                OSError) as exc:
+            self._append(f"arena apply: {exc}", "error")
+            return
+        # The workspace changed under the index: rebuild it before the next
+        # task gathers (same fresh static index a newly opened project gets).
+        try:
+            self.idx = index_mod.build([str(self.root)], self.cfg, client=None,
+                                       root=self.root, summarise=False,
+                                       verbose=False)
+            self.agent = Agent(self.idx, self._ensure_client(), self.cfg)
+        except Exception:
+            pass
+        self._append(
+            f"Arena winner applied: {out['model']} — "
+            f"{len(out['files_changed'])} file(s) changed.\n"
+            f"Checkpoint {out['post_checkpoint']} (undo with /undo).",
+            "receipt")
+        self._redraw(force=True)
+
+    def _profiler_command(self, arg: str) -> None:
+        """`/profile show|run|reset`: the CLI's profiler actions in the TUI."""
+        from . import profiler
+        action = (arg or "show").strip().lower()
+        probe = None
+        if action == "reset":
+            path = profiler.reset()
+            changed = ""
+            try:
+                from . import config as config_mod
+                from . import config_editor
+                config_path = Path(
+                    getattr(self.cfg, "_config_path", "")
+                    or config_mod.USER_CONFIG)
+                changed = config_editor.disable_auto_tune_opt_in(
+                    config_path,
+                    str(getattr(self.cfg, "active_profile", "") or ""))
+            except Exception:
+                changed = ""
+            try:
+                self.cfg.auto_tune = False
+                self.cfg.sources["auto_tune"] = "user (TUI /profile reset)"
+            except Exception:
+                pass
+            message = f"Dropped cached profiling measurements ({path}). "
+            if changed:
+                message += f"Set auto_tune = false in {changed}. "
+            else:
+                message += ("No explicit auto_tune = true was found in the "
+                            "selected config file. ")
+            message += "auto_tune is off for this session."
+            self._append(message, "system")
+            return
+        if action == "run":
+            if not servers_mod.is_local_url(self.cfg.base_url):
+                self._append(
+                    f"{profiler.HOSTED_PROBE_REFUSAL}: {self.cfg.model} on "
+                    f"{self.cfg.base_url} (speed probes are local-only).",
+                    "system")
+                return
+            self._append(
+                f"Probing {self.cfg.model} on {self.cfg.base_url} "
+                "(one prefill, one tiny completion)...", "system")
+            probe = profiler.probe_model_speed(
+                self.cfg.base_url, self.cfg.model, self.cfg, force=True)
+            if not probe.get("ok"):
+                self._append("Probe failed: "
+                             + str(probe.get("detail") or
+                                   "the server did not answer"), "error")
+                return
+        report = profiler.build_report(self.cfg, probe=probe,
+                                       fetch_metadata=True)
+        self._append(profiler.format_profile_report(report), "system")
+
+    def _servers(self, arg: str = "") -> None:
+        """`/servers`: live VRAM/RAM plus each configured local server.
+        `/servers pin|unpin SERVER [MODEL]` toggles Lemonade's LRU exemption
+        for a loaded model."""
+        parts = arg.strip().split(None, 2)
+        if parts and parts[0].lower() in ("pin", "unpin"):
+            if len(parts) < 2:
+                self._append(
+                    "usage: /servers pin SERVER [MODEL]  |  "
+                    "/servers unpin SERVER [MODEL]", "error")
+                return
+            action = parts[0].lower()
+            target = parts[1]
+            model = parts[2].strip() if len(parts) > 2 else ""
+            try:
+                result = servers_mod.pin_server_model(
+                    target, model, action == "pin", self.cfg)
+            except Exception as exc:
+                self._append(f"{action} failed: {exc}", "error")
+                return
+            name = result.get("server") or target
+            chosen = str(result.get("model") or "").strip()
+            detail = str(result.get("detail") or "").strip()
+            label = ("SKIPPED" if result.get("skipped")
+                     else "OK" if result.get("ok") else "FAILED")
+            self._append(
+                f"{label} {action} {name}"
+                + (f" \u00b7 {chosen}" if chosen else "")
+                + (f" \u2014 {detail}" if detail else ""),
+                "system" if result.get("ok") else "error")
+            return
+        try:
+            payload = servers_mod.server_summary(self.cfg)
+        except Exception as exc:
+            self._append(f"could not read local servers: {exc}", "error")
+            return
+        self._append(
+            servers_mod.format_server_states(
+                payload.get("servers") or [], payload.get("memory")),
+            "system")
+
+    def _unload(self, arg: str) -> None:
+        """`/unload [server]`: unload one server, or every idle local server."""
+        target = arg.strip()
+        try:
+            if target:
+                result = servers_mod.unload_server_model(
+                    target, "", self.cfg)
+                results = [result]
+            else:
+                results = servers_mod.unload_all_local_servers(self.cfg)
+        except Exception as exc:
+            self._append(f"unload failed: {exc}", "error")
+            return
+        if not results:
+            self._append("No resident model on any configured local server.",
+                         "system")
+            return
+        lines = ["Unload results"]
+        for result in results:
+            ok = bool(result.get("ok"))
+            name = result.get("server") or result.get("base_url") or "?"
+            detail = str(result.get("detail") or "").strip()
+            model = str(result.get("model") or "").strip()
+            lines.append(
+                f"  {'OK' if ok else 'FAILED'} {name}"
+                + (f" \u00b7 {model}" if model else "")
+                + (f" \u2014 {detail}" if detail else ""))
+        try:
+            mem = servers_mod.get_hardware_memory()
+            lines.append(f"  {servers_mod.memory_badge(mem)}")
+        except Exception:
+            pass
+        self._append("\n".join(lines),
+                     "system" if all(r.get("ok") for r in results)
+                     else "error")
+
+    def _evict_servers(self) -> None:
+        """Auto-evict handshake before a run starts on this profile's server."""
+        try:
+            result = servers_mod.evict_other_local_servers(
+                getattr(self.cfg, "active_profile", "") or self.cfg.base_url,
+                self.cfg)
+        except Exception:
+            return
+        evicted = [r for r in result.get("evicted", []) if r]
+        if evicted:
+            names = ", ".join(str(r.get("server") or r.get("base_url") or "?")
+                              for r in evicted)
+            self._append(
+                f"Unloaded {names} from another local server so this run can "
+                "use the VRAM/RAM.", "system")
+
     def _creative(self, arg: str) -> None:
         """Tri-state creative/design mode: on forces the Builder persona for
         every task, off keeps surgical edits everywhere, auto detects design
@@ -2719,6 +4121,86 @@ class TuiSession:
         self._append(f"Writes: {'ON' if self.apply else 'off (dry run)'}",
                      "system")
 
+    def _verify(self, arg: str) -> None:
+        """`/verify [on|off|status]`: control the post-edit verification
+        command without touching the always-on cheap gates. `on` fills an
+        empty `auto_verify` from the project's detected test command."""
+        value = arg.strip().lower()
+        cfg = self.cfg
+        if value in ("", "status", "show"):
+            cmd = str(getattr(cfg, "auto_verify", "") or "").strip()
+            static = bool(getattr(cfg, "static_gate", True))
+            static_s = float(getattr(cfg, "static_gate_timeout", 3.0) or 0.0)
+            repair = int(getattr(cfg, "auto_repair_rounds", 2) or 0)
+            rounds = int(getattr(cfg, "auto_verify_rounds", 2) or 0)
+            final = bool(getattr(cfg, "auto_verify_final", False))
+            ratchet = bool(getattr(cfg, "auto_green_ratchet", True))
+            lock = bool(getattr(cfg, "interface_lock", True))
+            timeout = int(getattr(cfg, "test_timeout", 300) or 300)
+            self._append("\n".join([
+                "Post-edit verify (auto_verify): "
+                + (f"ON \u2014 {cmd}" if cmd
+                   else "OFF (auto_verify is empty)"),
+                f"Static gate (static_gate): {'ON' if static else 'OFF'} "
+                f"(ruff or AST fallback, {static_s:g} s, new errors only)",
+                f"Repair rounds (auto_repair_rounds): {repair}; runtime "
+                f"verification rounds (auto_verify_rounds): {rounds}"
+                + ("; final-only (auto_verify_final)" if final else ""),
+                "Scoped tests: import-graph impacted tests only "
+                f"(testsel.run_impacted), bounded by test_timeout "
+                f"({timeout} s); the full suite is the verify command",
+                f"Green ratchet (auto_green_ratchet): "
+                f"{'ON' if ratchet else 'OFF'} (rolls back a failed Auto "
+                f"step); interface lock (interface_lock): "
+                f"{'ON' if lock else 'OFF'}",
+            ]), "system")
+            return
+        if value in ("on", "true", "yes", "1"):
+            cmd = str(getattr(cfg, "auto_verify", "") or "").strip()
+            if cmd:
+                self._append(f"Post-edit verify: ON \u2014 {cmd}", "system")
+                return
+            detected = ""
+            try:
+                detected = str(testsel.detect_test_command(
+                    self.root, cfg) or "").strip()
+            except Exception:
+                detected = ""
+            if detected:
+                cfg.auto_verify = detected
+                try:
+                    cfg.sources["auto_verify"] = "tui /verify"
+                except Exception:
+                    pass
+                self._append(
+                    f"Post-edit verify: ON \u2014 detected {detected}",
+                    "system")
+            else:
+                cfg.auto_verify = ""
+                try:
+                    cfg.sources["auto_verify"] = "tui /verify"
+                except Exception:
+                    pass
+                self._append(
+                    "Post-edit verify: no test command detected; auto_verify "
+                    "stays empty.\nThe syntax/AST, static and "
+                    "interface-contract gates and the scoped impacted tests "
+                    "still run on every edit. Set test_command or auto_verify "
+                    "in config.toml to add a full-suite check.", "system")
+            return
+        if value in ("off", "false", "no", "0"):
+            cfg.auto_verify = ""
+            try:
+                cfg.sources["auto_verify"] = "tui /verify"
+            except Exception:
+                pass
+            self._append(
+                "Post-edit verify: OFF \u2014 auto_verify cleared. The "
+                "syntax/AST, static and interface-contract gates and the "
+                "scoped impacted tests still run on every edit.", "system")
+            return
+        self._append("Usage: /verify on|off|status", "error")
+
     def _skills(self, arg: str) -> None:
         words = arg.split(None, 1)
         action = words[0].lower() if words else "list"
@@ -2756,6 +4238,34 @@ class TuiSession:
             return
         self._append("Usage: /skills [list|show NAME|draft TEXT]", "error")
 
+    def _skill(self, arg: str) -> None:
+        """`/skill NAME` -- load a skill body into the next task's pinned
+        context. The body is read through `skills.load`, validated now, and
+        stored as a `skill:NAME` pin so every later task (and `/pin list`)
+        sees exactly the same pinned-context mechanism as @file/@symbol."""
+        name = arg.strip().lower()
+        if not name:
+            self._append(
+                "Usage: /skill <name> \u2014 loads the full skill checklist "
+                "into the next task's pinned context. `/skills` lists names.",
+                "error")
+            return
+        text, info = skills_mod.load(self.root, self.cfg, name)
+        if info is None:
+            self._append(text, "error")
+            return
+        ref = f"skill:{name}"
+        if ref not in self.pins:
+            self.pins.append(ref)
+            self._sync_pins()
+        source = info.get("source") or "unknown"
+        body = (text.split("\n", 1)[1] if "\n" in text else text).strip()
+        self._append(
+            f"Skill '{name}' pinned for the next task ({source}, "
+            f"{len(body)} chars). It rides in the pinned-context block above "
+            f"the map; `/pin remove {ref}` or `/pin clear` unpins it.",
+            "receipt")
+
     def _memory(self, arg: str) -> None:
         words = arg.split(None, 1)
         action = words[0].lower() if words else "list"
@@ -2785,6 +4295,117 @@ class TuiSession:
             return
         for scope, category, text in rows:
             self._append(f"[{scope}/{category}] {text}", "system")
+
+    def _pin(self, arg: str) -> None:
+        """`/pin [list|add REF|remove REF|clear]` -- explicit session pins."""
+        words = arg.split(None, 1)
+        action = words[0].lower() if words else "list"
+        rest = words[1].strip() if len(words) > 1 else ""
+        if action in ("list", "show", ""):
+            if not self.pins:
+                self._append(
+                    "No session pins. Use `/pin add <file|symbol>` "
+                    "(or type @file/@Class.method in a prompt).", "system")
+                return
+            self._append(f"Pinned context ({len(self.pins)}):", "system")
+            for ref in self.pins:
+                self._append(f"  {ref}", "system")
+            return
+        if action == "clear":
+            self.pins = []
+            self._sync_pins()
+            self._append("Session pins cleared.", "system")
+            return
+        if action in ("add", "remove"):
+            if not rest:
+                self._append(f"Usage: /pin {action} <file|symbol>", "error")
+                return
+            if action == "remove":
+                wanted = rest.lstrip("@").strip()
+                hit = [p for p in self.pins
+                       if p.lower() == wanted.lower()]
+                if not hit:
+                    hit = [p for p in self.pins
+                           if wanted.lower() in p.lower()]
+                if not hit:
+                    self._append(f"Not pinned: {wanted}", "error")
+                    return
+                for ref in hit:
+                    self.pins.remove(ref)
+                self._sync_pins()
+                self._append(f"Unpinned {', '.join(hit)}", "system")
+                return
+            target = self.idx
+            if target is None:
+                target = self.root
+            try:
+                pins = select_mod.resolve_pinned_references(rest, target)
+            except Exception as exc:
+                self._append(f"pin: {exc}", "error")
+                return
+            if not pins:
+                self._append(
+                    f"Could not resolve '{rest}' in this workspace. "
+                    "Try an exact path or indexed symbol name.", "error")
+                return
+            added = []
+            for pin in pins:
+                ref = (pin.symbol_name if pin.kind == "symbol" else pin.path)
+                if ref and ref not in self.pins:
+                    self.pins.append(ref)
+                    added.append(ref)
+            self._sync_pins()
+            if added:
+                self._append("Pinned " + ", ".join(added) + " (session)",
+                             "system")
+            else:
+                self._append("Already pinned.", "system")
+            return
+        self._append("Usage: /pin [list|add REF|remove REF|clear]", "error")
+
+    def _rules(self, arg: str) -> None:
+        """`/rules [list|set TEXT|clear]` -- `.pedacito/rules.md`."""
+        words = arg.split(None, 1)
+        action = words[0].lower() if words else "list"
+        rest = words[1].strip() if len(words) > 1 else ""
+        path = prompts_mod.project_rules_path(self.root)
+        rel = prompts_mod.RULES_REL
+        if action in ("list", "show"):
+            text = prompts_mod.load_project_rules(self.root)
+            if text:
+                self._append(f"Project rules ({rel}):", "system")
+                self._append(text, "system")
+            else:
+                self._append(
+                    f"{rel} is empty or absent. Use `/rules set <text>` "
+                    "to add persistent project instructions.", "system")
+            return
+        if action == "set":
+            if not rest:
+                self._append("Usage: /rules set <text>", "error")
+                return
+            text = rest
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+                text = text[1:-1]
+            try:
+                prompts_mod.save_project_rules(self.root, text)
+            except (OSError, ValueError) as exc:
+                self._append(f"rules: {exc}", "error")
+                return
+            self._append(f"Project rules saved to {rel}.", "system")
+            return
+        if action == "clear":
+            try:
+                prompts_mod.save_project_rules(self.root, "")
+            except (OSError, ValueError) as exc:
+                self._append(f"rules: {exc}", "error")
+                return
+            self._append(f"Project rules cleared ({rel}).", "system")
+            return
+        if action == "path" and path is not None:
+            self._append(str(path), "system")
+            return
+        self._append("Usage: /rules [list|set TEXT|clear]", "error")
 
     def _procs(self, arg: str) -> None:
         words = arg.split(None, 1)
@@ -2841,15 +4462,66 @@ class TuiSession:
             return
         self._append("No git changes or backup snapshots to show.", "system")
 
+    def _checkpoints(self, arg: str = "") -> None:
+        limit = 0
+        text = str(arg or "").strip()
+        if text:
+            try:
+                limit = max(1, int(text))
+            except ValueError:
+                limit = 0
+        try:
+            self._append(checkpoints_mod.render_list(self.root, limit=limit),
+                         "system")
+        except OSError as exc:
+            self._append(f"checkpoints: {exc}", "error")
+
+    def _checkout(self, arg: str) -> None:
+        checkpoint_id = str(arg or "").strip()
+        if not checkpoint_id:
+            self._append("Usage: /checkout <id> (see /checkpoints)",
+                         "error")
+            return
+        try:
+            resolved = checkpoints_mod.resolve_id(self.root, checkpoint_id)
+            result = checkpoints_mod.restore_checkpoint(self.root, resolved)
+        except (checkpoints_mod.CheckpointError, OSError) as exc:
+            self._append(f"checkout: {exc}", "error")
+            return
+        self._append(f"checkout: restored {result['files']} file(s) from "
+                     f"{resolved}; head is now {resolved}", "system")
+        for rel in result["restored"]:
+            self._append(f"  restored {rel}", "system")
+        for rel in result["deleted"]:
+            self._append(f"  deleted  {rel}", "system")
+        if result.get("skipped"):
+            self._append(f"  skipped {len(result['skipped'])} unsafe path(s)",
+                         "system")
+        if result.get("safety_id"):
+            self._append(f"  safety snapshot: {result['safety_id']}", "system")
+
     def _undo(self) -> None:
+        result = checkpoints_mod.undo_last_run(self.root)
+        if result.get("ok"):
+            self._append(f"undo: back to {result['undone_to']} "
+                         f"({result['files']} file(s) restored)", "system")
+            for rel in result["restored"]:
+                self._append(f"  restored {rel}", "system")
+            for rel in result["deleted"]:
+                self._append(f"  deleted  {rel}", "system")
+            if result.get("safety_id"):
+                self._append(f"  safety snapshot: {result['safety_id']}",
+                             "system")
+            return
+        # Projects that predate the checkpoint tree still have backup
+        # snapshots; keep the original one-step undo working there.
         try:
             snapshots = workspace.list_backups(self.root)
         except OSError as exc:
             self._append(f"could not list backups: {exc}", "error")
             return
         if not snapshots:
-            self._append("No backups under .pedacito/backups/ to restore.",
-                         "system")
+            self._append("No checkpoints or backups to restore.", "system")
             return
         snapshot = snapshots[0]
         try:
@@ -2861,6 +4533,117 @@ class TuiSession:
                      f"{snapshot.name}", "system")
         for rel in files:
             self._append(f"  restored {rel}", "system")
+
+    def _run_command(self, arg: str) -> None:
+        cmd = str(arg or "").strip() or None
+        if cmd is None:
+            targets = runner_mod.detect_runnable_targets(self.root)
+            if not targets["commands"]:
+                self._append("No runnable entrypoint detected. Use "
+                             "/run <command> to run one explicitly.", "system")
+                return
+            cmd = targets["commands"][0]
+        shown = (cmd if isinstance(cmd, str)
+                 else str((cmd or {}).get("command") or ""))
+        self._append(f"\u00bb /run {shown}".rstrip(), "user")
+
+        def work():
+            return runner_mod.run_project_command(self.root, cmd)
+
+        holder = self._run_in_worker(work)
+        error = holder.get("error")
+        if error is not None:
+            text = f"{type(error).__name__}: {error}"
+            self.last_traceback = text
+            self.last_run_failure = {
+                "ok": False, "command": shown, "exit_code": None,
+                "stdout": "", "stderr": text, "traceback_summary": "",
+            }
+            self._append(f"run failed: {text}", "error")
+            return
+        result = holder.get("result") or {}
+        for line in str(result.get("stdout") or "").splitlines():
+            self._append(line, "system")
+        for line in str(result.get("stderr") or "").splitlines():
+            self._append(line, "error")
+        tb = str(result.get("traceback_summary") or "").strip()
+        if tb and tb not in str(result.get("stderr") or ""):
+            for line in tb.splitlines():
+                self._append(line, "error")
+        if result.get("ok"):
+            self.last_run_failure = None
+            self.last_traceback = ""
+            self._append(f"run: ok (exit 0, {result.get('duration_ms', 0)} ms)"
+                         f" \u00b7 {result.get('command', '')}", "system")
+            return
+        self.last_run_failure = dict(result)
+        self.last_traceback = (str(result.get("traceback_summary") or "").strip()
+                               or str(result.get("stderr") or "").strip())
+        self._append(
+            f"run: FAILED exit {result.get('exit_code')} "
+            f"\u00b7 {result.get('command', '')} \u2014 type /fix to send the "
+            "failure into a repair task", "error")
+
+    def _fix_last_crash(self) -> None:
+        failure = self.last_run_failure
+        if not failure:
+            self._append("No failed /run to fix. Run something first.",
+                         "system")
+            return
+        prompt = runner_mod.crash_prompt(failure)
+        self._append("Sending the last crash into a repair task\u2026",
+                     "system")
+        self.run_task(prompt)
+
+    def _update(self, arg: str) -> None:
+        """`/update [run]`: installed vs latest PyPI release, the detected
+        install method, and the matching upgrade. `run` skips the y/N
+        confirmation; editable installs get git instructions, no command."""
+        run_now = arg.strip().lower() in ("run", "--run", "-y")
+        info = update_mod.check_for_update(self.cfg, manual=True)
+        if info["detail"] == "disabled":
+            self._append("Update checks are disabled (check_for_updates = "
+                         "false). No network call was made.\n"
+                         + info["instructions"], "system")
+            return
+        if not info["ok"]:
+            self._append("Could not reach PyPI (offline?). Nothing was "
+                         "changed.\nManual upgrade: " + info["instructions"],
+                         "system")
+            return
+        lines = [f"Installed: {info['current']}    Latest: {info['latest']}",
+                 f"Install method: {info['method']}"]
+        if not info["update_available"]:
+            self._append("\n".join(lines + ["You are up to date."]), "system")
+            return
+        lines.append(info["instructions"])
+        self._append("\n".join(lines), "system")
+        if info["command"] is None:
+            return                      # editable/source: instructions only
+        if not run_now and not self._confirm(
+                f"Upgrade to {info['latest']} now? (y/N):"):
+            self._append("upgrade cancelled", "system")
+            return
+        self._append("Running: " + " ".join(info["command"]), "system")
+        out: list[str] = []
+        code = update_mod.run_upgrade(info["command"], on_line=out.append)
+        tail = "\n".join(out[-40:])
+        prefix = tail + "\n" if tail else ""
+        if code == 0:
+            self._append(prefix + f"Upgrade finished (exit 0). Restart "
+                         f"Pedacito to run {info['latest']}.", "system")
+        else:
+            self._append(prefix + f"Upgrade failed (exit {code}).\n"
+                         f"Manual upgrade: {info['instructions']}", "error")
+
+    def _note_update(self, info: dict) -> None:
+        """The startup check's daemon-thread result: remember it, and drop
+        one quiet line into the transcript when a newer release exists."""
+        self.update_info = info
+        if info.get("update_available"):
+            self._append(f"Pedacito v{info['latest']} is available (you have "
+                         f"{info['current']}). Run /update to upgrade.",
+                         "system")
 
     def _confirm(self, question: str) -> bool:
         self._set_banner(question)
@@ -2939,6 +4722,8 @@ class TuiSession:
 
     def close(self) -> None:
         """Idempotent teardown: watcher, listeners, broker, terminal."""
+        with self._write_lock:
+            self._closed = True
         self._stop_watcher()
         try:
             if self._listener in self.elog.listeners:
@@ -2984,6 +4769,12 @@ class TuiSession:
             key = self.read_key_event(0.05)
             if key is None:
                 self._idle_tick()
+                continue
+            if key == "PASTE_START":
+                pasted = self._read_bracketed_paste()
+                if pasted:
+                    self.handle_paste(pasted)
+                    self._redraw()
                 continue
             if key == "CTRL_C":
                 if self.input_buf:
@@ -3042,14 +4833,156 @@ class TuiSession:
             self.close()
         return 0
 
+    def _set_lang(self, new_lang: str, *, persist: bool = True) -> str:
+        """Switch the TUI's active interface language, persist it, and log a notice."""
+        if not i18n.is_valid_lang(new_lang):
+            self._append(i18n.t("tui.lang_invalid", lang=self.lang,
+                                value=str(new_lang)), "error")
+            return self.lang
+        code = i18n.normalize_lang(new_lang)
+        self.lang = code
+        self.cfg.language = code
+        i18n.set_current_lang(code)
+        if persist:
+            try:
+                i18n.save_user_language(code)
+            except OSError:
+                pass
+        name = i18n.t(f"lang.{code}", lang=code)
+        self._append(i18n.t("tui.lang_switched", lang=code,
+                            name=name, code=code), "system")
+        self._dirty = True
+        return code
+
+    def _toggle_lang(self) -> str:
+        """Toggle interface language en <-> es (F3)."""
+        return self._set_lang("es" if self.lang == "en" else "en", persist=True)
+
+    def _lang_command(self, arg: str) -> None:
+        raw = str(arg or "").strip().lower()
+        if not raw:
+            name = i18n.t(f"lang.{self.lang}", lang=self.lang)
+            self._append(i18n.t("tui.lang_current", lang=self.lang,
+                                name=name, code=self.lang), "system")
+            return
+        self._set_lang(raw, persist=True)
+
+    def _image_command(self, arg: str) -> None:
+        """`/image PROMPT [--out FILE] [--size WxH] [--steps N] [--seed N]
+        [--cfg-scale F] [--negative TEXT] [--profile NAME]`."""
+        import shlex
+        from . import imagegen
+
+        raw = str(arg or "").strip()
+        if not raw:
+            self._append(i18n.t("tui.image.usage", lang=self.lang), "error")
+            return
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            tokens = raw.split()
+
+        out: str | None = None
+        size = ""
+        steps = 0
+        cfg_scale: float | None = None
+        seed: int | None = None
+        negative = ""
+        profile: str | None = None
+        prompt_parts: list[str] = []
+
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            flag = ""
+            val: str | None = None
+            if tok.startswith("--") and "=" in tok:
+                flag, val = tok.split("=", 1)
+            elif tok in ("--out", "--size", "--steps", "--cfg-scale",
+                         "--seed", "--negative", "--profile"):
+                flag = tok
+                if i + 1 < len(tokens):
+                    val = tokens[i + 1]
+                    i += 1
+            if flag == "--out" and val is not None:
+                out = val
+            elif flag == "--size" and val is not None:
+                size = val
+            elif flag == "--steps" and val is not None:
+                try:
+                    steps = int(val)
+                except ValueError:
+                    pass
+            elif flag == "--cfg-scale" and val is not None:
+                try:
+                    cfg_scale = float(val)
+                except ValueError:
+                    pass
+            elif flag == "--seed" and val is not None:
+                try:
+                    seed = int(val)
+                except ValueError:
+                    pass
+            elif flag == "--negative" and val is not None:
+                negative = val
+            elif flag == "--profile" and val is not None:
+                profile = val
+            else:
+                prompt_parts.append(tok)
+            i += 1
+
+        prompt = " ".join(prompt_parts).strip()
+        if not prompt:
+            self._append(i18n.t("tui.image.usage", lang=self.lang), "error")
+            return
+
+        self._append(
+            i18n.t("tui.image.generating", lang=self.lang, prompt=prompt[:80]),
+            "system",
+        )
+        holder = self._run_in_worker(lambda: imagegen.generate_image(
+            self.cfg, prompt,
+            output_path=out,
+            size=size,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            negative_prompt=negative,
+            profile=profile,
+            root=self.root,
+        ))
+        err = holder.get("error")
+        if err is not None:
+            if not isinstance(err, KeyboardInterrupt):
+                self._append(
+                    i18n.t("tui.image.error", lang=self.lang, message=str(err)),
+                    "error",
+                )
+            return
+        res = holder.get("result") or {}
+        rel = str(res.get("rel_path") or res.get("path") or "")
+        dims = (f"{res['width']}x{res['height']}"
+                if res.get("width") and res.get("height")
+                else str(res.get("format") or ""))
+        elapsed = f"{float(res.get('elapsed_s') or 0.0):.2f}s"
+        model = str(res.get("model") or "")
+        self._append(
+            i18n.t("tui.image.saved", lang=self.lang,
+                   path=rel, dims=dims, elapsed=elapsed, model=model),
+            "receipt",
+        )
+        if rel and rel not in self.modified:
+            self.modified.append(rel)
+
     def handle_command(self, line: str) -> bool:
         """Compatibility alias for callers that drive the session directly."""
         return self.handle_line(line)
 
 
 def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
+            initial_images: list[dict] | None = None,
             headless: bool = False, stdin=None, stdout=None,
-            client=None, apply: bool = True) -> int:
+            client=None, apply: bool = True, lang: str | None = None) -> int:
     """Entry point for `pedacito tui`; returns the process exit code.
 
     `headless=True`, or any non-TTY stdin, reads commands from `stdin` and
@@ -3058,5 +4991,6 @@ def run_tui(root: Path, cfg: Config, *, initial_task: str = "",
     """
     session = TuiSession(root, cfg, client=client, apply=apply,
                          headless=headless, stdin=stdin, stdout=stdout,
-                         initial_task=initial_task)
+                         initial_task=initial_task,
+                         initial_images=initial_images, lang=lang)
     return session.run()

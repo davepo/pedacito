@@ -1,3 +1,5 @@
+🌐 **English** | [Español](QUICKSTART.es.md)
+
 # Pedacito quickstart
 
 Pedacito lets a small local model work on a codebase that is far bigger than its
@@ -5,7 +7,9 @@ context window. It builds an index of your project, then lets the model fetch
 only the pieces it needs to answer a question or propose an edit. For the
 background, see the [README](README.md). For how the small-model techniques
 work, see [TECHNIQUES.md](TECHNIQUES.md). For choosing a model, see the
-[model guide](MODEL_GUIDE.md).
+[model guide](MODEL_GUIDE.md). The canonical reference for settings, commands and
+security is in [docs/](docs/), starting with [docs/CONFIG.md](docs/CONFIG.md). Custom skills, MCP
+servers and hooks are in [docs/SKILLS_AND_TOOLS.md](docs/SKILLS_AND_TOOLS.md).
 
 There are two ways in, and they run the same engine and read the same config:
 
@@ -19,6 +23,15 @@ shorter alias `pdc`, or `python -m pedacito` (`py -m pedacito` on Windows) if
 neither is on your `PATH`.
 
 ---
+
+## Switching language (EN | ES)
+
+Everything below works in English or Spanish. In the GUI use the **EN | ES** switcher in the
+top bar. In the TUI press `F3` or type `/lang es` (and `/profiles` lists your profiles). On the
+command line pass `--lang es` (for example `pedacito --lang es gui`) or set
+`PEDACITO_LANG=es`. The `language` and `llm_reply_language` settings make the choice permanent;
+see [docs/CONFIG.md](docs/CONFIG.md#language--localization-language-llm_reply_language) and
+[docs/USAGE.md](docs/USAGE.md#switching-language-en--es).
 
 ## Before you start
 
@@ -41,7 +54,7 @@ Pedacito talks to any server with an OpenAI-compatible `/v1` API.
 Ports are defaults, not rules. The scanner identifies each server by its replies,
 so two servers can run on one machine.
 
-Not sure which model size to load? The [VRAM quick reference](README.md#which-model-fits-your-gpu)
+Not sure which model size to load? The [VRAM quick reference](docs/INSTALLATION.md#which-model-fits-your-gpu)
 maps 6–8 GB, 12–16 GB, and 24 GB+ cards to the model sizes that work best on
 each. Start with one local model; add a hosted planner or verifier later if you
 want one, and it is optional.
@@ -113,6 +126,8 @@ Back in the top bar, the profile picker switches the model for the next task.
 Its status light shows whether the server is reachable. The **no-think** or
 **thinking** chip next to it shows whether reasoning is allowed for that profile,
 and a calibration badge shows whether the active model has a fresh model card.
+
+The scanned models list is collapsible per server (click a server's header) and closable with **Close**, so a long scan never pushes the rest of **Model discovery** off screen. Image generators show a **🎨 Image** badge and a **Probe image** button, which runs one fast 512×512 check.
 
 To measure every local model at once, open **Project ▾ → Calibrate All Local
 Models…** (also in **Settings → Model discovery**). A confirmation lists the
@@ -189,6 +204,10 @@ rewrites instead of the smallest-diff discipline. With the toggle off, design
 tasks (websites, restyles, `.html`/`.css`/UI-component work) are still
 auto-detected — that is `creative_auto`; `creative_mode = true` in the config
 forces it for every task (A21).
+
+**Routing and verification toggles.** **✦ Auto-route** (send each task to the specialist model whose tags fit) and **Post-edit verify** (run your `auto_verify` command after each Auto task) are checkboxes in the composer row, beside **✨ Creative**. The top bar only keeps the profile picker and the `EN | ES` switcher.
+
+**Generate an image.** With an image profile configured, open **Project ▾ → 🎨 Generate image…**, type a prompt, optionally set size, steps, seed or a save path, and click **Generate**. The file is saved under `.pedacito/images/` and previewed in the dialog.
 
 ### A6. Ask a question (Ask)
 
@@ -301,8 +320,11 @@ the checked IP so a second DNS answer cannot swap it mid-request.
   compacts a long chat into a handoff checkpoint (A20). The CLI prints the
   same numbers as a one-line ribbon after each task; `show_telemetry = false`
   hides it.
-- **Themes:** pick a color scheme from the theme menu in the top bar. There are
-  nine. The choice is saved to your config as `gui_theme`.
+- **Themes:** open the Theme Manager with the palette button in the top bar. It
+  offers nine built-in schemes (`slate`, `light`, `daylight`, `nord`, `midnight`,
+  `jazz_solo`, `trapper_keeper`, `memphis_arcade`, `windbreaker`) and any custom
+  themes you save — the same set the TUI's `/theme` offers. The choice is saved
+  in `themes.json` beside your config.
 - **Attach** a text file, or drag it into the chat box, to use it as the task, a
   question, or a spec.
 - **Steer:** while a task runs, type a note to redirect the model. You can also
@@ -393,7 +415,7 @@ to override the config.
 
 ### A19. Browse and create skills
 
-Skills are short checklists the model follows for one kind of task. Eighteen
+Skills are short checklists the model follows for one kind of task. Nineteen
 starters ship built in (testing, refactoring, FastAPI endpoints, canvas/SVG,
 SQLite migrations, async safety, security hardening, i18n, parsers,
 profiling, web design, desktop GUIs & games, …); the top-2 trigger matches
@@ -524,6 +546,27 @@ documented options to your config, commented out, without touching your
 existing settings or comments. `pedacito config --upgrade --dry-run` lists
 what would be added without writing.
 
+Pedacito also tells you when a newer release exists: one anonymous PyPI check
+at startup (cached 24 h, silent when offline). `pedacito update` shows
+installed vs latest, `pedacito update --run` upgrades with the command for
+your install method (pipx, venv or pip --user; editable checkouts get
+`git pull` instructions), the GUI shows a dismissible banner with a streamed
+upgrade and Restart, and the TUI has `/update`. Set `check_for_updates = false`
+to opt out entirely — zero network calls, everything else unchanged.
+
+Inspect the machine and, if you want, let Pedacito tune the profile from it:
+
+```bash
+pedacito profile            # RAM/VRAM with a source per number, last probe, tuning
+pedacito profile --run      # force a prefill/generation speed probe
+pedacito profile --reset    # drop cached measurements and the auto_tune opt-in
+```
+
+`auto_tune` is off by default. Set `auto_tune = true` in a profile to fit
+`context_tokens`, the retrieval budgets and timeout to free VRAM/RAM; explicit
+values always win and missing telemetry makes auto-tune abstain. See
+[Advanced system profiling and auto-tune](docs/CONFIG.md#advanced-system-profiling-and-auto-tune).
+
 ### B2. Find models and measure them
 
 ```bash
@@ -572,6 +615,17 @@ task command stops before the next model call once the estimated spend reaches
 that cap (it needs `price_*_per_mtok` set for the model). In the GUI footer,
 **KV Cache Hit %** shows how much of the prompt your local server reused, which
 is the number to watch if a long session starts feeling slow.
+
+### B2b. Generate an image (`pedacito image`)
+
+```bash
+pedacito image "a lighthouse at dusk, watercolor"
+pedacito image "app icon, flat" --size 512x512 --steps 4 --seed 7 --out assets/icon.png
+```
+
+Needs a profile with `modality = "image"` (auto-detected for Lemonade `sd-cpp`, Stable Diffusion and Flux
+servers; see [Model guide](MODEL_GUIDE.md#image-models-modality--image)). The file lands in `.pedacito/images/` unless
+you pass `--out`. Inside `pedacito tui`, `/image PROMPT` does the same.
 
 ### B3. See what would be indexed
 
@@ -693,6 +747,27 @@ During a task, the model can undo its own writes with the `undo` action (this
 needs `allow_write`, and backups are on by default). That reverts this task's
 snapshots and removes the files it created.
 
+For a finer rewind, every Task, Auto step and New scaffold also records a
+time-travel checkpoint (`.pedacito/checkpoints/`). Inspect the tree, restore a
+single file or the whole workspace, and branch a new run from any node:
+
+```bash
+pedacito undo ~/code/anki                    # state immediately before the last run
+pedacito checkpoints ~/code/anki             # ids, parents, modes, changed files
+pedacito checkout cp_0003_a1b2c3 ~/code/anki # restore the whole workspace
+pedacito checkout cp_0003 ~/code/anki --file app.py
+```
+
+The GUI header's **Checkpoints / Undo** button previews each checkpoint's
+unified diff and offers **Restore Entire Workspace**, **Restore Selected File**
+and **Branch Prompt From Here**. The TUI exposes `/checkpoints`, `/undo` and
+`/checkout ID`.
+
+The GUI's **Run** tab previews a static `index.html` live and runs detected
+entrypoints (`python main.py`, `pytest -q`, ...) or a custom command. A crash
+offers **Fix This Crash**, which fills the Task composer with the command,
+exit code and traceback. In the TUI use `/run [cmd]` and then `/fix`.
+
 ### B8. Ask a question (no edits)
 
 ```bash
@@ -793,12 +868,21 @@ optional SGR wheel capture, and `/mouse off` restores native selection.
 live bottom. A scrolled-back view shows `[ ↑ Scrolled back N lines ... ]` and
 stays stationary as new log lines arrive.
 
+**Multi-line input:** `Shift+Enter`, `Alt+Enter` or `Ctrl+J` add a newline, as
+does a trailing `\` then `Enter`; bracketed paste (`?2004h`) keeps a multi-line
+paste in the prompt as one block. `Enter` submits.
+
+**Images:** `/attach [PATH | list | clear]` or `@image.png` stages PNG/JPEG/WebP/GIF
+files for the next task. The same works elsewhere: `--image PATH` on the CLI
+(repeatable), and in the GUI `Ctrl+V` / `Cmd+V` paste, drag-and-drop or
+`📎 Attach`. Limits: 4 images, 10 MB each.
+
 Type a task as usual, or use `/help`, `/keys`, `/status`, `/auto GOAL`
 (single-pass edits get a Task-mode suggestion first; `/auto! GOAL` forces the
 multi-step loop), `/plan`, `/consolidate`, `/profile`, `/auto-route`, `/think`,
 `/creative [on|off|auto]` (design mode: on = every task, auto = detect design
 tasks, off = surgical edits), `/apply`,
-`/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
+`/image PROMPT` (draw an image with your image profile), `/skills`, `/memory`, `/procs`, `/diff`, `/undo`, `/reset`, `/sidebar`,
 `/scroll up|down|top|bottom|N`, `/mouse [on|off]`, `/clear` and `/quit`.
 Permission prompts appear in the prompt bar (`y` once, `a` for the session,
 `n` deny).
@@ -1026,6 +1110,7 @@ only the map is stale.
 | `pedacito calibrate` | Measure the model and save a model card that tunes defaults; `--all` walks every local profile (hosted models are refused) |
 | `pedacito profiles [--recommend]` | List profiles and their scores; suggest roles |
 | `pedacito how "..."` | Ask how to use Pedacito. No project needed |
+| `pedacito image PROMPT` | Draw an image with a configured image model (`--out`, `--size`, `--steps`, `--seed`) |
 | `pedacito files PROJ` | What would be indexed, and why. Free |
 | `pedacito cost PROJ` | What indexing will cost. Free |
 | `pedacito index PROJ` | Build or refresh the index |
@@ -1043,7 +1128,7 @@ only the map is stale.
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six diagnostic benchmarks and holdout rubric. `--list`/`--recent` are free; `--json`/`--strict` for CI |
 | `pedacito memory PROJ` | List, add, or forget remembered facts; `--consolidate` compacts session history into a handoff |
-| `pedacito skills [list\|show\|add\|draft\|rm] [PROJ]` | Browse and manage the skill library (18 built-ins + custom); `--global` targets the user library |
+| `pedacito skills [list\|show\|add\|draft\|rm] [PROJ]` | Browse and manage the skill library (19 built-ins + custom); `--global` targets the user library |
 | `pedacito tests PROJ --files F` | Detected test command, and the tests an edit to F can break |
 | `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
 | `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors, unbound controls and silent Web Audio failures (needs Playwright) |

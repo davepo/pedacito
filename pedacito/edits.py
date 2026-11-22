@@ -424,10 +424,15 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
         found.append((m.start(), Edit(fname, search, replace,
                                       lines=lines_anchor,
                                       symbol=symbol_anchor)))
+    def _in_owned(pos: int) -> bool:
+        return any(a <= pos < b for a, b in owned)
+
     # Zero-anchor splice blocks: `<<<<<<< SYMBOL file :: name` (replace) and
     # `<<<<<<< AFTER_SYMBOL file :: name` (insert after), closed by
     # `>>>>>>> END_SYMBOL`. No SEARCH section exists to quote or mis-indent.
     for m in SYMBOL_BLOCK_RE.finditer(cleaned):
+        if _in_owned(m.start()):
+            continue
         owned.append((m.start(), m.end()))
         kind = m.group("kind").upper()
         fname = fileio.normalise_rel(m.group("file").strip())
@@ -441,9 +446,6 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
     # DELETE`, or a bare `DELETE_FILE: path` line. The body between the
     # markers is ignored; a DELETE quoted inside another block's body is
     # documentation, not an edit (the `owned` spans above).
-    def _in_owned(pos: int) -> bool:
-        return any(a <= pos < b for a, b in owned)
-
     for m in DELETE_BLOCK_RE.finditer(cleaned):
         if _in_owned(m.start()):
             continue
@@ -459,7 +461,9 @@ def parse_edits(text: str, discards: list | None = None) -> list[Edit]:
             continue
         fname = fileio.normalise_rel(m.group("file").strip())
         found.append((m.start(), Edit(fname, "", "", delete=True)))
-    found.extend(parse_edit_actions(cleaned))
+    for pos, act in parse_edit_actions(cleaned):
+        if not _in_owned(pos):
+            found.append((pos, act))
     found.sort(key=lambda t: t[0])
     return [e for _pos, e in found]
 
@@ -487,16 +491,27 @@ def locate(haystack: str, needle: str, cfg=None,
     defaults to the needle, a no-op, for callers that only want the span.
 
     Tries, in order: an exact unique match; a whitespace-tolerant unique match
-    (trailing whitespace and blank lines ignored); and, when `cfg.fuzzy_match`
+    (trailing whitespace ignored); a deterministic dedent-normalized unique
+    match (stripping common leading indent and re-indenting `replacement` to
+    the matched window's base indentation); and, when `cfg.fuzzy_match`
     allows, a similarity match against every same-length window, accepted only
     if the best window clears `cfg.fuzzy_min_ratio` and clearly beats the
     runner-up. An ambiguous match is always a failure: editing the wrong
     occurrence silently is worse than asking the model for more context.
     """
     repl = needle if replacement is None else replacement
-    span = _locate(haystack, needle)
-    if span is not None:
-        return Span(*span, repl)
+    hit = _locate_with_indent(haystack, needle)
+    if hit is not None:
+        start, stop, win_base, need_base = hit
+        if win_base != need_base and repl.strip():
+            win_w = len(win_base.expandtabs(4))
+            need_w = len(need_base.expandtabs(4))
+            delta = win_w - need_w
+            rep_w = len(_common_indent(repl.split("\n")).expandtabs(4))
+            if delta < 0 and rep_w < -delta:
+                delta = win_w - rep_w
+            repl = _shift_indent(repl, delta, win_base)
+        return Span(start, stop, repl)
     if haystack.count(needle) > 1:
         return None
     if not (cfg is not None and getattr(cfg, "fuzzy_match", False)):
@@ -636,32 +651,102 @@ def _closest_hint(text: str, needle: str, cfg=None) -> str:
             "text in REPLACE (SEARCH empty).")
 
 
-def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
-    """Find the unique span of `needle` in `haystack`: exact match first, then
-    a retry ignoring trailing whitespace per line. Ambiguous matches fail."""
+def _common_indent(lines: list[str]) -> str:
+    """Minimum leading whitespace (by 4-col tab width) across non-blank lines."""
+    best: str | None = None
+    best_w = -1
+    for ln in lines:
+        if not ln.strip():
+            continue
+        ind = ln[: len(ln) - len(ln.lstrip())]
+        w = len(ind.expandtabs(4))
+        if best is None or w < best_w:
+            best, best_w = ind, w
+    return best or ""
+
+
+def _dedent_lines(lines: list[str]) -> list[str]:
+    """Strip common leading indent (in 4-col tab columns) and trailing
+    whitespace from every line, leaving blank lines empty."""
+    widths = [len(ln[: len(ln) - len(ln.lstrip())].expandtabs(4))
+              for ln in lines if ln.strip()]
+    if not widths:
+        return ["" for _ in lines]
+    min_w = min(widths)
+    out: list[str] = []
+    for ln in lines:
+        if not ln.strip():
+            out.append("")
+        else:
+            out.append(ln.rstrip().expandtabs(4)[min_w:])
+    return out
+
+
+def _locate_with_indent(haystack: str, needle: str
+                        ) -> tuple[int, int, str, str] | None:
+    """Find the unique span of `needle` in `haystack` as
+    `(start, end, win_base_indent, needle_base_indent)`:
+    1. exact unique match;
+    2. trailing-whitespace-tolerant unique match;
+    3. dedent-normalized unique match (stripping common leading indent).
+    Ambiguous matches fail at every tier."""
     if not needle.strip():
         return None
     n = haystack.count(needle)
     if n == 1:
         i = haystack.index(needle)
-        return i, i + len(needle)
+        return i, i + len(needle), "", ""
     if n > 1:
         return None
 
     hay, need = _rstripped_lines(haystack), _rstripped_lines(needle)
     if not need:
         return None
-    starts = [i for i in range(len(hay) - len(need) + 1) if hay[i : i + len(need)] == need]
-    if len(starts) != 1:
+
+    def _window_char_span(s: int) -> tuple[int, int]:
+        lines = haystack.splitlines(keepends=True)
+        seg = lines[s : s + len(need)]
+        start = sum(len(x) for x in lines[:s])
+        # Exclude the final line terminator: exact-match needles carry none.
+        tail = len(seg[-1]) - len(seg[-1].rstrip("\r\n"))
+        end = start + sum(len(x) for x in seg) - tail
+        return start, end
+
+    starts = [i for i in range(len(hay) - len(need) + 1)
+              if hay[i : i + len(need)] == need]
+    if len(starts) == 1:
+        start, end = _window_char_span(starts[0])
+        return start, end, "", ""
+    if len(starts) > 1:
         return None
-    s = starts[0]
-    lines = haystack.splitlines(keepends=True)
-    seg = lines[s : s + len(need)]
-    start = sum(len(x) for x in lines[:s])
-    # Exclude the final line terminator: exact-match needles carry none.
-    tail = len(seg[-1]) - len(seg[-1].rstrip("\r\n"))
-    end = start + sum(len(x) for x in seg) - tail
-    return start, end
+
+    # Tier 3: deterministic dedent-normalized unique match.
+    need_ded = _dedent_lines(need)
+    if not any(need_ded):
+        return None
+    first_stripped = need[0].lstrip()
+    ded_starts: list[int] = []
+    k = len(need)
+    for i in range(len(hay) - k + 1):
+        if hay[i].lstrip() != first_stripped:
+            continue
+        if _dedent_lines(hay[i : i + k]) == need_ded:
+            ded_starts.append(i)
+            if len(ded_starts) > 1:
+                return None
+    if len(ded_starts) != 1:
+        return None
+    s = ded_starts[0]
+    start, end = _window_char_span(s)
+    return start, end, _common_indent(hay[s : s + k]), _common_indent(need)
+
+
+def _locate(haystack: str, needle: str) -> tuple[int, int] | None:
+    """Find the unique span of `needle` in `haystack`: exact match first,
+    then trailing-whitespace tolerant, then dedent-normalized. Ambiguous
+    matches fail."""
+    hit = _locate_with_indent(haystack, needle)
+    return None if hit is None else (hit[0], hit[1])
 
 
 def _indent_of_line(text: str, lineno: int) -> str:
@@ -671,6 +756,43 @@ def _indent_of_line(text: str, lineno: int) -> str:
         return ""
     ln = lines[lineno - 1]
     return ln[: len(ln) - len(ln.lstrip())]
+
+
+def _shift_indent(body: str, delta: int, base_indent: str) -> str:
+    """Shift every non-blank line in `body` by `delta` 4-col tab columns,
+    preserving relative indentation and handling tab-dedent overshoots."""
+    if delta == 0:
+        return body
+    out: list[str] = []
+    for ln in body.split("\n"):
+        if not ln.strip():
+            out.append(ln)
+            continue
+        if delta > 0:
+            pad = ("\t" * (delta // 4) if "\t" in base_indent and delta % 4 == 0
+                   else " " * delta)
+            out.append(pad + ln)
+        else:
+            drop = -delta
+            nlead = len(ln) - len(ln.lstrip())
+            ind = ln[:nlead]
+            if " \t" in ind:
+                # A space before a tab makes the tab's column width depend on
+                # its starting column; expand to exact columns before dedenting.
+                ind = ind.expandtabs(4)
+                out.append(ind[drop:] + ln[nlead:])
+                continue
+            j = 0
+            while j < len(ind) and drop > 0:
+                drop -= 4 if ind[j] == "\t" else 1
+                j += 1
+            if drop < 0:                     # overshot a tab stop: restore excess spaces
+                j -= 1
+                ind = ind[j + 1:] + (" " * -drop)
+                out.append(ind + ln[nlead:])
+                continue
+            out.append(ind[j:] + ln[nlead:])
+    return "\n".join(out)
 
 
 def normalise_symbol_indent(body: str, base_indent: str) -> str:
@@ -697,30 +819,7 @@ def normalise_symbol_indent(body: str, base_indent: str) -> str:
         return body
     cur_w = len(cur.expandtabs(4))
     base_w = len(base_indent.expandtabs(4))
-    delta = base_w - cur_w
-    out = []
-    for ln in lines:
-        if not ln.strip():
-            out.append(ln)
-            continue
-        if delta >= 0:
-            pad = ("\t" * (delta // 4) if "\t" in base_indent and delta % 4 == 0
-                   else " " * delta)
-            out.append(pad + ln)
-        else:
-            drop = -delta
-            ind = ln[: len(ln) - len(ln.lstrip())]
-            j = 0
-            while j < len(ind) and drop > 0:
-                drop -= 4 if ind[j] == "\t" else 1
-                j += 1
-            if drop < 0:                     # would eat into the token itself
-                j -= 1
-                ind = ind[:j] + (" " * -drop)
-                out.append(ind + ln[len(ln) - len(ln.lstrip()):])
-                continue
-            out.append(ind[j:] + ln[len(ln) - len(ln.lstrip()):])
-    return "\n".join(out)
+    return _shift_indent(body, base_w - cur_w, base_indent)
 
 
 def _leading_decorators(original: str, a: int, b: int) -> list[str]:
@@ -855,6 +954,39 @@ _EXPORT_FORM_RE = re.compile(
     r"|\b(?:window|globalThis)\[\s*['\"][A-Za-z_$][\w$]*['\"]\s*\]\s*=(?!=)")
 _JS_FAMILY_EXT = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts",
                   ".cts")
+
+
+_IMPLAUSIBLE_PATH_CHARS = set('`${};=<>|"*?\x00\n\r\t\'()[]:,#@')
+
+
+def _plausible_new_path(rel: str) -> bool:
+    """Whether `rel` looks like a file path rather than a copied code line.
+
+    A model can emit the line it meant to edit as the `--- FILE:` header. The
+    path is normalised and confined to the project, so that used to create a
+    real file named after the code line (for example
+    `tile.className = `tile tile-${value}`;`) while the target file stayed
+    untouched. New paths must not carry code/prose punctuation or padded
+    segments. The punctuation set covers the common code-line shapes --
+    single-quoted calls (`console.log('hi')`), signatures (`def greet(name):`),
+    indexing (`arr[0]`), comments (`# ...`) and decorators (`@app.route`) --
+    while leaving ordinary names alone (`Q&A.md`, `a+b.txt`, `my file.txt`,
+    unicode names). A multi-word basename with no extension (`import os`,
+    `return x`) is a code line too: real extensionless files (Makefile,
+    LICENSE) are single tokens.
+    """
+    if not rel or len(rel) > 240:
+        return False
+    if any(ch in _IMPLAUSIBLE_PATH_CHARS for ch in rel):
+        return False
+    parts = Path(rel).parts
+    if not parts or not all(part and part == part.strip()
+                            and part not in (".", "..") for part in parts):
+        return False
+    name = parts[-1]
+    if " " in name and "." not in name:
+        return False
+    return True
 
 
 def _wipe_refusal(rel: str) -> str:
@@ -1021,7 +1153,10 @@ def _replace_already_present(text: str, repl: str, start: int = -1,
         return False
     if not want:
         return False
-    hay = _content_lines(text if start < 0 else text[start:])
+    if start >= 0:
+        hay = _content_lines(text[start:])
+        return hay[:len(want)] == want
+    hay = _content_lines(text)
     for i in range(len(hay) - len(want) + 1):
         if hay[i:i + len(want)] == want:
             if len(want) == 1 and hay.count(want[0]) != 1:
@@ -1541,8 +1676,15 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                         if not e.search.strip() and not _is_anchored(e)]
             if creating and len(creating) == len(group):
                 original = None
+                style = None
                 if path.is_file():
-                    original, _sty = fileio.read(path, errors="replace")
+                    original, style = fileio.read(path, errors="replace")
+                if original is None and not _plausible_new_path(rel):
+                    results.append(Result(
+                        False, rel,
+                        "refusing to create this file: its name looks like a "
+                        "copied source line, not a project path"))
+                    continue
                 text = _creation_text(group)
                 note = f"created with {len(text.splitlines())} line(s)"
                 if original is not None:
@@ -1568,7 +1710,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 if gone:
                     note += (" [already absent, nothing to move: " +
                              ", ".join(gone) + "]")
-                results.append(_finish(rel, path, original, text, None, note,
+                results.append(_finish(rel, path, original, text, style, note,
                                        renames_from=srcs_now,
                                        whole_file=original is not None
                                        and not srcs_now))
@@ -1627,9 +1769,10 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     if not e.lines and (e.symbol or e.insert_after):
                         # Zero-anchor splice (or a SYMBOL header no index
                         # resolved): locate the definition's exact span from the
-                        # AST/tree-sitter, right now, on the current bytes.
+                        # AST/tree-sitter on the evolving in-memory `text` so
+                        # sequential SYMBOL/AFTER_SYMBOL edits compose cleanly.
                         sym = e.symbol or e.insert_after
-                        span = locate_symbol_span(path, sym)
+                        span = locate_symbol_span(path, sym, text=text)
                         if span is None:
                             results.append(Result(
                                 False, rel,
@@ -1642,24 +1785,24 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             break
                         s0, e0, base_ind = span
                         body = normalise_symbol_indent(e.replace, base_ind)
+                        lspan = _line_span(text, s0, e0)
+                        if lspan is None:
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: symbol '{sym}' resolved to lines "
+                                f"{s0}-{e0}, which are out of bounds in this "
+                                "file; `read` it again"))
+                            failed = True
+                            break
+                        needle = text[lspan[0]:lspan[1]]
+                        if not needle.strip():
+                            results.append(Result(
+                                False, rel,
+                                f"block {k}: symbol '{sym}' spans only blank "
+                                "lines; nothing to anchor an edit against"))
+                            failed = True
+                            break
                         if e.insert_after:
-                            lspan = _line_span(original, s0, e0)
-                            if lspan is None:
-                                results.append(Result(
-                                    False, rel,
-                                    f"block {k}: symbol '{sym}' resolved to lines "
-                                    f"{s0}-{e0}, which are out of bounds in this "
-                                    "file; `read` it again"))
-                                failed = True
-                                break
-                            needle = original[lspan[0]:lspan[1]]
-                            if not needle.strip():
-                                results.append(Result(
-                                    False, rel,
-                                    f"block {k}: symbol '{sym}' spans only blank "
-                                    "lines; nothing to anchor an insert after"))
-                                failed = True
-                                break
                             repl = needle
                             if body.strip():
                                 if not repl.endswith("\n"):
@@ -1669,8 +1812,27 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                             e = Edit(e.file, needle, repl)
                             converted = True
                         else:
-                            e = Edit(e.file, e.search, body,
-                                     lines=(s0, e0), symbol=sym)
+                            repl = body
+                            decs = _leading_decorators(text, s0, e0)
+                            if decs and repl.strip() \
+                                    and not repl.lstrip().startswith("@"):
+                                repl = "\n".join(decs) + "\n" + repl
+                            if repl and needle.endswith("\n") and not repl.endswith("\n"):
+                                repl += "\n"
+                            total_lines = len(text.splitlines())
+                            if s0 <= 1 and e0 >= total_lines:
+                                whole_file = True
+                                whole = repl if not repl or repl.endswith("\n") \
+                                    else repl + "\n"
+                                refusal = fragment_refusal(rel, text, whole, task=task_text)
+                                if refusal:
+                                    results.append(Result(False, rel,
+                                                          f"block {k}: {refusal}"))
+                                    failed = True
+                                    break
+                            anchored[k] = (s0, e0)
+                            e = Edit(e.file, needle, repl)
+                            converted = True
                     if not converted:
                         if not e.lines:
                             results.append(Result(

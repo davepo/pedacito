@@ -15,6 +15,7 @@ model server may optionally rewrite the retrieved facts into a shorter answer
 from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 
 from .config import Config
@@ -31,6 +32,54 @@ _STOP = {
     "with", "would", "you", "your", "please", "want", "need", "there",
     "option", "options", "preference", "preferences", "set", "up",
 }
+
+# Spanish question filler (accent-folded), so Spanish questions rank offline.
+_ES_STOP = {
+    "como", "cual", "cuales", "que", "quien", "donde", "cuando", "por",
+    "para", "con", "sin", "el", "la", "los", "las", "un", "una", "unos",
+    "unas", "de", "del", "al", "en", "es", "se", "mi", "mis", "tu", "tus",
+    "su", "puedo", "puedes", "quiero", "necesito", "hacer", "hay", "y", "o",
+    "lo", "le", "me", "te", "cambio", "cambiar", "uso", "usar", "esta",
+    "este", "eso", "muy", "mas", "ya", "no", "si",
+}
+
+_ES_SYNONYMS = {
+    "idioma": ("language", "lang", "es", "spanish", "espanol"),
+    "lenguaje": ("language", "lang"),
+    "espanol": ("language", "lang", "es", "spanish"),
+    "configurar": ("configure", "setup", "config", "settings"),
+    "configuracion": ("configuration", "config", "settings", "toml"),
+    "modelo": ("model", "models", "profile", "server"),
+    "modelos": ("model", "models", "profile", "server"),
+    "deshacer": ("undo", "restore", "backup", "snapshot"),
+    "revertir": ("revert", "restore", "backup", "snapshot"),
+    "tema": ("theme", "appearance", "gui"),
+    "habilidad": ("skill", "skills"),
+    "habilidades": ("skill", "skills"),
+    "instalar": ("install", "pip", "setup"),
+    "instalacion": ("install", "pip", "setup"),
+    "comando": ("command", "commands", "cli", "usage"),
+    "comandos": ("command", "commands", "cli", "usage"),
+    "error": ("fail", "failure", "troubleshoot"),
+    "ayuda": ("help", "how"),
+    "herramienta": ("tool", "tools"),
+    "herramientas": ("tool", "tools"),
+    "indice": ("index", "indexing"),
+    "ignorar": ("ignore", "exclude", "pedacitoignore"),
+    "archivo": ("file", "files"),
+    "archivos": ("file", "files"),
+    "cambios": ("changes", "apply", "review"),
+    "seguridad": ("security", "sandbox", "permissions"),
+    "memoria": ("memory", "vram", "gpu", "context"),
+    "lento": ("slow", "performance", "context"),
+}
+
+
+def _fold(text: str) -> str:
+    """Strip accents so "cómo" and "como" match (English text is unchanged)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(c))
+
 
 _SYNONYMS = {
     "setup": ("configure", "configuration", "init", "install", "config"),
@@ -111,9 +160,9 @@ _PHRASE_HINTS = {
 def _terms(question: str) -> dict[str, float]:
     """Weighted lowercase terms, with light synonym expansion."""
     raw: list[str] = []
-    for word in _WORD_RE.findall(question.lower()):
+    for word in _WORD_RE.findall(_fold(question.lower())):
         word = word.strip(".-/")
-        if len(word) >= 2 and word not in _STOP:
+        if len(word) >= 2 and word not in _STOP and word not in _ES_STOP:
             raw.append(word)
     weights: dict[str, float] = {}
     for word in raw:
@@ -127,7 +176,7 @@ def _terms(question: str) -> dict[str, float]:
         if word.endswith("s") and len(word) > 4:
             weights.setdefault(word[:-1], 0.5)
     for term in list(weights):
-        for synonym in _SYNONYMS.get(term, ()):
+        for synonym in _SYNONYMS.get(term, ()) + _ES_SYNONYMS.get(term, ()):
             weights.setdefault(synonym, 0.55)
     return weights
 
@@ -163,7 +212,12 @@ COMMON_FLAGS = [
      "help": "server base URL, e.g. http://localhost:1234/v1"},
     {"flag": "--model ID", "help": "model id/name as the server reports it"},
     {"flag": "--root DIR", "help": "project root (default: inferred)"},
+    {"flag": "--image PATH",
+     "help": "attach a PNG/JPEG/WebP/GIF image to the task; repeatable "
+             "(max 4, 10 MB each)"},
     {"flag": "--config FILE", "help": "use this config file as well"},
+    {"flag": "--lang {en,es}",
+     "help": "interface language for this run (also PEDACITO_LANG)"},
     {"flag": "--profile NAME", "help": "apply a [profiles.NAME] block"},
     {"flag": "--steps N",
      "help": "hard lookup limit for gather; 0 = no limit (the default)"},
@@ -228,6 +282,7 @@ CLI_COMMANDS = [
             'pedacito ask . -t "add retries" --review',
             'pedacito ask . -t "refactor pricing and billing" --plan --review-plan',
             'pedacito ask . -t "finish the previous task" --continue',
+            'pedacito ask . -t "fix the parser tests" --apply --json --verify-cmd "pytest -q"',
         ],
         "flags": [
             {"flag": "-t, --task TEXT", "help": "the task (required)"},
@@ -236,6 +291,14 @@ CLI_COMMANDS = [
              "help": "open the side-by-side review page before writing"},
             {"flag": "--no-review",
              "help": "never open the reviewer, even if config enables it"},
+            {"flag": "--json",
+             "help": "one JSON summary object on stdout at run end (human "
+                     "output to stderr); turns = model calls; implies "
+                     "--no-review"},
+            {"flag": "--verify-cmd COMMAND",
+             "help": "run this verification command once after an applied "
+                     "task; overrides auto_verify for this run only (never "
+                     "written to config)"},
             {"flag": "--reindex", "help": "force a fresh index first"},
             {"flag": "--refine",
              "help": "expand a one-line idea into a repo-aware spec first"},
@@ -342,6 +405,9 @@ CLI_COMMANDS = [
              "help": "new project directory (created; must be empty)"},
             {"flag": "-t, --task TEXT", "help": "one-line project description"},
             {"flag": "--spec FILE", "help": "larger spec (.md/.txt)"},
+            {"flag": "--image PATH",
+             "help": "attach a reference image (PNG/JPEG/WebP/GIF); "
+                     "repeatable, max 4 at 10 MB each"},
             {"flag": "--refine",
              "help": "expand a one-line idea into a repo-aware spec first"},
             {"flag": "--plan-only",
@@ -361,7 +427,9 @@ CLI_COMMANDS = [
             {"flag": "--repair N",
              "help": "with --complex: fix rounds per failed verification"},
             {"flag": "--max-tasks N", "help": "with --complex: task cap"},
-            {"flag": "--max-minutes N", "help": "with --complex: minute cap"},
+            {"flag": "--max-minutes N",
+             "help": "wall-clock minute cap for the whole run (checked between "
+                     "calls and files)"},
             {"flag": "--keep-going",
              "help": "with --complex: continue past failures"},
             {"flag": "--auto-install",
@@ -423,7 +491,8 @@ CLI_COMMANDS = [
                      "sidebar", "plan",
                      "slash commands", "live activity", "scroll", "pgup",
                      "pgdn", "mouse wheel", "keybindings", "tab completion",
-                     "command history"],
+                     "command history", "/image", "/attach", "multi-line",
+                     "bracketed paste", "shift+enter"],
         "examples": [
             "pedacito tui .",
             "pedacito tui ~/code/anki --apply",
@@ -459,8 +528,16 @@ CLI_COMMANDS = [
             "Slash commands: /help, /keys, /status (/telemetry), /auto GOAL, "
             "/auto! GOAL (force the multi-step loop, skipping the Task-mode "
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
-            "/auto-route, /think, /creative, /apply, /skills, /memory, /procs, "
-            "/diff, /undo, /reset, /sidebar, /scroll, /mouse, /clear, /quit",
+            "/auto-route, /think, /creative, /apply, /verify on|off|status, "
+            "/skills, /memory, /procs, /diff, /undo, /image, /attach, "
+            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/attach [PATH | list | clear] (or @image.png) stages "
+            "PNG/JPEG/WebP/GIF images for the next task (max 4, 10 MB each)",
+            "Multi-line input: Shift+Enter, Alt+Enter, Ctrl+J or a trailing "
+            "\\ then Enter insert a newline; bracketed paste (?2004h) keeps "
+            "a multi-line paste as one block; Enter submits",
+            "/lang [en|es] switches the interface language; F3 toggles "
+            "EN/ES",
             "/auto GOAL nudges single-pass edits: when the goal looks like a "
             "one-pass Task (existing-file tweaks, localized edit verbs, a "
             "tiny project), the TUI asks 'Run as a single-pass Task instead? "
@@ -682,6 +759,105 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "models show",
+        "usage": "pedacito models [show] [--json]",
+        "summary": "Print the active model's tuned numbers next to its "
+                   "profile info: hardware snapshot, footprint confidence, "
+                   "last speed probe, context/timeout/max_concurrency and the "
+                   "per-field auto-tune sources. The default when no action "
+                   "is given; `models scan` is unchanged.",
+        "keywords": ["models", "show models", "tuned numbers", "auto tune",
+                     "context tokens", "timeout", "vram", "profile info"],
+        "examples": [
+            "pedacito models",
+            "pedacito models show",
+            "pedacito models --json",
+        ],
+        "flags": [
+            {"flag": "show", "help": "print the active profile's tuning "
+                                     "(the default)"},
+            {"flag": "--json", "help": "print structured JSON"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
+        "name": "profile",
+        "usage": "pedacito profile [--show | --run | --reset] [--json]",
+        "summary": "Show the vendor-neutral hardware snapshot (RAM/VRAM with a "
+                   "source per number), the last cached speed probe and the "
+                   "active auto-tune. --run forces one prefill/generation "
+                   "probe; --reset drops cached measurements and turns off an "
+                   "explicit auto_tune opt-in.",
+        "keywords": ["profile", "profiling", "hardware snapshot", "auto tune",
+                     "auto_tune", "vram", "ram", "nvidia-smi", "vm_stat",
+                     "winapi", "prefill", "tokens per second", "confidence",
+                     "kv cache", "footprint"],
+        "examples": [
+            "pedacito profile",
+            "pedacito profile --show",
+            "pedacito profile --run",
+            "pedacito profile --reset",
+            "pedacito profile --show --json --profile strata",
+        ],
+        "flags": [
+            {"flag": "--show", "help": "snapshot + last probe + active tuning"},
+            {"flag": "--run", "help": "force a speed/prefill probe now"},
+            {"flag": "--reset", "help": "drop cached measurements and the "
+                                        "auto_tune opt-in"},
+            {"flag": "--json", "help": "print structured JSON"},
+            {"flag": "--config FILE", "help": "use this config file"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+    },
+    {
+        "name": "image",
+        "usage": 'pedacito image PROMPT [--out FILE] [--size WxH] '
+                 '[--steps N] [--seed N] [--profile NAME]',
+        "summary": "Generate one image with a configured image-model "
+                   "profile (modality = \"image\": Lemonade sd-cpp, Stable "
+                   "Diffusion, Flux or a hosted image endpoint) and save it "
+                   "inside the workspace, by default under "
+                   ".pedacito/images/. No chat model is involved. The same "
+                   "call is the /image slash command in the TUI and the "
+                   "Project menu's Generate image dialog in the GUI.",
+        "keywords": ["image", "generate image", "draw", "picture",
+                     "stable diffusion", "flux", "sd-cpp", "lemonade",
+                     "text to image", "image generation", "txt2img"],
+        "examples": [
+            'pedacito image "a lighthouse at dusk, watercolor"',
+            'pedacito image "app icon, flat" --size 512x512 --steps 4 '
+            '--out assets/icon.png',
+            'pedacito image "a red fox" --seed 7 --json',
+        ],
+        "flags": [
+            {"flag": "PROMPT", "help": "description of the image"},
+            {"flag": "--out FILE",
+             "help": "output path inside the workspace (default "
+                     ".pedacito/images/...)"},
+            {"flag": "--size WxH",
+             "help": "dimensions, e.g. 1024x1024 (default image_default_size)"},
+            {"flag": "--steps N",
+             "help": "diffusion steps (default image_default_steps; 0 = "
+                     "the server's own)"},
+            {"flag": "--cfg-scale F", "help": "classifier-free guidance scale"},
+            {"flag": "--seed N", "help": "random seed for reproducible output"},
+            {"flag": "--negative TEXT", "help": "what to avoid"},
+            {"flag": "--profile NAME", "help": "image profile to use"},
+            {"flag": "--json", "help": "print the result as a JSON object"},
+        ],
+        "notes": [
+            "Needs an image profile: modality = \"image\" on the profile "
+            "(auto-detected by models scan) and image_profile naming it; "
+            "empty image_profile uses the first image profile found",
+            "allow_image_gen = true additionally exposes the generate_image "
+            "agent action; it is an execution switch, ignored from a "
+            "project's own config until pedacito trust",
+            "pedacito calibrate on an image profile runs a single 512x512 "
+            "readiness probe instead of the text probes",
+        ],
+    },
+    {
         "name": "rename",
         "usage": "pedacito rename OLD NEW [--file PATH] [--strings] "
                  "[--include-labels] [--apply] [--root DIR]",
@@ -750,6 +926,62 @@ CLI_COMMANDS = [
              "help": "also delete files that run created"},
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--config FILE", "help": "use this config file as well"},
+        ],
+    },
+    {
+        "name": "undo",
+        "usage": "pedacito undo [PROJECT] [--list]",
+        "summary": "Undo the last run: restore the workspace to the state "
+                   "immediately before the active checkpoint (or the newest "
+                   "backup snapshot on older projects).",
+        "keywords": ["undo", "revert", "last run", "checkpoint", "rollback"],
+        "examples": [
+            "pedacito undo .",
+            "pedacito undo . --list",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--list", "help": "show the checkpoint tree instead"},
+        ],
+    },
+    {
+        "name": "checkpoints",
+        "usage": "pedacito checkpoints PROJECT [--limit N] [--json]",
+        "summary": "List the time-travel checkpoint tree: ids, parents, "
+                   "timestamps, modes, prompts and changed-file counts.",
+        "keywords": ["checkpoint", "timeline", "history", "snapshot",
+                     "time travel", "branch"],
+        "examples": [
+            "pedacito checkpoints .",
+            "pedacito checkpoints . --limit 10",
+            "pedacito checkpoints . --json",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--limit N", "help": "show only the newest N checkpoints"},
+            {"flag": "--json", "help": "print structured metadata"},
+        ],
+    },
+    {
+        "name": "checkout",
+        "usage": "pedacito checkout ID [PROJECT] [--file PATH]",
+        "summary": "Restore the whole workspace, or one file, from a "
+                   "checkpoint. The restored checkpoint becomes the active "
+                   "head, so the next run branches from it.",
+        "keywords": ["checkout", "restore checkpoint", "time travel",
+                     "branch", "undo"],
+        "examples": [
+            "pedacito checkout cp_0003_a1b2c3 .",
+            "pedacito checkout cp_0003 . --file app.py",
+        ],
+        "flags": [
+            {"flag": "ID", "help": "checkpoint id; a unique prefix works"},
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--file PATH",
+             "help": "restore only this file; repeatable"},
         ],
     },
     {
@@ -857,6 +1089,9 @@ CLI_COMMANDS = [
             {"flag": "--port N", "help": "fixed port (default: OS-chosen)"},
             {"flag": "--no-open",
              "help": "print the URL instead of opening a browser"},
+            {"flag": "--lang {en,es}",
+             "help": "interface language for the GUI (also the EN | ES "
+                     "top-bar switcher)"},
         ],
     },
     {
@@ -957,6 +1192,36 @@ CLI_COMMANDS = [
         "flags": [
             {"flag": "--root DIR", "help": "the project"},
             {"flag": "--file FILE", "help": "restrict to one project file"},
+        ],
+    },
+    {
+        "name": "update",
+        "usage": "pedacito update [--run] [--config FILE]",
+        "summary": "Check PyPI for a newer Pedacito release and upgrade this "
+                   "install. One anonymous GET (2 s timeout, cached 24 h); "
+                   "offline is a quiet no-op. The upgrade command matches "
+                   "how Pedacito was installed (pipx, venv, pip --user); "
+                   "editable checkouts get git-pull instructions instead.",
+        "keywords": ["update", "upgrade", "new version", "release", "pipx",
+                     "check for updates", "offline"],
+        "examples": [
+            "pedacito update",
+            "pedacito update --run",
+        ],
+        "flags": [
+            {"flag": "--run",
+             "help": "run the detected upgrade command without asking"},
+            {"flag": "--config FILE",
+             "help": "config file to read check_for_updates from"},
+        ],
+        "notes": [
+            "Opt out entirely with check_for_updates = false in config.toml "
+            "(or PEDACITO_CHECK_FOR_UPDATES=false): zero network calls and "
+            "zero upgrade subprocesses, everywhere (GUI banner, TUI /update, "
+            "this command).",
+            "The GUI shows a slim dismissible banner when a newer release "
+            "exists; Update streams the upgrade into an output drawer and "
+            "offers Restart on success. The TUI command is /update [run].",
         ],
     },
     {
@@ -1204,7 +1469,7 @@ CLI_COMMANDS = [
         "name": "skills",
         "usage": "pedacito skills [list | show NAME | add NAME | draft "
                  "\"PROMPT\" | rm NAME] [PROJECT] [--global]",
-        "summary": "Browse and manage the skill library: eighteen bundled "
+        "summary": "Browse and manage the skill library: nineteen bundled "
                    "starters plus your own user/project skills. list (the "
                    "default) shows every skill with its scope badge; show "
                    "prints one skill's triggers and checklist; add writes a "
@@ -1252,6 +1517,28 @@ CLI_COMMANDS = [
 # --------------------------------------------------------------- GUI map ------
 
 GUI_TOPICS = [
+    {
+        "id": "image-input",
+        "title": "Send an image with your task (multimodal input)",
+        "summary": "Attach PNG/JPEG/WebP/GIF images (max 4, 10 MB each) to a "
+                   "task for a vision-capable model: paste, drag and drop or "
+                   "use 📎 Attach in the GUI, /attach in the TUI, --image "
+                   "PATH on the CLI.",
+        "steps": [
+            "GUI: paste with Ctrl+V / Cmd+V, drag and drop onto the "
+            "composer, or click 📎 Attach",
+            "TUI: /attach [PATH | list | clear] or @image.png in the prompt",
+            "CLI: --image PATH (repeatable) on ask, auto, chat or new",
+            "Use a vision-capable model; images over 10 MB or beyond four "
+            "are refused",
+        ],
+        "keywords": ["image", "attach", "attachment", "screenshot", "paste "
+                     "image", "drag and drop", "multimodal", "vision",
+                     "image input", "send image", "upload", "picture",
+                     "/attach", "--image"],
+        "settings": [],
+        "cli": ["ask", "new", "tui"],
+    },
     {
         "id": "switch-model",
         "title": "Switch the active model or profile",
@@ -1307,6 +1594,98 @@ GUI_TOPICS = [
                      "reasoning"],
         "settings": ["disable_thinking", "thinking_suffix"],
         "cli": ["config", "calibrate"],
+    },
+    {
+        "id": "install-pedacito",
+        "title": "Install Pedacito",
+        "summary": "Install from PyPI with `pip install pedacito` (or "
+                   "`pipx install pedacito` for an isolated CLI install); "
+                   "Python 3.11+ is required. Both put `pedacito` and the "
+                   "short alias `pdc` on your PATH.",
+        "steps": [
+            "pip install pedacito   (Windows: py -m pip install pedacito)",
+            "pipx install pedacito   isolated install, recommended for a tool",
+            "Optional extras: pip install \"pedacito[browser,vision]\" adds "
+            "browser verification (Playwright) and screenshot analysis "
+            "(Pillow); with pipx use pipx install \"pedacito[browser,vision]\"",
+            "After the browser extra: python -m playwright install chromium "
+            "(pipx: pipx run --spec playwright playwright install chromium)",
+            "From source: git clone https://github.com/davepo/pedacito.git, "
+            "then pip install -e \".[dev]\" inside a virtualenv",
+            "Command not found? `python -m pedacito` is identical. Next "
+            "step after installing: pedacito config --init",
+        ],
+        "keywords": ["install", "install pedacito", "installation", "pip",
+                     "pip install", "pipx", "pypi", "setup pedacito",
+                     "getting started", "python 3.11", "playwright",
+                     "browser extra", "vision extra", "from source"],
+        "settings": ["base_url", "model", "vram_gb"],
+        "cli": ["config", "update"],
+    },
+    {
+        "id": "update-pedacito",
+        "title": "Update Pedacito to a newer release",
+        "summary": "A slim banner appears when a newer release is on PyPI; "
+                   "Update runs the command for your install method and "
+                   "streams its output, then offers Restart. Fully opt-out.",
+        "steps": [
+            "When a newer release exists, a banner appears under the topbar: "
+            "Pedacito vX.Y.Z is available (you have A.B.C)",
+            "Click Update: the detected upgrade command (pipx upgrade / pip "
+            "install --upgrade) runs in the background and its output "
+            "streams into a small drawer",
+            "Exit 0 → click Restart Pedacito; the GUI reopens on the same "
+            "port with the new version",
+            "A failed upgrade (or an editable/source install) shows the "
+            "output plus the manual command instead",
+            "Dismiss hides the banner until an even newer release appears",
+            "Opt out entirely: ⚙ Settings → Updates → check_for_updates → "
+            "off (zero network calls; the banner never appears)",
+        ],
+        "keywords": ["update", "upgrade", "new version", "new release",
+                     "update pedacito", "upgrade pedacito", "check for "
+                     "updates", "check_for_updates", "update banner",
+                     "pipx upgrade", "restart"],
+        "settings": ["check_for_updates"],
+        "cli": ["update"],
+    },
+    {
+        "id": "profiling-auto-tune",
+        "title": "Profile the hardware and auto-tune model budgets",
+        "summary": "`pedacito profile --show` combines a vendor-neutral hardware "
+                   "snapshot (free VRAM/RAM with a source per number), a cached "
+                   "prefill/generation probe and the active profile's tuning. "
+                   "Set auto_tune = true to apply it; the default is off.",
+        "steps": [
+            "Run `pedacito profile` (or `pedacito models`) to see RAM/VRAM, "
+            "the reader that answered (drm-sysfs, nvidia-smi, vm_stat, "
+            "winapi), the footprint confidence and the last probe",
+            "Run `pedacito profile --run` to force one tiny completion plus a "
+            "2k-token prefill (512 when the window is smaller); the result is "
+            "cached for a week per server+model",
+            "Set auto_tune = true in the profile (Settings → Profiles → "
+            "Profiling and auto-tuning) to adjust context_tokens, retrieval "
+            "budgets and timeout from free memory",
+            "A tight pool shrinks to the 4096-token safety floor; spare "
+            "headroom is only proposed as growth, never forced",
+            "Tiered local-moe servers keep max_concurrency = 1 and the 600 s "
+            "timeout; hosted APIs get only their 30 s timeout default",
+            "Missing telemetry (for example AMD/Intel on Windows) makes "
+            "auto-tune abstain and leaves every value untouched",
+            "`pedacito profile --reset` drops the cached measurements and the "
+            "optimistic opt-in; the TUI uses /profile show|run|reset",
+        ],
+        "keywords": ["profile", "profiling", "auto tune", "auto_tune",
+                     "hardware", "vram", "ram", "nvidia", "amd", "intel",
+                     "apple silicon", "windows", "macos", "prefill",
+                     "tokens per second", "confidence", "kv cache",
+                     "footprint", "context_tokens"],
+        "settings": ["auto_tune", "context_tokens", "timeout",
+                     "max_concurrency", "model_params_b",
+                     "model_active_params_b", "model_layers",
+                     "model_kv_heads", "model_head_dim", "model_quant",
+                     "model_arch"],
+        "cli": ["profile", "models scan", "profiles"],
     },
     {
         "id": "reset-config",
@@ -1587,17 +1966,20 @@ GUI_TOPICS = [
     },
     {
         "id": "change-theme",
-        "title": "Change the GUI colour scheme",
-        "summary": "Pick a theme in the topbar; it is stored as gui_theme in "
-                   "the user config.",
+        "title": "Change the GUI color scheme",
+        "summary": "Open the Theme Manager from the top bar. The choice is "
+                   "saved in themes.json beside your config.",
         "steps": [
-            "Topbar → theme dropdown (Light / Dark / 1990s)",
-            "The choice is saved as gui_theme in the user config when one "
-            "exists",
+            "Top bar → palette button (theme manager and custom color editor)",
+            "Pick one of the nine built-in schemes: slate, light, daylight, "
+            "nord, midnight, jazz_solo, trapper_keeper, memphis_arcade or "
+            "windbreaker (the TUI's /theme offers the same set)",
+            "Or save a custom theme with ten color tokens; a project can pin "
+            "its own theme in .pedacito/config.json",
         ],
         "keywords": ["theme", "color scheme", "colour scheme", "dark mode",
-                     "light mode", "gui_theme"],
-        "settings": ["gui_theme"],
+                     "light mode", "theme manager", "palette"],
+        "settings": [],
         "cli": ["config"],
     },
     {
@@ -1616,11 +1998,20 @@ GUI_TOPICS = [
             "as ***REDACTED***, and saving the mask unchanged keeps the stored "
             "value (a mask for a key the file does not have is refused)",
             "Set json_mode = object for hosted APIs that reject json_schema",
+            "api.anthropic.com uses the native /v1/messages transport by "
+            "default (anthropic_native = true): explicit cache_control "
+            "breakpoints with a 5m/1h prompt_cache_ttl, "
+            "cache_read_input_tokens / cache_creation_input_tokens usage, "
+            "native extended thinking, tools and images; set "
+            "anthropic_native = false for the OpenAI-compatible layer",
         ],
         "keywords": ["api key", "hosted", "openai", "deepseek", "anthropic",
-                     "server url", "base_url", "api_key_env", "authentication"],
+                     "server url", "base_url", "api_key_env", "authentication",
+                     "anthropic_native", "claude", "cache_control",
+                     "messages api", "cache_read_input_tokens"],
         "settings": ["base_url", "api_key", "api_key_env", "model",
-                     "json_mode", "tier"],
+                     "json_mode", "tier", "anthropic_native",
+                     "prompt_cache", "prompt_cache_ttl"],
         "cli": ["config", "models scan", "calibrate"],
     },
     {
@@ -1671,7 +2062,7 @@ GUI_TOPICS = [
             "Project ▾ → Memory & repo lessons…: list, add or forget "
             "remembered facts (this project or all projects) and read the "
             "repair lessons; the same store as pedacito memory",
-            "Project ▾ → Skills library & creator…: browse the eighteen "
+            "Project ▾ → Skills library & creator…: browse the nineteen "
             "built-in starters plus user/project skills, preview a task's "
             "trigger matches, and write or auto-draft custom skills "
             "(pedacito skills)",
@@ -1702,7 +2093,7 @@ GUI_TOPICS = [
         "id": "skills-library",
         "title": "Skills library & creator: browse, match, write skills",
         "summary": "Project ▾ → Skills library & creator… (also ⚙ Settings → "
-                   "Quick links) browses the eighteen built-in starters plus "
+                   "Quick links) browses the nineteen built-in starters plus "
                    "your user and project skills, previews which checklists "
                    "a task injects, and creates custom skills by hand or "
                    "with a model draft.",
@@ -1828,6 +2219,9 @@ GUI_TOPICS = [
         "steps": [
             "Composer → Auto → Options → Verify command after each task "
             "(e.g. pytest -q)",
+            "Composer row → Post-edit verify checkbox (or TUI /verify on) detects "
+            "the project runner and stores it in auto_verify; /verify status "
+            "shows the gates, rounds and ratchet",
             "⚙ Settings → All settings → search verify_tests → on; set "
             "test_command if detection guesses wrong",
             "CLI: pedacito auto ... --apply --verify \"pytest -q\"; "
@@ -2140,6 +2534,33 @@ GUI_TOPICS = [
         "cli": ["profiles", "config", "ask"],
     },
     {
+        "id": "image-generation",
+        "title": "Generate an image with a local image model",
+        "summary": "Draw an image with an image-model profile (Lemonade "
+                   "sd-cpp, Stable Diffusion, Flux or a hosted image "
+                   "endpoint). The dialog, the CLI and the TUI all use the "
+                   "image profile and save into the project under "
+                   ".pedacito/images/ unless you choose a path.",
+        "steps": [
+            "Project ▾ → 🎨 Generate image…",
+            "Type the prompt; optionally set Size, Steps, Seed, Negative "
+            "prompt and a Save path, then click Generate",
+            "No image profile yet? ⚙ Settings → Model discovery → Scan "
+            "local servers; image generators get a 🎨 Image badge. Click "
+            "Probe image to verify the endpoint with one fast 512x512 call",
+            "Set image_profile to pick the profile and allow_image_gen = "
+            "true to let the agent call generate_image on its own",
+            "CLI: pedacito image \"PROMPT\"; TUI: /image PROMPT",
+        ],
+        "keywords": ["generate image", "image generation", "draw image",
+                     "picture", "stable diffusion", "flux", "sd-cpp",
+                     "lemonade", "image model", "image profile",
+                     "text to image", "generate_image", "probe image"],
+        "settings": ["image_profile", "allow_image_gen", "image_default_size",
+                     "image_default_steps", "modality"],
+        "cli": ["image", "models scan", "calibrate"],
+    },
+    {
         "id": "specialist-routing",
         "title": "Route tasks to specialist profiles (auto_route_specialties)",
         "summary": "With auto-routing on, each task runs on the profile whose "
@@ -2161,7 +2582,7 @@ GUI_TOPICS = [
             "Or let pedacito calibrate detect the tags: six micro-probes "
             "(SVG/UI, math, translation, SQL, testing, planning) plus the "
             "model name; the card shows them under specialties",
-            "Turn routing on: the ✦ Auto-route checkbox in the topbar, or "
+            "Turn routing on: the ✦ Auto-route checkbox in the composer row, or "
             "auto_route_specialties = true in config.toml, or --auto-route "
             "per run (--no-auto-route overrides the config)",
             "Plans can prefix a task with [specialty: TAG] to force a "
@@ -2320,6 +2741,35 @@ GUI_TOPICS = [
         "cli": ["ask", "auto", "new", "chat", "tui"],
     },
     {
+        "id": "language-switch",
+        "title": "Switch the interface language: English / Spanish "
+                 "(language, llm_reply_language)",
+        "summary": "Pedacito's GUI, TUI and CLI speak English and Spanish. "
+                   "Switch live in the GUI or TUI, per run on the CLI, or "
+                   "permanently with the language setting; "
+                   "llm_reply_language separately controls the language of "
+                   "the model's prose explanations.",
+        "steps": [
+            "In the GUI: click the EN | ES switcher in the top bar; the "
+            "choice is saved to the language setting",
+            "In the TUI: press F3 to toggle EN/ES, or type /lang es "
+            "(/lang en)",
+            "On the CLI: pass --lang es (for example pedacito --lang es "
+            "gui) or set PEDACITO_LANG=es (alias PEDACITO_LANGUAGE)",
+            "Or set language = \"es\" in config.toml (⚙ Settings → All "
+            "settings → search language)",
+            "To choose the language of the model's explanations, set "
+            "llm_reply_language to match_ui (follow the UI), auto "
+            "(follow your prompt), en or es",
+        ],
+        "keywords": ["language", "idioma", "spanish", "español", "english",
+                     "translate", "locale", "switch language", "lang",
+                     "en es", "interface language", "localization",
+                     "i18n", "reply language"],
+        "settings": ["language", "llm_reply_language"],
+        "cli": ["gui", "tui", "config"],
+    },
+    {
         "id": "live-preview",
         "title": "Live Preview: see the project's HTML as you build it "
                  "(🌐 Preview tab)",
@@ -2384,6 +2834,8 @@ GUI_TOPICS = [
 ]
 
 TOPICS = [
+    ("Install Pedacito",
+     "How do I install pedacito?"),
     ("Switch or import models",
      "How do I switch models or import a new model?"),
     ("Tune settings for small models",
@@ -2439,8 +2891,10 @@ _SETTING_GUI = {
     "default_profile": "⚙ Settings → Profiles → [Select Profile] → Make default",
     "specialties": "⚙ Settings → Profiles → [Select Profile] → Connection & "
                    "Capabilities → specialties (tag pills + custom tag)",
-    "auto_route_specialties": "Topbar → ✦ Auto-route checkbox, or ⚙ Settings "
+    "auto_route_specialties": "Composer row → ✦ Auto-route checkbox, or ⚙ Settings "
                               "→ All settings → search auto_route_specialties",
+    "auto_verify": "Composer row → Post-edit verify checkbox, TUI /verify on, or "
+                   "⚙ Settings → All settings → search auto_verify",
     "creative_mode": "✨ Creative button above the composer, or ⚙ Settings → "
                      "All settings → search creative_mode",
     "creative_auto": "⚙ Settings → All settings → search creative_auto "
@@ -2450,6 +2904,9 @@ _SETTING_GUI = {
                                "routing)",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
+    "check_for_updates": "⚙ Settings → All settings → Updates → "
+                         "check_for_updates (off = fully offline: no release "
+                         "check, no update banner)",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
                         "& Execution Overrides → disable_thinking (Thinking)",
     "thinking_suffix": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
@@ -2517,13 +2974,17 @@ _SETTING_KEYWORDS = {
     "default_profile": ["default model", "default profile", "startup model"],
     "gui_theme": ["theme", "colour scheme", "color scheme", "dark mode",
                   "light mode"],
+    "check_for_updates": ["update", "upgrade", "new version", "new release",
+                          "check for updates", "update check", "phone home",
+                          "offline", "opt out", "update banner"],
     "review": ["review page", "diff review", "approve changes"],
     "backup": ["backup", "snapshot", "undo", "restore"],
     "allow_shell": ["run commands", "shell", "tool permission", "allow run"],
     "allow_write": ["write files", "gather write", "allow write"],
     "allow_browser": ["browser", "playwright", "web page", "screenshots"],
     "allow_screenshots": ["screenshot", "screen capture", "vision"],
-    "auto_verify": ["verify command", "run tests after task", "auto verify"],
+    "auto_verify": ["verify command", "run tests after task", "auto verify",
+                    "post-edit verify"],
     "incremental_edit_loop": ["small model edits", "incremental edit",
                               "symbol edits"],
     "edit_plan_brief": ["edit plan", "brief before edits"],
@@ -2556,6 +3017,8 @@ _SETTING_KEYWORDS = {
     "keep_backups": ["retention", "old backups", "prune backups"],
     "keep_sessions": ["retention", "old sessions", "prune sessions"],
     "prompt_cache": ["prompt cache", "caching", "cache control"],
+    "anthropic_native": ["anthropic", "claude", "messages api",
+                         "native transport", "cache_control"],
     "enable_prompt_cache": ["cache_prompt", "kv cache", "local server "
                             "cache", "llama.cpp cache", "faster local"],
     "enable_prompt_lookup": ["prompt lookup", "n-gram", "speculative "

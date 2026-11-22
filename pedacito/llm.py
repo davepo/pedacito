@@ -38,10 +38,13 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
+
+from . import security as security_mod
 
 
 class LLMError(RuntimeError):
@@ -83,11 +86,46 @@ class CancelledError(LLMError):
     kind = "cancelled"
 
 
+class RunCancelledError(CancelledError):
+    """A streaming call stopped because its cancellation token was set.
+
+    This is the stream-level spelling of `CancelledError`: the HTTP socket is
+    closed immediately and the partial reply stays in `partial_text`, so a
+    GUI Stop or a TUI Ctrl-C never waits for the remaining generated tokens.
+    """
+
+    kind = "cancelled"
+
+
 class CircuitOpenError(LLMError):
     """Repeated transport/server failures opened the circuit breaker; callers
     get a fast, actionable error instead of another timeout."""
 
     kind = "circuit"
+
+
+class SecretConfirmationRequired(LLMError):
+    """The request targets an external provider and carries secrets the user
+    has not acknowledged yet.
+
+    Raised only by an interactive surface (the GUI/TUI permission broker is
+    active) that did not make an explicit choice. The message lists masked
+    findings only; callers can inspect `.findings` for fingerprints. Plain
+    non-interactive runs auto-redact instead, so a script never blocks.
+    """
+
+    kind = "secrets"
+
+    def __init__(self, findings, provider: str = ""):
+        self.findings = list(findings or ())
+        lines = [security_mod.format_finding(f) for f in self.findings[:8]]
+        where = f" to {provider}" if provider else " to an external provider"
+        super().__init__(
+            "Secrets were detected in the outbound prompt" + where + ".\n"
+            + "\n".join(f"  - {line}" for line in lines)
+            + ("\n  - ..." if len(self.findings) > 8 else "")
+            + "\nChoose Acknowledge & send as-is, Redact & send, or Cancel "
+              "before this request can leave the machine.")
 
 
 class _Transient(LLMError):
@@ -121,6 +159,18 @@ _TEMPLATE_HINTS = (
 # status code alone can't distinguish transient from fatal.
 _LOADING = ("is loading", "loading model", "model is not loaded", "please wait")
 _LOAD_FAILED = ("failed to load model", "error loading model", "no model loaded")
+
+# HTTP 400 bodies indicating the active model/server does not accept image inputs.
+_VISION_UNSUPPORTED_HINTS = (
+    "image_url",
+    "vision",
+    "multimodal",
+    "content must be a string",
+    "does not support image",
+    "images are not supported",
+    "not a multimodal",
+    "unsupported content type",
+)
 
 # Shown on a plain connection failure; the fix differs per server.
 CONNECT_HELP = """\
@@ -410,7 +460,7 @@ def _load_mode_cache(base_url: str, model: str) -> bool | None:
 def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
     """Persist a probed verdict; an unwritable config dir never kills a run."""
     try:
-        from . import config
+        from . import config, fileio
         path = config.USER_CONFIG.parent / "server_modes.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -420,8 +470,7 @@ def _save_mode_cache(base_url: str, model: str, supported: bool) -> None:
             data = {}
         data[_mode_cache_key(base_url, model)] = {
             "schema_supported": supported, "ts": time.time()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        fileio.write_bytes(path, json.dumps(data, indent=1).encode("utf-8"))
     except OSError:
         pass
 
@@ -442,10 +491,10 @@ def _json_cap_key(base_url: str, model: str) -> tuple[str, str]:
 
 
 def _json_caps(base_url: str, model: str) -> dict[str, bool]:
-    """The mutable {schema: bool, object: bool} tier table for an endpoint."""
+    """A copy of the {schema: bool, object: bool} tier table for an endpoint."""
     with _JSON_CAPS_LOCK:
-        return _JSON_CAPS.setdefault(
-            _json_cap_key(base_url, model), {"schema": True, "object": True})
+        return dict(_JSON_CAPS.setdefault(
+            _json_cap_key(base_url, model), {"schema": True, "object": True}))
 
 
 def _deny_json_cap(base_url: str, model: str, tier: str) -> None:
@@ -477,10 +526,10 @@ def _accel_cap_key(base_url: str, model: str) -> tuple[str, str]:
 
 
 def _accel_caps(base_url: str, model: str) -> dict[str, bool]:
-    """The mutable {cache: bool, lookup: bool} capability table for an endpoint."""
+    """A copy of the {cache: bool, lookup: bool} capability table for an endpoint."""
     with _ACCEL_CAPS_LOCK:
-        return _ACCEL_CAPS.setdefault(
-            _accel_cap_key(base_url, model), {"cache": True, "lookup": True})
+        return dict(_ACCEL_CAPS.setdefault(
+            _accel_cap_key(base_url, model), {"cache": True, "lookup": True}))
 
 
 def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
@@ -531,7 +580,48 @@ def _is_local_server(cfg) -> bool:
         # box is an explicit statement that the endpoint is self-hosted.
     name = str(getattr(cfg, "provider", "") or "").lower().replace("_", "")
     return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
-                                   "vllm", "lmstudio", "ollama"))
+                                   "vllm", "lmstudio", "ollama",
+                                   "strata", "avalon"))
+
+
+def is_external_provider(cfg) -> bool:
+    """True when this config targets a hosted/cloud provider rather than
+    loopback or the user's LAN. This is the one predicate the outbound
+    secret guard, the GUI preflight and the TUI warning share."""
+    try:
+        return not _is_local_server(cfg)
+    except Exception:
+        return False
+
+
+def _is_local_moe(cfg) -> bool:
+    """True for a tiered local-MoE config (Strata/Avalon or a matching model
+    on a self-hosted endpoint). Kept here as the single check the transport
+    and the GUI/TUI read; the classification itself lives in config.py."""
+    try:
+        from .config import is_local_moe
+        return bool(is_local_moe(cfg))
+    except Exception:
+        return False
+
+
+def _supports_reasoning_effort(cfg) -> bool:
+    """Whether a configured reasoning_effort may be sent to this endpoint.
+
+    Local-MoE servers expose it natively; hosted APIs get it only for the
+    families that document the field, so a strict API is never sent an
+    unknown key."""
+    if _is_local_moe(cfg):
+        return True
+    if _is_local_server(cfg):
+        # Dense local runtimes vary: only the families with a native control.
+        model = _model_name(cfg)
+        return _is_effort_model(model) or _is_gpt_oss(model) \
+            or _is_qwen_soft(model) or _is_gemma_reasoning(model)
+    model = _model_name(cfg)
+    return _is_effort_model(model) or _is_gpt_oss(model) \
+        or _is_qwen_soft(model) or _is_gemma_reasoning(model) \
+        or _is_deepseek(model) or _has(model, "reasoner", "thinking", "qwq")
 
 
 # Sampling keys a hosted provider tunes per model itself; pedacito omits
@@ -600,8 +690,11 @@ def unload_model(client) -> str:
             r = requests.post(url, headers=headers, json=payload, timeout=2)
         except Exception:
             continue
-        if r.status_code == 200:
-            return model
+        try:
+            if r.status_code == 200:
+                return model
+        finally:
+            _close(r)
     return ""
 
 
@@ -761,6 +854,9 @@ _STREAM_REPEAT_WINDOW = 4000        # chars of tail the cycle test inspects
 _STREAM_REPEAT_MIN_CYCLE = 80       # shorter repeats may be real style
 _STREAM_REPEAT_MIN_TIMES = 3        # 2 copies is quoting; 3 is a loop
 _STREAM_REPEAT_CHECK_CHARS = 512    # re-test only after this much new text
+# Cap on the live reasoning/content buffers handed to the GUI drawer and the
+# TUI status line: a runaway reply must not grow process memory without bound.
+_STREAM_LIVE_BUFFER = 200_000
 
 # Degenerate edit loops re-emit the SAME completed edit block under changing
 # `--- FILE: ... L<n>-<m>` headers, so the verbatim tail test never trips
@@ -865,6 +961,98 @@ def _reasoning_text(message: dict) -> str:
             if parts:
                 return "".join(parts)
     return ""
+
+
+# Streaming inline-reasoning support. A token stream can split `<think>` (or
+# `<thinking>` / `<reasoning>`) across arbitrary chunk boundaries, so a plain
+# regex on each delta would leak half a tag into the visible answer. The
+# splitter below holds only a possible partial tag suffix between chunks and
+# returns (reasoning, content) text for every delta.
+_STREAM_THINK_OPEN = ("<think>", "<thinking>", "<reasoning>",
+                      "[think]", "<seed:think>")
+_STREAM_THINK_CLOSE = ("</think>", "</thinking>", "</reasoning>",
+                       "[/think]", "</seed:think>")
+_STREAM_THINK_OPEN_RE = re.compile(
+    "|".join(re.escape(t) for t in _STREAM_THINK_OPEN), re.IGNORECASE)
+_STREAM_THINK_CLOSE_RE = re.compile(
+    "|".join(re.escape(t) for t in _STREAM_THINK_CLOSE), re.IGNORECASE)
+_STREAM_THINK_TAGS = _STREAM_THINK_OPEN + _STREAM_THINK_CLOSE
+_STREAM_THINK_MAX_TAG = max(len(t) for t in _STREAM_THINK_TAGS)
+
+
+class _StreamThinkSplitter:
+    """Incrementally separate inline reasoning tags from answer content.
+
+    `feed(text)` returns `(reasoning_delta, content_delta)`; `flush()` returns
+    whatever remains when the stream ends. Text that merely looks like the
+    beginning of a tag is held until the next chunk decides it.
+    """
+
+    def __init__(self):
+        self._pending = ""
+        self._inside = False
+
+    def _hold_len(self, tags) -> int:
+        text = self._pending
+        low = text.lower()
+        for n in range(min(len(text), _STREAM_THINK_MAX_TAG - 1), 0, -1):
+            suffix = low[-n:]
+            if any(tag.startswith(suffix) for tag in tags):
+                return n
+        return 0
+
+    def feed(self, text: str) -> tuple[str, str]:
+        self._pending += text or ""
+        reasoning: list[str] = []
+        content: list[str] = []
+        while self._pending:
+            if self._inside:
+                match = _STREAM_THINK_CLOSE_RE.search(self._pending)
+                if match:
+                    if match.start():
+                        reasoning.append(self._pending[:match.start()])
+                    self._pending = self._pending[match.end():]
+                    self._inside = False
+                    continue
+                hold = self._hold_len(_STREAM_THINK_CLOSE)
+                if hold:
+                    reasoning.append(self._pending[:-hold])
+                    self._pending = self._pending[-hold:]
+                else:
+                    reasoning.append(self._pending)
+                    self._pending = ""
+                break
+            opening = _STREAM_THINK_OPEN_RE.search(self._pending)
+            closing = _STREAM_THINK_CLOSE_RE.search(self._pending)
+            if closing and (opening is None or closing.start() < opening.start()):
+                # A stray close marker when the runtime already moved the
+                # thinking to a separate field: drop it, keep the answer.
+                if closing.start():
+                    content.append(self._pending[:closing.start()])
+                self._pending = self._pending[closing.end():]
+                continue
+            if opening:
+                if opening.start():
+                    content.append(self._pending[:opening.start()])
+                self._pending = self._pending[opening.end():]
+                self._inside = True
+                continue
+            hold = self._hold_len(_STREAM_THINK_TAGS)
+            if hold:
+                content.append(self._pending[:-hold])
+                self._pending = self._pending[-hold:]
+            else:
+                content.append(self._pending)
+                self._pending = ""
+            break
+        return "".join(reasoning), "".join(content)
+
+    def flush(self) -> tuple[str, str]:
+        text, self._pending = self._pending, ""
+        if not text:
+            return "", ""
+        return (text, "") if self._inside else ("", text)
+
 
 
 def extract_content(message: dict) -> str:
@@ -1054,12 +1242,50 @@ def repair_truncated_json(text: str) -> str | None:
             while k < n and buf[k] in " \t\r\n":
                 k += 1
             if k < n and buf[k] == '"' and _complete_value_end(k) is None:
-                # Keep the opening quote; escape only what follows it.
+                # Keep the opening quote; preserve valid JSON escapes while
+                # escaping any stray backslashes, unescaped quotes, or raw
+                # control characters in the surviving fragment.
                 frag = buf[k + 1:]
-                frag = (frag.replace("\\", "\\\\")
-                            .replace('"', '\\"').replace("\n", "\\n")
-                            .replace("\r", "\\r").replace("\t", "\\t"))
-                kept.append(buf[i:k] + '"' + frag + '"')
+                out_chars: list[str] = []
+                idx = 0
+                flen = len(frag)
+                while idx < flen:
+                    c = frag[idx]
+                    if c == "\\":
+                        if idx + 1 < flen:
+                            nxt = frag[idx + 1]
+                            if nxt in '"\\/bfnrt':
+                                out_chars.append(c + nxt)
+                                idx += 2
+                                continue
+                            if nxt == "u" and idx + 6 <= flen and all(
+                                    h in "0123456789abcdefABCDEF"
+                                    for h in frag[idx + 2:idx + 6]):
+                                out_chars.append(frag[idx:idx + 6])
+                                idx += 6
+                                continue
+                        # Trailing lone backslash or incomplete/invalid escape.
+                        out_chars.append("\\\\")
+                        idx += 1
+                    elif c == '"':
+                        out_chars.append('\\"')
+                        idx += 1
+                    elif c == "\n":
+                        out_chars.append("\\n")
+                        idx += 1
+                    elif c == "\r":
+                        out_chars.append("\\r")
+                        idx += 1
+                    elif c == "\t":
+                        out_chars.append("\\t")
+                        idx += 1
+                    elif ord(c) < 0x20:
+                        out_chars.append(f"\\u{ord(c):04x}")
+                        idx += 1
+                    else:
+                        out_chars.append(c)
+                        idx += 1
+                kept.append(buf[i:k] + '"' + "".join(out_chars) + '"')
                 break                          # nothing after the cut survives
             break                              # value missing or cut off
         kept.append(buf[i:vend])
@@ -1069,14 +1295,58 @@ def repair_truncated_json(text: str) -> str | None:
     return "{" + ",".join(kept) + "}"
 
 
+def _content_parts(content) -> list[dict]:
+    """Normalize str or list content into a shallow-copied list of part dicts."""
+    if isinstance(content, list):
+        return [dict(p) if isinstance(p, dict) else {"type": "text", "text": str(p)}
+                for p in content]
+    text = str(content or "")
+    return [{"type": "text", "text": text}] if text else []
+
+
+def _merge_content(left, right):
+    """Join two message contents with a blank line, preserving multimodal parts."""
+    if isinstance(left, str) and isinstance(right, str):
+        return f"{left}\n\n{right}"
+    if left is None:
+        return right
+    if right is None:
+        return left
+    parts = _content_parts(left)
+    rparts = _content_parts(right)
+    if (parts and rparts
+            and parts[-1].get("type") == "text"
+            and rparts[0].get("type") == "text"):
+        parts[-1] = dict(parts[-1])
+        parts[-1]["text"] = f"{parts[-1].get('text') or ''}\n\n{rparts[0].get('text') or ''}"
+        parts.extend(rparts[1:])
+    else:
+        parts.extend(rparts)
+    return parts
+
+
+def _content_plain_text(content) -> str:
+    """Extract plain text from str or multimodal list content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(p.get("text") or "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content or "")
+
+
 def merge_consecutive(messages: list[dict]) -> list[dict]:
     """Collapse adjacent same-role messages into one; a stray repeat would
     otherwise surface as an opaque Jinja error from the server."""
     out: list[dict] = []
     for m in messages:
         if out and out[-1]["role"] == m["role"]:
-            out[-1] = {"role": m["role"],
-                       "content": f"{out[-1]['content']}\n\n{m['content']}"}
+            merged = dict(out[-1])
+            merged["content"] = _merge_content(out[-1].get("content", ""),
+                                               m.get("content", ""))
+            out[-1] = merged
         else:
             out.append(dict(m))
     return out
@@ -1085,12 +1355,15 @@ def merge_consecutive(messages: list[dict]) -> list[dict]:
 def fold_system(messages: list[dict]) -> list[dict]:
     """Move system content into the first user turn, for templates without a
     system role (Gemma being the common one)."""
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
-    rest = [dict(m) for m in messages if m["role"] != "system"]
+    system = "\n\n".join(
+        _content_plain_text(m.get("content", ""))
+        for m in messages if m.get("role") == "system"
+    )
+    rest = [dict(m) for m in messages if m.get("role") != "system"]
     if not system:
         return rest
-    if rest and rest[0]["role"] == "user":
-        rest[0]["content"] = f"{system}\n\n{rest[0]['content']}"
+    if rest and rest[0].get("role") == "user":
+        rest[0]["content"] = _merge_content(system, rest[0].get("content", ""))
     else:
         rest.insert(0, {"role": "user", "content": system})
     return merge_consecutive(rest)
@@ -1103,6 +1376,8 @@ CHARS_PER_TOKEN = 3.6
 # few for the reply primer. Counting only `len(content)` undercounts a long
 # agent conversation by hundreds of tokens.
 MESSAGE_OVERHEAD_TOKENS = 4
+# Conservative per-image token estimate for context-window budgeting.
+IMAGE_TOKENS_ESTIMATE = 1000
 
 
 def estimate_tokens(text: str) -> int:
@@ -1110,12 +1385,133 @@ def estimate_tokens(text: str) -> int:
     return int(len(text) / CHARS_PER_TOKEN) + 1
 
 
+def _estimate_content(content, est) -> int:
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype == "text":
+                    total += est(str(part.get("text") or ""))
+                elif ptype in ("image_url", "image"):
+                    total += IMAGE_TOKENS_ESTIMATE
+            elif isinstance(part, str):
+                total += est(part)
+        return total
+    return est(str(content or ""))
+
+
 def estimate_messages(messages: list[dict], est=None) -> int:
     """Token estimate for a whole conversation, including per-message framing
-    overhead. `est` is a text estimator (a client's calibrated one)."""
+    overhead and ~1,000 tokens per attached image. `est` is a text estimator
+    (a client's calibrated one)."""
     est = est or estimate_tokens
-    return sum(est(m.get("content") or "") + MESSAGE_OVERHEAD_TOKENS
+    return sum(_estimate_content(m.get("content") or "", est)
+               + MESSAGE_OVERHEAD_TOKENS
                for m in messages) + 3
+
+
+@dataclass(frozen=True)
+class CallTiming:
+    """Public timing record for one completion request.
+
+    Get one from :meth:`LLMClient.timing_record` (or the module-level
+    :func:`timing_record`) after a call. All timestamps are monotonic seconds
+    from `time.monotonic()`; they are only meaningful as differences inside
+    this process, never as wall-clock dates.
+
+    Attributes
+    ----------
+    request_started_at:
+        Monotonic time immediately before the HTTP request was sent. None
+        before the first request or when no request was made.
+    first_token_at:
+        Monotonic time of the first streamed content or reasoning delta.
+        None when the reply was buffered or no token arrived.
+    last_timings:
+        The last server-reported ``timings`` block, when the endpoint sends
+        one (llama.cpp/LM Studio style: ``prompt_per_second``,
+        ``predicted_per_second``, ...). Empty otherwise.
+    prompt_tokens:
+        Prompt tokens reported by the server, or the client's estimate when
+        the server reported none.
+    completion_tokens:
+        Completion tokens reported by the server, or the client's estimate.
+    elapsed_s:
+        Wall-clock seconds spent in the last request.
+    stream_tok_per_s:
+        The last streamed reply's token rate, as surfaced by telemetry.
+    chars_per_token:
+        Calibrated characters per token for this model; 0.0 means the
+        package heuristic (~3.6) is used by :meth:`estimate_tokens`.
+    """
+
+    request_started_at: float | None = None
+    first_token_at: float | None = None
+    last_timings: dict = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    elapsed_s: float = 0.0
+    stream_tok_per_s: float = 0.0
+    chars_per_token: float = 0.0
+
+    @property
+    def prefill_s(self) -> float | None:
+        """Seconds from request start to first token, or None when either
+        anchor is missing (a buffered reply has no first-token anchor)."""
+        if self.first_token_at is None or not self.request_started_at:
+            return None
+        return max(0.0, float(self.first_token_at)
+                   - float(self.request_started_at))
+
+    def estimate_tokens(self, text: str) -> int:
+        """Token count for `text` using this model's calibrated ratio, else
+        the package heuristic."""
+        if self.chars_per_token:
+            return int(len(text) / self.chars_per_token) + 1
+        return estimate_tokens(text)
+
+
+def one_shot_completion(client, messages: list[dict], max_tokens: int,
+                        *, stream: bool = False,
+                        disable_thinking: bool | None = None) -> str:
+    """One completion request with no retry, trim or continuation logic.
+
+    The public entry point for tooling that needs a single request (the speed
+    probe): it delegates to :meth:`LLMClient.complete_once`. Duck-typed test
+    doubles that predate that method expose the equivalent single-request
+    path; they stay supported here rather than in the caller.
+    """
+    run = getattr(client, "complete_once", None)
+    if callable(run):
+        return run(messages, max_tokens=max_tokens, stream=stream,
+                   disable_thinking=disable_thinking)
+    return client._chat_once(messages, max_tokens=max_tokens, stream=stream,
+                             disable_thinking=disable_thinking)
+
+
+def timing_record(client) -> CallTiming:
+    """The public timing record for `client`'s last completion.
+
+    `LLMClient` supplies it directly; duck-typed test doubles that expose the
+    same timing fields are accepted so callers never read stream internals.
+    """
+    getter = getattr(client, "timing_record", None)
+    if callable(getter):
+        return getter()
+    started = getattr(client, "request_started_at", None)
+    return CallTiming(
+        request_started_at=float(started) if started else None,
+        first_token_at=getattr(client, "first_token_at", None),
+        last_timings=dict(getattr(client, "last_timings", {}) or {}),
+        prompt_tokens=int(getattr(client, "last_prompt_tokens", 0) or 0),
+        completion_tokens=int(
+            getattr(client, "last_completion_tokens", 0) or 0),
+        elapsed_s=float(getattr(client, "last_elapsed_s", 0.0) or 0.0),
+        stream_tok_per_s=float(
+            getattr(client, "last_stream_tok_per_s", 0.0) or 0.0),
+        chars_per_token=float(getattr(client, "chars_per_token", 0.0) or 0.0),
+    )
 
 
 # Structural request keys a user `sampler` table must never override: they
@@ -1138,8 +1534,106 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     re.IGNORECASE)
 
 # Pool one connection set per client; tests (and users) may monkeypatch
-# `requests.post`, so a patched function is honoured over the session.
+# `requests.post` / `time.sleep`, so patched functions are honoured.
 _REAL_POST = requests.post
+_REAL_SLEEP = time.sleep
+
+_OOM_MARKERS = (
+    "cudamalloc",
+    "out of memory",
+    "hiperror",
+    "ggml_assert",
+    "vk::outofdevicememoryerror",
+)
+
+
+def _oom_hint(text: str) -> str:
+    """Actionable hint when a server 500 or dropped stream indicates GPU/VRAM OOM."""
+    low = (text or "").lower()
+    if not any(marker in low for marker in _OOM_MARKERS):
+        return ""
+    return (
+        "\n  Likely GPU/VRAM out-of-memory on the model server. "
+        "Try lowering `context_tokens` (e.g. 16384 or 8192) or setting "
+        '`k_cache_quant = "q8_0"` in your profile/server config.'
+    )
+
+
+def _append_message_text(msg: dict, addition: str) -> None:
+    """Append `addition` to `msg['content']` whether it is str, list, or None."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = content + addition
+    elif isinstance(content, list):
+        parts = [dict(p) if isinstance(p, dict) else p for p in content]
+        for idx in range(len(parts) - 1, -1, -1):
+            if isinstance(parts[idx], dict) and parts[idx].get("type") == "text":
+                parts[idx]["text"] = str(parts[idx].get("text") or "") + addition
+                break
+        else:
+            parts.append({"type": "text", "text": addition.lstrip("\n")})
+        msg["content"] = parts
+    elif content is None:
+        msg["content"] = addition.lstrip("\n")
+
+
+class _StreamLoopGuard:
+    """Detect degenerate tool-syntax, verbatim, and duplicate-edit loops."""
+
+    def __init__(self):
+        self.tool_opens = 0
+        self.probe_tail = ""
+        self.rep_acc = ""
+        self.rep_since = 0
+        self.block_acc = ""
+        self.block_tail = ""
+
+    def feed(self, client: "LLMClient", delta: str) -> bool:
+        """Feed one content delta; return True when the stream must stop."""
+        probe = self.probe_tail + delta
+        self.tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
+        self.probe_tail = probe[-4:]
+        if self.tool_opens >= _MAX_STREAM_TOOL_OPENS:
+            print("\n[stopped the reply: the model is repeating "
+                  "tool-call syntax instead of answering; no tools "
+                  "can run in this phase]", file=sys.stderr)
+            return True
+        self.rep_acc += delta
+        self.rep_since += len(delta)
+        if self.rep_since >= _STREAM_REPEAT_CHECK_CHARS:
+            self.rep_since = 0
+            self.rep_acc = self.rep_acc[-_STREAM_REPEAT_WINDOW:]
+            if _repeat_run(self.rep_acc)[0]:
+                client.stream_repetition = True
+                client._nudge_presence = True
+                client.stream_truncated = True
+                print("\n[stopped the reply: the model is "
+                      "repeating the same text verbatim -- a "
+                      "degenerate loop; treating the answer as "
+                      "cut off]", file=sys.stderr)
+                return True
+        self.block_acc += delta
+        if len(self.block_acc) > _STREAM_BLOCK_WINDOW:
+            self.block_acc = self.block_acc[-_STREAM_BLOCK_WINDOW:]
+        block_probe = self.block_tail + delta
+        self.block_tail = block_probe[-20:]
+        if ">>>>>" in block_probe:
+            counts: dict[str, int] = {}
+            for m in _STREAM_BLOCK_DONE_RE.finditer(self.block_acc):
+                body = " ".join(m.group(0).split())
+                if len(body) < _STREAM_BLOCK_MIN_CHARS:
+                    continue
+                counts[body] = counts.get(body, 0) + 1
+            if max(counts.values(), default=0) >= _MAX_STREAM_DUP_BLOCKS:
+                client.stream_repetition = True
+                client._nudge_presence = True
+                client.stream_truncated = True
+                print("\n[stopped the reply: the model is "
+                      "re-emitting the same edit block over and "
+                      "over -- a degenerate loop; treating the "
+                      "answer as cut off]", file=sys.stderr)
+                return True
+        return False
 
 
 def _close(response) -> None:
@@ -1172,12 +1666,28 @@ class LLMClient:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        # Tiered local-MoE execution (Strata/Avalon): floor the output budget
+        # so a reasoning block is not cut mid-thought, pin a single stream,
+        # and keep the long timeout that covers weight loading and a 30k
+        # prefill. apply_local_moe_defaults is idempotent per model/server.
+        try:
+            from . import config as config_mod
+            self.local_moe = bool(config_mod.apply_local_moe_defaults(cfg))
+        except Exception:
+            self.local_moe = False
+        if self.local_moe:
+            try:
+                cfg.max_concurrency = 1
+            except Exception:
+                pass
+        self.max_concurrency = int(getattr(cfg, "max_concurrency", 0) or 0)
         self.url = cfg.base_url.rstrip("/") + "/chat/completions"
         key = _api_key(cfg)
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        }
+        self.headers = {"Content-Type": "application/json"}
+        # Local servers need no credential. Sending `Bearer ` with an empty
+        # key is rejected by some proxies, so omit the header entirely.
+        if key:
+            self.headers["Authorization"] = f"Bearer {key}"
         # Anthropic authenticates its OpenAI-compatible surface (and its
         # native /v1/messages API) with `x-api-key` + a version stamp. Send
         # both spellings when the server is Anthropic's so either accepted
@@ -1191,11 +1701,27 @@ class LLMClient:
                       "seconds": 0.0, "cost": 0.0, "by_site": {}}
         self._session = requests.Session()
         self._session_used = False
+        self._session_lock = threading.Lock()
         self._stats_lock = threading.Lock()
+        self._circuit_lock = threading.Lock()
         self._cancel = threading.Event()
+        # Optional external cancellation token (threading.Event, a callable
+        # predicate, or any object with is_set()). The GUI sets it to the
+        # active job's token so Stop closes an in-flight SSE socket at once.
+        self.cancel_event = None
         # Called with each streamed text delta instead of echoing to stdout
         # (GUI streaming, tests). None = echo to stdout.
         self.stream_callback = None
+        # Called with one rich dict per throttled stream progress event:
+        # {kind: "llm_stream", phase, delta_reasoning, delta_content,
+        #  tokens_so_far, tok_per_sec, ...}. `on_stream_event` is an alias so
+        # integrations can use either spelling.
+        self.on_stream = None
+        self.on_stream_event = None
+        # The live SSE response, so cancel() can close the socket from the
+        # Stop thread instead of waiting for the next line to arrive.
+        self._active_response = None
+        self._active_response_lock = threading.Lock()
         self.echo_stream = True
         # Called with one dict per finished request (events.py attaches here).
         self.on_call = None
@@ -1247,6 +1773,25 @@ class LLMClient:
         # empty-completion retry uses it to tell an instant-EOS flake (retry
         # identical) from a thinking runaway (retry with thinking disabled).
         self.last_reasoning_chars = 0
+        # Live/final view of the last streamed reply: the reasoning pane, the
+        # visible answer, and the token/speed counters the GUI drawer and TUI
+        # status line render. Cleared at the start of every streamed attempt.
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
+        # Wall-clock anchors for the public timing record (`timing_record()`),
+        # used by the speed probe: request_started_at is just before the HTTP
+        # POST, first_token_at is the first content/reasoning delta of a
+        # streamed reply. None means the reply was buffered (or no token
+        # ever arrived).
+        self.request_started_at = 0.0
+        # The last server-reported llama.cpp `timings` block (prompt_per_second
+        # / predicted_per_second), when the endpoint sends one; exposed through
+        # `timing_record()`.
+        self.last_timings: dict = {}
         # Circuit breaker: consecutive transport/server failures, and the
         # monotonic deadline before which calls fail fast. A success closes it.
         self._failures = 0
@@ -1347,6 +1892,43 @@ class LLMClient:
             return int(len(text) / self.chars_per_token) + 1
         return estimate_tokens(text)
 
+    def timing_record(self) -> CallTiming:
+        """Public timing record for the last completion request.
+
+        Callers that drive one request directly (the speed probe, scripts)
+        read request/first-token anchors, server timings and token counts
+        here instead of reaching into the stream bookkeeping. The values
+        describe the most recent attempt and are replaced by the next call.
+        Timestamps are monotonic seconds (see :class:`CallTiming`).
+        """
+        return CallTiming(
+            request_started_at=(float(self.request_started_at)
+                                if self.request_started_at else None),
+            first_token_at=self.first_token_at,
+            last_timings=dict(self.last_timings or {}),
+            prompt_tokens=int(self.last_prompt_tokens or 0),
+            completion_tokens=int(self.last_completion_tokens or 0),
+            elapsed_s=float(self.last_elapsed_s or 0.0),
+            stream_tok_per_s=float(self.last_stream_tok_per_s or 0.0),
+            chars_per_token=float(self.chars_per_token or 0.0),
+        )
+
+    def complete_once(self, messages: list[dict], max_tokens: int,
+                      *, schema: dict | None = None, stream: bool = False,
+                      disable_thinking: bool | None = None,
+                      json_schema: dict | None = None,
+                      cancel_event=None, on_stream=None) -> str:
+        """One completion request with no retry, trim or continuation logic.
+
+        The public counterpart of the internal single-request path, for
+        tooling that needs exactly one HTTP call (the speed probe). Returns
+        the reply text; timing is available from :meth:`timing_record`.
+        """
+        return self._chat_once(
+            messages, max_tokens, schema=schema, stream=stream,
+            disable_thinking=disable_thinking, json_schema=json_schema,
+            cancel_event=cancel_event, on_stream=on_stream)
+
     def _context_too_long(self, body: str) -> bool:
         """True when a 400 body says the prompt overflowed the context window.
         llama.cpp/LM Studio say "exceeds the available context size" /
@@ -1363,7 +1945,9 @@ class LLMClient:
         fn = requests.post
         if fn is not _REAL_POST:
             return fn(url, **kw)
-        return self._session.post(url, **kw)
+        with self._session_lock:
+            sess = self._session
+        return sess.post(url, **kw)
 
     def temperature(self, value: float):
         """Context manager: sample at `value` for the calls inside it (used to
@@ -1390,59 +1974,238 @@ class LLMClient:
         return prov
 
     def _reset_session(self) -> None:
+        with self._session_lock:
+            old = self._session
+            self._session = requests.Session()
+            self._session_used = False
         try:
-            self._session.close()
+            old.close()
         except Exception:
             pass
-        self._session = requests.Session()
-        self._session_used = False
 
     def cancel(self) -> None:
         """Ask the in-flight (or next) streamed call to stop at the next
-        chunk. Safe from any thread; cleared when the next call starts."""
+        chunk. Safe from any thread; cleared when the next call starts.
+
+        The live SSE response is closed immediately as well, so a blocking
+        socket read (a server that has not sent its next token yet) returns
+        at once instead of waiting for generation to finish.
+        """
         self._cancel.set()
+        event = getattr(self, "cancel_event", None)
+        setter = getattr(event, "set", None)
+        if callable(setter):
+            try:
+                setter()
+            except Exception:
+                pass
+        with self._active_response_lock:
+            response = self._active_response
+        if response is not None:
+            _close(response)
+
+    def set_cancel_event(self, event) -> None:
+        """Install the cancellation token for this client (GUI job Stop)."""
+        self.cancel_event = event
+
+    @staticmethod
+    def _token_set(source) -> bool:
+        """True when a cancellation token is set, callable, or truthy."""
+        if source is None:
+            return False
+        checker = getattr(source, "is_set", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        if callable(source):
+            try:
+                return bool(source())
+            except Exception:
+                return False
+        try:
+            return bool(source)
+        except Exception:
+            return False
+
+    def _cancel_requested(self, extra=None) -> bool:
+        """Check the client's own flag, an explicit token, and the run-wide
+        token the GUI stores on the config. Never raises."""
+        for source in (self._cancel, extra, getattr(self, "cancel_event", None),
+                       getattr(self.cfg, "_cancel_event", None)):
+            if self._token_set(source):
+                return True
+        return False
+
+    def stream_state(self) -> dict:
+        """The last/current stream's reasoning, content, tokens and speed."""
+        return {
+            "phase": self.stream_phase,
+            "reasoning": self.last_stream_reasoning,
+            "content": self.last_stream_content,
+            "tokens": int(self.last_stream_tokens or 0),
+            "tok_per_sec": round(float(self.last_stream_tok_per_s or 0.0), 1),
+        }
+
+    def _emit_stream_event(self, event: dict, callback=None) -> None:
+        """Deliver one throttled `llm_stream` event to the stream callback and
+        the project's EventLog (the GUI drawer and TUI status line listen
+        there). Telemetry must never break a model call."""
+        cb = callback or self.on_stream or getattr(self, "on_stream_event", None)
+        if cb is not None:
+            try:
+                cb(event)
+            except Exception:
+                pass
+        try:
+            from . import events as events_mod
+            events_mod.get(self._outbound_root(), self.cfg).emit(
+                "llm_stream", _full=True,
+                **{k: v for k, v in event.items() if k != "kind"})
+        except Exception:
+            pass
 
     def _circuit_enabled(self) -> bool:
         return bool(getattr(self.cfg, "circuit_breaker", True))
 
+    def _sleep_cancelable(self, seconds: float, cancel_event=None) -> None:
+        """Sleep up to `seconds` in 0.25s slices, aborting promptly if cancelled."""
+        if self._cancel_requested(cancel_event):
+            raise RunCancelledError("Stopped by user during retry wait.")
+        if seconds <= 0:
+            return
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(seconds)
+            if self._cancel_requested(cancel_event):
+                raise RunCancelledError("Stopped by user during retry wait.")
+            return
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._cancel_requested(cancel_event):
+                raise RunCancelledError("Stopped by user during retry wait.")
+            chunk = min(0.25, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        if self._cancel_requested(cancel_event):
+            raise RunCancelledError("Stopped by user during retry wait.")
+
     def _check_circuit(self) -> None:
         """Fail fast while the breaker is open; half-open after the cooldown."""
-        if not self._circuit_enabled() or not self._circuit_until:
+        if not self._circuit_enabled():
             return
-        now = time.monotonic()
-        if now < self._circuit_until:
-            wait = self._circuit_until - now
-            raise CircuitOpenError(
-                f"The model server failed repeatedly; pausing requests for "
-                f"another {wait:.0f}s (circuit breaker). Check that "
-                f"{self.cfg.base_url} is reachable and the model is loaded, "
-                "or set circuit_breaker = false to disable this guard.")
-        # Cooldown elapsed: allow one probe. A failure re-opens immediately.
-        self._circuit_until = 0.0
+        with self._circuit_lock:
+            until = self._circuit_until
+            if not until:
+                return
+            now = time.monotonic()
+            if now < until:
+                wait = until - now
+                raise CircuitOpenError(
+                    f"The model server failed repeatedly; pausing requests for "
+                    f"another {wait:.0f}s (circuit breaker). Check that "
+                    f"{self.cfg.base_url} is reachable and the model is loaded, "
+                    "or set circuit_breaker = false to disable this guard.")
+            # Cooldown elapsed: allow one probe. A failure re-opens immediately.
+            self._circuit_until = 0.0
 
     def _record_success(self) -> None:
-        self._failures = 0
-        self._circuit_until = 0.0
+        with self._circuit_lock:
+            self._failures = 0
+            self._circuit_until = 0.0
 
     def _record_failure(self) -> None:
         if not self._circuit_enabled():
             return
-        self._failures += 1
-        limit = max(1, int(getattr(self.cfg, "circuit_failures", 4) or 4))
-        if self._failures < limit:
-            return
-        cooldown = max(1.0, float(getattr(self.cfg, "circuit_cooldown", 60.0)
-                                  or 60.0))
-        self._failures = 0
-        self._circuit_until = time.monotonic() + cooldown
-        self.circuit_trips += 1
+        with self._circuit_lock:
+            self._failures += 1
+            limit = max(1, int(getattr(self.cfg, "circuit_failures", 4) or 4))
+            if self._failures < limit:
+                return
+            cooldown = max(1.0, float(getattr(self.cfg, "circuit_cooldown", 60.0)
+                                      or 60.0))
+            self._failures = 0
+            self._circuit_until = time.monotonic() + cooldown
+            self.circuit_trips += 1
         print(f"[circuit breaker: {limit} consecutive model-server failures; "
               f"pausing requests for {cooldown:.0f}s]", file=sys.stderr)
+
+    def _outbound_root(self):
+        """The workspace this request belongs to, when the caller set one."""
+        root = getattr(self.cfg, "_root", "") or ""
+        return root or None
+
+    def _notify_redaction(self, count: int, findings, mode: str) -> None:
+        """Tell the listening surface that raw secrets were replaced."""
+        message = (f"Auto-redacted {count} secret(s) before sending to "
+                   "external provider")
+        print(f"[security] {message}", file=sys.stderr)
+        root = self._outbound_root()
+        try:
+            from . import events as events_mod
+            events_mod.get(root, self.cfg).emit(
+                "security_redacted", count=count, message=message,
+                mode=mode, findings=[f.to_dict() for f in findings])
+        except Exception:
+            pass
+
+    def _apply_outbound_guard(self, payload: dict) -> dict:
+        """Scan/redact or confirm a request bound for an external provider.
+
+        Local endpoints (loopback, LAN, or a self-hosted provider name) are
+        never inspected: the user's own box is not an exfiltration path.
+        External endpoints obey `security_outbound_mode`:
+
+        - "allow": send unchanged.
+        - "redact": replace every unacknowledged secret with
+          `<REDACTED_SECRET>` and emit a notification event.
+        - "warn": use an explicit per-run choice (`acknowledge_secrets` or
+          `redact_secrets` from the GUI/TUI); otherwise raise
+          `SecretConfirmationRequired` while an interactive broker is
+          installed, and auto-redact in a non-interactive run.
+        """
+        if not payload or not is_external_provider(self.cfg):
+            return payload
+        mode = security_mod.outbound_mode(self.cfg)
+        if mode == "allow":
+            return payload
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return payload
+        root = self._outbound_root()
+        findings = security_mod.scan_messages_for_secrets(messages, root)
+        if not findings:
+            return payload
+        if mode == "redact" or getattr(
+                self.cfg, "_outbound_redact_secrets", False):
+            messages, count, redacted = security_mod.redact_messages(
+                messages, root)
+            payload = {**payload, "messages": messages}
+            if count:
+                self._notify_redaction(count, redacted, "redact")
+            return payload
+        if getattr(self.cfg, "_outbound_acknowledge_secrets", False):
+            # The user chose "Acknowledge & Send As-Is" for this request.
+            # Persist the fingerprints so the same key is not raised again.
+            if root:
+                security_mod.acknowledge_findings(root, findings)
+            return payload
+        if security_mod.permission_broker_active():
+            host = _host_name(self.cfg) or "external provider"
+            raise SecretConfirmationRequired(findings, host)
+        # Non-interactive CLI/script: redact by default rather than block.
+        messages, count, redacted = security_mod.redact_messages(
+            messages, root)
+        payload = {**payload, "messages": messages}
+        if count:
+            self._notify_redaction(count, redacted, "warn")
+        return payload
 
     def _post(self, payload: dict, stream: bool = False):
         """POST to the chat completions endpoint, raising a specific LLMError
         subclass on failure (connection, timeout, load failure, template,
         transient/rate limit, context overflow, or other server error)."""
+        payload = self._apply_outbound_guard(payload)
         self._check_circuit()
         try:
             try:
@@ -1453,13 +2216,16 @@ class LLMClient:
                 # A pooled keep-alive connection the server already closed
                 # looks like a refused connection; retry once on a fresh
                 # session before declaring the server unreachable.
-                if not self._session_used:
+                with self._session_lock:
+                    used = self._session_used
+                if not used:
                     raise
                 self._reset_session()
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
                     timeout=self.cfg.timeout, stream=stream)
-            self._session_used = True
+            with self._session_lock:
+                self._session_used = True
         except requests.exceptions.ConnectionError as e:
             self._record_failure()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
@@ -1502,9 +2268,16 @@ class LLMClient:
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
+            if r.status_code == 400 and any(h in low for h in _VISION_UNSUPPORTED_HINTS):
+                raise LLMError(
+                    f"The active model '{self.cfg.model}' does not support image "
+                    "inputs. Switch to a vision-capable model (e.g. Gemma 4, "
+                    "Qwen-VL, Claude, or GPT-4o) and try again.\n"
+                    f"Server detail: {body[:300]}")
             if r.status_code >= 500 and not loading:
                 self._record_failure()
-            raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+            hint = _oom_hint(body) if r.status_code >= 500 else ""
+            raise LLMError(f"Server returned {r.status_code}: {body[:500]}{hint}")
         self._record_success()
         return r
 
@@ -1527,21 +2300,25 @@ class LLMClient:
         except requests.exceptions.RequestException as e:
             raise LLMError(f"Embeddings request failed: "
                            f"{type(e).__name__}: {str(e)[:200]}") from e
-        if r.status_code >= 400:
-            raise LLMError(
-                f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
-                f"Set embedding_model to a model your server can load, or turn "
-                f"semantic_search off.")
         try:
-            data = r.json()["data"]
-            if isinstance(data, dict):        # single-input server shape
-                data = [data]
-            data = sorted(data, key=lambda d: d.get("index", 0))
-            self.stats["calls"] += 1
-            return [[float(x) for x in d["embedding"]] for d in data]
-        except Exception as e:                  # pragma: no cover - server shape
-            raise LLMError(
-                f"Unexpected embeddings response: {r.text[:300]}") from e
+            if r.status_code >= 400:
+                raise LLMError(
+                    f"Embeddings request failed ({r.status_code}): {r.text[:300]}. "
+                    f"Set embedding_model to a model your server can load, or turn "
+                    f"semantic_search off.")
+            try:
+                data = r.json()["data"]
+                if isinstance(data, dict):        # single-input server shape
+                    data = [data]
+                data = sorted(data, key=lambda d: d.get("index", 0))
+                with self._stats_lock:
+                    self.stats["calls"] += 1
+                return [[float(x) for x in d["embedding"]] for d in data]
+            except Exception as e:                  # pragma: no cover - server shape
+                raise LLMError(
+                    f"Unexpected embeddings response: {r.text[:300]}") from e
+        finally:
+            _close(r)
 
     def vision(self, prompt: str, image_path, model: str | None = None,
                max_tokens: int = 400) -> str:
@@ -1571,15 +2348,19 @@ class LLMClient:
         try:
             msg = r.json()["choices"][0]["message"]
             content = msg.get("content") or ""
-            self.stats["calls"] += 1
+            with self._stats_lock:
+                self.stats["calls"] += 1
             return strip_reasoning(content).strip()
         except Exception as e:                  # pragma: no cover - server shape
             raise LLMError(
                 f"Unexpected vision response: {r.text[:300]}") from e
+        finally:
+            _close(r)
 
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
-             stream: bool = False, disable_thinking: bool | None = None,
-             json_schema: dict | None = None) -> str:
+             stream: bool | None = None, disable_thinking: bool | None = None,
+             json_schema: dict | None = None, cancel_event=None,
+             on_stream=None) -> str:
         """Send a chat completion request and return the response text.
 
         `json_schema` is the strict schema to attach as the
@@ -1598,7 +2379,17 @@ class LLMClient:
         agent.fold_middle) because every rewrite invalidates the server's
         prompt-prefix cache. The overflow path below is the last resort, taken
         only after the server itself refused the request.
+
+        Passing `cancel_event` (a threading.Event or callable predicate), or
+        installing `client.on_stream`, turns streaming on by default when the
+        caller did not choose a mode. `stream=False` always keeps the buffered
+        JSON path, so existing callers and mocks are untouched.
         """
+        if stream is None:
+            stream = bool(on_stream or self.on_stream
+                          or getattr(self, "on_stream_event", None)
+                          or cancel_event is not None
+                          or getattr(self, "cancel_event", None) is not None)
         messages = merge_consecutive(messages)
         if self._no_system_role:
             messages = fold_system(messages)
@@ -1625,7 +2416,9 @@ class LLMClient:
                     max_tokens = fit
             try:
                 text = self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
                 # (stock LM Studio 8192 / Ollama 4096). Halve the reply budget
@@ -1640,6 +2433,7 @@ class LLMClient:
                 if not trimmed_once:
                     body_idx = [i for i, m in enumerate(messages)
                                 if m["role"] == "user"
+                                and isinstance(m.get("content"), str)
                                 and m["content"].startswith("RESULT:\n")]
                     if len(body_idx) > 2:
                         drop = set(body_idx[: len(body_idx) // 2])
@@ -1650,16 +2444,18 @@ class LLMClient:
                         print("[server context overflow: dropped older tool "
                               "results and retrying]", file=sys.stderr)
                         continue
-                if any(m["role"] == "system" for m in messages) and \
+                if (any(m["role"] == "system" for m in messages)
+                        or self._no_system_role) and \
                         len([m for m in messages if m["role"] != "system"]) > 2:
                     # No RESULT turns to shed (answer phase): drop the middle
                     # assistant turns, keeping the first user turn (map+task)
                     # and the last (latest instruction/result).
-                    keep_first = next(i for i, m in enumerate(messages)
-                                      if m["role"] == "user")
-                    keep_last = max(i for i, m in enumerate(messages)
-                                    if m["role"] == "user")
-                    if keep_last - keep_first > 1:
+                    keep_first = next((i for i, m in enumerate(messages)
+                                       if m["role"] == "user"), None)
+                    keep_last = max((i for i, m in enumerate(messages)
+                                     if m["role"] == "user"), default=None)
+                    if keep_first is not None and keep_last is not None \
+                            and keep_last - keep_first > 1:
                         mid = [i for i in range(keep_first + 1, keep_last)
                                if messages[i]["role"] == "assistant"]
                         if mid:
@@ -1719,7 +2515,7 @@ class LLMClient:
                     print(f"[rate limited by the server; waiting {wait:.0f}s "
                           f"({rate_waits}/{_MAX_RATE_LIMIT_RETRIES})]",
                           file=sys.stderr)
-                    time.sleep(wait)
+                    self._sleep_cancelable(wait, cancel_event=cancel_event)
                     continue
                 waited = time.time() - started
                 if waited >= self.cfg.load_wait_seconds:
@@ -1737,7 +2533,8 @@ class LLMClient:
                     announced = True
                 elif attempt % 5 == 0:
                     print(f"[still waiting, {waited:.0f}s elapsed]", file=sys.stderr)
-                time.sleep(delay + random.uniform(0, 0.5))
+                self._sleep_cancelable(delay + random.uniform(0, 0.5),
+                                       cancel_event=cancel_event)
                 delay = min(delay * 1.6, 10.0)
                 continue
 
@@ -1801,7 +2598,7 @@ class LLMClient:
                   f"{self.last_reasoning_chars:,} chars of hidden reasoning, "
                   f"finish '{self.last_finish_reason or 'stop'}'); "
                   f"retrying{how}]", file=sys.stderr)
-            time.sleep(1.0)
+            self._sleep_cancelable(1.0, cancel_event=cancel_event)
 
     def _always_thinks_fit_error(self, max_tokens: int) -> str:
         """The model-fit message for an always-reasoning model that spent its
@@ -1820,17 +2617,19 @@ class LLMClient:
     def _check_budget(self) -> None:
         """Raise BudgetExceeded before a call when a configured token/cost
         budget is already spent."""
+        with self._stats_lock:
+            used = self.stats["prompt_tokens"] + self.stats["completion_tokens"]
+            cost = self.stats["cost"]
         cap_tokens = int(getattr(self.cfg, "max_total_tokens", 0) or 0)
-        used = self.stats["prompt_tokens"] + self.stats["completion_tokens"]
         if cap_tokens and used >= cap_tokens:
             raise BudgetExceeded(
                 f"Token budget spent: {used:,} of max_total_tokens="
                 f"{cap_tokens:,}. Raise it (or pass --max-tokens-budget) to "
                 "continue; progress so far is saved.")
         cap_cost = float(getattr(self.cfg, "max_cost", 0) or 0)
-        if cap_cost and self.stats["cost"] >= cap_cost:
+        if cap_cost and cost >= cap_cost:
             raise BudgetExceeded(
-                f"Cost budget spent: ${self.stats['cost']:.4f} of max_cost="
+                f"Cost budget spent: ${cost:.4f} of max_cost="
                 f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.")
 
     def _account(self, usage: dict, timings: dict | None, seconds: float,
@@ -1873,6 +2672,7 @@ class LLMClient:
         # Generation speed: the server's own measurement when it reports one
         # (llama.cpp `timings`), else completion tokens over wall time.
         speed = float((timings or {}).get("predicted_per_second") or 0.0)
+        self.last_timings = dict(timings or {})
         with self._stats_lock:      # summaries may run on several threads
             self.stats["prompt_tokens"] += pt
             self.stats["completion_tokens"] += ct
@@ -1924,7 +2724,8 @@ class LLMClient:
     def _chat_once(self, messages: list[dict], max_tokens: int,
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None,
-                   json_schema: dict | None = None) -> str:
+                   json_schema: dict | None = None, cancel_event=None,
+                   on_stream=None, _count_call: bool = True) -> str:
         """One HTTP request (no retry logic); returns the response text,
         buffered or streamed (to `stream_callback`, else stdout).
 
@@ -1935,6 +2736,26 @@ class LLMClient:
         and the request is re-sent one tier down immediately, so no call ever
         fails over server schema support differences."""
         self._check_budget()
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        # `_cancel` belongs to the PREVIOUS stream (client.cancel() may be
+        # called after a task ends); a new call starts clean. A caller-owned
+        # token (GUI job Stop) is checked after that reset and still aborts.
+        self._cancel.clear()
+        if self._token_set(external_cancel):
+            raise RunCancelledError(
+                "Cancelled before the request left; nothing was sent.")
+        # Native Anthropic transport: /v1/messages, with prompt caching,
+        # streaming usage, thinking, tools and images. The outbound secret
+        # guard, replay digest, telemetry and cost accounting still run on the
+        # OpenAI-shaped messages before they are translated.
+        from . import transport_anthropic
+        if transport_anthropic.is_anthropic_native(self.cfg):
+            return self._chat_once_anthropic(
+                messages, max_tokens, schema=schema, stream=stream,
+                disable_thinking=disable_thinking, json_schema=json_schema,
+                cancel_event=cancel_event, on_stream=on_stream,
+                _count_call=_count_call)
         fmt_schema = json_schema if json_schema is not None else schema
         msgs = [dict(m) for m in messages]
         want_off = (disable_thinking if disable_thinking is not None
@@ -1946,12 +2767,13 @@ class LLMClient:
         if not suffix and want_off:
             suffix = thinking_suffix_for(self.cfg)
         if suffix and msgs:
-            msgs[-1]["content"] += "\n\n" + suffix
+            _append_message_text(msgs[-1], "\n\n" + suffix)
         if fmt_schema is not None and self.cfg.json_mode == "object" and msgs:
             # Hosted APIs require the word "json" in the prompt for
             # json_object mode; naming the fields improves compliance.
             fields = ", ".join(fmt_schema.get("properties", {}).keys())
-            msgs[-1]["content"] += (
+            _append_message_text(
+                msgs[-1],
                 f"\n\nReply with one JSON object only, no prose. "
                 f"Fields: {fields}.")
 
@@ -1995,6 +2817,16 @@ class LLMClient:
             # A phase temperature (temperature_answer/_repair, best_of) is more
             # specific than a `temperature` key in the sampler table.
             payload["temperature"] = self._temp_override
+        # Reasoning effort: local-MoE servers and reasoning-capable hosted
+        # models accept it natively; "default" sends no field at all. It is
+        # set AFTER the sampler merge so a profile value cannot be shadowed
+        # by a sampler table, and before the thinking-off block so disabling
+        # thinking always wins.
+        effort = str(getattr(self.cfg, "reasoning_effort", "default")
+                     or "default").strip().lower()
+        if effort in ("low", "medium", "high") and not want_off \
+                and _supports_reasoning_effort(self.cfg):
+            payload["reasoning_effort"] = effort
         if self._nudge_presence:
             # A repetition guard cut the previous reply: nudge the NEXT local
             # request with a gentle presence penalty rather than a cold
@@ -2060,20 +2892,28 @@ class LLMClient:
                 }
             elif tier == "object":
                 payload["response_format"] = {"type": "json_object"}
-            elif self.cfg.json_mode != "object":
+                if self.cfg.json_mode != "object" and msgs:
+                    fields = ", ".join(fmt_schema.get("properties", {}).keys())
+                    _append_message_text(
+                        msgs[-1],
+                        f"\n\nReply with one JSON object only, no prose. "
+                        f"Fields: {fields}.")
+            elif self.cfg.json_mode != "object" and msgs:
                 fields = ", ".join(fmt_schema.get("properties", {}).keys())
                 shots = self.fewshot if "action" in (
                     fmt_schema.get("properties") or {}) else []
                 if shots:
                     examples = "\n".join(
                         schema_example_with(fmt_schema, **s) for s in shots)
-                    msgs[-1]["content"] += (
+                    _append_message_text(
+                        msgs[-1],
                         "\n\nReply with one JSON object only, no prose. "
                         f"Fields: {fields}.\nWorked examples (for THIS "
                         f"project; choose what the task needs):\n"
                         + examples)
                 else:
-                    msgs[-1]["content"] += (
+                    _append_message_text(
+                        msgs[-1],
                         "\n\nReply with one JSON object only, no prose. "
                         f"Fields: {fields}.\nExample of a well-formed "
                         "reply:\n" + _schema_example(fmt_schema))
@@ -2104,7 +2944,10 @@ class LLMClient:
             except Exception:
                 pass      # telemetry must never break a call
         t0 = time.time()
-        self.stats["calls"] += 1
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
+        self.request_started_at = time.monotonic()
         # Cleared per attempt so a stale "length" from an abandoned attempt
         # cannot trigger apply()'s continuation loop.
         self.stream_truncated = False
@@ -2112,8 +2955,12 @@ class LLMClient:
         # Cleared per attempt with stream_truncated: True when the repetition
         # guard stopped a degenerate answer loop.
         self.stream_repetition = False
-        if stream:
-            self._cancel.clear()
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
 
         if not stream:
             try:
@@ -2126,48 +2973,57 @@ class LLMClient:
                           file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema,
                                            stream, disable_thinking,
-                                           json_schema)
+                                           json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
                           "JSON grammar instead]", file=sys.stderr)
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if self._downgrade_response_format(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 if self._deny_accel_caps(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
-                                           disable_thinking, json_schema)
+                                           disable_thinking, json_schema,
+                                           cancel_event=cancel_event,
+                                           on_stream=on_stream,
+                                           _count_call=False)
                 raise
             try:
-                data = r.json()
+                with self._active_response_lock:
+                    self._active_response = r
+                if self._cancel_requested(external_cancel):
+                    raise RunCancelledError(
+                        "Cancelled before the reply was read; nothing was "
+                        "consumed.")
+                if self._response_is_sse(r):
+                    # The server chose SSE even though the request asked for a
+                    # buffered reply: parse it with the streaming reader so it
+                    # is not lost to an ``r.json()`` failure.
+                    return self._consume_stream_response(
+                        r, prompt_est=prompt_est, t0=t0, native=native,
+                        cancel_event=external_cancel, on_stream=on_stream)
+                return self._consume_buffered_response(
+                    r, native=native, prompt_est=prompt_est, t0=t0)
             finally:
+                with self._active_response_lock:
+                    if self._active_response is r:
+                        self._active_response = None
                 _close(r)
-            try:
-                self.last_finish_reason = data["choices"][0].get("finish_reason") or ""
-            except (KeyError, IndexError, AttributeError, TypeError):
-                self.last_finish_reason = ""
-            try:
-                msg = data["choices"][0]["message"]
-                text = (_tool_call_arguments(msg) if native else "") \
-                    or extract_content(msg)
-            except (KeyError, IndexError, TypeError) as e:
-                raise LLMError(f"Unexpected response shape: {json.dumps(data)[:500]}") from e
-            if native and self._native_ok is None:
-                self._native_ok = True
-            self._account(data.get("usage") or {}, data.get("timings"),
-                          time.time() - t0, prompt_est, text)
-            return text
 
         # Streaming, so the user sees progress at local-model speeds.
         out: list[str] = []
-        tool_opens = 0
-        probe_tail = ""
-        rep_acc = ""          # content tail for the repetition test
-        rep_since = 0         # new chars since the last repetition test
-        block_acc = ""        # content tail for the duplicate-block census
-        block_tail = ""       # overlap so a split closing marker still scans
+        guard = _StreamLoopGuard()
         reasoning_chars = 0
         usage: dict = {}
         timings: dict | None = None
@@ -2182,13 +3038,22 @@ class LLMClient:
                 print("[this server rejected explicit cache_control markers; "
                       "falling back to implicit caching]", file=sys.stderr)
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream,
+                                       _count_call=False)
             if self._downgrade_response_format(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream,
+                                       _count_call=False)
             if self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
-                                       disable_thinking, json_schema)
+                                       disable_thinking, json_schema,
+                                       cancel_event=cancel_event,
+                                       on_stream=on_stream,
+                                       _count_call=False)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -2199,12 +3064,97 @@ class LLMClient:
                 r = self._post(payload, stream=True)
             else:
                 raise
+        if self._response_is_json(r):
+            # A test mock or a server that ignores `stream: true` answered
+            # with a normal completion: use the buffered parser transparently.
+            try:
+                return self._consume_buffered_response(
+                    r, native=native, prompt_est=prompt_est, t0=t0)
+            finally:
+                _close(r)
         sink = self.stream_callback
         cancelled = False
         dropped: Exception | None = None
+        # Live token/char counters and throttled event state. `reported_tokens`
+        # is filled from SSE usage frames as they arrive; otherwise the count
+        # below remains a deterministic estimate.
+        splitter = _StreamThinkSplitter()
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        reasoning_chars = 0
+        counted_chars = 0
+        reported_tokens = 0
+        chunks_since_emit = 0
+        events_emitted = 0
+        sse_data_seen = 0
+        # Raw lines before the first SSE data frame: a server that ignores
+        # `stream: true` answers with a plain JSON body, and a real
+        # requests.Response cannot .json() once iter_lines consumed it.
+        # Keep that prefix (bounded) so the fallback can still parse it.
+        prelude: list[str] = []
+        prelude_chars = 0
+        stream_started = time.monotonic()
+        first_token_at: float | None = None
+        last_emit = stream_started
+
+        def tokens_now() -> int:
+            if reported_tokens:
+                return int(reported_tokens)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            return int(counted_chars / cpt)
+
+        def flush_stream(final: bool = False) -> None:
+            """Emit one throttled `llm_stream` event for the deltas seen so
+            far. Empty final calls still refresh the exact reported token
+            count after the usage frame arrives."""
+            nonlocal pending_reasoning, pending_content, events_emitted
+            nonlocal chunks_since_emit, last_emit
+            rtext = "".join(pending_reasoning)
+            ctext = "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            anchor = first_token_at or stream_started
+            elapsed = max(now - anchor, 0.001)
+            tokens = tokens_now()
+            speed = tokens / elapsed if tokens else 0.0
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext
+                     else (self.stream_phase or "content"))
+            event = {
+                "kind": "llm_stream",
+                "phase": phase,
+                "delta_reasoning": rtext,
+                "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(speed, 1),
+                "elapsed_s": round(now - stream_started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = speed
+            pending_reasoning, pending_content = [], []
+            chunks_since_emit = 0
+            last_emit = now
+            events_emitted += 1
+            self._emit_stream_event(event, callback=on_stream)
+
+        fallback_data = None
+        with self._active_response_lock:
+            self._active_response = r
         try:
+            if self._cancel_requested(external_cancel):
+                raise RunCancelledError(
+                    "Stopped by user; nothing was read from the reply.")
             for raw in r.iter_lines(decode_unicode=True):
-                if self._cancel.is_set():
+                if self._cancel_requested(external_cancel):
                     cancelled = True
                     break
                 if not raw:
@@ -2213,6 +3163,10 @@ class LLMClient:
                 # the bytes branch is belt-and-braces for a custom session.
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", "replace")
+                if sse_data_seen == 0 and not raw.startswith(":") \
+                        and prelude_chars < 2_000_000:
+                    prelude.append(raw)
+                    prelude_chars += len(raw)
                 if raw.startswith(":"):
                     continue                    # SSE comment / keep-alive
                 if raw.startswith("data:"):
@@ -2225,8 +3179,14 @@ class LLMClient:
                     obj = json.loads(body)
                 except Exception:
                     continue
+                sse_data_seen += 1
                 if isinstance(obj, dict) and obj.get("usage"):
                     usage = obj["usage"]
+                    # A usage frame can land before the last deltas; switch
+                    # the live counter to the reported count immediately.
+                    if isinstance(usage, dict) and \
+                            _positive_int(usage.get("completion_tokens")):
+                        reported_tokens = int(usage["completion_tokens"])
                 if isinstance(obj, dict) and obj.get("timings"):
                     timings = obj["timings"]
                 try:
@@ -2243,93 +3203,147 @@ class LLMClient:
                 rc = _reasoning_text(d)
                 if not delta and not rc:
                     continue
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                    self.first_token_at = first_token_at
                 if rc:
+                    if pending_content:
+                        flush_stream()     # keep content before thoughts
                     reasoning_chars += len(rc)       # counted, never echoed
+                    reasoning_parts.append(rc)
+                    pending_reasoning.append(rc)
+                    counted_chars += len(rc)
                 if delta:
                     out.append(delta)
-                    if sink is not None:
-                        try:
-                            sink(delta)
-                        except Exception:
-                            pass
-                    elif self.echo_stream:
-                        sys.stdout.write(delta)
-                        sys.stdout.flush()
-                    # Degenerate native-tool-call loop guard; the 4-char
-                    # overlap catches an opening tag split across chunks.
-                    probe = probe_tail + delta
-                    tool_opens += len(_NATIVE_TOOL_OPEN_RE.findall(probe))
-                    probe_tail = probe[-4:]
-                    if tool_opens >= _MAX_STREAM_TOOL_OPENS:
-                        print("\n[stopped the reply: the model is repeating "
-                              "tool-call syntax instead of answering; no tools "
-                              "can run in this phase]", file=sys.stderr)
+                    inline_reasoning, visible = splitter.feed(delta)
+                    counted_chars += len(delta)
+                    if inline_reasoning:
+                        if pending_content:
+                            flush_stream()
+                        reasoning_chars += len(inline_reasoning)
+                        reasoning_parts.append(inline_reasoning)
+                        pending_reasoning.append(inline_reasoning)
+                    if visible:
+                        if pending_reasoning:
+                            # The reasoning pane becomes its own event before
+                            # the first answer token lands.
+                            flush_stream()
+                        pending_content.append(visible)
+                        if sink is not None:
+                            try:
+                                sink(visible)
+                            except Exception:
+                                pass
+                        elif self.echo_stream:
+                            sys.stdout.write(visible)
+                            sys.stdout.flush()
+                    if guard.feed(self, delta):
                         break
-                    # Verbatim-repetition guard (degenerate answer loop): pace
-                    # the KMP period test so ordinary streams pay nothing extra.
-                    rep_acc += delta
-                    rep_since += len(delta)
-                    if rep_since >= _STREAM_REPEAT_CHECK_CHARS:
-                        rep_since = 0
-                        rep_acc = rep_acc[-_STREAM_REPEAT_WINDOW:]
-                        if _repeat_run(rep_acc)[0]:
-                            self.stream_repetition = True
-                            self._nudge_presence = True
-                            # The reply is cut off: flag it like a dropped
-                            # stream so the existing continuation/re-ask
-                            # machinery handles the rest of the phase.
-                            self.stream_truncated = True
-                            print("\n[stopped the reply: the model is "
-                                  "repeating the same text verbatim -- a "
-                                  "degenerate loop; treating the answer as "
-                                  "cut off]", file=sys.stderr)
-                            break
-                    # Duplicate-block guard (BUG-215): the same completed edit
-                    # block re-emitted under changing FILE headers is a loop
-                    # the verbatim tail test cannot see. Scan only when a
-                    # closing marker may have just completed; the overlap
-                    # catches a marker split across chunks.
-                    block_acc += delta
-                    if len(block_acc) > _STREAM_BLOCK_WINDOW:
-                        block_acc = block_acc[-_STREAM_BLOCK_WINDOW:]
-                    block_probe = block_tail + delta
-                    block_tail = block_probe[-20:]
-                    if ">>>>>" in block_probe:
-                        counts: dict[str, int] = {}
-                        for m in _STREAM_BLOCK_DONE_RE.finditer(block_acc):
-                            body = " ".join(m.group(0).split())
-                            if len(body) < _STREAM_BLOCK_MIN_CHARS:
-                                continue
-                            counts[body] = counts.get(body, 0) + 1
-                        if max(counts.values(), default=0) \
-                                >= _MAX_STREAM_DUP_BLOCKS:
-                            self.stream_repetition = True
-                            self._nudge_presence = True
-                            self.stream_truncated = True
-                            print("\n[stopped the reply: the model is "
-                                  "re-emitting the same edit block over and "
-                                  "over -- a degenerate loop; treating the "
-                                  "answer as cut off]", file=sys.stderr)
-                            break
+                if self._cancel_requested(external_cancel):
+                    cancelled = True
+                    break
+                chunks_since_emit += 1
+                now = time.monotonic()
+                if chunks_since_emit >= 15 or (
+                        (pending_reasoning or pending_content)
+                        and now - last_emit >= 0.1):
+                    flush_stream()
         except requests.exceptions.RequestException as e:
             dropped = e
+        except Exception as e:
+            # cancel() closes the live socket from another thread; a read
+            # interrupted that way may surface as a transport/library error.
+            # Only swallow it when a cancellation actually explains it.
+            if not (cancelled or self._cancel_requested(external_cancel)):
+                raise
+            dropped = e
+        else:
+            # Read fallback JSON body BEFORE _close(r) closes the response.
+            if sse_data_seen == 0 and not cancelled and not self._cancel_requested(external_cancel):
+                try:
+                    fallback_data = r.json()
+                except Exception:
+                    fallback_data = None
         finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
             _close(r)
+        # Release any character held for a possible split tag at EOF.
+        tail_reasoning, tail_content = splitter.flush()
+        if tail_reasoning:
+            reasoning_chars += len(tail_reasoning)
+            reasoning_parts.append(tail_reasoning)
+            pending_reasoning.append(tail_reasoning)
+            counted_chars += len(tail_reasoning)
+        if tail_content:
+            pending_content.append(tail_content)
+            if sink is not None:
+                try:
+                    sink(tail_content)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(tail_content)
+                sys.stdout.flush()
         if sink is None and self.echo_stream:
             sys.stdout.write("\n")
+        if self._cancel_requested(external_cancel):
+            cancelled = True
         self.last_reasoning_chars = reasoning_chars
         text = strip_reasoning("".join(out))
         self.partial_text = text
+
+        # A server (or a test double) may answer a streaming request with a
+        # standard JSON body instead of SSE. No data frame + a JSON body is
+        # that fallback: parse it transparently.
+        if sse_data_seen == 0 and not text and not cancelled:
+            data = fallback_data
+            if data is None and prelude:
+                # iter_lines consumed the body: parse the buffered raw lines
+                # instead (requests.Response.json() raises after consumption).
+                try:
+                    data = json.loads("\n".join(prelude))
+                except Exception:
+                    data = None
+            if isinstance(data, dict) and data.get("choices") is not None:
+                return self._consume_buffered_data(
+                    data, native=native, prompt_est=prompt_est, t0=t0)
+
+        # Usage fallback: servers that omit the final usage frame still get
+        # deterministic counted tokens instead of zero telemetry.
+        usage = dict(usage or {})
+        estimated = tokens_now()
+        if usage:
+            if not _positive_int(usage.get("completion_tokens")):
+                usage["completion_tokens"] = estimated
+            if not _positive_int(usage.get("prompt_tokens")):
+                usage["prompt_tokens"] = prompt_est
         self._account(usage, timings, time.time() - t0, prompt_est, text)
+        reported_tokens = max(reported_tokens,
+                              int(self.last_completion_tokens or 0))
+        self.last_stream_tokens = (reported_tokens or tokens_now())
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        # Flush the tail deltas first (they still live in the pending lists),
+        # then pin the exact final buffers; otherwise the final events would
+        # append the same reasoning a second time.
+        flush_stream(final=True)
+        self.last_stream_content = text
+        self.last_stream_reasoning = (
+            "".join(reasoning_parts)[-_STREAM_LIVE_BUFFER:])
+        self.last_stream_tokens = (reported_tokens or tokens_now())
+        self.last_stream_tok_per_s = self.last_tok_per_s
         if cancelled:
-            raise CancelledError("Cancelled by the user; the partial reply is "
-                                 "kept in client.partial_text.")
+            raise RunCancelledError(
+                "Stopped by user; the partial reply is kept in "
+                "client.partial_text.")
         if dropped is not None:
             self._record_failure()
             if not text.strip():
                 raise LLMError(
                     f"The connection to {self.cfg.base_url} dropped mid-reply "
-                    f"({type(dropped).__name__}: {str(dropped)[:160]}).") \
+                    f"({type(dropped).__name__}: {str(dropped)[:160]})."
+                    f"{_oom_hint(str(dropped))}") \
                     from dropped
             # Partial answer survives: flag it truncated so the existing
             # continuation machinery asks for the rest instead of losing it.
@@ -2337,6 +3351,685 @@ class LLMClient:
             print(f"\n[connection dropped mid-reply "
                   f"({type(dropped).__name__}); treating the reply as cut "
                   f"off]", file=sys.stderr)
+        return text
+
+    # ------------------------------------------------------------------ Anthropic
+    # Native /v1/messages transport. `_chat_once` routes here when the config
+    # targets Anthropic's own API. Everything before translation (outbound
+    # secret guard, replay digest, telemetry) runs on the OpenAI-shaped
+    # messages; everything after (the HTTP POST) speaks native Anthropic.
+
+    def _anthropic_post(self, payload: dict, headers: dict, stream: bool = False):
+        """POST to the native /v1/messages endpoint, raising the same LLMError
+        subclasses as `_post` (connection, timeout, transient/rate limit --
+        including Anthropic's 529 overloaded -- context overflow, and clear
+        auth diagnostics on 401/403)."""
+        from . import transport_anthropic
+        url = transport_anthropic.messages_endpoint(self.cfg.base_url)
+        self._check_circuit()
+        try:
+            try:
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            except requests.exceptions.ConnectionError:
+                with self._session_lock:
+                    used = self._session_used
+                if not used:
+                    raise
+                self._reset_session()
+                r = self._http_post(url, headers=headers, json=payload,
+                                    timeout=self.cfg.timeout, stream=stream)
+            with self._session_lock:
+                self._session_used = True
+        except requests.exceptions.ConnectionError as e:
+            self._record_failure()
+            raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
+        except requests.exceptions.Timeout as e:
+            self._record_failure()
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
+                "local model may need a larger timeout; a hosted API may be "
+                "overloaded.") from e
+        except requests.exceptions.RequestException as e:
+            self._record_failure()
+            raise LLMError(
+                f"Request to {self.cfg.base_url} failed: "
+                f"{type(e).__name__}: {str(e)[:200]}") from e
+        r.encoding = "utf-8"
+        if r.status_code >= 400:
+            try:
+                body = r.text[:800]
+                retry_after = _retry_after(r)
+            finally:
+                _close(r)
+            if r.status_code in (401, 403):
+                raise LLMError(
+                    f"Anthropic rejected the credentials ({r.status_code}): "
+                    f"{body[:300]}\n"
+                    "  - Set your key via ANTHROPIC_API_KEY (or api_key_env), "
+                    "or api_key in the\n"
+                    "    profile; it is sent as the x-api-key header.")
+            if r.status_code in (429, 529):
+                # 529 is Anthropic's "overloaded" status, retried like a 429.
+                raise _Transient(
+                    f"{r.status_code}: {body[:200]}",
+                    retry_after=retry_after, rate_limited=True)
+            if self._context_too_long(body):
+                raise ContextOverflowError(
+                    f"Server says the request exceeds its context window: "
+                    f"{body[:300]}")
+            low = body.lower()
+            if r.status_code == 400 and any(h in low for h in _VISION_UNSUPPORTED_HINTS):
+                raise LLMError(
+                    f"The active model '{self.cfg.model}' does not support image "
+                    "inputs. Switch to a vision-capable model (e.g. Claude, "
+                    "Gemma 4, Qwen-VL, or GPT-4o) and try again.\n"
+                    f"Server detail: {body[:300]}")
+            if r.status_code >= 500:
+                self._record_failure()
+            raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
+        self._record_success()
+        return r
+
+    @staticmethod
+    def _anthropic_text(parsed: dict, native: bool) -> str:
+        """The reply text from a parsed Anthropic message: the forced tool's
+        arguments in native mode, else the plain text."""
+        if native:
+            calls = parsed.get("tool_calls") or []
+            if calls:
+                return calls[0].get("arguments_json") or ""
+        return parsed.get("text") or ""
+
+    def _chat_once_anthropic(self, messages: list[dict], max_tokens: int,
+                             schema: dict | None = None, stream: bool = False,
+                             disable_thinking: bool | None = None,
+                             json_schema: dict | None = None,
+                             cancel_event=None, on_stream=None,
+                             _count_call: bool = True) -> str:
+        """One native /v1/messages request (see `_chat_once` for the contract).
+
+        Step schemas become a forced `step` tool (Anthropic has no
+        response_format); the reply text is the tool's JSON arguments, so
+        `chat_json` parses it unchanged. Retries on a cache_control 400 by
+        disabling markers; 429/529 surface as transient for the `chat()`
+        retry loop and a context-overflow 400 as `ContextOverflowError`.
+        """
+        from . import transport_anthropic
+        from .providers import cache_mode_for
+
+        external_cancel = (cancel_event if cancel_event is not None
+                           else getattr(self, "cancel_event", None))
+        fmt_schema = json_schema if json_schema is not None else schema
+        msgs = [dict(m) for m in messages]
+        want_off = (disable_thinking if disable_thinking is not None
+                    else self.cfg.disable_thinking)
+
+        native = (fmt_schema is not None and not stream
+                  and "action" in (fmt_schema.get("properties") or {}))
+        openai_tools = None
+        openai_tool_choice = None
+        if native:
+            openai_tools = [{"type": "function", "function": {
+                "name": "step",
+                "description": "Choose the next action for the task.",
+                "parameters": fmt_schema}}]
+            openai_tool_choice = {"type": "function", "function": {"name": "step"}}
+
+        # Outbound secret guard on the OpenAI-shaped messages, before they are
+        # translated (the scanner understands tool_calls, not tool_use).
+        msgs = self._apply_outbound_guard({"messages": msgs}).get("messages", msgs)
+
+        cache_enabled = (cache_mode_for(self.cfg) == "explicit"
+                         and not self._cache_markers_rejected)
+        cache_ttl = (getattr(self.cfg, "prompt_cache_ttl", "5m")
+                     or "5m").strip().lower()
+        if cache_ttl not in ("5m", "1h"):
+            cache_ttl = "5m"
+
+        # Hosted sampling: omit temperature unless opted in, and never send
+        # below 1.0 to Claude 4.7+ (the provider table's omit_temperature).
+        hosted, pinned_temp = _hosted_sampling(self.cfg)
+        omit_temp = _omit_hosted_temp(self.cfg, hosted, pinned_temp)
+        temp = (pinned_temp if pinned_temp is not None
+                else self._temp_override if self._temp_override is not None
+                else self.cfg.temperature)
+        if omit_temp or (self._provider().omit_temperature and float(temp) < 1.0):
+            temp = None
+
+        payload = transport_anthropic.build_payload(
+            self.cfg, msgs, max_tokens, stream=stream, disable_thinking=want_off,
+            tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
+            cache_enabled=cache_enabled, cache_ttl=cache_ttl)
+        headers = transport_anthropic.build_headers(_api_key(self.cfg),
+                                                    ttl=cache_ttl)
+
+        start_cb = self.on_start
+        if start_cb is not None:
+            try:
+                start_cb({"provider": self.provider_label(),
+                          "model": self.cfg.model,
+                          "phase": self.site or "call",
+                          "stream": bool(stream)})
+            except Exception:
+                pass
+
+        t0 = time.time()
+        if _count_call:
+            with self._stats_lock:
+                self.stats["calls"] += 1
+        self.request_started_at = time.monotonic()
+        self.stream_truncated = False
+        self.partial_text = ""
+        self.stream_repetition = False
+        self.stream_phase = ""
+        self.last_stream_reasoning = ""
+        self.last_stream_content = ""
+        self.last_stream_tokens = 0
+        self.last_stream_tok_per_s = 0.0
+        self.first_token_at = None
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
+
+        prompt_est = estimate_messages(msgs, self.estimate_tokens)
+
+        if not stream:
+            try:
+                r = self._anthropic_post(payload, headers, stream=False)
+            except LLMError as e:
+                if self._cache_markers_rejected_by(e) and cache_enabled:
+                    self._cache_markers_rejected = True
+                    print("[this server rejected explicit cache_control "
+                          "markers; retrying without them]", file=sys.stderr)
+                    return self._chat_once_anthropic(
+                        messages, max_tokens, schema=schema, stream=stream,
+                        disable_thinking=disable_thinking, json_schema=json_schema,
+                        cancel_event=cancel_event, on_stream=on_stream,
+                        _count_call=False)
+                raise
+            try:
+                data = r.json()
+            finally:
+                _close(r)
+            parsed = transport_anthropic.parse_json_response(data)
+            self.last_finish_reason = parsed["finish_reason"]
+            if parsed["finish_reason"] == "length":
+                self.stream_truncated = True
+            text = self._anthropic_text(parsed, native)
+            if native and self._native_ok is None and text:
+                self._native_ok = True
+            self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                          prompt_est, text)
+            return text
+
+        # Streaming.
+        sink = self.stream_callback
+        out_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        chunks = 0
+        events = 0
+        started = time.monotonic()
+        last_emit = started
+        cancelled = False
+
+        def emit(final: bool = False) -> None:
+            nonlocal pending_reasoning, pending_content, chunks, last_emit, events
+            rtext = "".join(pending_reasoning)
+            ctext = "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            elapsed = max(now - (self.first_token_at or started), 0.001)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            tokens = int((len(rtext) + len(ctext)) / cpt) if not final else \
+                int(self.last_completion_tokens or 0)
+            if not tokens:
+                tokens = 1
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext else (self.stream_phase or "content"))
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = tokens / elapsed if tokens else 0.0
+            pending_reasoning, pending_content = [], []
+            chunks = 0
+            last_emit = now
+            events += 1
+            self._emit_stream_event({
+                "kind": "llm_stream", "phase": phase,
+                "delta_reasoning": rtext, "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(self.last_stream_tok_per_s, 1),
+                "elapsed_s": round(now - started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }, callback=on_stream)
+
+        def on_text(delta: str) -> None:
+            nonlocal chunks, last_emit
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            out_parts.append(delta)
+            pending_content.append(delta)
+            if sink is not None:
+                try:
+                    sink(delta)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def on_reasoning(delta: str) -> None:
+            nonlocal chunks, last_emit
+            if self.first_token_at is None:
+                self.first_token_at = time.monotonic()
+            reasoning_parts.append(delta)
+            pending_reasoning.append(delta)
+            chunks += 1
+            now = time.monotonic()
+            if chunks >= 15 or (pending_reasoning or pending_content) \
+                    and now - last_emit >= 0.1:
+                emit()
+
+        def cancel_check() -> bool:
+            return self._cancel_requested(external_cancel)
+
+        try:
+            r = self._anthropic_post(payload, headers, stream=True)
+        except LLMError as e:
+            if self._cache_markers_rejected_by(e) and cache_enabled:
+                self._cache_markers_rejected = True
+                print("[this server rejected explicit cache_control markers; "
+                      "retrying without them]", file=sys.stderr)
+                return self._chat_once_anthropic(
+                    messages, max_tokens, schema=schema, stream=stream,
+                    disable_thinking=disable_thinking, json_schema=json_schema,
+                    cancel_event=cancel_event, on_stream=on_stream,
+                    _count_call=False)
+            raise
+
+        with self._active_response_lock:
+            self._active_response = r
+        try:
+            if self._response_is_json(r):
+                # A server (or test) answered a stream request with JSON.
+                try:
+                    return self._consume_anthropic_data(
+                        r.json(), native=native, prompt_est=prompt_est, t0=t0)
+                finally:
+                    _close(r)
+            parsed = transport_anthropic.parse_sse_stream(
+                r, on_text=on_text, on_reasoning=on_reasoning,
+                cancel_check=cancel_check)
+        except transport_anthropic.StreamCancelled:
+            cancelled = True
+            parsed = {"text": "".join(out_parts),
+                      "reasoning": "".join(reasoning_parts),
+                      "tool_calls": [], "finish_reason": "", "usage": {}}
+        except transport_anthropic.StreamError as e:
+            low = (e.err_type or "").lower()
+            if "overload" in low or "rate_limit" in low:
+                raise _Transient(f"Anthropic stream error: {e}",
+                                 retry_after=None, rate_limited=True) from e
+            raise LLMError(f"Anthropic stream error: {e}") from e
+        finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
+            _close(r)
+
+        if cancelled:
+            self.partial_text = parsed["text"]
+            self.last_reasoning_chars = len(parsed["reasoning"])
+            self.last_stream_content = parsed["text"][-_STREAM_LIVE_BUFFER:]
+            self.last_stream_reasoning = parsed["reasoning"][-_STREAM_LIVE_BUFFER:]
+            raise RunCancelledError(
+                "Stopped by user; the partial reply is kept in "
+                "client.partial_text.")
+
+        text = parsed["text"]
+        reasoning_text = parsed["reasoning"]
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        self.last_reasoning_chars = len(reasoning_text)
+        self.partial_text = text
+        if native and parsed.get("tool_calls"):
+            text = parsed["tool_calls"][0]["arguments_json"]
+            if self._native_ok is None and text:
+                self._native_ok = True
+
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
+
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        emit(final=True)
+        self.last_stream_content = text
+        self.last_stream_reasoning = reasoning_text[-_STREAM_LIVE_BUFFER:]
+        self.last_stream_tokens = int(self.last_completion_tokens or 0)
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        return text
+
+    def _consume_anthropic_data(self, data: dict, *, native: bool,
+                                prompt_est: int, t0: float) -> str:
+        """Parse one buffered /v1/messages body into text + telemetry."""
+        from . import transport_anthropic
+        parsed = transport_anthropic.parse_json_response(data)
+        self.last_finish_reason = parsed["finish_reason"]
+        if parsed["finish_reason"] == "length":
+            self.stream_truncated = True
+        text = self._anthropic_text(parsed, native)
+        if native and self._native_ok is None and text:
+            self._native_ok = True
+        self._account(parsed.get("usage") or {}, None, time.time() - t0,
+                      prompt_est, text)
+        return text
+
+    @staticmethod
+    def _response_content_type(response) -> str:
+        """Lower-case Content-Type of a response ('' when absent)."""
+        try:
+            headers = getattr(response, "headers", None) or {}
+            value = headers.get("Content-Type") or headers.get("content-type")
+        except Exception:
+            value = ""
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def _response_is_sse(cls, response) -> bool:
+        return cls._response_content_type(response).startswith(
+            "text/event-stream")
+
+    @classmethod
+    def _response_is_json(cls, response) -> bool:
+        ctype = cls._response_content_type(response)
+        return ctype.startswith("application/json") or ctype.endswith("+json")
+
+    def _consume_buffered_response(self, r, *, native: bool,
+                                   prompt_est: int, t0: float) -> str:
+        """Parse one standard JSON chat completion (the non-streaming path)."""
+        data = r.json()
+        return self._consume_buffered_data(
+            data, native=native, prompt_est=prompt_est, t0=t0)
+
+    def _consume_buffered_data(self, data, *, native: bool,
+                               prompt_est: int, t0: float) -> str:
+        """Turn one parsed JSON completion into the reply text + telemetry."""
+        try:
+            self.last_finish_reason = (
+                data["choices"][0].get("finish_reason") or "")
+        except (KeyError, IndexError, AttributeError, TypeError):
+            self.last_finish_reason = ""
+        try:
+            msg = data["choices"][0]["message"]
+            text = (_tool_call_arguments(msg) if native else "") \
+                or extract_content(msg)
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(
+                f"Unexpected response shape: {json.dumps(data)[:500]}") from e
+        if native and self._native_ok is None:
+            self._native_ok = True
+        self._account(data.get("usage") or {}, data.get("timings"),
+                      time.time() - t0, prompt_est, text)
+        return text
+
+    def _consume_stream_response(self, r, *, prompt_est: int, t0: float,
+                                 native: bool = False, cancel_event=None,
+                                 on_stream=None) -> str:
+        """Parse an SSE reply when the caller did not ask for streaming.
+
+        The normal streamed path inside `_chat_once` carries the loop guards
+        and continuation diagnostics; this reader exists for a server that
+        answers a buffered request with `text/event-stream` anyway. It uses
+        the same delta splitter and accounting, so the reply and telemetry are
+        identical to the primary path.
+        """
+        external = (cancel_event if cancel_event is not None
+                    else getattr(self, "cancel_event", None))
+        sink = self.stream_callback
+        splitter = _StreamThinkSplitter()
+        guard = _StreamLoopGuard()
+        out: list[str] = []
+        tool_call_parts: dict[int, list[str]] = {}
+        reasoning_parts: list[str] = []
+        pending_reasoning: list[str] = []
+        pending_content: list[str] = []
+        usage: dict = {}
+        timings: dict | None = None
+        reasoning_chars = 0
+        counted_chars = 0
+        reported_tokens = 0
+        chunks = 0
+        events = 0
+        started = time.monotonic()
+        first_token_at: float | None = None
+        last_emit = started
+        self.last_finish_reason = ""
+        self.last_reasoning_chars = 0
+        self.stream_phase = ""
+        self.stream_truncated = False
+        self.stream_repetition = False
+
+        def emit(final: bool = False) -> None:
+            nonlocal pending_reasoning, pending_content, chunks, last_emit
+            nonlocal events
+            rtext, ctext = "".join(pending_reasoning), "".join(pending_content)
+            if not (rtext or ctext or final):
+                return
+            now = time.monotonic()
+            elapsed = max(now - (first_token_at or started), 0.001)
+            cpt = self.chars_per_token or CHARS_PER_TOKEN
+            tokens = reported_tokens or int(counted_chars / cpt)
+            phase = ("reasoning" if rtext and not ctext else
+                     "content" if ctext
+                     else (self.stream_phase or "content"))
+            self.stream_phase = phase
+            self.last_stream_reasoning = (
+                self.last_stream_reasoning + rtext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_content = (
+                self.last_stream_content + ctext)[-_STREAM_LIVE_BUFFER:]
+            self.last_stream_tokens = tokens
+            self.last_stream_tok_per_s = tokens / elapsed if tokens else 0.0
+            pending_reasoning, pending_content = [], []
+            chunks = 0
+            last_emit = now
+            events += 1
+            self._emit_stream_event({
+                "kind": "llm_stream", "phase": phase,
+                "delta_reasoning": rtext, "delta_content": ctext,
+                "tokens_so_far": tokens,
+                "tok_per_sec": round(self.last_stream_tok_per_s, 1),
+                "elapsed_s": round(now - started, 3),
+                "site": self.site or "call",
+                "model": str(getattr(self.cfg, "model", "") or ""),
+            }, callback=on_stream)
+
+        with self._active_response_lock:
+            self._active_response = r
+        try:
+            if self._cancel_requested(external):
+                raise RunCancelledError(
+                    "Stopped by user; nothing was read from the reply.")
+            for raw in r.iter_lines(decode_unicode=True):
+                if self._cancel_requested(external):
+                    self.partial_text = strip_reasoning("".join(out))
+                    raise RunCancelledError(
+                        "Stopped by user; the partial reply is kept in "
+                        "client.partial_text.")
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                if raw.startswith(":") or not raw.startswith("data:"):
+                    continue
+                body = raw[5:].lstrip()
+                if body.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("usage"):
+                    usage = obj["usage"]
+                    # A usage frame can land before the last deltas; switch
+                    # the live counter to the reported count immediately.
+                    if isinstance(usage, dict) and \
+                            _positive_int(usage.get("completion_tokens")):
+                        reported_tokens = int(usage["completion_tokens"])
+                if isinstance(obj, dict) and obj.get("timings"):
+                    timings = obj["timings"]
+                try:
+                    chunk = obj["choices"][0]
+                    d = chunk.get("delta") or {}
+                    fr = chunk.get("finish_reason") or ""
+                except Exception:
+                    continue
+                if fr:
+                    self.last_finish_reason = fr
+                if fr == "length":
+                    self.stream_truncated = True
+                delta = d.get("content")
+                rc = _reasoning_text(d)
+                tc_added = 0
+                if native:
+                    for tc in (d.get("tool_calls") or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = int(tc.get("index", 0) or 0)
+                        fn = tc.get("function") or {}
+                        args = fn.get("arguments")
+                        if isinstance(args, dict):
+                            s = json.dumps(args)
+                            tool_call_parts.setdefault(idx, []).append(s)
+                            tc_added += len(s)
+                        elif isinstance(args, str) and args:
+                            tool_call_parts.setdefault(idx, []).append(args)
+                            tc_added += len(args)
+                if not delta and not rc and not tc_added:
+                    continue
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                    self.first_token_at = first_token_at
+                if tc_added:
+                    counted_chars += tc_added
+                if rc:
+                    if pending_content:
+                        emit()              # keep content before thoughts
+                    reasoning_chars += len(rc)
+                    reasoning_parts.append(rc)
+                    pending_reasoning.append(rc)
+                    counted_chars += len(rc)
+                if delta:
+                    out.append(delta)
+                    inline_reasoning, visible = splitter.feed(delta)
+                    counted_chars += len(delta)
+                    if inline_reasoning:
+                        if pending_content:
+                            emit()
+                        reasoning_chars += len(inline_reasoning)
+                        reasoning_parts.append(inline_reasoning)
+                        pending_reasoning.append(inline_reasoning)
+                    if visible:
+                        if pending_reasoning:
+                            emit()
+                        pending_content.append(visible)
+                        if sink is not None:
+                            try:
+                                sink(visible)
+                            except Exception:
+                                pass
+                        elif self.echo_stream:
+                            sys.stdout.write(visible)
+                            sys.stdout.flush()
+                    if guard.feed(self, delta):
+                        break
+                if self._cancel_requested(external):
+                    self.partial_text = strip_reasoning("".join(out))
+                    raise RunCancelledError(
+                        "Stopped by user; the partial reply is kept in "
+                        "client.partial_text.")
+                chunks += 1
+                now = time.monotonic()
+                if chunks >= 15 or (
+                        (pending_reasoning or pending_content)
+                        and now - last_emit >= 0.1):
+                    emit()
+        except requests.exceptions.RequestException as e:
+            if self._cancel_requested(external):
+                # cancel() closed the socket from another thread and the
+                # read surfaced as a transport error: this is a stop, not a
+                # completed reply (mirrors the in-loop cancel checks).
+                self.partial_text = strip_reasoning("".join(out))
+                raise RunCancelledError(
+                    "Stopped by user; the partial reply is kept in "
+                    "client.partial_text.") from e
+            self._record_failure()
+            raise LLMError(
+                f"The connection to {self.cfg.base_url} dropped mid-reply "
+                f"({type(e).__name__}: {str(e)[:160]})."
+                f"{_oom_hint(str(e))}") from e
+        finally:
+            with self._active_response_lock:
+                if self._active_response is r:
+                    self._active_response = None
+            _close(r)
+        tail_reasoning, tail_content = splitter.flush()
+        if tail_reasoning:
+            reasoning_chars += len(tail_reasoning)
+            reasoning_parts.append(tail_reasoning)
+            pending_reasoning.append(tail_reasoning)
+        if tail_content:
+            pending_content.append(tail_content)
+            if sink is not None:
+                try:
+                    sink(tail_content)
+                except Exception:
+                    pass
+            elif self.echo_stream:
+                sys.stdout.write(tail_content)
+                sys.stdout.flush()
+        if sink is None and self.echo_stream:
+            sys.stdout.write("\n")
+        self.last_reasoning_chars = reasoning_chars
+        tc_text = ""
+        if native and tool_call_parts:
+            first_idx = sorted(tool_call_parts)[0]
+            cand = "".join(tool_call_parts[first_idx])
+            if cand.strip():
+                tc_text = cand
+        text = tc_text or strip_reasoning("".join(out))
+        if native and self._native_ok is None and text:
+            self._native_ok = True
+        self.partial_text = text
+        usage = dict(usage or {})
+        if usage:
+            if not _positive_int(usage.get("completion_tokens")):
+                usage["completion_tokens"] = int(
+                    counted_chars / (self.chars_per_token or CHARS_PER_TOKEN))
+            if not _positive_int(usage.get("prompt_tokens")):
+                usage["prompt_tokens"] = prompt_est
+        self._account(usage, timings, time.time() - t0, prompt_est, text)
+        reported_tokens = max(reported_tokens,
+                              int(self.last_completion_tokens or 0))
+        emit(final=True)
+        self.last_stream_tokens = reported_tokens
+        self.last_stream_tok_per_s = self.last_tok_per_s
+        self.last_stream_content = text
+        self.last_stream_reasoning = (
+            "".join(reasoning_parts)[-_STREAM_LIVE_BUFFER:])
         return text
 
     @staticmethod
@@ -2445,6 +4138,10 @@ class LLMClient:
         caps = _accel_caps(self.cfg.base_url, self.cfg.model)
         names = {_ACCEL_CACHE_KEY: "cache", _ACCEL_LOOKUP_KEY: "lookup"}
         fresh = [k for k in attached if caps.get(names[k], True)]
+        if _ACCEL_LOOKUP_KEY in low and _ACCEL_CACHE_KEY not in low:
+            # Server specifically blamed prompt_lookup_num_tokens; keep
+            # cache_prompt active instead of disabling both.
+            fresh = [k for k in fresh if k == _ACCEL_LOOKUP_KEY]
         if not fresh:
             return False
         for k in fresh:
@@ -2507,7 +4204,8 @@ class LLMClient:
             for p in props.values())
 
     def chat_json(self, messages: list[dict], schema: dict, max_tokens: int,
-                  disable_thinking: bool | None = None) -> dict:
+                  disable_thinking: bool | None = None,
+                  deadline: float | None = None) -> dict:
         """Send a grammar-constrained chat request and return the parsed
         JSON object.
 
@@ -2515,6 +4213,11 @@ class LLMClient:
         max_tokens, so a truncated attempt retries with a larger budget (see
         `_schema_has_big_fields` for when it does not), or salvages the
         complete prefix of the object.
+
+        `deadline` (a `time.monotonic()` value) is the run's wall-clock time
+        budget: once it has passed, no further attempt starts and an
+        LLMError reports the expired budget. The call in flight is never
+        killed -- the gate sits between attempts, like the auto loop's cap.
         """
         retries = 2
         budget = max_tokens
@@ -2547,8 +4250,13 @@ class LLMClient:
                       max(usable, max_tokens))
         cap = max(cap, max_tokens)
         for attempt in range(retries + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LLMError(
+                    "The run's time budget expired before this JSON call "
+                    "could be retried (--max-minutes); stopping instead of "
+                    "spending more minutes on re-asks.")
             raw = self.chat(messages, max_tokens=budget, schema=schema,
-                            disable_thinking=disable_thinking)
+                            stream=False, disable_thinking=disable_thinking)
             truncated = self.last_finish_reason == "length"
             text = raw.strip()
             if text.startswith("```"):
@@ -2708,9 +4416,12 @@ class LLMClient:
         base = _server_root(self.cfg.base_url)
         try:
             r = requests.get(base + "/api/v0/models", headers=self.headers, timeout=10)
-            if r.status_code != 200:
-                return None
-            data = r.json().get("data", [])
+            try:
+                if r.status_code != 200:
+                    return None
+                data = r.json().get("data", [])
+            finally:
+                _close(r)
         except Exception:
             return None
         out = {m.get("id", "?"): m.get("state", "unknown") for m in data if isinstance(m, dict)}
@@ -2804,9 +4515,12 @@ class LLMClient:
         for path in ("/api/v1/health", "/api/v0/health"):
             try:
                 r = requests.get(root + path, headers=self.headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                finally:
+                    _close(r)
             except Exception:
                 continue
             entries = data.get("all_models_loaded") or []
@@ -2830,9 +4544,12 @@ class LLMClient:
                + "/options")
         try:
             r = requests.get(url, headers=self.headers, timeout=5)
-            if r.status_code != 200:
-                return None
-            data = r.json()
+            try:
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+            finally:
+                _close(r)
         except Exception:
             return None
         ctx = _positive_int(data.get("resolved_ctx_size"))
@@ -2886,9 +4603,12 @@ class LLMClient:
                 break
             try:
                 r = requests.get(url, headers=self.headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                finally:
+                    _close(r)
                 if isinstance(data, dict):
                     entries = data.get("models") or data.get("data") or []
                 else:
@@ -2917,8 +4637,11 @@ class LLMClient:
             try:
                 r = requests.post(root + "/api/show",
                                   json={"name": model}, timeout=5)
-                if r.status_code == 200:
-                    d = r.json()
+                try:
+                    d = r.json() if r.status_code == 200 else None
+                finally:
+                    _close(r)
+                if d is not None:
                     got: dict = {}
                     size = d.get("size")
                     if size is not None:
@@ -2981,22 +4704,25 @@ class LLMClient:
                     root = _server_root(self.cfg.base_url)
                     r = requests.get(root + "/api/v0/models",
                                      headers=self.headers, timeout=5)
-                    if r.status_code == 200:
-                        for m in r.json().get("data", []):
-                            if not isinstance(m, dict):
-                                continue
-                            if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
-                                sp = [str(x).lower() for x in
-                                      (m.get("supported_parameters") or [])]
-                                if any("response_format" in x or "json_schema" in x
-                                       for x in sp):
-                                    self._schema_supported = True
-                                elif sp:
-                                    self._schema_supported = False
-                                    print("[server does not support constrained "
-                                          "JSON; using plain JSON prompting]",
-                                          file=sys.stderr)
-                                break
+                    try:
+                        if r.status_code == 200:
+                            for m in r.json().get("data", []):
+                                if not isinstance(m, dict):
+                                    continue
+                                if m.get("id") == self.cfg.model or m.get("key") == self.cfg.model:
+                                    sp = [str(x).lower() for x in
+                                          (m.get("supported_parameters") or [])]
+                                    if any("response_format" in x or "json_schema" in x
+                                           for x in sp):
+                                        self._schema_supported = True
+                                    elif sp:
+                                        self._schema_supported = False
+                                        print("[server does not support constrained "
+                                              "JSON; using plain JSON prompting]",
+                                              file=sys.stderr)
+                                    break
+                    finally:
+                        _close(r)
                 except Exception:
                     pass   # best-effort probe
                 if self._schema_supported is not None:
@@ -3031,9 +4757,12 @@ class LLMClient:
             try:
                 r = requests.post(url, headers=self.headers, json=payload,
                                   timeout=10)
-                if r.status_code != 200:
-                    continue
-                d = r.json()
+                try:
+                    if r.status_code != 200:
+                        continue
+                    d = r.json()
+                finally:
+                    _close(r)
                 n = _positive_int(d.get("count")) or \
                     (len(d["tokens"]) if isinstance(d.get("tokens"), list) else 0)
                 if n > 0:
@@ -3098,7 +4827,11 @@ class LLMClient:
             if fmt is not None:
                 payload["response_format"] = fmt
             try:
-                data = self._post(payload).json()
+                r = self._post(payload)
+                try:
+                    data = r.json()
+                finally:
+                    _close(r)
                 text = (extract_content(data["choices"][0]["message"]) or "").strip()
                 i, j = text.find("{"), text.rfind("}")
                 obj = json.loads(text[i:j + 1]) if i != -1 and j > i else None
@@ -3122,17 +4855,54 @@ class LLMClient:
     def check(self, warn: bool = True) -> str:
         """Verify the server is reachable and return its comma-joined model ids;
         with `warn`, print a warning if the configured model is not listed."""
-        url = self.cfg.base_url.rstrip("/") + "/models"
+        from . import transport_anthropic
+        native = transport_anthropic.is_anthropic_native(self.cfg)
+        if native:
+            # Anthropic lists models at <origin>/v1/models with x-api-key.
+            ep = transport_anthropic.messages_endpoint(self.cfg.base_url)
+            url = ep[: -len("/messages")] + "/models"
+            headers = transport_anthropic.build_headers(_api_key(self.cfg))
+        else:
+            url = self.cfg.base_url.rstrip("/") + "/models"
+            headers = self.headers
+        r = None
         try:
-            r = requests.get(url, headers=self.headers, timeout=15)
+            r = requests.get(url, headers=headers, timeout=15)
             r.raise_for_status()
+            ids = [m.get("id", "?") for m in r.json().get("data", [])]
+        except requests.exceptions.HTTPError as e:
+            # BUG-007: the server WAS reached and answered with an error.
+            # Name the status (as _post does) instead of sending the user to
+            # check their port; a 5xx or a rejected key is not a dead server.
+            resp = e.response
+            status = resp.status_code if resp is not None else 0
+            try:
+                body = (resp.text if resp is not None else "")[:500]
+            except Exception:
+                body = ""
+            hint = ""
+            if status in (401, 403):
+                hint = (("\n  - Anthropic rejected the credentials: set "
+                         "ANTHROPIC_API_KEY (or api_key_env), or api_key in "
+                         "the profile; it is sent as the x-api-key header.")
+                        if native else
+                        ("\n  - The server rejected the credentials: check "
+                         "api_key in your config (`pedacito config --check`)."))
+            raise LLMError(f"Server returned {status}: {body}{hint}") from e
+        except requests.exceptions.Timeout as e:
+            raise LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                "15s while listing models. A local model may still be "
+                "loading; try again shortly.") from e
         except Exception as e:
             raise LLMError(
                 CONNECT_HELP.format(url=self.cfg.base_url) + "\n"
                 "  - Set base_url in your config: `pedacito config --init`, then\n"
                 "    `pedacito config --check` to test it."
             ) from e
-        ids = [m.get("id", "?") for m in r.json().get("data", [])]
+        finally:
+            if r is not None:
+                _close(r)
         if warn and self.cfg.model not in ids:
             print(f"[warn] model '{self.cfg.model}' not in loaded list: {ids}",
                   file=sys.stderr)

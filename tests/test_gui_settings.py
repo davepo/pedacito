@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pedacito import config
-from pedacito.config import ConfigError
+from pedacito.config import Config, ConfigError
+from pedacito.gui import core
 from pedacito.gui import settings as S
 from pedacito.gui import settings_api
 from test_gui import gui as _shared_gui  # noqa: F401  (pytest re-export)
@@ -565,6 +566,65 @@ def test_autotune_apply_writes_universal_settings(gui):
     assert _assigned(text, "max_read_tokens") == ["max_read_tokens = 1400"]
 
 
+def test_effort_endpoint_validates_live_value_and_persists(gui, monkeypatch):
+    """The Options-bar Effort selector: valid levels reach the live config,
+    carry the GUI source label and persist to the user file; bad levels are
+    refused without touching either. `default` must send no transport field."""
+    _config(gui)
+    with core.STATE.lock:
+        core.STATE.cfg = Config(reasoning_effort="medium")
+    status, j = gui.post("/api/effort", {"level": "extreme"})
+    assert status == 400 and j["ok"] is False
+    assert "default, low, medium or high" in j["detail"]
+
+    status, j = gui.post("/api/effort", {"level": "high"})
+    assert status == 200 and j["ok"] is True
+    assert j["reasoning_effort"] == "high"
+    assert "model_class" in j
+    with core.STATE.lock:
+        cfg = core.STATE.cfg
+        assert cfg.reasoning_effort == "high"
+        assert cfg.sources["reasoning_effort"] == "GUI Effort selector"
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert _assigned(text, "reasoning_effort") == ['reasoning_effort = "high"']
+
+    # The endpoint accepts the setting's own key as well as the UI's `level`.
+    status, j = gui.post("/api/effort", {"reasoning_effort": "low"})
+    assert status == 200 and j["reasoning_effort"] == "low"
+    with core.STATE.lock:
+        assert core.STATE.cfg.reasoning_effort == "low"
+
+    status, j = gui.post("/api/effort", {"level": "default"})
+    assert status == 200 and j["reasoning_effort"] == "default"
+    assert _assigned(gui.cfg_path.read_text(encoding="utf-8"),
+                     "reasoning_effort") == ['reasoning_effort = "default"']
+
+    # At the transport, "default" omits reasoning_effort entirely (the
+    # local-moe client would otherwise forward low/medium/high).
+    payloads = []
+
+    class Reply:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+    def fake_post(url, headers=None, timeout=None, json=None, **kw):
+        payloads.append(dict(json or {}))
+        return Reply()
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    from pedacito.llm import LLMClient
+    transport = Config(base_url="http://127.0.0.1:8000/v1",
+                       model="deepseek-v4.1-flash", provider="avalon",
+                       reasoning_effort="default")
+    LLMClient(transport).chat([{"role": "user", "content": "hi"}],
+                              max_tokens=16)
+    assert "reasoning_effort" not in payloads[-1]
+
+
 def test_profile_reasoning_overrides_persist(gui):
     """What the Profiles editor's override box writes: thinking-mode and
     edit-loop keys land inside [profiles.*], not the universal layer."""
@@ -590,6 +650,64 @@ def test_profile_reasoning_overrides_persist(gui):
         "file": "user", "profile": "default",
         "changes": {"prompt_pack": "giant"}})
     assert status == 400 and "prompt_pack must be one of" in j["detail"]
+
+
+def test_post_edit_verify_round_trips_auto_verify(gui):
+    """The Options-bar checkbox writes the COMMAND string, never a bool, and
+    /api/state reports it back so the checkbox reflects reality."""
+    _config(gui)
+    items = {i["name"]: i for i in S.schema()}
+    assert items["auto_verify"]["type"] == "str"
+
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"auto_verify": "npm test"}})
+    assert status == 200 and body["ok"], body
+    text = gui.cfg_path.read_text(encoding="utf-8")
+    assert 'auto_verify = "npm test"' in text
+    _status, state = gui.get("/api/state")
+    assert state["auto_verify"] == "npm test"
+    assert state["detected_test_command"] == ""   # scratchpad: no project
+
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"auto_verify": ""}})
+    assert status == 200 and body["ok"], body
+    assert 'auto_verify = ""' in gui.cfg_path.read_text(encoding="utf-8")
+    assert gui.get("/api/state")[1]["auto_verify"] == ""
+
+
+def test_config_without_auto_verify_is_untouched(gui):
+    """Old configs gain no key from a state poll or an unrelated edit."""
+    gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    gui.cfg_path.write_text('[universal]\nmodel = "m"\n', encoding="utf-8")
+    before = gui.cfg_path.read_bytes()
+    assert gui.get("/api/state")[0] == 200
+    assert gui.cfg_path.read_bytes() == before
+    status, body = gui.post("/api/settings/set", {
+        "file": "user", "changes": {"temperature": 0.3}})
+    assert status == 200 and body["ok"], body
+    assert "auto_verify" not in gui.cfg_path.read_text(encoding="utf-8")
+
+
+def test_state_exposes_the_detected_test_command(gui):
+    """The checkbox tooltip/enable-assist reads the detected runner from the
+    same state payload as auto_verify."""
+    root = gui.tmp / "detect-proj"
+    root.mkdir()
+    (root / "package.json").write_text(
+        '{"scripts": {"test": "node --test"}}\n', encoding="utf-8")
+    with core.STATE.lock:
+        core.STATE.root = root
+        core.STATE.cfg = config.Config()
+        core.STATE._detect_test = ("", "", "", 0.0)
+    try:
+        state = gui.get("/api/state")[1]
+        assert state["detected_test_command"] == "npm test"
+        assert state["auto_verify"] == ""
+    finally:
+        with core.STATE.lock:
+            core.STATE.root = None
+            core.STATE.cfg = None
+            core.STATE._detect_test = ("", "", "", 0.0)
 
 
 # --- Pre-configured hosted provider profiles -----------------------------------
@@ -633,10 +751,10 @@ def test_add_preset_creates_a_ready_hosted_profile(gui):
     assert prof["tier"] == "hosted"
     assert prof["context_tokens"] == 200000
     assert prof["max_read_tokens"] == 3000                     # cloud gather budgets
-    # Anthropic's OpenAI-compatible surface quirks come from the provider table
+    # Anthropic's native-surface quirks come from the provider table
     assert prof["json_mode"] == "schema"
-    assert prof["prompt_cache"] == "off"
-    assert prof["tool_mode"] == "grammar"
+    assert prof["prompt_cache"] == "explicit"
+    assert "tool_mode" not in prof                # forced native tool_choice is accepted
     # STATE reloaded: the profile is selectable right away, no restart
     _status, st = gui.get("/api/state")
     assert st["profile"] == "claude_sonnet"
@@ -984,3 +1102,98 @@ def test_import_refuses_bad_requests_without_writing(gui):
     status, j = gui.post("/api/providers/import", {"preset_id": "nope"})
     assert status == 400 and "unknown provider preset" in j["detail"]
     assert not gui.cfg_path.exists()       # the refusals wrote nothing
+
+
+def test_probe_server_only_attaches_stored_key_on_matching_origin(gui):
+    srv, seen = _hosted_server()
+    try:
+        good_base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        gui.cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        gui.cfg_path.write_text(
+            '[profiles.stored]\n'
+            f'base_url = "{good_base}"\n'
+            'model = "m"\n'
+            'api_key = "sk-good"\n',
+            encoding="utf-8",
+        )
+        # Same (scheme, host, port): stored api_key is attached
+        out = settings_api.probe_server(good_base, "", which="user",
+                                        profile="stored")
+        assert out["ok"] is True
+        assert seen[-1]["authorization"] == "Bearer sk-good"
+
+        # Different host/port: stored api_key is NOT sent
+        srv2, seen2 = _hosted_server()
+        try:
+            other_base = "http://127.0.0.1:%d/v1" % srv2.server_address[1]
+            out2 = settings_api.probe_server(other_base, "", which="user",
+                                             profile="stored")
+            assert out2["ok"] is False
+            assert seen2[-1]["authorization"] != "Bearer sk-good"
+        finally:
+            srv2.shutdown()
+
+        # Non-http(s) URL is rejected
+        bad = settings_api.probe_server("file:///etc/passwd", "")
+        assert bad["ok"] is False and "http" in bad["error"].lower()
+    finally:
+        srv.shutdown()
+
+
+def test_probe_provider_enforces_http_scheme_and_env_allowlist(gui, monkeypatch):
+    srv, seen = _hosted_server()
+    monkeypatch.setenv("HOME", "sk-good")
+    monkeypatch.setenv("CUSTOM_API_KEY", "sk-good")
+    try:
+        base = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+        # Arbitrary env var (HOME) is never read or sent
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": base, "api_key_env": "HOME"})
+        assert status == 200 and j["ok"] is False
+        assert seen[-1]["authorization"] == "Bearer "
+
+        # Valid *_API_KEY env var works
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": base,
+            "api_key_env": "CUSTOM_API_KEY"})
+        assert status == 200 and j["ok"] is True
+        assert seen[-1]["authorization"] == "Bearer sk-good"
+
+        # Non-http(s) base_url is rejected with 400
+        status, j = gui.post("/api/providers/probe", {
+            "preset_id": "custom", "base_url": "file:///etc/passwd"})
+        assert status == 400 and "http" in j["detail"].lower()
+    finally:
+        srv.shutdown()
+
+
+def test_mcp_env_is_redacted_on_read_and_preserved_on_save(gui):
+    spec = {
+        "name": "srv", "transport": "stdio",
+        "command": sys.executable, "args": ["-c", "pass"],
+        "env": {"GITHUB_TOKEN": "ghp_secret123456", "LOG_LEVEL": "debug"},
+        "trusted": False, "enabled": True,
+    }
+    status, body = gui.post("/api/mcp/servers", spec)
+    assert status == 200 and body["ok"]
+    row = next(s for s in body["servers"] if s["name"] == "srv")
+    assert row["env"]["GITHUB_TOKEN"] == "***REDACTED***"
+    assert row["env"]["LOG_LEVEL"] == "debug"
+
+    # Re-saving with the redacted sentinel preserves the stored secret on disk
+    status, body2 = gui.post("/api/mcp/servers", {
+        **spec,
+        "env": {"GITHUB_TOKEN": "***REDACTED***", "LOG_LEVEL": "info"},
+        "enabled": False,
+    })
+    assert status == 200 and body2["ok"]
+    on_disk = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8"))
+    assert on_disk["mcp_servers"]["srv"]["env"]["GITHUB_TOKEN"] == "ghp_secret123456"
+    assert on_disk["mcp_servers"]["srv"]["env"]["LOG_LEVEL"] == "info"
+
+    # An orphan sentinel for an unknown env key is refused
+    status, bad = gui.post("/api/mcp/servers", {
+        **spec,
+        "env": {"NEW_SECRET_TOKEN": "***REDACTED***"},
+    })
+    assert status == 400 and bad["ok"] is False

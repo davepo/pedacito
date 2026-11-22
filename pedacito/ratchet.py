@@ -38,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import fileio
+from . import fileio, security
 
 
 # --- configuration defaults (overridable through Config fields) ------------
@@ -234,8 +234,9 @@ def begin(
         manifest[rel.as_posix()] = {"size": size, "mtime_ns": mtime_ns,
                                     "linked": linked}
     try:
-        (directory / "manifest.json").write_text(
-            json.dumps(
+        fileio.write_bytes(
+            directory / "manifest.json",
+            (json.dumps(
                 {
                     "step": step,
                     "task": task[:200],
@@ -245,10 +246,7 @@ def begin(
                     "files": manifest,
                 },
                 indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+            ) + "\n").encode("utf-8"))
     except OSError:
         pass
     info["files"] = sorted(k for k, v in manifest.items() if "skip" not in v)
@@ -262,7 +260,8 @@ def green(root: Path, step: int) -> None:
     """Mark step *step* verified-green: it becomes the rollback target."""
     try:
         checkpoint_root(root).mkdir(parents=True, exist_ok=True)
-        _pointer_path(root).write_text(f"{max(1, int(step))}\n", encoding="utf-8")
+        fileio.write_bytes(_pointer_path(root),
+                           f"{max(1, int(step))}\n".encode("utf-8"))
     except OSError:
         pass
 
@@ -313,6 +312,14 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
     manifest, skip_set, max_files = loaded
     directory = step_dir(root, step)
     for rel, entry in manifest.items():
+        # Containment BEFORE any write or delete: a manifest is hand-editable,
+        # and a symlinked parent directory (or a `..` component) on `rel` would
+        # aim the restore or the pre-restore unlink outside the project.
+        try:
+            security.resolve_safe_path(root, rel)
+        except (security.SecurityError, OSError, ValueError, RuntimeError):
+            result["skipped"].append(rel)
+            continue
         target = root / rel
         if isinstance(entry, dict) and entry.get("skip"):
             result["skipped"].append(rel)

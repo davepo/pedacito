@@ -19,7 +19,7 @@ A skill is a markdown file with frontmatter:
 
 Search order (first name wins): `<root>/.pedacito/skills/<name>/SKILL.md` or
 `<root>/.pedacito/skills/<name>.md`, the same two layouts under
-`<config dir>/skills/`, then the bundled library of eighteen starters. The
+`<config dir>/skills/`, then the bundled library of nineteen starters. The
 catalog costs a few dozen tokens; a skill's text enters the conversation only
 when the model asks for it (or `select_skills` matches its triggers, capped at
 two skills / 1,200 chars so a prompt never bloats). Skills are PROMPT TEXT:
@@ -33,7 +33,7 @@ import json
 import re
 from pathlib import Path
 
-from . import security
+from . import fileio, security
 from .memory import _frontmatter
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
@@ -309,6 +309,19 @@ BUILTIN_SKILLS: dict[str, tuple[str, str, tuple[str, ...]]] = {
         ("calculator", "tkinter", "pyqt", "pyside", "gui", "game", "pygame",
          "arcade", "snake", "pong", "tetris", "breakout", "asteroids",
          "sprite", "keypad")),
+    "safe-git-commit": (
+        "Inspect changes and prepare a safe commit the user can run",
+        "1. `git_diff` for status + uncommitted diff; `git` with `log -n 8` to "
+        "match the repo's commit-message style.\n"
+        "2. Commit or push only when the user explicitly asks; stage only files "
+        "this task touched.\n"
+        "3. `.git` is read-only in the sandbox: never run git writes yourself -- "
+        "hand the user the exact `git add ...` / `git commit -m \"...\"` / "
+        "`git push` commands.\n"
+        "4. Never `reset --hard`, `clean`, `push --force`; undo agent edits with "
+        "`pdc undo` or checkpoints instead.\n"
+        "5. Git missing or not a repo: say so, continue without it.",
+        ("commit", "git", "stage", "push", "message")),
 }
 
 # Historical name kept for callers and drift guards that say "bundled".
@@ -563,6 +576,42 @@ def _scope_dir(root, scope: str) -> Path:
     return Path(root) / ".pedacito" / "skills"
 
 
+def _scope_root(root, scope: str) -> Path:
+    """The containment root for a scope's skill library: the project root, or
+    the user config directory (the skills folder's own parent)."""
+    scope = (scope or "project").strip().lower()
+    if scope in ("user", "global"):
+        from . import config as config_mod
+        return config_mod.USER_CONFIG.parent
+    return Path(root)
+
+
+def _skill_path(root, scope: str, key: str) -> Path:
+    """The skill file for `key` (folder layout preferred), validated: any
+    symlink on the scope directory or the target is refused, and the resolved
+    path must stay inside the scope's containment root (a symlinked parent
+    that escapes is refused by `resolve_safe_path`)."""
+    d = _scope_dir(root, scope)
+    legacy = d / key / "SKILL.md"
+    path = legacy if legacy.is_file() else d / f"{key}.md"
+    base = _scope_root(root, scope)
+    if (d.is_symlink() or (path.parent != d and path.parent.is_symlink())
+            or path.is_symlink()):
+        raise ValueError(f"refusing to touch a symlinked skill path: {path}")
+    try:
+        rel = path.relative_to(base)
+    except ValueError:
+        raise ValueError(f"skill path {path} lies outside {base}")
+    # The scope root must exist before resolve_safe_path can prove containment
+    # (a first user-scope save creates the config directory, as before).
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        security.resolve_safe_path(base, rel)
+    except (security.SecurityError, OSError, RuntimeError) as exc:
+        raise ValueError(f"refusing unsafe skill path {path}: {exc}") from exc
+    return path
+
+
 def _validate_slug(name: str) -> str:
     key = (name or "").strip().lower()
     if not _NAME_RE.match(key):
@@ -605,14 +654,12 @@ def save_skill(root: Path | None, *, name: str, description: str,
     if len(body) > MAX_SKILL_CHARS:
         raise ValueError(f"skill body is {len(body)} chars; the cap is "
                          f"{MAX_SKILL_CHARS}")
-    d = _scope_dir(root, scope)
-    legacy = d / key / "SKILL.md"
-    path = legacy if legacy.is_file() else d / f"{key}.md"
+    path = _skill_path(root, scope, key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(_skill_text(key, description, list(triggers or []), body),
-                   encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(
+        path,
+        _skill_text(key, description, list(triggers or []), body).encode(
+            "utf-8"))
     return path
 
 
@@ -624,15 +671,28 @@ def delete_skill(root: Path | None, name: str,
     shows through again)."""
     key = _validate_slug(name)
     d = _scope_dir(root, scope)
+    base = _scope_root(root, scope)
     for path in (d / key / "SKILL.md", d / f"{key}.md"):
-        if path.is_file():
-            path.unlink()
-            if path.parent != d:
-                try:
-                    path.parent.rmdir()     # only when the folder is now empty
-                except OSError:
-                    pass
-            return True
+        if (d.is_symlink() or (path.parent != d and path.parent.is_symlink())
+                or path.is_symlink()):
+            raise ValueError(
+                f"refusing to delete a symlinked skill path: {path}")
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(base)
+            security.resolve_safe_path(base, rel)
+        except (ValueError, security.SecurityError, OSError,
+                RuntimeError) as exc:
+            raise ValueError(
+                f"refusing unsafe skill path {path}: {exc}") from exc
+        path.unlink()
+        if path.parent != d:
+            try:
+                path.parent.rmdir()     # only when the folder is now empty
+            except OSError:
+                pass
+        return True
     return False
 
 

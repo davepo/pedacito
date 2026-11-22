@@ -41,9 +41,10 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import SimpleHTTPRequestHandler
-from pathlib import Path
-from urllib.parse import quote
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, unquote, urlsplit
 
+from . import security
 from .local_server import LocalHTTPServer
 
 __all__ = ["DomFinding", "DomResult", "available", "check", "find_entry",
@@ -164,6 +165,66 @@ class _QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *args):      # the check is not an access log
         pass
 
+    def _host_allowed(self) -> bool:
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+    def _guard_request(self) -> bool:
+        if not self._host_allowed():
+            self.send_error(403, "Forbidden")
+            return False
+        raw_path = unquote(urlsplit(self.path).path or "/")
+        if "\x00" in raw_path:
+            self.send_error(403, "Forbidden")
+            return False
+        rel = raw_path.lstrip("/")
+        root = Path(self.directory).resolve()
+        if not rel:
+            for idx_name in ("index.html", "index.htm"):
+                cand = root / idx_name
+                if cand.exists() or cand.is_symlink():
+                    try:
+                        security.resolve_safe_path(root, idx_name)
+                    except (security.SecurityError, OSError, ValueError):
+                        self.send_error(403, "Forbidden")
+                        return False
+                    break
+            return True
+        rel_parts = [p.lower() for p in PurePosixPath(rel.replace("\\", "/")).parts
+                     if p not in ("", ".")]
+        if any(p in (".git", ".pedacito") for p in rel_parts):
+            self.send_error(403, "Forbidden")
+            return False
+        try:
+            resolved = security.resolve_safe_path(root, rel)
+        except (security.SecurityError, OSError, ValueError):
+            self.send_error(403, "Forbidden")
+            return False
+        try:
+            resolved_parts = [p.lower() for p in resolved.relative_to(root).parts]
+        except ValueError:
+            self.send_error(403, "Forbidden")
+            return False
+        if any(p in (".git", ".pedacito") for p in resolved_parts):
+            self.send_error(403, "Forbidden")
+            return False
+        if (security.is_sensitive_path(resolved)
+                or security.is_sensitive_rel(root, rel)):
+            self.send_error(403, "Forbidden")
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._guard_request():
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if not self._guard_request():
+            return
+        super().do_HEAD()
+
 
 @contextmanager
 def _local_server(root: Path):
@@ -172,12 +233,14 @@ def _local_server(root: Path):
     the OS pick a free one; the thread dies with the process."""
     handler = functools.partial(_QuietHandler, directory=str(root))
     httpd = LocalHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
     try:
         yield f"http://127.0.0.1:{httpd.server_port}"
     finally:
         httpd.shutdown()
         httpd.server_close()
+        thread.join(timeout=2)
 
 
 # Wrap addEventListener BEFORE any project script runs, so every binding the

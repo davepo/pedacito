@@ -409,7 +409,7 @@ def test_run_loop_rolls_back_the_failed_step(tmp_path, monkeypatch):
     verdicts = iter([True, False])   # task 1 verifies green, task 2 fails
     monkeypatch.setattr(
         loop, "run_verify",
-        lambda root, cmd: (next(verdicts, False), "boom"))
+        lambda root, cmd, **kw: (next(verdicts, False), "boom"))
     code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                          verify="pytest -q", repair_rounds=0,
                          stop_on_fail=False)
@@ -443,7 +443,8 @@ def test_run_loop_ratchet_off_leaves_the_wreckage(tmp_path, monkeypatch):
                                "done", True, changed, idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (False, "boom"))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: (False, "boom"))
     loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                   verify="pytest -q", repair_rounds=0, stop_on_fail=False)
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "BAD = wrecked\n"
@@ -464,7 +465,8 @@ def test_run_loop_keeps_checkpoints_when_checks_pass(tmp_path, monkeypatch):
                                "done", True, ["f.py"], idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (True, ""))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: (True, ""))
     code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                          verify="pytest -q")
     assert code == 0
@@ -493,7 +495,7 @@ def test_run_loop_step_static_gate_blocks_the_verify_subprocess(
     monkeypatch.setattr(loop, "run_task", fake_run_task)
     monkeypatch.setattr(
         loop, "run_verify",
-        lambda root, cmd: verify_runs.append(1) or (True, ""))
+        lambda root, cmd, **kw: verify_runs.append(1) or (True, ""))
     code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                          verify="pytest -q", repair_rounds=0)
     assert code == 1

@@ -32,13 +32,15 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
+import threading
 import time
 import uuid
 from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import browser, proc, safety
+from . import browser, fileio, proc, safety, security
 from .index import state_dir
 
 PROC_DIR = "procs"
@@ -86,9 +88,7 @@ def _read_record(path: Path) -> dict | None:
 def _write_record(root: Path, rec: dict) -> None:
     path = _record_path(root, str(rec.get("name") or "serve"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    fileio.write_bytes(path, json.dumps(rec, indent=1).encode("utf-8"))
 
 
 # Popen objects for children THIS process started. Retaining them is what lets
@@ -97,20 +97,62 @@ def _write_record(root: Path, rec: dict) -> None:
 # 3-second grace period) until an unrelated Popen happened to clean up. A
 # server started by one CLI process and stopped by another has no entry here;
 # its parent exits, so the OS reparents and reaps it instead.
+_CHILDREN_LOCK = threading.Lock()
 _CHILDREN: dict[int, subprocess.Popen] = {}
+_START_LOCK = threading.Lock()
 
 
 def _forget_child(pid: int) -> None:
-    _CHILDREN.pop(int(pid or 0), None)
+    with _CHILDREN_LOCK:
+        _CHILDREN.pop(int(pid or 0), None)
+
+
+def _get_child(pid: int) -> subprocess.Popen | None:
+    with _CHILDREN_LOCK:
+        return _CHILDREN.get(int(pid or 0))
+
+
+def _linux_proc_start_ticks(pid: int) -> int:
+    """Process start-time ticks from Linux /proc/<pid>/stat, or 0 if unavailable.
+
+    Splits on the LAST ')' because the comm field in parens can contain spaces
+    and ')' characters. Field 22 (1-indexed) is starttime -> index 19 after ')'.
+    """
+    if os.name == "nt" or sys.platform != "linux" or pid <= 0:
+        return 0
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
+                                                  errors="replace")
+    except OSError:
+        return 0
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return 0
+    fields = raw[rparen + 1:].split()
+    if len(fields) <= 19:
+        return 0
+    try:
+        return int(fields[19])
+    except ValueError:
+        return 0
+
+
+def _pid_matches_born(pid: int, born: float) -> bool:
+    """True unless Linux /proc/<pid>/stat proves `pid` was recycled."""
+    if os.name != "nt" and sys.platform == "linux" and born:
+        cur_born = _linux_proc_start_ticks(pid)
+        if cur_born and cur_born != int(born):
+            return False
+    return True
 
 
 def _alive(pid: int) -> bool:
     pid = int(pid or 0)
-    child = _CHILDREN.get(pid)
+    child = _get_child(pid)
     if child is not None:
         try:
             if child.poll() is not None:      # reaps the zombie
-                _CHILDREN.pop(pid, None)
+                _forget_child(pid)
                 return False
         except (OSError, ValueError):
             pass
@@ -159,9 +201,17 @@ def start(root, command, *, name: str = "", cfg=None,
     if not argv:
         raise ValueError("empty command")
     base = name or _default_name(command_text)
-    name = _unique_name(root, base)
-    log = _log_path(root, name)
-    log.parent.mkdir(parents=True, exist_ok=True)
+    with _START_LOCK:
+        name = _unique_name(root, base)
+        log = _log_path(root, name)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # Reserve the record on disk under the lock before spawning / waiting
+        # so concurrent start() calls cannot collide on the same name.
+        _write_record(root, {
+            "name": name, "command": command_text, "pid": 0,
+            "cwd": str(root), "log": str(log), "url": "", "job": "",
+            "started": time.time(), "status": "starting",
+        })
     env = safety.child_env(cfg)
     p = None
     job = job_note = ""
@@ -171,7 +221,8 @@ def start(root, command, *, name: str = "", cfg=None,
             p = proc.spawn(argv, cwd=root, env=env,
                            stdout=fh, stderr=subprocess.STDOUT,
                            suspended=(os.name == "nt"))
-        _CHILDREN[p.pid] = p
+        with _CHILDREN_LOCK:
+            _CHILDREN[p.pid] = p
         # Windows: the child is frozen, so it cannot spawn anything before it
         # is in the job -- membership is inherited at CREATION, and a launcher
         # that runs first can leave its descendants outside the job forever.
@@ -181,6 +232,8 @@ def start(root, command, *, name: str = "", cfg=None,
                 ft = _process_created(k, p.pid)
                 if ft:
                     born = ft / 10_000_000 - 11644473600
+        elif sys.platform == "linux":
+            born = _linux_proc_start_ticks(p.pid)
         job, job_note = _job_wrap(p.pid, name)
         if not _resume_child(p):
             # Could not resume (exotic): a frozen server is worse than a racy
@@ -194,7 +247,8 @@ def start(root, command, *, name: str = "", cfg=None,
             with log.open("ab") as fh:
                 p = proc.spawn(argv, cwd=root, env=env,
                                stdout=fh, stderr=subprocess.STDOUT)
-            _CHILDREN[p.pid] = p
+            with _CHILDREN_LOCK:
+                _CHILDREN[p.pid] = p
             k = _kernel32()
             if k is not None:
                 ft = _process_created(k, p.pid)
@@ -212,6 +266,7 @@ def start(root, command, *, name: str = "", cfg=None,
            "cwd": str(root), "log": str(log), "url": "", "job": job,
            "job_note": job_note, "born": born,
            "started": time.time(), "status": "running"}
+    _write_record(root, rec)
     # Give a dev server a moment to print its URL. Never block a run for long:
     # `wait` is a ceiling, and a command that exits is reported immediately.
     deadline = time.monotonic() + max(0.0, float(wait or 0))
@@ -221,7 +276,7 @@ def start(root, command, *, name: str = "", cfg=None,
             rec["returncode"] = p.returncode
             _forget_child(p.pid)
             break
-        text = _log_tail(rec)
+        text = _log_tail(rec, root)
         url = browser.find_server_url(text)
         if url:
             rec["url"] = url
@@ -231,9 +286,21 @@ def start(root, command, *, name: str = "", cfg=None,
     return rec
 
 
-def _log_tail(rec: dict) -> str:
-    """The last few kilobytes of a record's log, without reading the whole file."""
-    path = Path(str(rec.get("log") or ""))
+def _log_tail(rec: dict, root=None) -> str:
+    """The last few kilobytes of a record's log, without reading the whole file.
+
+    `root` bounds the read: the record's `log` path must resolve inside
+    `.pedacito/procs/`, so a hand-edited record cannot point the reader at an
+    arbitrary file (a symlink escaping the directory included)."""
+    raw = str(rec.get("log") or "")
+    if not raw:
+        return ""
+    path = Path(raw)
+    if root is not None:
+        try:
+            security.resolve_safe_path(_dir(root), path)
+        except (security.SecurityError, OSError, ValueError, RuntimeError):
+            return ""
     try:
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -244,7 +311,7 @@ def _log_tail(rec: dict) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _refresh_url(rec: dict) -> bool:
+def _refresh_url(rec: dict, root=None) -> bool:
     """Recover a URL the server printed after `start` stopped waiting.
 
     `serve_wait` bounds how long a run may block, not how long the server has
@@ -256,7 +323,7 @@ def _refresh_url(rec: dict) -> bool:
     """
     if rec.get("url") or rec.get("status") == "error":
         return False
-    url = browser.find_server_url(_log_tail(rec))
+    url = browser.find_server_url(_log_tail(rec, root))
     if not url:
         return False
     rec["url"] = url
@@ -272,10 +339,13 @@ def list_procs(root) -> list[dict]:
         if not rec:
             continue
         stale = False
-        if rec.get("status") == "running" and not _alive(int(rec.get("pid") or 0)):
+        pid = int(rec.get("pid") or 0)
+        born = float(rec.get("born") or 0.0)
+        if rec.get("status") == "running" and not (
+                _pid_matches_born(pid, born) and _alive(pid)):
             rec["status"] = "exited"
             stale = True
-        if _refresh_url(rec):
+        if _refresh_url(rec, root):
             stale = True
         if stale:
             _write_record(root, rec)
@@ -300,15 +370,37 @@ def logs(root, name: str, tail: int = 4000) -> str:
     if rec is None:
         known = ", ".join(str(r.get("name")) for r in list_procs(root)) or "(none)"
         return f"ERROR: no background process named '{name}'. Known: {known}"
+    log_path = Path(str(rec.get("log") or ""))
     try:
-        text = Path(rec["log"]).read_text(encoding="utf-8", errors="replace")
+        security.resolve_safe_path(_dir(root), log_path)
+    except (security.SecurityError, OSError, ValueError, RuntimeError):
+        return (f"ERROR: could not read {rec.get('log')}: "
+                f"outside the process log directory")
+    tail = max(200, int(tail or 4000))
+    # Bounded read from EOF: a UTF-8 character is at most 4 bytes, so reading
+    # 4 * tail bytes (+ margin) guarantees at least `tail` decoded characters
+    # without slurping a multi-gigabyte log file into memory.
+    max_bytes = tail * 4 + 64
+    truncated = False
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                truncated = True
+            else:
+                fh.seek(0)
+            data = fh.read()
     except OSError as e:
         return f"ERROR: could not read {rec['log']}: {e}"
-    tail = max(200, int(tail or 4000))
-    if len(text) > tail:
+    text = data.decode("utf-8", errors="replace")
+    if truncated or len(text) > tail:
         text = f"[... earlier output omitted; last {tail} chars ...]\n" + text[-tail:]
     state = rec.get("status", "?")
-    if state == "running" and not _alive(int(rec.get("pid") or 0)):
+    pid = int(rec.get("pid") or 0)
+    born = float(rec.get("born") or 0.0)
+    if state == "running" and not (_pid_matches_born(pid, born) and _alive(pid)):
         state = "exited"
     head = f"{rec.get('name')} [{state}, pid {rec.get('pid')}]"
     if rec.get("url"):
@@ -674,6 +766,10 @@ def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
         return
     if pid <= 0:
         return
+    # On Linux, verify start-time ticks when `born` was recorded so a recycled
+    # PID is never killed. Legacy records without `born` keep existing behavior.
+    if not _pid_matches_born(pid, born):
+        return
     # `proc.spawn` makes the child a session/group leader, so its pid IS the
     # pgid. If the leader already exited, `getpgid(pid)` fails but orphaned
     # descendants still belong to that group: signal the group by the id we
@@ -701,6 +797,12 @@ def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+    child = _get_child(pid)
+    if child is not None:
+        try:
+            child.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def stop(root, name: str) -> str:
@@ -714,6 +816,12 @@ def stop(root, name: str) -> str:
     _terminate_pid(pid, str(rec.get("job") or ""),
                    started=float(rec.get("started") or 0.0),
                    born=float(rec.get("born") or 0.0))
+    child = _get_child(pid)
+    if child is not None:
+        try:
+            child.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
     _forget_child(pid)
     rec["status"] = "stopped"
     rec["stopped"] = time.time()

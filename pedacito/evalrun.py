@@ -36,6 +36,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import fileio
+
 # --------------------------------------------------------------------- fixtures
 PY_SHOP = {
     "README.md": ("# shop\n\nA tiny shopping cart.\n\n"
@@ -1235,9 +1237,7 @@ def save_eval_summary(cfg, summary: dict) -> Path:
     data[card_key(cfg)] = {"ts": time.time(), "model": cfg.model,
                            "summary": summary}
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(p)
+    fileio.write_bytes(p, json.dumps(data, indent=1).encode("utf-8"))
     return p
 
 

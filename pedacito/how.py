@@ -29,12 +29,13 @@ import re
 import site
 import sys
 import sysconfig
+import unicodedata
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 from . import config as config_mod
-from . import how_index
+from . import how_index, i18n, prompts
 from .chunker import Chunk, chunk_source
 from .config import (Config, ConfigError, auto_fit, find_project_config,
                      load as load_config, missing_hardware)
@@ -45,6 +46,10 @@ DOC_FILES = ("README.md", "QUICKSTART.md")
 # Optional docs: older installs may not have these, so they are not required
 # for find_docs_root(), but they join the help corpus when present.
 OPTIONAL_DOC_FILES = ("MODEL_GUIDE.md",)
+# The README split moved the long-form prose into docs/*.md. Those guides are
+# optional too (a wheel may predate them), but when present they are part of
+# the corpus under their checkout-relative name (for example docs/CONFIG.md).
+DOCS_DIR = "docs"
 # Split long documentation sections and source units so retrieval can pick the
 # matching part instead of feeding a 20k-character section to a small model.
 MAX_ITEM_CHARS = 3200
@@ -71,6 +76,54 @@ _STOP = {
     "use", "using", "what", "when", "where", "which", "who", "why", "will",
     "with", "would", "you", "your",
 }
+
+# Spanish question filler (accent-folded), so Spanish questions rank offline.
+_ES_STOP = {
+    "como", "cual", "cuales", "que", "quien", "donde", "cuando", "por",
+    "para", "con", "sin", "el", "la", "los", "las", "un", "una", "unos",
+    "unas", "de", "del", "al", "en", "es", "se", "mi", "mis", "tu", "tus",
+    "su", "puedo", "puedes", "quiero", "necesito", "hacer", "hay", "y", "o",
+    "lo", "le", "me", "te", "cambio", "cambiar", "uso", "usar", "esta",
+    "este", "eso", "muy", "mas", "ya", "no", "si",
+}
+
+_ES_SYNONYMS = {
+    "idioma": ("language", "lang", "es", "spanish", "espanol"),
+    "lenguaje": ("language", "lang"),
+    "espanol": ("language", "lang", "es", "spanish"),
+    "configurar": ("configure", "setup", "config", "settings"),
+    "configuracion": ("configuration", "config", "settings", "toml"),
+    "modelo": ("model", "models", "profile", "server"),
+    "modelos": ("model", "models", "profile", "server"),
+    "deshacer": ("undo", "restore", "backup", "snapshot"),
+    "revertir": ("revert", "restore", "backup", "snapshot"),
+    "tema": ("theme", "appearance", "gui"),
+    "habilidad": ("skill", "skills"),
+    "habilidades": ("skill", "skills"),
+    "instalar": ("install", "pip", "setup"),
+    "instalacion": ("install", "pip", "setup"),
+    "comando": ("command", "commands", "cli", "usage"),
+    "comandos": ("command", "commands", "cli", "usage"),
+    "error": ("fail", "failure", "troubleshoot"),
+    "ayuda": ("help", "how"),
+    "herramienta": ("tool", "tools"),
+    "herramientas": ("tool", "tools"),
+    "indice": ("index", "indexing"),
+    "ignorar": ("ignore", "exclude", "pedacitoignore"),
+    "archivo": ("file", "files"),
+    "archivos": ("file", "files"),
+    "cambios": ("changes", "apply", "review"),
+    "seguridad": ("security", "sandbox", "permissions"),
+    "memoria": ("memory", "vram", "gpu", "context"),
+    "lento": ("slow", "performance", "context"),
+}
+
+
+def _fold(text: str) -> str:
+    """Strip accents so "cómo" and "como" match (English text is unchanged)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(c))
+
 
 # Question words that rarely appear verbatim in documentation. Expanding them
 # makes "how do I set this up?" find Configure/--setup, "undo" find restore,
@@ -230,14 +283,24 @@ class HowError(RuntimeError):
 
 def find_docs_root() -> Path:
     """Return the directory containing README.md and QUICKSTART.md: $PEDACITO_DOCS,
-    the checkout around this package, the package directory, setuptools
-    `data-files` locations, then the current directory."""
+    the checkout around this package, the package directory, package-relative
+    and interpreter `share/pedacito` data-files locations, then the current
+    directory. A normal wheel install keeps the modular guides beside those
+    files in `<share>/pedacito/docs/`."""
     here = Path(__file__).resolve().parent
     candidates: list[Path] = []
     env = os.environ.get("PEDACITO_DOCS")
     if env:
         candidates.append(Path(env).expanduser())
     candidates += [here.parent, here]
+    # `pip install --target DIR` puts the package at DIR/pedacito and its
+    # data-files at DIR/share/pedacito, while sysconfig still reports the
+    # running interpreter's prefix. Check the package-relative layouts first
+    # so an isolated target install finds its own docs.
+    candidates += [
+        here.parent / "share" / "pedacito",
+        here.parent / "data" / "share" / "pedacito",
+    ]
     try:
         data = sysconfig.get_path("data")
         if data:
@@ -319,13 +382,40 @@ def _string_constants(rel: str, source: str) -> list[Chunk]:
     return out
 
 
-def build_corpus(docs_root: Path | None = None) -> list[Chunk]:
-    """README, QUICKSTART, the config templates and the package's Python modules
-    as searchable chunks."""
+def _spanish_mirror(name: str, path: Path, root: Path) -> Path:
+    """The Spanish mirror of a doc file when it exists, else `path`."""
+    rel = Path(name)
+    if rel.parent.name == DOCS_DIR:
+        mirror = root / DOCS_DIR / "es" / rel.name
+    else:
+        mirror = root / f"{rel.stem}.es{rel.suffix}"
+    return mirror if mirror.is_file() else path
+
+
+def _documentation_paths(root: Path, lang: str = "en") -> list[tuple[str, Path]]:
+    """The root guides plus every docs/*.md, keyed by their checkout-relative
+    name. The docs directory is optional: an older installation without it
+    still gets the README/QUICKSTART/source corpus."""
+    paths = [(name, root / name) for name in DOC_FILES + OPTIONAL_DOC_FILES]
+    docs = root / DOCS_DIR
+    if docs.is_dir():
+        paths += [(f"{DOCS_DIR}/{path.name}", path)
+                  for path in sorted(docs.glob("*.md"))]
+    if lang == "es":
+        # Chunks keep the English name (the ranking rules key on it) but read
+        # the Spanish text, falling back per file.
+        paths = [(name, _spanish_mirror(name, path, root))
+                 for name, path in paths]
+    return paths
+
+
+def build_corpus(docs_root: Path | None = None,
+                 lang: str = "en") -> list[Chunk]:
+    """README, QUICKSTART, docs/*.md, the config templates and the package's
+    Python modules as searchable chunks."""
     root = docs_root or find_docs_root()
     chunks: list[Chunk] = []
-    for name in DOC_FILES + OPTIONAL_DOC_FILES:
-        path = root / name
+    for name, path in _documentation_paths(root, lang):
         if not path.is_file():
             continue
         try:
@@ -358,9 +448,9 @@ def _weighted_terms(text: str) -> dict[str, float]:
     """Lowercase question terms with weights: a compound identifier such as
     `max_steps` counts fully, its pieces much less."""
     raws: list[str] = []
-    for raw in _WORD_RE.findall(text.lower()):
+    for raw in _WORD_RE.findall(_fold(text.lower())):
         raw = raw.strip(".-")
-        if len(raw) >= 2 and raw not in _STOP:
+        if len(raw) >= 2 and raw not in _STOP and raw not in _ES_STOP:
             raws.append(raw)
 
     weights: dict[str, float] = {}
@@ -370,13 +460,13 @@ def _weighted_terms(text: str) -> dict[str, float]:
             weights[raw] = 1.6          # identifier, not prose
     for raw in raws:
         for part in re.split(r"[_\-.]", raw):
-            if len(part) >= 3 and part not in _STOP:
+            if len(part) >= 3 and part not in _STOP and part not in _ES_STOP:
                 weights.setdefault(part, 0.35)
         if raw.endswith("s") and len(raw) > 4:
             weights.setdefault(raw[:-1], 0.5)
 
     for term in list(weights):
-        for synonym in _SYNONYMS.get(term, ()):
+        for synonym in _SYNONYMS.get(term, ()) + _ES_SYNONYMS.get(term, ()):
             weights.setdefault(synonym, 0.6)
     return weights
 
@@ -422,7 +512,7 @@ def rank_chunks(question: str, chunks: list[Chunk]) -> list[tuple[float, Chunk]]
                 tf + 1.2 * (0.25 + 0.75 * dl / max(avgdl, 1)))
             if term in heading:
                 score += weight * idf * 2.5
-        if chunk.file in DOC_FILES:
+        if chunk.file in DOC_FILES or chunk.file.startswith(DOCS_DIR + "/"):
             score *= 1.12
         ranked.append((score, chunk))
     ranked.sort(key=lambda pair: pair[0], reverse=True)
@@ -457,8 +547,8 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
                       history: list[tuple[str, str]] | None = None
                       ) -> tuple[str, list[Chunk]]:
     """Pick excerpts for one question: always the best README section, the best
-    QUICKSTART section and the CLI preamble, then top-ranked source and docs
-    until the budget is used."""
+    QUICKSTART section, the best relevant docs/ guide and the CLI preamble,
+    then top-ranked source and docs until the budget is used."""
     history = history or []
     ranked = rank_chunks(question, chunks)
     by_file: dict[str, list[tuple[float, Chunk]]] = {}
@@ -487,10 +577,18 @@ def select_references(question: str, chunks: list[Chunk], cfg: Config,
         used += len(block) + 2
         return True
 
-    # Best section from each documentation file.
+    # Best section from each root guide.
     for name in DOC_FILES:
         candidates = [(s, c) for s, c in by_file.get(name, []) if c.source]
         add(candidates[0][1] if candidates else None)
+
+    # The best scored docs/ section, when one matched the question at all.
+    docs_candidates = [(s, c) for _name, candidates in by_file.items()
+                       if _name.startswith(DOCS_DIR + "/")
+                       for s, c in candidates if c.source]
+    docs_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    if docs_candidates and docs_candidates[0][0] > 0:
+        add(docs_candidates[0][1])
 
     # cli.py's command list helps almost every "what command..." question.
     cli_preamble = next(
@@ -576,8 +674,9 @@ tool that lets a small local LLM work on a codebase through a lookup index.
 Your only job is to explain how to install, configure, and use Pedacito.
 
 Use the REFERENCE MATERIAL and CURRENT CONFIG below as the source of truth.
-They come from Pedacito's README, QUICKSTART, and source code. Use the code
-excerpts to confirm exact command names, flags, defaults, and behaviors.
+They come from Pedacito's README, QUICKSTART, the modular guides in docs/
+when installed, and source code. Use the code excerpts to confirm exact
+command names, flags, defaults, and behaviors.
 Do not invent commands, flags, paths, defaults, or settings that are not
 supported there.
 
@@ -661,6 +760,8 @@ def _model_synthesis(question: str, matches: dict, cfg: Config,
             fast = cfg
         client = LLMClient(fast)
     system = MODEL_SYNTH_SYSTEM
+    if prompts.effective_reply_language(cfg) == "es":
+        system += "\n\n" + prompts.reply_language_directive(cfg)
     user = (f"QUESTION\n{question}\n\n"
             f"STRUCTURED REFERENCE\n{how_index.model_context(matches)}")
     try:
@@ -753,7 +854,8 @@ class HowSession:
 
     def _corpus(self) -> list[Chunk]:
         if self.chunks is None:
-            self.chunks = build_corpus(self.docs_root)
+            self.chunks = build_corpus(
+                self.docs_root, i18n.detect_lang(cfg=self.cfg))
         return self.chunks
 
     def answer(self, question: str, verbose: bool = True) -> str:
@@ -765,16 +867,24 @@ class HowSession:
         context, picked = select_references(
             question, self._corpus(), self.cfg, snapshot, self.history)
         if verbose:
+            # Mention docs/ only when an excerpt actually came from it, so the
+            # footer stays true for older installs without the modular guides.
+            sources = ("README, QUICKSTART, docs/, and source"
+                       if any(c.file.startswith(DOCS_DIR + "/") for c in picked)
+                       else "README, QUICKSTART, and source")
             print(f"  [help references: {len(picked)} excerpt(s), "
-                  f"~{estimate_tokens(context):,} tokens from README, "
-                  f"QUICKSTART, and source]", file=sys.stderr)
+                  f"~{estimate_tokens(context):,} tokens from {sources}]",
+                  file=sys.stderr)
 
         user = (
             f"QUESTION\n{question}\n\n"
             f"CURRENT CONFIG\n{snapshot}\n\n"
             f"REFERENCE MATERIAL\n{context or '(no matching excerpts)'}"
         )
-        messages = [{"role": "system", "content": QUESTION_SYSTEM}]
+        system = QUESTION_SYSTEM
+        if prompts.effective_reply_language(self.cfg) == "es":
+            system += "\n\n" + prompts.reply_language_directive(self.cfg)
+        messages = [{"role": "system", "content": system}]
         messages += _history_messages(self.history)
         messages.append({"role": "user", "content": user})
         answer = self.client.chat(

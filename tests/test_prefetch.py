@@ -34,7 +34,7 @@ def test_prefetch_reads_the_task_symbol_before_step_one(tmp_path):
     msgs = _first_call(client)
     # the prefetch read observation rides between user0 and the first step
     assert any("RESULT:" in m and "bulk_discount" in m for m in msgs)
-    assert any("'action': 'read'" in m and "prefetch" in m for m in msgs)
+    assert any('"action": "read"' in m and "prefetch" in m for m in msgs)
     # and the read landed in the ledger, so the source is genuinely gathered
     assert "pricing.py" in _a._read_spans
 

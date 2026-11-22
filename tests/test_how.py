@@ -1,4 +1,4 @@
-"""Tests for `pedacito how` (built-in help from README, QUICKSTART, code)."""
+"""Tests for `pedacito how` (help from README, QUICKSTART, docs/, code)."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
 from pedacito import how
+from pedacito import how_index
 from pedacito.cli import main
 
 
@@ -28,6 +29,15 @@ def _free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+MODULAR_DOCS = (
+    "docs/ARCHITECTURE.md",
+    "docs/CONFIG.md",
+    "docs/INSTALLATION.md",
+    "docs/SECURITY.md",
+    "docs/USAGE.md",
+)
 
 
 def test_corpus_contains_docs_templates_and_source():
@@ -46,6 +56,34 @@ def test_corpus_contains_docs_templates_and_source():
     for c in chunks:
         assert c.source.strip()
         assert c.start >= 1 and c.end >= c.start
+
+
+def test_corpus_includes_modular_docs():
+    """The README split moved the long-form prose into docs/; those guides
+    must be searchable, under their checkout-relative names, when present."""
+    chunks = how.build_corpus()
+    files = {c.file for c in chunks}
+    for name in MODULAR_DOCS:
+        assert name in files, name
+    # Section chunks, not one opaque blob per file.
+    config_titles = {c.qualname for c in chunks if c.file == "docs/CONFIG.md"}
+    assert "Advanced system profiling and auto-tune" in config_titles
+    assert any(c.file == "docs/INSTALLATION.md" and "pipx" in c.source
+               for c in chunks)
+
+
+def test_retrieval_grounds_installation_answer_in_docs():
+    """A docs-only installation answer must reach the selected references.
+    'installs the full core' appears in docs/INSTALLATION.md, not the root
+    guides, so this fails if the modular docs never enter the corpus."""
+    chunks = how.build_corpus()
+    text, picked = how.select_references(
+        "how do I install pedacito on a GPU server?", chunks,
+        config_mod.Config())
+    assert any(c.file == "docs/INSTALLATION.md" for c in picked), \
+        [c.file for c in picked]
+    assert "installs the full core" in text
+    assert "pipx install pedacito" in text
 
 
 def test_retrieval_grounds_config_answer_in_docs_and_code():
@@ -234,6 +272,43 @@ def test_cli_how_offline_json_is_structured(monkeypatch, tmp_path, capsys):
         payload["matches"]["gui"][0]["steps"])
     assert "config" in _names(payload["matches"], "cli")
     assert "default_profile" in _names(payload["matches"], "settings")
+
+
+# BUG-008: the install question had no card to retrieve, so both the offline
+# and the model-assisted answer omitted `pip install pedacito` even though
+# docs/INSTALLATION.md leads with it.
+@pytest.mark.parametrize("question", [
+    "how do I install pedacito?",
+    "install pedacito",
+    "how to install pedacito with pip",
+])
+def test_install_question_answers_with_the_install_commands(question):
+    matches = how_index.search(question)
+    assert matches["gui"], question
+    assert matches["gui"][0]["id"] == "install-pedacito", question
+    answer = how_index.render_answer(question, matches)
+    assert "pip install pedacito" in answer, question
+    assert "pipx install pedacito" in answer, question
+    assert "playwright install chromium" in answer, question
+    # The model-assisted path synthesises from the same retrieved facts.
+    context = how_index.model_context(matches)
+    assert "pip install pedacito" in context, question
+
+
+def test_cli_how_offline_install_answer_carries_the_commands(monkeypatch,
+                                                             tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "missing.toml")
+    for key in list(os.environ):
+        if key.startswith("PEDACITO_"):
+            monkeypatch.delenv(key, raising=False)
+
+    code = main(["how", "--offline", "how do I install pedacito?"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "pip install pedacito" in out
+    assert "pipx install pedacito" in out
+    assert not (tmp_path / ".pedacito").exists()
 
 
 @pytest.mark.network

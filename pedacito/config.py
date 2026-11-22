@@ -36,6 +36,8 @@ from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import kvcache as kv_cache_mod
+
 
 def _is_windows() -> bool:
     """True on Windows, including a Linux test that simulates win32."""
@@ -51,6 +53,15 @@ def _user_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pedacito"
 
 
+def user_config_dir() -> Path:
+    """Public spelling of the per-user config directory.
+
+    `themes.py` and the GUI handlers use this instead of copying the XDG /
+    APPDATA rules, so `themes.json` always lives beside `config.toml`.
+    """
+    return _user_config_dir()
+
+
 def _user_state_dir() -> Path:
     """Per-user state that is not tied to a project (session logs and chat
     threads opened with no folder): $XDG_STATE_HOME/pedacito on Linux/macOS
@@ -63,6 +74,12 @@ def _user_state_dir() -> Path:
 
 
 USER_CONFIG = _user_config_dir() / "config.toml"
+# Unified theme store: custom palettes and the globally selected theme.  The
+# GUI's Theme Manager and the TUI's `/theme` command both read this file.
+USER_THEMES = _user_config_dir() / "themes.json"
+# Optional per-project state config.  A theme override lives under
+# `{"theme": "name"}`; other projects may keep unrelated keys there.
+PROJECT_STATE_CONFIG = Path(".pedacito") / "config.json"
 USER_STATE_DIR = _user_state_dir()
 PROJECT_CONFIG_NAMES = (".pedacito.toml", "pedacito.toml")
 
@@ -113,8 +130,52 @@ class Config:
     # Storing the variable name instead of the secret keeps the key out of the
     # config file; `llm.py` reads it at request time.
     api_key_env: str = ""
+    # Runtime/provider label for this server: "lemonade", "llama-server",
+    # "strata", "avalon", "local-moe", "lmstudio", "ollama", ... It selects
+    # the server-control endpoints in servers.py and the execution profile
+    # ("local-moe" for tiered MoE servers). Empty = detect from the profile
+    # name and endpoint.
+    provider: str = ""
+    # Route Anthropic's own API (api.anthropic.com, or a provider labelled
+    # "anthropic") through the native /v1/messages transport, which is the only
+    # surface that supports prompt caching, streaming usage, extended thinking,
+    # tools and images. false falls back to the OpenAI-compatible shim.
+    anthropic_native: bool = True
+    # Optional commands that start/stop a single-model local daemon when the
+    # server has no HTTP load/unload endpoint. Run with shlex.split and
+    # shell=False; {model} is replaced by the model id. Use them only for a
+    # server you control: loading and unloading are deliberate actions.
+    load_cmd: str = ""
+    unload_cmd: str = ""
+    # When a run starts on one configured local server, unload models resident
+    # on the other local servers before the request goes out (a tiered MoE
+    # server and a dense llama-server cannot share the same VRAM/RAM safely).
+    # Servers are probed with a 1.5 s timeout; no other server is touched.
+    auto_evict_servers: bool = True
     model: str = "google/gemma-3-27b"
+    # Discovery modality of this model/server: "" (auto-detect from the model
+    # id and server metadata), "text", "image", "audio" or "embedding". Only
+    # "image" opens the local image-generation path; a profile marked "image"
+    # is routed to `generate_image` instead of the text tool loop.
+    modality: str = ""
+    # The profile in [profiles.*] that serves /images/generations (a local
+    # Stable Diffusion / Flux backend, or a hosted image endpoint). Empty =
+    # auto-detect the first image-model profile.
+    image_profile: str = ""
+    # Opt-in: expose the `generate_image` agent tool. Even with this off, the
+    # GUI permission broker can still approve a single call when an image
+    # profile is configured.
+    allow_image_gen: bool = False
+    # Default `size` sent to /images/generations when the caller passes none.
+    image_default_size: str = "1024x1024"
+    # Default diffusion steps sent to /images/generations (0 = the server's
+    # own default).
+    image_default_steps: int = 0
     timeout: float = 600.0
+    # Concurrent requests this endpoint can serve. Local servers default to
+    # one stream; a local-moe server is always pinned to 1 (its prefill and
+    # weight residency assume a single queue). 0 = let the runtime decide.
+    max_concurrency: int = 0
     # Seconds to wait while the server loads a model (unload + read from disk).
     load_wait_seconds: int = 240
     # Stop a batch after this many failures in a row.
@@ -543,6 +604,35 @@ class Config:
     # 0 omits max_tokens from requests entirely.
     request_max_tokens_cap: int = 32768
 
+    # --- Profiling and auto-tuning --------------------------------------------
+    # Opt-in advanced profiling (pedacito/profiler.py): combine the live
+    # hardware snapshot (free VRAM/RAM, with a source per number) with a cached
+    # speed probe and adjust context_tokens, retrieval budgets and timeout.
+    # false keeps every existing value exactly as before. Explicit per-key
+    # settings always win; tiered local-moe concurrency never leaves 1.
+    auto_tune: bool = False
+    # Schedule the automatic prefill/generation speed probe after a successful
+    # explicit server load (once per server+model, cached for a week). true
+    # preserves the historical behavior; false means no probe thread starts
+    # after load (an explicit `pedacito profile --run` still works).
+    profile_probe_on_load: bool = True
+    # Explicit architecture overrides for the footprint estimate. 0 / "" means
+    # discover it from llama.cpp /props + /models, Ollama /api/show, then the
+    # model name. Set these when a server reports no metadata. Missing fields
+    # lower the estimate's confidence instead of being treated as measured.
+    model_params_b: float = 0.0
+    model_active_params_b: float = 0.0
+    model_layers: int = 0
+    model_kv_heads: int = 0
+    model_head_dim: int = 0
+    # Weight quantization: f16/fp16/bf16, f32/fp32, q8/q6/q5/q4/q2 (a full
+    # name such as Q4_K_M is accepted). Empty = infer from the model id, then
+    # use a conservative 0.6 bytes/parameter.
+    model_quant: str = ""
+    # "dense" or "moe"; empty = infer from the model id/metadata. An MoE keeps
+    # all experts in RAM and only its active experts VRAM-resident.
+    model_arch: str = ""
+
     # --- Project scaffolding (`pedacito new`) ---------------------------------
     # Cap on files a plan may propose; the excess is reported.
     max_new_files: int = 24
@@ -625,6 +715,12 @@ class Config:
     #     message. Empty = auto (/no_think for Qwen3/SmolLM3 only).
     disable_thinking: bool = False
     thinking_suffix: str = ""
+    # Reasoning effort for models that expose it (local-moe servers such as
+    # Strata/Avalon, and reasoning-capable hosted APIs). "default" sends no
+    # field at all; "low", "medium" and "high" are forwarded verbatim as
+    # `reasoning_effort`. It never clamps sampling: a local MoE keeps its own
+    # temperature. TUI: /effort LEVEL. GUI: the Effort selector.
+    reasoning_effort: str = "default"
 
     # --- Editing --------------------------------------------------------------
     # Snapshot originals into .pedacito/backups/<timestamp>/ before writing;
@@ -632,6 +728,13 @@ class Config:
     backup: bool = True
     # Write a readable record of each task to .pedacito/sessions/<timestamp>.md.
     log_sessions: bool = True
+    # Opt-in full-prompt trajectory export for SFT/GRPO datasets: one JSON
+    # file per task under .pedacito/trajectories/, holding the real ChatML
+    # messages (unlike replay's hash + preview). Every string is redacted and
+    # scanned for secrets; a residual finding is masked or the write refused.
+    # Local only, no network or telemetry. `ask --save-trajectory` forces it
+    # for one run without changing this key.
+    record_trajectories: bool = False
     # Open a side-by-side review page instead of printing a diff. Served from
     # 127.0.0.1 only, since it can write files.
     review: bool = False
@@ -658,6 +761,23 @@ class Config:
     # runs on the active profile too. An unknown or unreachable scout profile
     # warns once and behaves like "".
     scout_profile: str = ""
+    # Split-stage hybrid routing: a strong ARCHITECT model plans each task
+    # (Stage 1: root cause, target files, exact signatures/contracts, edge
+    # cases -- one focused HYBRID_BLUEPRINT call), then the active fast
+    # EDITOR model implements that blueprint (Stage 2: gather + edits).
+    # Built for one GPU: the architect is evicted before the editor loads
+    # (auto_evict_servers), so a 27B planner and a 9B editor share the card.
+    # Off by default; selecting an architect model in the GUI/TUI turns it
+    # on for the session.
+    hybrid_routing: bool = False
+    # Where the Stage-1 architect lives: a profile name from [profiles.*],
+    # a profile's `provider` label, or a base URL ("http://127.0.0.1:1234/v1").
+    # Empty keeps the active endpoint (a second model on the same server).
+    architect_provider: str = ""
+    # The architect's model id. Empty = hybrid routing stays off even when
+    # hybrid_routing is true; a model equal to the active `model` is a no-op
+    # (nothing to split). The GUI Options bar and TUI /hybrid set both keys.
+    architect_model: str = ""
     # What this profile's model is good at, e.g. ["coding", "testing_qa"].
     # Canonical tags: general, coding, frontend_ui, 3d_graphics_svg,
     # math_algorithms, testing_qa, sql_data, translation_i18n; custom
@@ -779,6 +899,14 @@ class Config:
     wrap_observations: bool = True
     # Mask secret-looking values in prompts, logs, and session files.
     redact_secrets: bool = True
+    # Outbound cloud-provider guard: before a request leaves for a hosted
+    # endpoint, scan its messages for unacknowledged secrets.
+    #   "warn"   -- GUI/TUI ask Acknowledge & send / Redact & send / Cancel
+    #               (non-interactive runs auto-redact)
+    #   "redact" -- always replace detected secrets with <REDACTED_SECRET>
+    #   "allow"  -- send unchanged
+    # Loopback and LAN endpoints are never scanned.
+    security_outbound_mode: str = "warn"
     # Paths (gitignore-style fnmatch) the model may never write, on top of
     # .git/, .pedacito/, PLAN.md and todo.md.
     protected_paths: tuple[str, ...] = ()
@@ -895,6 +1023,16 @@ class Config:
     # Colorscheme of `pedacito gui`. Purely cosmetic: applying it never
     # reloads the project. Unknown names fall back to the built-in default.
     gui_theme: str = "slate"
+    # Interface language: "en" or "es". Menus, messages and the GUI/TUI chrome
+    # are localised from pedacito/locales/<code>.json; the CLI flag,
+    # PEDACITO_LANG (alias PEDACITO_LANGUAGE) and this key all feed
+    # i18n.detect_lang, and saving a choice persists it here.
+    language: str = "en"
+    # What language the model writes its prose explanations in. "match_ui"
+    # follows `language`; "es" forces neutral Latin American Spanish prose
+    # (code, identifiers, paths and edit markers stay English); "auto" leaves
+    # it to the model; "en" forces English.
+    llm_reply_language: str = "match_ui"
     # Parent folder for the built-in model benchmark projects. Empty = a
     # `benchmarks/` folder beside the currently open project (or ./benchmarks
     # when no project is open). Each run gets its own generated subfolder.
@@ -912,6 +1050,17 @@ class Config:
     keep_events: int = 20
     log_max_bytes: int = 2_000_000
 
+    # --- Updates (opt-out) ------------------------------------------------------
+    # Quiet check for newer Pedacito releases on PyPI: one anonymous GET at
+    # startup (daemon thread, 2 s timeout, cached 24 h beside the user
+    # config), a dismissible GUI banner, `pdc update` and the TUI `/update`.
+    # false = zero network calls and zero upgrade subprocesses, everywhere.
+    check_for_updates: bool = True
+    # Which PyPI releases count as "latest": "stable" ignores pre/dev/rc/
+    # alpha/beta tags, "any" also considers them. PEDACITO_UPDATE_CHANNEL
+    # overrides it like any other setting.
+    update_channel: str = "stable"
+
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
     profiles: dict = None
@@ -926,6 +1075,16 @@ class Config:
             self.sources = {}
         if self.profiles is None:
             self.profiles = {}
+
+    @property
+    def model_class(self) -> str:
+        """The execution profile: "local-dense", "local-moe" or "hosted"."""
+        return capability_profile(self)
+
+    @property
+    def is_local_moe(self) -> bool:
+        """True for a tiered MoE local server (Strata/Avalon)."""
+        return is_local_moe(self)
 
 
 # "server" is the documented section name for connection settings; "lmstudio"
@@ -970,49 +1129,34 @@ _ALIASES = {
     "v_cache_quantization": "v_cache_quant",
     "kv_cache_k_quant": "k_cache_quant",
     "kv_cache_v_quant": "v_cache_quant",
+    # A server's "type" is its runtime/provider label (strata, avalon,
+    # lemonade, llama-server, ...): one canonical key feeds routing and the
+    # server control plane.
+    "type": "provider",
+    "server_type": "provider",
+    "provider_type": "provider",
 }
 
-# Effective bits per cache element, including llama.cpp's per-block scale/min
-# overhead. Only the size relative to f16 matters, so approximate is fine.
-_KV_QUANT_BITS = {
-    "f32": 32.0, "fp32": 32.0,
-    "f16": 16.0, "fp16": 16.0, "bf16": 16.0,
-    "q8_0": 8.5,
-    "q6_k": 6.5625,
-    "q5_1": 6.0, "q5_0": 5.5,
-    "q4_1": 5.0, "q4_0": 4.5, "iq4_nl": 4.5, "iq4_xs": 4.25,
-}
-_KV_QUANT_SHORT = {
-    "q8": "q8_0", "q6": "q6_k", "q6k": "q6_k",
-    "q5": "q5_1", "q5.1": "q5_1", "q5.0": "q5_0",
-    "q4": "q4_0", "q4.1": "q4_1", "q4.0": "q4_0",
-    "float16": "f16", "half": "f16", "float32": "f32", "bfloat16": "bf16",
-}
+# Effective bits per cache element; the table and spelling normalisation live
+# in `pedacito.kvcache` so config and the footprint estimate share one model.
+_KV_QUANT_BITS = kv_cache_mod.KV_QUANT_BITS
+_KV_QUANT_SHORT = kv_cache_mod.KV_QUANT_SHORT
 
 
 def _normalise_kv_quant(value) -> str:
     """Canonicalise a cache-quantization spelling, or raise ConfigError."""
-    raw = str(value or "").strip().lower().replace("-", "_")
-    if not raw or raw in ("auto", "default", "none", "false"):
-        return ""
-    raw = raw.replace(" ", "_")
-    if raw in _KV_QUANT_BITS:
-        return raw
-    dotted = raw.replace("_", ".")
-    if dotted in _KV_QUANT_SHORT:
-        return _KV_QUANT_SHORT[dotted]
-    if raw in _KV_QUANT_SHORT:
-        return _KV_QUANT_SHORT[raw]
-    raise ConfigError(
-        f"k_cache_quant/v_cache_quant: unknown cache quantization {value!r}. "
-        "Use f16, bf16, f32, q8_0, q6_k, q5_1, q5_0, q4_1, q4_0, "
-        "iq4_nl or iq4_xs.")
+    try:
+        return kv_cache_mod.normalise_kv_quant(value)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def kv_quant_bits(value: str) -> float | None:
     """Effective bits per cache element for a quantization name, or None if unset."""
-    name = _normalise_kv_quant(value)
-    return _KV_QUANT_BITS.get(name) if name else None
+    try:
+        return kv_cache_mod.kv_quant_bits(value)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _canonical(name: str) -> str:
@@ -1038,8 +1182,13 @@ _ENUM_FIELDS = {
     "prompt_cache_ttl": ("5m", "1h"),
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
+    "reasoning_effort": ("default", "low", "medium", "high"),
+    "update_channel": ("stable", "any"),
+    "language": ("en", "es"),
+    "llm_reply_language": ("match_ui", "auto", "en", "es"),
+    "modality": ("", "text", "image", "audio", "embedding"),
 }
-_ENUM_EMPTY_OK = ("prompt_pack", "answer_mode")
+_ENUM_EMPTY_OK = ("prompt_pack", "answer_mode", "modality")
 
 
 class ConfigError(RuntimeError):
@@ -1187,6 +1336,16 @@ def _coerce(name: str, value, path: Path | None = None):
         return value
     if name in ("k_cache_quant", "v_cache_quant"):
         return _normalise_kv_quant(value)
+    if name == "model_arch":
+        norm = str(value or "").strip().lower().replace("-", "_")
+        if norm in ("", "auto", "none", "default"):
+            return ""
+        if norm in ("dense", "moe"):
+            return norm
+        raise ConfigError(f"{where}{name} must be 'dense', 'moe' or empty, "
+                          f"got {value!r}")
+    if name == "model_quant":
+        return str(value or "").strip().lower()
     if name == "kv_cache_bytes_per_token":
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ConfigError(
@@ -1346,10 +1505,14 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
                "base_url", "api_key", "api_key_env",
+               "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
                "shell_allowlist", "browser_eval_hosts",
-               "allow_fetch", "fetch_allowed_hosts")
+               "allow_fetch", "fetch_allowed_hosts",
+               "enable_web", "wrap_observations", "redact_secrets",
+               "security_outbound_mode", "protected_paths", "auto_plan_file",
+               "allow_image_gen")
 TRUST_FILE = "trusted_projects.json"
 
 
@@ -1428,6 +1591,11 @@ def load(root: Path | None = None, explicit: Path | None = None,
     never need it. `pedacito config` passes require_hardware=False so it can
     inspect and repair an incomplete file."""
     cfg = Config()
+    # The file a reset command should edit: the explicit --config layer when
+    # one was passed, otherwise the user config. Recorded so the TUI can share
+    # the CLI's `profile --reset` write path without re-parsing argv.
+    cfg._config_path = (str(Path(explicit)) if explicit is not None
+                        else str(USER_CONFIG))
     for f in _FIELDS:
         cfg.sources[f] = "default"
     profiles: dict = {}
@@ -1558,6 +1726,28 @@ def load(root: Path | None = None, explicit: Path | None = None,
                 continue
             setattr(cfg, key, _parse_env(key, raw))
             cfg.sources[key] = f"env PEDACITO_{key.upper()}"
+        # PEDACITO_LANG is a short alias for PEDACITO_LANGUAGE, and wins when
+        # both are set (matching the i18n.detect_lang precedence).
+        lang_alias = os.environ.get("PEDACITO_LANG")
+        if lang_alias is not None:
+            cfg.language = _parse_env("language", lang_alias)
+            cfg.sources["language"] = "env PEDACITO_LANG"
+
+    # Tiered local MoE servers (Strata/Avalon) reason before they answer:
+    # floor their output budgets and pin one stream. Hosted APIs with a
+    # similar model name are untouched (endpoint decides).
+    apply_local_moe_defaults(cfg)
+
+    # Opt-in advanced profiling sits at the same point as the local-moe
+    # defaults. With the default auto_tune = false this is a no-op: no
+    # hardware reader, subprocess or network call runs, so an existing
+    # config is byte-identical to earlier releases.
+    if bool(getattr(cfg, "auto_tune", False)):
+        try:
+            from . import profiler
+            profiler.apply_auto_tune(cfg)
+        except Exception:
+            pass
 
     # Hosted APIs (DeepSeek in particular) reject response_format json_schema,
     # so switch to "object" unless the user spelled json_mode somewhere.
@@ -1744,10 +1934,6 @@ def is_hosted(cfg: Config) -> bool:
 
 
 _GIB = 1024 ** 3
-# KV-cache heuristic: at about this many tokens of context the cache is roughly
-# as large as the model's weights on disk (fits common llama/gemma/qwen GGUFs:
-# a 27B Q4 is ~16 GB at 32k).
-_KV_REFERENCE_TOKENS = 32768
 
 
 def missing_hardware(cfg: Config) -> list[str]:
@@ -1764,10 +1950,11 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int,
     """Estimate how many context tokens fit in VRAM beside the model weights.
 
     System RAM is not counted (spilling is slow); 0.5 GB is kept for the
-    driver/desktop. Cache bytes per token come from the file size (see
-    _KV_REFERENCE_TOKENS), scaled by the K/V quantization bits; an explicit
-    `kv_cache_bytes_per_token` bypasses both. Returns 0 when the model does
-    not fit; callers then keep the fallback budgets.
+    driver/desktop. Cache bytes per token come from the shared
+    `pedacito.kvcache` helper: an explicit `kv_cache_bytes_per_token`
+    bypasses every heuristic, otherwise the model file size (see
+    `KV_REFERENCE_TOKENS`) is scaled by the K/V quantization bits. Returns 0
+    when the model does not fit; callers then keep the fallback budgets.
     """
     if model_size_bytes <= 0:
         return 0
@@ -1775,19 +1962,16 @@ def hardware_context_tokens(vram_gb: int, model_size_bytes: int,
     free = vram - int(model_size_bytes) - (_GIB // 2)
     if free <= 0:
         return 0
-    if kv_cache_bytes_per_token and kv_cache_bytes_per_token > 0:
-        kv_per_token = int(kv_cache_bytes_per_token)
-    else:
-        kv_per_token = max(16 * 1024,
-                           int(model_size_bytes) // _KV_REFERENCE_TOKENS)
-        k_bits = kv_quant_bits(k_cache_quant)
-        v_bits = kv_quant_bits(v_cache_quant)
-        if k_bits is not None or v_bits is not None:
-            # Baseline is f16 for both K and V; an unset side stays f16.
-            k_bits = 16.0 if k_bits is None else k_bits
-            v_bits = 16.0 if v_bits is None else v_bits
-            kv_per_token = max(
-                4 * 1024, int(kv_per_token * (k_bits + v_bits) / 32.0))
+    try:
+        kv_per_token = kv_cache_mod.kv_bytes_per_token(
+            kv_cache_bytes_per_token=kv_cache_bytes_per_token,
+            model_size_bytes=model_size_bytes,
+            k_cache_quant=k_cache_quant,
+            v_cache_quant=v_cache_quant)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if kv_per_token <= 0:
+        return 0
     return int(free // kv_per_token)
 
 
@@ -2241,6 +2425,8 @@ def _parse_env(name: str, raw: str):
         return tuple(x.strip() for x in raw.split(",") if x.strip())
     if name in ("k_cache_quant", "v_cache_quant"):
         return _normalise_kv_quant(raw)
+    if name in ("model_arch", "model_quant"):
+        return _coerce(name, raw)
     if name in _ENUM_FIELDS:
         return _coerce(name, raw)
     if name in _TABLE_FIELDS:
@@ -2276,8 +2462,10 @@ def _parse_env(name: str, raw: str):
 #   small   ~9B local models (qwen3-8b, gemma-3-12b, llama-3.1-8b)
 #   medium  ~14B/32B local models (qwen3-14b, qwen3-32b, gemma-3-27b)
 #   large   big local models (27B+ at full context, 70B rigs)
+#   local-moe  tiered MoE servers (Strata/Avalon): frontier reasoning at
+#              local transport limits -- generous output, one stream, long loads
 #   hosted  capable APIs: DeepSeek, OpenAI, Anthropic, xAI, ...
-PRESET_TIERS = ("tiny", "small", "medium", "large", "hosted")
+PRESET_TIERS = ("tiny", "small", "medium", "large", "local-moe", "hosted")
 
 PRESETS: dict[str, dict] = {
     "tiny": {
@@ -2357,6 +2545,30 @@ PRESETS: dict[str, dict] = {
         "context_tokens": 65536,
         "reserve_tokens": 8192,
     },
+    "local-moe": {
+        # Strata/Avalon-style tiered MoE servers: reasoning blocks (<think> or
+        # reasoning_content) are part of the answer path, so a reply budget
+        # that fits a dense 9B truncates the model mid-thought. Every reply
+        # starts at 8192; plan/build calls, which reason across a whole file,
+        # get 16384. One stream only: these servers hold most of VRAM plus
+        # DDR5 and a second concurrent prefill evicts the resident weights.
+        "max_tokens_summary": 400,
+        "max_tokens_step": 8192,
+        "max_steps": 0,
+        "max_tokens_answer": 8192,
+        "max_tokens_plan": 16384,
+        "max_tokens_build": 16384,
+        "flat_map_token_budget": 4096,
+        "max_gathered_chars": 48000,
+        "max_read_lines": 300,
+        "max_spec_chars": 120000,
+        "max_new_files": 40,
+        "repair_rounds": 2,
+        "context_tokens": 32768,
+        "reserve_tokens": 8192,
+        "timeout": 600.0,
+        "max_concurrency": 1,
+    },
     "hosted": {
         # The window is a declared budget, not a server limit: auto_fit only
         # grows these. max_tokens_step stays below ~8k because the provider's
@@ -2393,6 +2605,9 @@ def _guess_tier(name: str, body: dict) -> str | None:
     # the name heuristic still stands (the config's fallback may be remote).
     base = str(body.get("base_url", "") or "")
     remote = not base or not _endpoint_is_local(base)
+    if is_local_moe(model=body.get("model"), provider=body.get("provider"),
+                    profile=name, base_url=base):
+        return "local-moe"
     if remote and any(h in hay for h in ("deepseek", "openai", "anthropic",
                                          "api.", "moonshot", "x.ai", "groq",
                                          "together", "mistral.ai", "hosted")):
@@ -2423,6 +2638,201 @@ def _endpoint_is_local(base_url: str) -> bool:
     except ValueError:
         return False
     return addr.is_loopback or addr.is_link_local or addr.is_private
+
+
+# --- model capability profiles ------------------------------------------------
+# Three execution classes, each with its own transport and budget rules:
+#
+#   local-dense  a conventional local model (<35B): one GPU queue, modest
+#                output budgets, a short timeout.
+#   local-moe    a tiered MoE server (Strata, Avalon, or a model whose id says
+#                so): frontier reasoning on local hardware. It gets a generous
+#                output budget (reasoning must not be cut mid-thought), native
+#                sampling, reasoning_effort when configured, exactly one
+#                concurrent stream, and a long timeout for weight loading and
+#                a slow 30k-token prefill.
+#   hosted       a remote API: the provider's own sampling, budgets and
+#                reasoning controls.
+EXECUTION_PROFILES = ("local-dense", "local-moe", "hosted")
+LOCAL_MOE_PROVIDERS = ("strata", "avalon", "local-moe", "local_moe",
+                       "localmoe", "tiered-moe")
+LOCAL_MOE_TIMEOUT = 600.0
+LOCAL_MOE_MAX_TOKENS = 8192
+LOCAL_MOE_MAX_TOKENS_COMPLEX = 16384
+
+# Model-id patterns for MoE servers whose runtime label is not configured.
+# Spelled loosely so separators and vendor prefixes do not matter:
+# qwen3.8-flash, Qwen3_8_Flash, deepseek-v4.1-flash, qwen3-35b-a3b, *moe*.
+_LOCAL_MOE_PATTERNS = (
+    re.compile(r"qwen[\s._-]*3[\s._-]*8[\s._-]*flash", re.IGNORECASE),
+    re.compile(r"deepseek[\s._-]*v?[\s._-]*4(?:[\s._-]*1)?[\s._-]*flash",
+               re.IGNORECASE),
+    re.compile(r"qwen[\s._-]*(?:3[\s._-]*)?35[\s._-]*b[\s._-]*a[\s._-]*3"
+               r"[\s._-]*b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s/_.-])moe(?:$|[\s/_.-])", re.IGNORECASE),
+)
+
+
+def _cfg_get(cfg, key: str, default=""):
+    """Read one value from a Config, a profile body, or a SimpleNamespace."""
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _local_moe_texts(cfg=None, model=None, provider=None, base_url=None,
+                     profile=None) -> tuple[str, str, str, str]:
+    """The four haystacks the classifier uses, from keyword args first, then
+    from the config object (a Config, a profile body, or a namespace)."""
+    if cfg is not None:
+        model = model if model is not None else _cfg_get(cfg, "model", "")
+        provider = (provider if provider is not None
+                    else _cfg_get(cfg, "provider", "")
+                    or _cfg_get(cfg, "server_type", ""))
+        base_url = (base_url if base_url is not None
+                    else _cfg_get(cfg, "base_url", ""))
+        profile = (profile if profile is not None
+                   else _cfg_get(cfg, "active_profile", "")
+                   or _cfg_get(cfg, "profile", ""))
+        # A hand-built Config may carry only [profiles.NAME] values; read the
+        # active profile's body when the top-level fields are still defaults.
+        profiles = _cfg_get(cfg, "profiles", {}) or {}
+        body = profiles.get(profile) if isinstance(profiles, dict) else None
+        if isinstance(body, dict):
+            model = model or body.get("model", "")
+            provider = provider or body.get("provider", "") \
+                or body.get("server_type", "")
+            base_url = base_url or body.get("base_url", "")
+    elif isinstance(model, str) and model.lower().startswith(("http://",
+                                                             "https://")):
+        # is_local_moe("http://127.0.0.1:8000/v1") from a one-string call.
+        base_url, model = model, ""
+    return (str(model or ""), str(provider or ""), str(base_url or ""),
+            str(profile or ""))
+
+
+def is_local_moe(cfg=None, model=None, provider=None, base_url=None,
+                 profile=None) -> bool:
+    """True when this model/provider belongs to the `local-moe` class.
+
+    Auto-detection, either signal is enough:
+      * the runtime/provider label (or profile name) is strata, avalon or
+        local-moe; or
+      * a LOCAL endpoint's model id matches a tiered-MoE pattern
+        (qwen3.8-flash, deepseek-v4.1-flash, qwen35b-a3b, *moe*).
+
+    A remote endpoint is only local-moe when its provider explicitly says so;
+    otherwise it stays hosted even if the model id looks like a MoE."""
+    model_s, provider_s, base_s, profile_s = _local_moe_texts(
+        cfg, model, provider, base_url, profile)
+    label = " ".join((provider_s, profile_s)).strip().lower()
+    label = re.sub(r"[\s_]+", "-", label)
+    if any(word in label for word in LOCAL_MOE_PROVIDERS):
+        return True
+    local = True
+    if base_s:
+        local = _endpoint_is_local(base_s)
+    if not local:
+        return False
+    return any(p.search(model_s) for p in _LOCAL_MOE_PATTERNS)
+
+
+def capability_profile(cfg=None, model=None, provider=None, base_url=None,
+                       profile=None) -> str:
+    """Classify a model/provider as "local-moe", "local-dense" or "hosted".
+
+    Hosted-ness is decided by the endpoint (the same rule as `is_hosted`),
+    except an explicit strata/avalon/local-moe provider, which is always a
+    local-MoE runtime."""
+    if is_local_moe(cfg, model, provider, base_url, profile):
+        return "local-moe"
+    from types import SimpleNamespace
+    probe = cfg if cfg is not None else SimpleNamespace(
+        model=model or "", provider=provider or "", base_url=base_url or "",
+        active_profile=profile or "", active_tier="", _hosted_server=False,
+        json_mode="schema")
+    try:
+        return "hosted" if is_hosted(probe) else "local-dense"
+    except Exception:
+        return "local-moe" if is_local_moe(probe) else "local-dense"
+
+
+# Readable aliases: callers name the same idea a capability profile, an
+# execution profile, or a model class.
+model_profile = capability_profile
+execution_profile = capability_profile
+classify_model = capability_profile
+detect_local_moe = is_local_moe
+local_moe = is_local_moe
+
+
+def local_moe_output_budget(complex_plan: bool = False) -> int:
+    """The default output budget for a local-MoE reply: 8192 tokens so a
+    reasoning block is never cut mid-thought, 16384 for a complex/auto plan."""
+    return LOCAL_MOE_MAX_TOKENS_COMPLEX if complex_plan else LOCAL_MOE_MAX_TOKENS
+
+
+def apply_local_moe_defaults(cfg) -> bool:
+    """Apply the `local-moe` execution defaults to `cfg` in place.
+
+    Only raises budgets, never lowers one the user (or a tier preset) set:
+      * max_tokens_step/answer >= 8192; plan/build >= 16384;
+      * timeout >= 600 s (weight loading + a slow 30k-token prefill);
+      * max_concurrency pinned to 1.
+
+    Idempotent for one model/server pair, and re-applied when a role profile
+    switches to a different model. Returns True when the config is local-moe.
+    """
+    if not is_local_moe(cfg):
+        return False
+    key = (_cfg_get(cfg, "model", ""), _cfg_get(cfg, "provider", ""),
+           _cfg_get(cfg, "base_url", ""))
+    if _cfg_get(cfg, "_local_moe_applied", None) == key:
+        # A role/client reuses this object: still enforce the hardware rule.
+        try:
+            cfg.max_concurrency = 1
+        except Exception:
+            pass
+        return True
+    sources = getattr(cfg, "sources", None)
+    if not isinstance(sources, dict):
+        sources = {}
+        try:
+            cfg.sources = sources
+        except Exception:
+            sources = None
+
+    def raise_to(name: str, value):
+        current = getattr(cfg, name, 0) or 0
+        if current < value:
+            setattr(cfg, name, value)
+            if sources is not None:
+                sources[name] = "local-moe default"
+
+    raise_to("max_tokens_step", LOCAL_MOE_MAX_TOKENS)
+    raise_to("max_tokens_answer", LOCAL_MOE_MAX_TOKENS)
+    raise_to("max_tokens_plan", LOCAL_MOE_MAX_TOKENS_COMPLEX)
+    raise_to("max_tokens_build", LOCAL_MOE_MAX_TOKENS_COMPLEX)
+    try:
+        if float(getattr(cfg, "timeout", 0) or 0) < LOCAL_MOE_TIMEOUT:
+            cfg.timeout = LOCAL_MOE_TIMEOUT
+            if sources is not None:
+                sources["timeout"] = "local-moe default"
+    except (TypeError, ValueError):
+        pass
+    try:
+        cfg.max_concurrency = 1
+        if sources is not None:
+            sources["max_concurrency"] = "local-moe (single stream)"
+    except Exception:
+        pass
+    try:
+        cfg._local_moe_applied = key
+    except Exception:
+        pass
+    return True
 
 
 def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
@@ -2532,6 +2942,9 @@ _EXTRA_FIELD_HELP = {
                         "circuit opens.",
     "circuit_cooldown": "Seconds the circuit stays open before one probe is "
                         "allowed.",
+    "security_outbound_mode": "Outbound secret guard for hosted providers: "
+                              "warn, redact, or allow. Loopback/LAN endpoints "
+                              "are never scanned.",
     "price_output_per_mtok": "USD per million output tokens, used for cost "
                              "reporting and max_cost.",
     "price_cached_per_mtok": "USD per million cache-read tokens, used for "
@@ -2728,6 +3141,16 @@ timeout = 600.0
 load_wait_seconds = 240
 max_consecutive_failures = 3
 json_mode = "schema"
+# Image generation (opt-in discovery modality). Point image_profile at a
+# [profiles.*] table whose server serves /images/generations (a local
+# Stable Diffusion / Flux backend, or a hosted image endpoint) and mark that
+# profile `modality = "image"`. allow_image_gen exposes the generate_image
+# agent tool; image_default_size/steps are the fallback request size and
+# diffusion steps when the caller passes none.
+# image_profile = ""
+# allow_image_gen = false
+# image_default_size = "1024x1024"
+# image_default_steps = 0
 # Engine-level constrained JSON: schema requests (gather and plan) are sent as
 # response_format json_schema so the server constrains sampling to valid
 # tool-call JSON; a 400 downgrades that endpoint automatically.
@@ -2781,6 +3204,10 @@ static_gate_timeout = 3.0
 auto_heal_imports = true
 backup = true
 log_sessions = true
+# record_trajectories: opt-in full-prompt ChatML export for SFT/GRPO under
+# .pedacito/trajectories/ (redacted, local only). Off by default; `pdc ask
+# --save-trajectory` turns it on for one run.
+record_trajectories = false
 review = false
 review_port = 0
 open_browser = true
@@ -2791,6 +3218,21 @@ create_ignore_file = true
 # midnight, jazz_solo, trapper_keeper, memphis_arcade, windbreaker). The GUI's
 # topbar picker writes this key; cosmetic only, never reloads the project.
 gui_theme = "slate"
+# check_for_updates: quiet PyPI release check at startup (one anonymous GET,
+# cached 24 h; GUI banner, `pdc update`, TUI `/update`). false = fully offline.
+check_for_updates = true
+# update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
+# includes them (PEDACITO_UPDATE_CHANNEL overrides).
+update_channel = "stable"
+# language: interface language, "en" or "es". Menus, messages and the GUI/TUI
+# chrome localise from pedacito/locales/<code>.json; the CLI flag, PEDACITO_LANG
+# (alias PEDACITO_LANGUAGE) and this key feed i18n.detect_lang.
+# language = "en"
+# llm_reply_language: what language the model writes its prose in. "match_ui"
+# follows `language`; "es" forces neutral Latin American Spanish prose (code,
+# identifiers, paths and edit markers stay English); "auto" leaves it to the
+# model; "en" forces English.
+# llm_reply_language = "match_ui"
 
 [indexing]
 # Chunking and retrieval. Oversized units split at statement boundaries.
@@ -2932,6 +3374,7 @@ max_tokens_build = 8000
 # The fallback profile. Replace these with your server and model.
 base_url = "http://localhost:1234/v1"
 model    = "google/gemma-3-27b"
+# modality = ""                 # text | image | audio | embedding (auto = "")
 
 # Every profile-overridable setting, commented at its built-in default.
 # Uncomment only the keys this profile needs; a profile beats [universal],
@@ -2968,6 +3411,17 @@ model    = "google/gemma-3-27b"
 # context_tokens = 128000
 # max_gathered_chars = 100000
 # max_read_lines = 400
+
+# --- Local image generation example (Flux via Lemonade) ----------------------
+# [profiles.example_image]
+# base_url = "http://localhost:8001/v1"
+# model    = "flux-schnell"
+# modality = "image"             # routes this profile to /images/generations
+# image_default_size = "1024x1024"
+# image_default_steps = 4
+# Then set image_profile = "example_image" in [universal], or run with
+# --profile example_image, and set allow_image_gen = true to give the agent
+# the generate_image tool.
 '''
 
 
@@ -2997,6 +3451,16 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # call for it. false turns engine schemas off everywhere.
 # timeout: seconds per request. load_wait_seconds: model load wait.
 # max_consecutive_failures: abort an indexing batch after N failures.
+# Image generation (opt-in discovery modality): `modality = "image"` marks a
+# profile as an image generator; `image_profile` names the [profiles.*] table
+# whose server serves /images/generations (Lemonade sd-cpp/Flux, or a hosted
+# image endpoint). `allow_image_gen = true` exposes the generate_image agent
+# tool; with it off, the GUI permission broker can still approve one call when
+# an image profile is configured. `image_default_size` is the fallback `size`
+# sent when the caller passes none; `image_default_steps` the fallback
+# diffusion steps (0 = the server's own default). The image profile is written
+# into `.pedacito/images/` (or the tool's `file` target) via the same
+# workspace containment and atomic write every other file write uses.
 # temperature: keep low for tool calls. temperature_answer / temperature_repair
 # override it for the answer and the repair re-asks, which copy SEARCH text
 # character for character (0 = greedy; unset = temperature). temperature_answer
@@ -3198,7 +3662,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # scrub_env launches model-chosen commands with a minimal environment;
 # env_passthrough names variables (or PREFIX*) they may still see.
 # wrap_observations fences untrusted tool output; redact_secrets masks secrets
-# in session files, logs and events. protected_paths lists files the model may
+# in session files, logs and events. security_outbound_mode ("warn", "redact"
+# or "allow") controls the guard that scans requests to hosted cloud providers
+# for secrets before they leave the machine; loopback/LAN endpoints are exempt.
+# protected_paths lists files the model may
 # never write (on top of .git/, .pedacito/, the plan file); shell_deny lists
 # command patterns `run` refuses; browser_eval_hosts limits where the browser
 # `eval` action may run JavaScript.
@@ -3216,6 +3683,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # --- Review, workspace, and backups ----------------------------------------
 # backup snapshots originals before writes; `pedacito restore` restores them.
 # log_sessions writes .pedacito/sessions/*.md.
+# record_trajectories (off) writes full-prompt ChatML transcripts under
+# .pedacito/trajectories/ for SFT/GRPO datasets; unlike replay they contain the
+# real prompts, so they are opt-in, redacted and local only.
 # review/review_port/open_browser/review_timeout control the side-by-side page.
 # manage_gitignore/create_ignore_file control first-run workspace scaffolding.
 #

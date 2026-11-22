@@ -27,18 +27,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from . import checkpoints as checkpoints_mod
 from . import diagnostics, events as events_mod, hooks as hooks_mod
 from . import fileio
 from . import safety, workspace
 from . import index as index_mod
 from . import instructions as instructions_mod
 from . import proc as proc_mod
+from . import prompts as prompts_mod
 from . import ratchet as ratchet_mod
 from . import review as review_mod
+from . import security as security_mod
 from . import testsel
 from . import todo as todo_mod
+from . import trajectories
 from .edits import Result, parse_edits
-from .llm import LLMError
+from .llm import CancelledError, LLMError
 
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
@@ -50,6 +54,42 @@ _NOOP_PHRASES = (
     "no change", "nothing to", "nothing needs", "already ", "no edit",
     "no code change", "no code edit", "leave as", "as-is",
 )
+
+
+def _cancel_requested(cfg, client=None) -> bool:
+    """True when the GUI/TUI cancellation token for this run is set.
+
+    Accepts a threading.Event, any object with `is_set()`, or a callable
+    predicate. Checked between tasks so a Stop never starts another worker
+    session, even when the abort landed between LLM calls.
+    """
+    sources = [getattr(cfg, "_cancel_event", None)]
+    if client is not None:
+        sources.append(getattr(client, "cancel_event", None))
+    for source in sources:
+        if source is None:
+            continue
+        checker = getattr(source, "is_set", None)
+        try:
+            if callable(checker):
+                if checker():
+                    return True
+            elif callable(source):
+                if source():
+                    return True
+            elif source:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _emit_run_cancelled(root, cfg, stage: str, **fields) -> None:
+    """Record a user Stop in the event log (GUI activity + TUI status)."""
+    try:
+        events_mod.get(root, cfg).emit("run_cancelled", stage=stage, **fields)
+    except Exception:
+        pass
 
 
 def _is_noop(reply: str) -> bool:
@@ -270,7 +310,8 @@ def _is_noop_verify_item(task: str) -> bool:
     return (task or "").strip().lower().startswith(_NOOP_VERIFY_PREFIXES)
 
 
-def _noop_verify_already_green(root: Path, task: str, verify: str) -> bool:
+def _noop_verify_already_green(root: Path, task: str, verify: str,
+                               cfg=None) -> bool:
     """Objective disk evidence that a no-op verification item is already
     satisfied: webcheck finds nothing, the configured verify command (the
     tests) passes, and no requirement of the title is still owed on disk.
@@ -286,7 +327,7 @@ def _noop_verify_already_green(root: Path, task: str, verify: str) -> bool:
         return False
     gate_ran = bool(htmls or jss)
     if verify:
-        ok, _out = run_verify(root, verify)
+        ok, _out = run_verify(root, verify, cfg=cfg)
         if not ok:
             return False
         gate_ran = True
@@ -308,6 +349,35 @@ def _task_title(task: str) -> str:
     if marker in body:
         body = body.split(marker, 1)[1]
     return body.split("\n", 1)[0]
+
+
+def checkpoint_mode(cfg) -> str:
+    """`auto` for a step owned by the outer loop, else `task`."""
+    return "auto" if getattr(cfg, "_auto_step", 0) else "task"
+
+
+def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
+    """Record the pre-run baseline or the post-run checkpoint for one task.
+
+    Checkpointing is best-effort: a full disk or a racing process must never
+    turn a working task into a failed one.  Dry runs leave the tree untouched;
+    a review task records its pre-sign-off baseline here and its accepted
+    write in `_review`.
+    """
+    try:
+        mode = checkpoint_mode(cfg)
+        title = _task_title(task).strip()[:200] or "task"
+        if phase == "pre":
+            return checkpoints_mod.ensure_baseline(
+                root, f"baseline before {title}", mode=mode)
+        return checkpoints_mod.create_checkpoint(
+            root, title, mode=mode)
+    except Exception as e:
+        try:
+            workspace.log_event(root, f"checkpoint skipped: {e}", "WARN")
+        except Exception:
+            pass
+        return None
 
 
 # Clipping budget for investigation reports carried between tasks. Caveats can
@@ -1187,6 +1257,9 @@ def generate_tasks(spec_text: str, client, cfg,
     notes = instructions_mod.render(root, cfg) if root is not None else ""
     if notes:
         plan_system += "\n\n" + notes
+    rules = prompts_mod.project_rules_block(cfg, root=root)
+    if rules:
+        plan_system += "\n\n" + rules
     base_user = (f"GOAL\n\n{body}\n\n"
                  "Break this into an ordered task list. Each task title must be "
                  "a single imperative sentence a coding agent can implement and "
@@ -1251,10 +1324,16 @@ def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
                ) -> tuple[bool, str]:
     """Run `command` (a shell string) in `root`. Returns (passed, output).
 
-    The whole process group is killed on timeout, so a GUI/launcher child
-    cannot keep a window alive after the check gives up."""
+    The command is user-authored config, so it still runs through the shell,
+    but its environment is the same allow-list scrub model-chosen commands
+    get: ambient API keys and tokens never reach it. `proc.run` still prepends
+    the project's venv bin directories to PATH via `with_venv_path`, so a bare
+    `pytest`/`ruff` resolves as before. The whole process group is killed on
+    timeout, so a GUI/launcher child cannot keep a window alive after the
+    check gives up."""
     rc, out, stopped, _ = proc_mod.run(
-        command, cwd=root, timeout=timeout, shell=True, max_output=200_000)
+        command, cwd=root, timeout=timeout, shell=True, max_output=200_000,
+        env=safety.child_env(cfg))
     if stopped == "timeout":
         return False, f"(verification timed out after {timeout}s)"
     if stopped == "error":
@@ -2317,16 +2396,36 @@ def _new_frontend_errors(root, cfg, files: list[str]) -> list[str]:
     errors = _frontend_errors(root, cfg, files)
     if not errors:
         return []
+    from . import spec as spec_mod
     baseline = getattr(cfg, "_frontend_baseline", None)
-    if baseline is None:
-        return errors
-    try:
-        from . import spec as spec_mod
-        keys = {spec_mod.contract_error_key(e) for e in baseline}
-        return [e for e in errors
-                if spec_mod.contract_error_key(e) not in keys]
-    except Exception:
-        return [e for e in errors if e not in baseline]
+
+    def fresh(items):
+        if baseline is None:
+            return list(items)
+        try:
+            keys = {spec_mod.contract_error_key(e) for e in baseline}
+            return [e for e in items
+                    if spec_mod.contract_error_key(e) not in keys]
+        except Exception:
+            return [e for e in items if e not in baseline]
+
+    new = fresh(errors)
+    if new and getattr(cfg, "auto_heal_imports", True):
+        # Deterministic ES module import auto-healing: unambiguous missing
+        # sibling imports identified by _js_module_link_errors are healed on
+        # disk (tree-sitter validated) and re-checked before spending a repair.
+        try:
+            after, receipts = spec_mod.heal_js_module_imports(
+                root, files=files, errors=new, cfg=cfg)
+            for receipt in receipts:
+                print(f"  {receipt}", file=sys.stderr)
+            if receipts:
+                workspace.log_event(root, "js import auto-heal: " +
+                                    "; ".join(receipts), "INFO")
+                new = fresh(after)
+        except Exception:
+            pass
+    return new
 
 
 def _capture_frontend_baseline(root, cfg) -> None:
@@ -3502,6 +3601,13 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str,
 
     if outcome == "applied":
         print(f"  {detail}", file=sys.stderr)
+        # The sign-off is the Task's write: record its checkpoint now, so the
+        # next run branches from exactly what the user accepted.
+        try:
+            checkpoints_mod.create_checkpoint(
+                root, f"review: {task[:180]}", mode="task")
+        except Exception as e:
+            workspace.log_event(root, f"review checkpoint skipped: {e}", "WARN")
         # A reviewer may sign off on only some files (the GUI can), dropping
         # the rest from `diffs`; only those were written.
         written = {d.rel for d in diffs}
@@ -3877,67 +3983,386 @@ def _specialist_zero_edit_fallback(root, cfg, client, idx, task, tr, kw):
     return tr
 
 
+# ------------------------------------------- split-stage hybrid routing
+# hybrid_routing runs a task on TWO models in sequence: a strong ARCHITECT
+# plans first (Stage 1: root cause, target files, exact signatures, edge
+# cases), then the fast EDITOR implements that plan (Stage 2). The blueprint
+# rides ahead of the editor's gathered context, so the cheap model never has
+# to rediscover the analysis. When the two models live on different LOCAL
+# servers, the VRAM handoff evicts the outgoing server between stages
+# (auto_evict_servers); hosted endpoints coexist and skip the handshake.
+
+_HYBRID_SYSTEM = """\
+You are the ARCHITECT in a split-stage coding pipeline. A faster editor model
+will implement your plan verbatim in the next stage; it cannot ask you
+questions, so the plan must be complete and precise. Do not write code edits
+and do not use tools -- reason from the task text and the project map.
+
+Reply with exactly one blueprint block in this shape:
+
+HYBRID_BLUEPRINT
+1. ROOT CAUSE / GOAL: what is actually wrong (or what must exist), in 1-3
+   sentences.
+2. TARGET FILES: the exact paths to change or create, and why each.
+3. EXACT SIGNATURES & CONTRACTS: function/class signatures, argument and
+   return types, and the invariants the edit must preserve.
+4. EDGE CASES: failure modes, empty/None inputs, concurrency, encoding,
+   backwards compatibility -- anything the editor could get wrong.
+END_BLUEPRINT
+
+Name real files and symbols from the map. Be specific enough that an editor
+who has never seen this codebase can implement the change correctly."""
+
+
+def hybrid_active(cfg) -> bool:
+    """True when a distinct architect model is armed for split-stage runs:
+    the toggle is on AND an architect model is selected that differs from
+    the editor's (same-model 'hybrid' would just pay twice for one brain)."""
+    model = str(getattr(cfg, "architect_model", "") or "").strip()
+    return (bool(getattr(cfg, "hybrid_routing", False)) and bool(model)
+            and model != str(getattr(cfg, "model", "") or "").strip())
+
+
+def _architect_client(cfg, editor):
+    """The cached Stage-1 architect client for (architect_provider,
+    architect_model). Unreachable servers cache None and warn once, exactly
+    like the scout: a dead architect degrades to a plain editor run, never a
+    failed task. The architect keeps its OWN stats ledger (clean per-stage
+    deltas) but reports calls into the editor's sink so run telemetry sees
+    both stages."""
+    from . import roles as roles_mod
+    provider = str(getattr(cfg, "architect_provider", "") or "").strip()
+    model = str(getattr(cfg, "architect_model", "") or "").strip()
+    key = (provider, model)
+    cache = cfg.__dict__.setdefault("_architect_clients", {})
+    if key in cache:
+        return cache[key]
+    new_cfg = roles_mod.resolve_model_config(cfg, provider, model)
+    if new_cfg is None:
+        cache[key] = None
+        return None
+    from .llm import LLMClient
+    try:
+        client = LLMClient(new_cfg)
+        client.check(warn=False)
+        client.warmup()
+    except LLMError as e:
+        print(f"[hybrid] architect '{model}' is unavailable "
+              f"({str(e).splitlines()[0][:100]}); the editor runs alone",
+              file=sys.stderr)
+        cache[key] = None
+        return None
+    client.active_model_role = {"profile": provider, "model": new_cfg.model,
+                                "role": "architect", "specialty": ""}
+    if hasattr(editor, "on_call"):
+        client.on_call = editor.on_call
+    cache[key] = client
+    return client
+
+
+def _hybrid_evict(cfg, from_url: str, to_url: str) -> None:
+    """The VRAM handoff between two stages: when BOTH endpoints are local
+    servers on different ports and auto_evict_servers is on, unload the
+    outgoing server before the incoming model loads. Never raises."""
+    from . import servers as servers_mod
+    try:
+        if not getattr(cfg, "auto_evict_servers", True):
+            return
+        if not (servers_mod.is_local_url(from_url)
+                and servers_mod.is_local_url(to_url)):
+            return
+        if servers_mod.normalize_url(from_url) == servers_mod.normalize_url(to_url):
+            return
+        servers_mod.evict_other_local_servers(to_url, cfg)
+    except Exception:
+        pass
+
+
+def _extract_blueprint(reply: str) -> str:
+    """The blueprint body between the markers; a reply without markers is
+    taken whole (a small architect that forgot the fence still planned)."""
+    m = re.search(r"HYBRID_BLUEPRINT\s*\n(.*?)\n\s*END_BLUEPRINT",
+                  reply or "", re.DOTALL)
+    return (m.group(1) if m else (reply or "")).strip()
+
+
+def _hybrid_stage1(root, cfg, client, agent, idx, task):
+    """Stage 1: the architect writes the blueprint. Returns a dict with the
+    blueprint text, the architect client and its per-stage usage, or None
+    when the architect is unavailable/empty -- the caller then runs the
+    ordinary single-model path."""
+    arch = _architect_client(cfg, client)
+    if arch is None:
+        return None
+    # The architect is built and cached raw; wrap only this run's use so its
+    # planning exchange enters the transcript without giving a later run a
+    # proxy bound to this run's (finished) capture.
+    capture = getattr(client, "_capture", None)
+    if capture is not None:
+        arch = capture.wrap(arch)
+    acfg = arch.cfg
+    _hybrid_evict(cfg, str(getattr(cfg, "base_url", "") or ""),
+                  str(getattr(acfg, "base_url", "") or ""))
+    label = f"Hybrid Stage 1 (Architect): {acfg.model}"
+    print(f"\n[{label}]", file=sys.stderr)
+    workspace.log_event(root, label)
+    try:
+        events_mod.get(root, cfg).emit(
+            "hybrid_stage", stage=1, role="architect", model=acfg.model,
+            provider=str(getattr(cfg, "architect_provider", "") or ""),
+            label=label)
+    except Exception:
+        pass
+    try:
+        if agent is not None:
+            map_text, _tier = agent._map(task)
+        else:
+            map_text, _tier = idx.map_for_prompt(cfg, task=task)
+    except Exception:
+        map_text = ""
+    user = (f"TASK:\n{task}\n\nPROJECT MAP:\n{map_text}\n\n"
+            "Write the HYBRID_BLUEPRINT for this task now.")
+    arch.site = "plan"
+    before = _snapshot_stats(arch)      # after warmup: only the plan counts
+    started = time.time()
+    try:
+        reply = arch.chat(
+            [{"role": "system", "content": _HYBRID_SYSTEM},
+             {"role": "user", "content": user}],
+            max_tokens=int(getattr(cfg, "max_tokens_plan", 2000) or 2000),
+            stream=False, cancel_event=getattr(cfg, "_cancel_event", None))
+    except LLMError as e:
+        print(f"[hybrid] architect planning failed "
+              f"({str(e).splitlines()[0][:100]}); the editor runs alone",
+              file=sys.stderr)
+        return None
+    blueprint = _extract_blueprint(reply)
+    if not blueprint:
+        print("[hybrid] architect returned an empty blueprint; the editor "
+              "runs alone", file=sys.stderr)
+        return None
+    return {"blueprint": blueprint, "client": arch,
+            "stats": _task_stats(arch, before, started),
+            "model": str(acfg.model),
+            "provider": str(getattr(cfg, "architect_provider", "") or "")}
+
+
+def _hybrid_finish(root, cfg, client, hybrid: dict, tr: TaskResult) -> None:
+    """Fold the architect's usage into the task's combined telemetry and
+    emit the per-stage breakdown (the GUI result card and TUI receipt read
+    tr.stats['hybrid'])."""
+    a = hybrid.get("stats") or {}
+    e = tr.stats or {}
+    merged = dict(e)
+    for k in ("calls", "prompt_tokens", "completion_tokens", "cached_tokens",
+              "cache_write_tokens"):
+        merged[k] = int(e.get(k, 0) or 0) + int(a.get(k, 0) or 0)
+    merged["cost"] = round(float(e.get("cost", 0.0) or 0.0)
+                           + float(a.get("cost", 0.0) or 0.0), 6)
+    merged["seconds"] = round(float(e.get("seconds", 0.0) or 0.0)
+                              + float(a.get("seconds", 0.0) or 0.0), 2)
+    pt = merged.get("prompt_tokens", 0)
+    merged["cache_hit"] = (round(merged.get("cached_tokens", 0) / pt, 3)
+                           if pt else 0.0)
+    merged["hybrid"] = {
+        "architect": {"model": hybrid.get("model", ""),
+                      "provider": hybrid.get("provider", ""), **a},
+        "editor": {"model": str(getattr(cfg, "model", "") or ""),
+                   "provider": str(getattr(cfg, "active_profile", "") or ""),
+                   **{k: v for k, v in e.items() if k != "hybrid"}},
+    }
+    tr.stats = merged
+    try:
+        events_mod.get(root, cfg).emit("hybrid", **merged["hybrid"],
+                                       calls=merged.get("calls", 0),
+                                       prompt_tokens=merged.get("prompt_tokens", 0),
+                                       completion_tokens=merged.get("completion_tokens", 0),
+                                       cost=merged.get("cost", 0.0))
+    except Exception:
+        pass
+
+
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
              apply: bool = True, review: bool = False,
              answer_system: str | None = None,
-             is_repair: bool = False) -> TaskResult:
+             is_repair: bool = False,
+             pinned: list | None = None,
+             images: list[dict] | None = None) -> TaskResult:
     """`_run_ladder`, plus failure memory: a task that ends without a usable
     edit is remembered (files looked at, why) so a similar later task is warned
     off the same dead end; a success clears the warning. Zero-edit runs are
     also counted per profile: once `escalation_zero_edit_runs` accumulate, the
-    next task carries an escalation suggestion into its ladder."""
+    next task carries an escalation suggestion into its ladder.
+
+    `pinned` is an optional explicit context list (`@file`, `Class.method`);
+    the prompt's own @mentions are always parsed by Agent.gather.
+    `images` is an optional list of normalized image attachment dicts.
+    """
     from . import memory as memory_mod
-    if not getattr(cfg, "_auto_step", 0):
-        # Standalone task (ask/chat/eval): no outer loop owns the static or
-        # contract baseline, so drop any leftover one and let _run_task_once
-        # record a fresh snapshot for this task.
-        cfg._static_baseline = None
-        cfg._contract_baseline = None
-        cfg._dom_baseline = None
-        # Standalone tasks route here; run_loop routes before it builds the
-        # agent (its _auto_step marker is set), so there is no double switch.
-        client, agent = _specialist_route(root, cfg, client, agent, idx,
-                                          task, is_repair)
-    tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
-                     review=review, answer_system=answer_system,
-                     is_repair=is_repair)
-    tr = _specialist_zero_edit_fallback(
-        root, cfg, client, idx, task, tr,
-        dict(apply=apply, review=review, answer_system=answer_system,
-             is_repair=is_repair))
-    if answer_system is not None or review or not getattr(cfg, "use_memory", True):
-        return tr
+    has_saved_pinned = hasattr(cfg, "_pinned_refs")
+    saved_pinned = getattr(cfg, "_pinned_refs", None)
+    if pinned is not None:
+        cfg._pinned_refs = [str(p).lstrip("@").strip()
+                            for p in pinned if str(p).strip()]
+    has_saved_images = hasattr(cfg, "_task_images")
+    saved_images = getattr(cfg, "_task_images", None)
+    if images is not None:
+        cfg._task_images = list(images)
     try:
-        if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
-            memory_mod.clear_attempts(root, task)
-            memory_mod.clear_zero_edit(root, cfg)
-            # The profile un-stuck itself: drop this task's lease strikes and
-            # any escalation suggestion its earlier failures queued up.
-            strikes = getattr(cfg, "_lease_strikes", None)
-            if strikes:
-                strikes.pop(" ".join((task or "").split())[:200], None)
-            if getattr(cfg, "_pending_escalation_reason", ""):
-                cfg._pending_escalation_reason = ""
-        else:
-            looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
-                      if " read " in f" {ln} "][:4]
-            why = ("fabricated edits" if tr.fabricated
-                   else "no valid edit was produced")
-            memory_mod.note_attempt(root, task, why, looked)
-            threshold = int(getattr(cfg, "escalation_zero_edit_runs", 3) or 0)
-            if threshold > 0:
-                n = memory_mod.note_zero_edit(root, cfg)
-                if n >= threshold:
-                    profile = getattr(cfg, "active_profile", "") or "(default)"
-                    _suggest_escalation(
-                        root, cfg,
-                        f"{n} consecutive zero-edit runs on profile "
-                        f"'{profile}'; a stronger model may succeed where "
-                        "this one keeps producing no usable edit",
-                        pending=True)
-    except Exception:
-        pass
-    return tr
+        if _cancel_requested(cfg, client):
+            _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
+            raise CancelledError("Stopped by user; no further work was done.")
+        writes = bool(apply) and not review
+        if apply or review:
+            # A review task writes only after a human sign-off, but the state
+            # before the proposal is exactly what an undo must restore, so the
+            # baseline is recorded here and the accepted review adds its child.
+            _checkpoint_task(root, cfg, task, "pre")
+        if not getattr(cfg, "_auto_step", 0):
+            # Standalone task (ask/chat/eval): no outer loop owns the static or
+            # contract baseline, so drop any leftover one and let _run_task_once
+            # record a fresh snapshot for this task.
+            cfg._static_baseline = None
+            cfg._contract_baseline = None
+            cfg._dom_baseline = None
+            cfg._frontend_baseline = None
+            # Standalone tasks route here; run_loop routes before it builds the
+            # agent (its _auto_step marker is set), so there is no double switch.
+            client, agent = _specialist_route(root, cfg, client, agent, idx,
+                                              task, is_repair)
+        # Opt-in trajectory export: wrap the client the task will actually use
+        # (and the agent that owns it) so every gather/answer/repair call is the
+        # real transcript. Capture is diagnostics: any failure here is ignored.
+        capture = None
+        try:
+            capture = trajectories.begin(root, cfg, task, client)
+            if capture is not None:
+                client, agent = capture.install(client, agent)
+        except Exception:
+            capture = None
+
+        def _finish_capture(result):
+            """Write the trajectory; every failure is the capture's, not the
+            task's. Kept here so a broken hook can never skip the task's return."""
+            try:
+                trajectories.finish(capture, root, cfg, result)
+            except Exception:
+                pass
+        # Split-stage hybrid: the architect plans before the editor runs. Repair
+        # rounds and scaffold/answer_system tasks keep their single-model path.
+        hybrid = None
+        if ((apply or review) and not is_repair and answer_system is None
+                and hybrid_active(cfg)):
+            hybrid = _hybrid_stage1(root, cfg, client, agent, idx, task)
+        saved_mode = getattr(cfg, "answer_mode", "")
+        if hybrid is not None:
+            # Stage 1 -> 2 handoff: give the editor's server the VRAM, then
+            # inject the blueprint. Continue mode reuses only the gather
+            # conversation, so Stage 2 must rebuild its context to see the plan.
+            _hybrid_evict(cfg, str(getattr(hybrid["client"].cfg, "base_url", "") or ""),
+                          str(getattr(cfg, "base_url", "") or ""))
+            label = f"Hybrid Stage 2 (Editor): {cfg.model}"
+            print(f"\n[{label}]", file=sys.stderr)
+            workspace.log_event(root, label)
+            try:
+                events_mod.get(root, cfg).emit(
+                    "hybrid_stage", stage=2, role="editor",
+                    model=str(getattr(cfg, "model", "") or ""),
+                    provider=str(getattr(cfg, "active_profile", "") or ""),
+                    label=label)
+            except Exception:
+                pass
+            cfg._hybrid_blueprint = hybrid["blueprint"]
+            cfg.answer_mode = "rebuild"
+        try:
+            tr = _run_ladder(root, cfg, client, agent, idx, task, apply=apply,
+                             review=review, answer_system=answer_system,
+                             is_repair=is_repair)
+        except BaseException:
+            # A cancelled or failed run still leaves the exchanged messages that
+            # did happen; write them before propagating the original exception.
+            _finish_capture(None)
+            raise
+        finally:
+            if hybrid is not None:
+                cfg.answer_mode = saved_mode
+                cfg._hybrid_blueprint = ""
+        if hybrid is not None:
+            _hybrid_finish(root, cfg, client, hybrid, tr)
+        tr = _specialist_zero_edit_fallback(
+            root, cfg, client, idx, task, tr,
+            dict(apply=apply, review=review, answer_system=answer_system,
+                 is_repair=is_repair))
+        if answer_system is not None or review or not getattr(cfg, "use_memory", True):
+            if writes:
+                _checkpoint_task(root, cfg, task, "post")
+            _finish_capture(tr)
+            return tr
+        try:
+            if any(r.ok for r in tr.results) or tr.changed or _is_noop(tr.reply):
+                memory_mod.clear_attempts(root, task)
+                memory_mod.clear_zero_edit(root, cfg)
+                # The profile un-stuck itself: drop this task's lease strikes and
+                # any escalation suggestion its earlier failures queued up.
+                strikes = getattr(cfg, "_lease_strikes", None)
+                if strikes:
+                    strikes.pop(" ".join((task or "").split())[:200], None)
+                if getattr(cfg, "_pending_escalation_reason", ""):
+                    cfg._pending_escalation_reason = ""
+            else:
+                looked = [ln.split(None, 2)[-1][:60] for ln in tr.steps
+                          if " read " in f" {ln} "][:4]
+                why = ("fabricated edits" if tr.fabricated
+                       else "no valid edit was produced")
+                memory_mod.note_attempt(root, task, why, looked)
+                threshold = int(getattr(cfg, "escalation_zero_edit_runs", 3) or 0)
+                if threshold > 0:
+                    n = memory_mod.note_zero_edit(root, cfg)
+                    if n >= threshold:
+                        profile = getattr(cfg, "active_profile", "") or "(default)"
+                        _suggest_escalation(
+                            root, cfg,
+                            f"{n} consecutive zero-edit runs on profile "
+                            f"'{profile}'; a stronger model may succeed where "
+                            "this one keeps producing no usable edit",
+                            pending=True)
+        except Exception:
+            pass
+        if writes:
+            _checkpoint_task(root, cfg, task, "post")
+        _finish_capture(tr)
+        return tr
+    finally:
+        if pinned is not None:
+            if has_saved_pinned:
+                cfg._pinned_refs = saved_pinned
+            elif hasattr(cfg, "_pinned_refs"):
+                delattr(cfg, "_pinned_refs")
+        if images is not None:
+            if has_saved_images:
+                cfg._task_images = saved_images
+            elif hasattr(cfg, "_task_images"):
+                delattr(cfg, "_task_images")
+
+
+def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,
+                      idx=None):
+    bdir = getattr(attempt_tr, "backup_dir", None) if attempt_tr else None
+    cur_idx = idx if idx is not None else getattr(attempt_tr, "idx", None)
+    if not bdir:
+        return cur_idx
+    bpath = Path(bdir)
+    if not bpath.is_dir():
+        return cur_idx
+    restored = workspace.restore(root, bpath)
+    workspace.delete_created(root, bpath)
+    if cur_idx is not None:
+        for rel in restored:
+            try:
+                cur_idx = index_mod.reindex_file(cur_idx, rel, cfg)
+            except Exception:
+                pass
+    return cur_idx
 
 
 def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
@@ -4000,17 +4425,26 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"escalating task to the escalate role: "
                                   f"{reason}", "WARN")
         from .agent import Agent
-        tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx,
-                             task, **kw)
-        landed2 = any(r.ok for r in tr2.results) or bool(tr2.changed)
+        wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
+                  or any(r.ok for r in tr.results)
+                  or bool(getattr(cfg, "_task_mutations", None)))
+        base_idx = tr.idx
+        if apply and wrote1 and getattr(tr, "tests_ok", None) is not True:
+            base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+        cfg._task_mutations = []
+        tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg),
+                             base_idx, task, **kw)
+        landed2 = any(r.ok for r in tr2.results) or bool(getattr(tr2, "changed", None))
         if not landed2:
+            _rollback_attempt(root, cfg, tr2)
             return tr
-        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))
         # Keep the first attempt only when it landed a GREEN result and the
         # escalated one came back red; otherwise the stronger model's work
         # wins (it was asked precisely because the first verdict was broken).
         if landed1 and getattr(tr, "tests_ok", None) is True \
                 and getattr(tr2, "tests_ok", None) is False:
+            _rollback_attempt(root, cfg, tr2)
             return tr
         return tr2
     if reason and apply and esc is client:
@@ -4019,7 +4453,7 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         # the SAME client and budgets with the edit style flipped: a model
         # stuck on exact-quote SEARCH blocks often lands SYMBOL splices, and
         # vice versa. Green runs never reach this branch.
-        landed1 = tr.applied and (any(r.ok for r in tr.results) or tr.changed)
+        landed1 = tr.applied and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))
         if getattr(tr, "tests_ok", None) is True:
             return tr                     # green: nothing to recover
         if landed1 and getattr(tr, "tests_ok", None) is not False:
@@ -4034,21 +4468,30 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
         workspace.log_event(root, f"strategy_shift: edit_style {style} -> "
                                   f"{flipped}: {reason}", "WARN")
         from .agent import Agent
+        wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
+                  or any(r.ok for r in tr.results)
+                  or bool(getattr(cfg, "_task_mutations", None)))
+        base_idx = tr.idx
+        if apply and wrote1:
+            base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+        cfg._task_mutations = []
         cfg.edit_style = flipped
         try:
-            tr2 = _run_task_once(root, cfg, client, Agent(tr.idx, client, cfg),
-                                 tr.idx, task, **kw)
+            tr2 = _run_task_once(root, cfg, client, Agent(base_idx, client, cfg),
+                                 base_idx, task, **kw)
         finally:
             cfg.edit_style = style
-        landed2 = tr2.applied and (any(r.ok for r in tr2.results) or tr2.changed)
+        landed2 = tr2.applied and (any(r.ok for r in tr2.results) or bool(getattr(tr2, "changed", None)))
         if not landed2:
+            _rollback_attempt(root, cfg, tr2)
             return tr                     # the retry landed nothing: keep first
         if getattr(tr, "tests_ok", None) is False \
                 and getattr(tr2, "tests_ok", None) is False:
+            _rollback_attempt(root, cfg, tr2)
             return tr                     # both proven red: keep the first
         return tr2
     if esc is client or (tr.applied
-                         and (any(r.ok for r in tr.results) or tr.changed)):
+                         and (any(r.ok for r in tr.results) or bool(getattr(tr, "changed", None)))):
         return tr
     if any(r.ok for r in tr.results) and not apply:
         return tr                      # a dry run that produced a valid diff
@@ -4059,9 +4502,21 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     workspace.log_event(root, "escalating a failed task to the escalate role",
                         "WARN")
     from .agent import Agent
-    tr2 = _run_task_once(root, cfg, esc, Agent(tr.idx, esc, cfg), tr.idx, task,
-                         **kw)
-    return tr2 if any(r.ok for r in tr2.results) else tr
+    wrote1 = (tr.applied or bool(getattr(tr, "changed", None))
+              or any(r.ok for r in tr.results)
+              or bool(getattr(cfg, "_task_mutations", None)))
+    base_idx = tr.idx
+    if apply and wrote1:
+        base_idx = _rollback_attempt(root, cfg, tr, base_idx)
+    cfg._task_mutations = []
+    tr2 = _run_task_once(root, cfg, esc, Agent(base_idx, esc, cfg), base_idx,
+                         task, **kw)
+    landed2 = any(r.ok for r in tr2.results) or (
+        not tr2.results and bool(getattr(tr2, "changed", None)))
+    if not landed2:
+        _rollback_attempt(root, cfg, tr2)
+        return tr
+    return tr2
 
 
 def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
@@ -4099,6 +4554,14 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
     gathered = agent.gather(task, backup_dir=backup_dir, is_repair=is_repair)
+    blueprint = str(getattr(cfg, "_hybrid_blueprint", "") or "")
+    if blueprint:
+        # Hybrid Stage 2: the architect's plan rides ahead of everything the
+        # editor gathered, so the cheap model implements instead of guessing.
+        gathered = ("HYBRID_BLUEPRINT (from the architect model -- implement "
+                    "this plan; it already names the root cause, target "
+                    "files, exact signatures and edge cases):\n"
+                    + blueprint + "\n\n" + (gathered or ""))
     # Files a gather-phase action wrote/moved/deleted (write/append/move/
     # delete/rename). A worker that finishes the job with gather actions --
     # the deepclitest pattern -- produces no answer-phase edit blocks, and
@@ -4457,6 +4920,13 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 "clauses": list(clauses.get(fileio_norm(r.file), ()))}
                for r in results],
         clause_texts=clause_texts, unaccepted=unaccepted)
+    # Post-run hygiene, non-blocking: scan the files this task touched plus
+    # the workspace's sensitive-file ignore state, then emit a masked notice
+    # for the GUI banner / TUI transcript. A scan failure never fails a run.
+    try:
+        security_mod.emit_post_run_notice(root, cfg, files=changed)
+    except Exception:
+        pass
     if stats.get("calls"):
         print(f"[task: {stats['calls']} calls, {stats['prompt_tokens']:,} "
               f"in / {stats['completion_tokens']:,} out tokens, cache hit "
@@ -4572,7 +5042,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
              goal: str = "", on_task=None, strict: bool = False,
-             verify_final: bool = False) -> int:
+             verify_final: bool = False,
+             pinned: list | None = None) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
     Each iteration: read the plan, take the first unchecked task, run it in a
@@ -4637,6 +5108,26 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
       is still paid for once, for the record, after the loop.
     """
     from .agent import Agent
+
+    if pinned is not None:
+        cfg._pinned_refs = [str(p).lstrip("@").strip()
+                            for p in pinned if str(p).strip()]
+    elif goal:
+        # An Auto goal's @file/@symbol mentions apply to every generated task,
+        # even when the planner shortens a task title and drops them.
+        try:
+            from . import select as select_mod
+            refs = [str(p).lstrip("@").strip()
+                    for p in (getattr(cfg, "_pinned_refs", None) or ())
+                    if str(p).strip()]
+            for pin in select_mod.parse_pinned_references(
+                    goal, idx if idx is not None else root):
+                ref = pin.symbol_name if pin.kind == "symbol" else pin.path
+                if ref and ref not in refs:
+                    refs.append(ref)
+            cfg._pinned_refs = refs
+        except Exception:
+            pass
 
     attempted = 0
     done = 0
@@ -4869,16 +5360,17 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 # is not due yet. Return as passed; the cheap gates inside
                 # _gated_check still vetoed this step before we got here.
                 return True, ""
-            # Call positionally: existing callers (and tests) monkeypatch
-            # run_verify with a two-argument callable. Record the outcome here,
-            # where cfg is available, rather than threading it into the call.
-            ok, out = run_verify(root, verify)
+            # cfg rides along so the check gets the configured environment
+            # (env_passthrough / scrub_env) and run_verify records the outcome
+            # in project memory exactly once.
+            ok, out = run_verify(root, verify, cfg=cfg)
             final_state["ran"] = True
-            try:
-                from . import memory
-                memory.observe_command(root, verify, ok, cfg, kind="test")
-            except Exception:
-                pass
+            if verify_final:
+                # Tell `auto`'s post-run pass that the whole-goal check has
+                # already run, so it does not run the same command a second
+                # time after the loop.
+                cfg._verify_final_ran = True
+                cfg._verify_final_ok = ok
             return ok, out
         if use_diag:
             return diagnostics.run_changed(root, cfg, changed)
@@ -4892,6 +5384,12 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 pass
 
     while max_tasks == 0 or attempted < max_tasks:
+        if _cancel_requested(cfg, client):
+            print(f"\n[stopped by user; {plan_path.name} keeps its "
+                  f"remaining unchecked tasks]", file=sys.stderr)
+            workspace.log_event(root, "auto stopped by user", "WARN")
+            _emit_run_cancelled(root, cfg, "loop", plan=str(plan_path))
+            break
         nxt = next_task(read_plan(plan_path))
         if nxt is None:
             if failed:
@@ -4931,7 +5429,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             break
         _, task = nxt
         if _is_noop_verify_item(task) and \
-                _noop_verify_already_green(root, task, verify):
+                _noop_verify_already_green(root, task, verify, cfg):
             # A "Run tests / Verify the page" re-check the planner should
             # not have emitted: the loop already verified after every edit
             # task, and the disk evidence says nothing is owed. Tick it
@@ -5024,6 +5522,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                 tr = run_task(root, cfg, task_client, agent, idx,
                               task_for_agent, apply=apply, review=False,
                               answer_system=answer_system)
+        except CancelledError:
+            raise
         except LLMError as e:
             print(f"  task failed: {e}", file=sys.stderr)
             workspace.log_event(root, f"task failed: {e}", "ERROR")
@@ -5469,6 +5969,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                     tr2 = run_task(root, cfg, client, Agent(idx, client, cfg),
                                    idx, fix_task, apply=apply, review=False,
                                    answer_system=answer_system, is_repair=True)
+                except CancelledError:
+                    raise
                 except LLMError as e:
                     print(f"  repair failed: {e}", file=sys.stderr)
                     workspace.log_event(root, f"repair failed: {e}", "ERROR")
@@ -5643,7 +6145,9 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         # inside the loop, so pay for it once now, for the record. Repair
         # and exit-code responsibility after the loop stays with the
         # caller (auto's post-run verification pass).
-        ok, out = run_verify(root, verify)
+        ok, out = run_verify(root, verify, cfg=cfg)
+        cfg._verify_final_ran = True
+        cfg._verify_final_ok = ok
         print(f"  [final-only check was not reached inside the loop; running "
               f"`{verify}` once for the record: "
               f"{'passed' if ok else 'FAILED'}]", file=sys.stderr)

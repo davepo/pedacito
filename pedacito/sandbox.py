@@ -34,7 +34,9 @@ from pathlib import Path
 SECRET_DIRS = (".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
                ".config/gcloud", ".config/gh", ".config/pedacito",
                ".var/app/ai.opencode.opencode/config/pedacito")
-SECRET_FILES = (".netrc", ".git-credentials", ".npmrc", ".pypirc")
+SECRET_FILES = (".netrc", ".git-credentials", ".npmrc", ".pypirc",
+                ".pgpass", ".my.cnf", ".boto", ".cargo/credentials.toml",
+                ".config/git/credentials", ".bash_history", ".zsh_history")
 # Inside the project: readable, never writable by a sandboxed command.
 GUARDED = (".git", ".pedacito", ".pedacito.toml", "pedacito.toml",
            ".pedacitoignore")
@@ -52,7 +54,9 @@ def backend_name() -> str:
 
 
 def _home() -> Path:
-    return Path(os.path.expanduser("~"))
+    # Resolve symlinks (macOS homes, /tmp -> /private/tmp) so the canonical
+    # path matches what Seatbelt/bwrap rules compare against.
+    return Path(os.path.expanduser("~")).resolve()
 
 
 def _under(path: Path, parent: Path) -> bool:
@@ -90,17 +94,20 @@ def _bwrap_args(root: Path, network: bool, extra_rw: list[Path]) -> list[str]:
             args += ["--ro-bind", str(p), str(p)]
     if not network:
         args.append("--unshare-net")
-    dirs, files = _existing_secrets(root)
-    for d in dirs:
-        args += ["--tmpfs", str(d)]
-    for f in files:
-        args += ["--ro-bind", "/dev/null", str(f)]
     for p in [root, *extra_rw]:
         args += ["--bind", str(p), str(p)]
     for name in GUARDED:
         g = root / name
         if g.exists():
             args += ["--ro-bind", str(g), str(g)]
+    # Secret mounts come AFTER `extra_rw`: a writable path the user listed
+    # must never be able to re-bind over a hidden credential (bwrap applies
+    # mounts in order, last one wins).
+    dirs, files = _existing_secrets(root)
+    for d in dirs:
+        args += ["--tmpfs", str(d)]
+    for f in files:
+        args += ["--ro-bind", "/dev/null", str(f)]
     return args + ["--chdir", str(root), "--"]
 
 
@@ -114,7 +121,6 @@ def seatbelt_profile(root: Path, network: bool, extra_rw: list[Path]) -> str:
     lines = ["(version 1)", "(allow default)"]
     if not network:
         lines.append("(deny network*)")
-        lines.append('(allow network* (remote unix-socket))')
     lines.append("(deny file-write*)")
     lines.append("(allow file-write* "
                  + " ".join(f"(subpath {_sbpl(str(p))})" for p in writable)
@@ -122,8 +128,7 @@ def seatbelt_profile(root: Path, network: bool, extra_rw: list[Path]) -> str:
                  + ' (regex #"^/dev/ttys[0-9]+$"))')
     for name in GUARDED:
         g = root / name
-        if g.exists():
-            lines.append(f"(deny file-write* (subpath {_sbpl(str(g))}))")
+        lines.append(f"(deny file-write* (subpath {_sbpl(str(g))}))")
     dirs, files = _existing_secrets(root)
     for p in dirs:
         lines.append(f"(deny file-read* (subpath {_sbpl(str(p))}))")
@@ -136,7 +141,9 @@ def _prefix(backend: str, root: Path, network: bool, extra_rw: list[Path]
             ) -> list[str]:
     if backend == "bwrap":
         return _bwrap_args(root, network, extra_rw)
-    return ["sandbox-exec", "-p", seatbelt_profile(root, network, extra_rw)]
+    # `--` ends sandbox-exec's own options, so an argv[0] starting with `-`
+    # can never be read as a Seatbelt flag.
+    return ["sandbox-exec", "-p", seatbelt_profile(root, network, extra_rw), "--"]
 
 
 def _probe(backend: str, network: bool) -> tuple[bool, str]:
@@ -179,7 +186,8 @@ def status(cfg, root=None) -> tuple[str, str]:
 
 
 class SandboxRefused(RuntimeError):
-    """`sandbox_strict` is set and no sandbox could be applied."""
+    """The command could not be sandboxed (`sandbox_strict`, or an argv the
+    sandbox backend could misread as its own flags)."""
 
 
 def wrap(argv: list[str], cfg, root) -> tuple[list[str], str]:
@@ -201,5 +209,16 @@ def wrap(argv: list[str], cfg, root) -> tuple[list[str], str]:
              for p in (getattr(cfg, "sandbox_writable", ()) or ())
              if Path(p).expanduser().exists()]
     net = bool(getattr(cfg, "sandbox_network", False))
+    argv = list(argv)
+    if not argv:
+        raise SandboxRefused("refusing to sandbox an empty command")
+    head = str(argv[0])
+    # An argv[0] beginning with `-` would be parsed as a backend flag even
+    # behind `--` on some platforms, and is a sign of a confused caller.
+    # Allow only an explicit path that actually exists on disk.
+    if head.startswith("-") and not Path(head).exists():
+        raise SandboxRefused(
+            f"refusing to sandbox a command whose program name starts with '-' "
+            f"({head!r}); pass an explicit existing path instead")
     backend = backend_name()
-    return _prefix(backend, root, net, extra) + list(argv), detail
+    return _prefix(backend, root, net, extra) + argv, detail

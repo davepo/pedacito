@@ -3,6 +3,8 @@ import http.client
 import json
 import threading
 
+import pytest
+
 from pedacito import review
 
 
@@ -53,7 +55,7 @@ def test_review_server_rejects_foreign_host_and_cross_site_post():
         assert status == 200 and json.loads(data)["ok"]
     finally:
         if not applied:
-            _req(port, "POST", "/cancel")
+            _req(port, "POST", "/cancel", {"nonce": "tok"})
         t.join(10)
     assert result["out"] == ("applied", "ok")
 
@@ -66,10 +68,121 @@ def test_review_server_survives_non_object_body():
                      headers={"Content-Type": "application/json"})
         assert conn.getresponse().status == 403
         conn.close()
-        assert _req(port, "POST", "/cancel")[0] == 200
+        assert _req(port, "POST", "/cancel", {"nonce": "wrong"})[0] == 403
+        assert t.is_alive()
+        assert _req(port, "POST", "/cancel", {"nonce": "tok"})[0] == 200
     finally:
         t.join(10)
     assert result["out"][0] == "cancelled"
+
+
+def test_review_server_requires_cancel_nonce_sets_headers_and_oneshot():
+    from pedacito.local_server import LocalHTTPServer
+
+    t, result, port = _serve(lambda: (True, "ok"))
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        hdrs = {k.lower(): v for k, v in resp.getheaders()}
+        resp.read()
+        conn.close()
+        assert hdrs.get("x-frame-options") == "DENY"
+        assert hdrs.get("x-content-type-options") == "nosniff"
+
+        # /cancel without nonce is refused (403) and server stays alive
+        assert _req(port, "POST", "/cancel", {})[0] == 403
+        assert _req(port, "POST", "/cancel", {"nonce": "bad"})[0] == 403
+        assert t.is_alive()
+
+        # Valid /cancel decides once
+        assert _req(port, "POST", "/cancel", {"nonce": "tok"})[0] == 200
+    finally:
+        t.join(10)
+    assert result["out"][0] == "cancelled"
+
+    # One-shot guard & serialization: once decided, further /apply or /cancel gets 409
+    calls = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_writer():
+        calls.append(1)
+        entered.set()
+        release.wait(5)
+        return True, "ok"
+
+    srv = LocalHTTPServer(("127.0.0.1", 0), review._Handler)
+    srv.page = "<html></html>"
+    srv.nonce = "tok"
+    srv.writer = slow_writer
+    srv.on_discard = None
+    srv.lock = threading.Lock()
+    srv.done = threading.Event()
+    srv.outcome = ("timeout", "")
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        p2 = srv.server_address[1]
+        r1 = {}
+        t1 = threading.Thread(
+            target=lambda: r1.update(
+                res=_req(p2, "POST", "/apply", {"nonce": "tok"})))
+        t1.start()
+        assert entered.wait(5)
+        r2 = {}
+        t2 = threading.Thread(
+            target=lambda: r2.update(
+                res=_req(p2, "POST", "/cancel", {"nonce": "tok"})))
+        t2.start()
+        release.set()
+        t1.join(5)
+        t2.join(5)
+        assert r1["res"][0] == 200
+        assert r2["res"][0] == 409
+        assert _req(p2, "POST", "/apply", {"nonce": "tok"})[0] == 409
+        assert len(calls) == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        th.join(5)
+
+    page = review.build_page([], "t", "m", "p", "tok123", True, "s")
+    assert "post('/cancel', { nonce: window.NONCE })" in page
+
+
+def test_review_write_files_and_diffs_from_backup_block_escape_and_symlinks(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+
+    # Traversal target in FileDiff is refused before any write
+    bad_diff = review.FileDiff("../outside.txt", [], 1, 0, "", "pwn\n", "new")
+    ok, msg = review.write_files(root, [bad_diff], None)
+    assert not ok and "unsafe path" in msg.lower()
+    assert outside.read_text(encoding="utf-8") == "secret\n"
+
+    # Symlink target inside root pointing outside root is refused
+    link = root / "escape.txt"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    sym_diff = review.FileDiff("escape.txt", [], 1, 0, "", "pwn\n", "edit")
+    ok, msg = review.write_files(root, [sym_diff], None)
+    assert not ok and "unsafe path" in msg.lower()
+    assert outside.read_text(encoding="utf-8") == "secret\n"
+
+    # diffs_from_backup skips symlinks in backup_dir and root
+    bak = tmp_path / "bak"
+    bak.mkdir()
+    (bak / "link_in_bak.txt").symlink_to(outside)
+    (bak / "real.txt").write_text("old\n", encoding="utf-8")
+    (root / "real.txt").write_text("new\n", encoding="utf-8")
+    diffs = review.diffs_from_backup(root, bak)
+    assert [d.rel for d in diffs] == ["real.txt"]
 
 
 def test_write_files_keeps_first_backup_on_repeat_apply(tmp_path):

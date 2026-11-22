@@ -149,6 +149,9 @@ def _reset_gui_state(tmp_path, *, teardown=False):
     _clear_thread_store(tmp_path)
     core.STATE.__init__()          # fresh bus, transcript, review and job slot
     if teardown:
+        from pedacito import lsp, mcp
+        mcp.close_all()
+        lsp.close_all()
         with core.STATE.lock:
             core.STATE.job = None
             core.STATE.review = None
@@ -170,6 +173,8 @@ def gui(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "RECENT_FILE", tmp_path / "cfg" / "gui_recent.json")
     for var in [k for k in os.environ if k.startswith("PEDACITO_")]:
         monkeypatch.delenv(var)
+    # Keep GUI tests offline too (the conftest guard was just scrubbed).
+    monkeypatch.setenv("PEDACITO_CHECK_FOR_UPDATES", "false")
     _reset_gui_state(tmp_path)
     srv = server.create_server(0)
     thread = threading.Thread(target=srv.serve_forever, daemon=True,
@@ -236,7 +241,7 @@ def test_static_pages_and_security_headers(gui):
     assert status == 200 and b"pedacito" in body
     assert "default-src 'self'" in headers["Content-Security-Policy"]
     assert headers["X-Frame-Options"] == "DENY"
-    for name in ("app.css", "app.js", "panels.js", "settings.js", "main.js"):
+    for name in ("app.css", "app.js", "settings.js"):
         assert gui.req("GET", "/static/" + name)[0] == 200
     assert gui.req("GET", "/static/../gui/server.py")[0] == 404
     assert gui.req("GET", "/static/nope.js")[0] == 404
@@ -1741,3 +1746,91 @@ def test_theme_persists_and_loads_with_no_project_open(gui):
     core.STATE._user_cfg_stamp = None
     assert gui.get("/api/state")[1]["gui_theme"] == "trapper_keeper"
     assert 'data-theme="trapper_keeper"' in gui.req("GET", "/")[2].decode()
+
+
+# --- WP-07 concurrency, resync, reset & theme hardening -----------------------
+
+def test_bus_wait_resyncs_when_after_exceeds_seq(gui):
+    bus = core.Bus()
+    t0 = time.monotonic()
+    events, resync = bus.wait(10, 5.0)
+    assert events == [] and resync is True
+    assert time.monotonic() - t0 < 1.0
+    bus.publish("x", n=1)
+    assert bus.wait(10, 5.0) == ([], True)
+    # SSE stream with a stale Last-Event-ID after restart triggers resync
+    conn = http.client.HTTPConnection("127.0.0.1", gui.port, timeout=5)
+    conn.request("GET", "/events?since=999999")
+    resp = conn.getresponse()
+    assert resp.status == 200
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert "event: resync" in body
+
+
+def test_project_reset_clears_state_agent_alongside_idx(gui):
+    root = gui.tmp / "reset-agent-proj"
+    root.mkdir()
+    (root / ".pedacito").mkdir()
+    with core.STATE.lock:
+        core.STATE.root = root
+        core.STATE.cfg = config_mod.Config()
+        core.STATE.idx = object()
+        core.STATE.agent = object()
+    status, body = gui.post("/api/project/reset", {})
+    assert status == 200 and body["ok"] is True
+    with core.STATE.lock:
+        assert core.STATE.idx is None
+        assert core.STATE.agent is None
+
+
+def test_save_theme_does_not_clobber_live_client_or_agent(gui):
+    sentinel_client = object()
+    sentinel_agent = object()
+    cfg = config_mod.Config()
+    with core.STATE.lock:
+        core.STATE.cfg = cfg
+        core.STATE.client = sentinel_client
+        core.STATE.agent = sentinel_agent
+        core.STATE.job = core.Job(99, "task", "running")
+    try:
+        status, body = gui.post("/api/settings/theme", {"gui_theme": "nord"})
+        assert status == 200 and body["ok"] is True
+        with core.STATE.lock:
+            assert core.STATE.client is sentinel_client
+            assert core.STATE.agent is sentinel_agent
+            assert core.STATE.cfg.gui_theme == "nord"
+    finally:
+        with core.STATE.lock:
+            core.STATE.job = None
+
+
+def test_llm_error_recorded_once_in_chat(gui):
+    from pedacito.llm import LLMError
+
+    def fail_llm(job):
+        raise LLMError("model down")
+
+    jobs.spawn("task", "failing llm", fail_llm)
+    assert gui.wait_idle(10)
+    matches = [m for m in core.STATE.messages if "model down" in m.get("text", "")]
+    assert len(matches) == 1
+    assert matches[0]["role"] == "error"
+
+
+def test_restore_and_rename_refuse_while_job_active(gui):
+    root = gui.tmp / "busy-guards"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    with core.STATE.lock:
+        core.STATE.root = root
+        core.STATE.cfg = config_mod.Config()
+        core.STATE.job = core.Job(101, "task", "busy")
+    try:
+        s1, b1 = gui.post("/api/checkpoints/restore", {"id": "cp-1"})
+        assert s1 == 409 and b1["ok"] is False
+        s2, b2 = gui.post("/api/refactor/rename", {"old": "x", "new": "y"})
+        assert s2 == 409 and b2["ok"] is False
+    finally:
+        with core.STATE.lock:
+            core.STATE.job = None

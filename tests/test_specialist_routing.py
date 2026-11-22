@@ -1026,3 +1026,71 @@ def test_gui_state_tracks_the_routed_specialist(tmp_path, monkeypatch):
         assert st.engine()["specialist"] == {}
     finally:
         st.bus.close()
+
+
+def test_role_and_scout_clients_share_ledger_cancel_and_streaming_callbacks(
+        monkeypatch):
+    cfg = _routed_cfg(
+        scout_profile="coder",
+        roles={"planner": "ui"},
+        profiles={
+            "worker": {"model": "worker-m"},
+            "coder": {"model": "coder-m", "base_url": LOCAL2},
+            "ui": {"model": "ui-m", "base_url": LOCAL2},
+        },
+    )
+    orig_check, orig_warmup = llm_mod.LLMClient.check, llm_mod.LLMClient.warmup
+    llm_mod.LLMClient.check = lambda self, warn=True: ""
+    llm_mod.LLMClient.warmup = lambda self: None
+    try:
+        worker = llm_mod.LLMClient(cfg)
+        cancel = threading.Event()
+        worker.cancel_event = cancel
+        worker.on_call = lambda rec: None
+        worker.stream_callback = lambda d: None
+        worker.on_stream = lambda ev: None
+        worker.on_stream_event = lambda ev: None
+        worker.on_start = lambda ev: None
+        worker.echo_stream = False
+
+        planner = roles.client_for(cfg, "planner", worker)
+        scout = roles.scout_client(cfg, worker)
+        spec = roles.switch_specialist_client(cfg, worker, "coder")
+        for c in (planner, scout, spec):
+            assert c is not worker
+            assert c.stats is worker.stats
+            assert c._stats_lock is worker._stats_lock
+            assert c.cancel_event is worker.cancel_event
+            assert c.on_call is worker.on_call
+            assert c.stream_callback is worker.stream_callback
+            assert c.on_stream is worker.on_stream
+            assert c.on_stream_event is worker.on_stream_event
+            assert c.on_start is worker.on_start
+            assert c.echo_stream is False
+    finally:
+        llm_mod.LLMClient.check = orig_check
+        llm_mod.LLMClient.warmup = orig_warmup
+
+
+def test_specialist_warmup_failure_clears_slot_and_rewarms_worker(
+        monkeypatch, capsys):
+    cfg, worker, factory, unloaded = _handoff_setup(
+        monkeypatch, fail_warmup=("coder-m",))
+    cfg.__dict__["_specialist_on_worker_server"] = "stale"
+    assert roles.switch_specialist_client(cfg, worker, "coder") is worker
+    assert unloaded == ["worker-m"]
+    assert "_specialist_on_worker_server" not in cfg.__dict__
+    assert worker.warmups == 1
+    assert "failed to load" in capsys.readouterr().err
+
+    # Also test reload failure of a cached specialist after unloading another
+    cfg2, worker2, factory2, unloaded2 = _handoff_setup(monkeypatch)
+    c_coder = roles.switch_specialist_client(cfg2, worker2, "coder")
+    c_ui = roles.switch_specialist_client(cfg2, worker2, "ui")
+    assert c_ui is not worker2
+    assert cfg2.__dict__["_specialist_on_worker_server"] == "ui"
+    c_coder.fail_warmup = True
+    assert roles.switch_specialist_client(cfg2, worker2, "coder") is worker2
+    assert "_specialist_on_worker_server" not in cfg2.__dict__
+    assert worker2.warmups == 1
+    assert "failed to reload" in capsys.readouterr().err

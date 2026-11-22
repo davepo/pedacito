@@ -9,18 +9,24 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
 from .. import config as config_mod
 from .. import config_editor
+from .. import fileio
+from .. import i18n
+from .. import imagegen
 from ..config import USER_CONFIG, ConfigError
 from . import settings
 from .core import STATE
 
 SECRET_MASK_KEYS = settings.SECRET_KEYS
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 def config_path(which: str) -> Path:
@@ -45,15 +51,14 @@ def _read_text(path: Path) -> str:
 def write_config(path: Path, text: str) -> None:
     """Validate, back up the old file as `<name>.bak`, and write atomically."""
     settings.validate_text(text, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        try:
-            Path(str(path) + ".bak").write_bytes(path.read_bytes())
-        except OSError:
-            pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, path)
+    with _CONFIG_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                Path(str(path) + ".bak").write_bytes(path.read_bytes())
+            except OSError:
+                pass
+        fileio.write_bytes(path, text.encode("utf-8"))
 
 
 def _mask(body: dict) -> dict:
@@ -79,9 +84,12 @@ def file_info(which: str) -> dict:
     if text.strip():
         try:
             flat, profiles = settings.validate_text(text, str(path))
-            info["settings"] = {k: (list(v) if isinstance(v, tuple) else v)
-                                for k, v in flat.items()
-                                if k not in SECRET_MASK_KEYS}
+            info["settings"] = {
+                k: (config_editor.redact_mcp_servers_dict(v)
+                    if k == "mcp_servers" and isinstance(v, dict)
+                    else (list(v) if isinstance(v, tuple) else v))
+                for k, v in flat.items()
+                if k not in SECRET_MASK_KEYS}
             info["settings_secret_set"] = [k for k in flat
                                            if k in SECRET_MASK_KEYS]
             info["profiles"] = {n: _mask(b) for n, b in profiles.items()}
@@ -236,6 +244,20 @@ def profile_action(which: str, action: str, name: str, values: dict,
     else:
         raise ConfigError(f"unknown profile action {action!r}")
     write_config(path, new)
+    if action == "delete":
+        with STATE.lock:
+            was_selected = (
+                STATE.profile_request == name
+                or (STATE.cfg is not None
+                    and STATE.cfg.active_profile == name)
+            )
+            if STATE.profile_request == name:
+                STATE.profile_request = ""
+            STATE._user_cfg_stamp = None
+            STATE._user_raw_prefs = None
+            STATE._global_cfg_stamp = None
+        if was_selected:
+            return reload_state_config(profile=None)
     return payload()
 
 
@@ -269,10 +291,8 @@ def rename_profile(which: str, old_name: str, new_name: str) -> dict:
     with STATE.lock:
         requested = STATE.profile_request
         active = STATE.cfg.active_profile if STATE.cfg is not None else ""
-    out = reload_state_config(profile=new_name
-                              if requested == old_name else None)
-    if out["active_profile"] == "" and active == old_name:
-        out = reload_state_config(profile=new_name)
+    target = new_name if (requested == old_name or active == old_name) else None
+    out = reload_state_config(profile=target)
     out["renamed"] = {"from": old_name, "to": new_name}
     out["profiles"] = sorted(set((out["user"].get("profiles") or {}))
                              | set((out["project"].get("profiles") or {})))
@@ -311,14 +331,41 @@ def trust_project_config() -> dict:
     return payload()
 
 
-def _stored_api_key(which: str, profile: str) -> str:
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return `(scheme, hostname, port)` for an http(s) URL, else None."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return None
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return (scheme, parsed.hostname.lower(), port)
+
+
+def _stored_api_key(which: str, profile: str, probe_url: str = "") -> str:
+    probe_origin = _url_origin(probe_url) if probe_url else None
     try:
         text = _read_text(config_path(which))
         body = settings.profile_body(text, profile) if profile else {}
-        if body.get("api_key"):
-            return str(body["api_key"])
         flat, _ = settings.validate_text(text)
-        return str(flat.get("api_key", ""))
+        if body.get("api_key"):
+            stored_url = body.get("base_url") or flat.get("base_url") or ""
+            if probe_origin is None or _url_origin(stored_url) == probe_origin:
+                return str(body["api_key"])
+            return ""
+        if flat.get("api_key"):
+            stored_url = ((body.get("base_url") if profile else "")
+                          or flat.get("base_url") or "")
+            if probe_origin is None or _url_origin(stored_url) == probe_origin:
+                return str(flat["api_key"])
+        return ""
     except (ConfigError, OSError):
         return ""
 
@@ -329,9 +376,14 @@ def probe_server(base_url: str, api_key: str, which: str = "user",
     base_url = (base_url or "").strip()
     if not base_url:
         return {"ok": False, "error": "Enter the server URL first."}
+    probe_origin = _url_origin(base_url)
+    if probe_origin is None:
+        return {"ok": False, "error": "Server URL must use http or https."}
     if not api_key:
-        api_key = _stored_api_key(which, profile) or (
-            STATE.cfg.api_key if STATE.cfg is not None else "")
+        api_key = _stored_api_key(which, profile, base_url)
+        if not api_key and STATE.cfg is not None and STATE.cfg.api_key:
+            if _url_origin(getattr(STATE.cfg, "base_url", "")) == probe_origin:
+                api_key = STATE.cfg.api_key
     try:
         r = requests.get(base_url.rstrip("/") + "/models",
                          headers={"Authorization": f"Bearer {api_key}"},
@@ -455,17 +507,16 @@ def reset_to_baseline() -> dict:
     assignments, and restore the recommended baseline defaults."""
     path = config_path("user")
     backup = ""
-    if path.exists():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        bp = Path(f"{path}.reset.{stamp}.bak")
-        bp.write_bytes(path.read_bytes())
-        backup = str(bp)
     text = baseline_text()
     settings.validate_text(text, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, path)
+    with _CONFIG_WRITE_LOCK:
+        if path.exists():
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bp = Path(f"{path}.reset.{stamp}.bak")
+            bp.write_bytes(path.read_bytes())
+            backup = str(bp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fileio.write_bytes(path, text.encode("utf-8"))
     out = reload_state_config()
     out["backup"] = backup
     return out
@@ -475,7 +526,8 @@ def reset_to_baseline() -> dict:
 
 def save_theme(name: str) -> dict:
     """Persist `gui_theme` in the user config and reflect it in the live
-    config. Purely cosmetic, so nothing is reloaded or restarted. When no
+    theme state only. Purely cosmetic, so nothing is reloaded or restarted and
+    live `STATE.client`/`STATE.agent` are never swapped (safe mid-job). When no
     user config exists yet it is created from the starter template first, so
     a project-less GUI session still remembers the choice."""
     name = str(name or "").strip().lower()
@@ -486,15 +538,48 @@ def save_theme(name: str) -> dict:
     created = not USER_CONFIG.exists()
     text = _read_text(USER_CONFIG) if not created else config_mod.TEMPLATE
     write_config(USER_CONFIG, settings.set_values(text, {"gui_theme": name}))
-    # Re-read the user file so /api/state reports the new theme even when no
-    # project is open (STATE.cfg is None until one is). In-place and job-free
-    # -- the whole point of a dedicated theme route -- and the dropdown's
-    # explicit profile pick survives the reload.
     with STATE.lock:
-        keep = STATE.profile_request or None
-    reload_state_config(profile=keep)
+        if STATE.cfg is not None:
+            STATE.cfg.gui_theme = name
+        if STATE._user_cfg is not None:
+            STATE._user_cfg.gui_theme = name
+        if STATE._global_cfg is not None:
+            STATE._global_cfg.gui_theme = name
+        STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
+        STATE._global_cfg_stamp = None
     return {"gui_theme": name, "themes": themes, "persisted": True,
             "created": created}
+
+
+def save_language(lang: str) -> dict:
+    """Persist `language` in the user config and reflect it in the live
+    language state only. Purely UI/cosmetic, so nothing is reloaded or
+    restarted and live `STATE.client`/`STATE.agent` are never swapped
+    (safe mid-job). When no user config exists yet it is created from the
+    starter template first."""
+    raw = str(lang or "").strip().lower()
+    langs = list(i18n.SUPPORTED_LANGUAGES)
+    if raw not in langs:
+        raise ConfigError(
+            f"unknown language {raw!r}. Use one of: " + ", ".join(langs))
+    with _CONFIG_WRITE_LOCK:
+        res = i18n.save_user_language(raw)
+    code = res["language"]
+    i18n.set_current_lang(code)
+    with STATE.lock:
+        if STATE.cfg is not None:
+            STATE.cfg.language = code
+        if STATE._user_cfg is not None:
+            STATE._user_cfg.language = code
+        if STATE._global_cfg is not None:
+            STATE._global_cfg.language = code
+        STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
+        STATE._global_cfg_stamp = None
+    return {"language": code, "supported": langs,
+            "persisted": bool(res.get("persisted", True)),
+            "created": bool(res.get("created", False))}
 
 
 # --- dual-GPU Scout + Architect pairing ---------------------------------------
@@ -626,7 +711,7 @@ def mcp_servers_payload() -> dict:
             "args": [str(a) for a in (body.get("args") or [])]
             if isinstance(body.get("args"), (list, tuple)) else [],
             "url": str(body.get("url") or ""),
-            "env": dict(body.get("env") or {})
+            "env": config_editor.redact_mcp_env(body.get("env"))
             if isinstance(body.get("env"), dict) else {},
             "enabled": bool(body.get("enabled", True)),
             "trusted": bool(body.get("trusted", False)),
@@ -692,6 +777,26 @@ def _mcp_body_from_request(body: dict) -> tuple[str, str, dict]:
     return name, transport, spec
 
 
+def _restore_mcp_env(env, stored_env: dict) -> dict | None:
+    if env is None:
+        return None
+    norm = config_editor._normalise_mcp_env(env)
+    if norm is None:
+        return None
+    out: dict[str, str] = {}
+    for k, v in norm.items():
+        if v == config_editor.REDACTED_SECRET:
+            orig = stored_env.get(k) if isinstance(stored_env, dict) else None
+            if orig in (None, ""):
+                raise ConfigError(
+                    f"MCP env `{k}` is masked as {config_editor.REDACTED_SECRET} "
+                    "but has no stored value to restore.")
+            out[k] = str(orig)
+        else:
+            out[k] = v
+    return out
+
+
 def save_mcp_server(body: dict) -> dict:
     """Add or update one named server. Writes USER_CONFIG, or a project file
     only when it is trusted; every write is validated and backed up."""
@@ -700,6 +805,9 @@ def save_mcp_server(body: dict) -> dict:
     name, _transport, spec = _mcp_body_from_request(body)
     path, which = _mcp_write_target(body)
     text = _read_config_text(path)
+    if "env" in spec and spec["env"] is not None:
+        stored_env = (_mcp_specs(path).get(name) or {}).get("env") or {}
+        spec["env"] = _restore_mcp_env(spec["env"], stored_env)
     new = config_editor.upsert_mcp_server(text, name, spec)
     write_config(path, new)
     if which == "project":
@@ -739,31 +847,38 @@ def delete_mcp_server(body: dict) -> dict:
     return out
 
 
+def _stored_mcp_spec(name: str) -> dict:
+    raw = _mcp_specs(USER_CONFIG).get(name) or {}
+    if raw:
+        return raw
+    try:
+        pp = config_path("project")
+    except ConfigError:
+        pp = None
+    if pp is not None and pp.exists() and config_mod.is_trusted(pp):
+        return _mcp_specs(pp).get(name) or {}
+    return {}
+
+
 def test_mcp_server(body: dict) -> dict:
     """Probe one server (saved or as edited in the dialog) for 5 seconds."""
     from .. import mcp
     body = body or {}
     name = str(body.get("name") or "").strip() or "test"
     if body.get("command") or body.get("url") or body.get("transport"):
+        env = body.get("env") or {}
+        if isinstance(env, dict) and any(
+                v == config_editor.REDACTED_SECRET for v in env.values()):
+            stored_env = _stored_mcp_spec(name).get("env") or {}
+            env = _restore_mcp_env(env, stored_env) or {}
         raw = {"command": body.get("command"),
                "args": body.get("args") or [],
                "url": body.get("url"),
-               "env": body.get("env") or {},
+               "env": env,
                "enabled": bool(body.get("enabled", True)),
                "trusted": bool(body.get("trusted", False))}
     else:
-        raw = {}
-        for path in (USER_CONFIG,):
-            raw = _mcp_specs(path).get(name) or {}
-            if raw:
-                break
-        if not raw:
-            try:
-                pp = config_path("project")
-            except ConfigError:
-                pp = None
-            if pp is not None and pp.exists() and config_mod.is_trusted(pp):
-                raw = _mcp_specs(pp).get(name) or {}
+        raw = _stored_mcp_spec(name)
         if not raw:
             raise ConfigError(f"no MCP server named '{name}'")
     return mcp.probe_named_server(name, raw, budget=5.0)
@@ -1136,11 +1251,15 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
             seen_models.add((skey, mid))
             already = (skey, mid) in imported
             name = _suggest_profile_name(mid, taken, label)
+            is_img = imagegen.is_image_model(
+                mid, labels=rec.get("labels"), recipe=rec.get("recipe"))
             row = {"server_url": base_url, "provider": label, "model_id": mid,
                    "base_url": base_url, "loaded": rec.get("loaded"),
                    "context_length": int(rec.get("context_length") or 0),
                    "size_bytes": int(rec.get("size_bytes") or 0),
                    "quant": str(rec.get("quant") or ""),
+                   "modality": "image" if is_img else "text",
+                   "is_image_model": bool(is_img),
                    "suggested_profile_name": name,
                    "already_imported": bool(already)}
             rows.append(row)
@@ -1171,6 +1290,8 @@ def import_models(models) -> dict:
     imported: list[str] = []
     skipped: list[str] = []
     default = ""
+    default_is_image = False
+    imported_text = False
     for sel in models:
         if not isinstance(sel, dict):
             continue
@@ -1190,12 +1311,19 @@ def import_models(models) -> dict:
                 "'_' (starting with a letter or digit, max "
                 f"{_MAX_PROFILE_NAME} characters)")
         name = fixed
+        is_img = bool(sel.get("is_image_model")) \
+            or str(sel.get("modality") or "").strip() == "image" \
+            or imagegen.is_image_model(mid)
         if name in config_editor.profile_names(text):
             skipped.append(name)
             if sel.get("set_default"):
                 default = default or name
             continue
         values: dict = {"base_url": base, "model": mid}
+        if is_img:
+            values["modality"] = "image"
+        else:
+            imported_text = True
         tier = str(sel.get("tier") or "").strip()
         if not tier:
             tier = config_mod._guess_tier(name, values) or ""
@@ -1213,8 +1341,13 @@ def import_models(models) -> dict:
         imported.append(name)
         if sel.get("set_default"):
             default = name
+            default_is_image = is_img
     if not imported and not skipped:
         raise ConfigError("Nothing to import: the selection was empty.")
+    # An image generator can never run the chat agent, so when a text model is
+    # imported in the same batch an image model must not become the default.
+    if default and default_is_image and imported_text:
+        default = ""
     if default:
         if default not in config_editor.profile_names(text):
             raise ConfigError(f"default profile '{default}' was not imported")
@@ -1489,6 +1622,16 @@ def _provider_rows(items, base_url: str, taken: set, imported: set) -> list:
     return rows
 
 
+_KNOWN_PROVIDER_ENV_VARS = frozenset(
+    p["api_key_env"] for p in CLOUD_PROVIDERS if p.get("api_key_env"))
+_PROVIDER_ENV_KEY_RE = re.compile(r"^[A-Z0-9_]+_(?:API_KEY|KEY|TOKEN)$")
+
+
+def _allowed_provider_env_var(name: str) -> bool:
+    return bool(name and (name in _KNOWN_PROVIDER_ENV_VARS
+                          or _PROVIDER_ENV_KEY_RE.fullmatch(name)))
+
+
 def probe_provider(body: dict) -> dict:
     """`POST /api/providers/probe`: verify a hosted provider key live against
     `<base_url>/models` and return the model list the dialog imports from.
@@ -1508,10 +1651,12 @@ def probe_provider(body: dict) -> dict:
                    or (preset or {}).get("base_url") or "").strip()
     if not base_url:
         raise ConfigError("Give the provider base URL first.")
+    if _url_origin(base_url) is None:
+        raise ConfigError("Provider base URL must use http or https.")
     api_key = str(body.get("api_key") or "").strip()
     env = str(body.get("api_key_env") or "").strip() \
         or str((preset or {}).get("api_key_env") or "")
-    key = api_key or os.environ.get(env, "")
+    key = api_key or (os.environ.get(env, "") if _allowed_provider_env_var(env) else "")
     which = "project" if str(body.get("file") or "user") == "project" else "user"
     taken, imported = _existing_profile_index(which)
     error = ""

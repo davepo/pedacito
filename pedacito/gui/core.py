@@ -14,12 +14,12 @@ and terminal text are also kept here, so a reloaded page rebuilds itself from
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
 import sys
 import threading
 import time
+import tomllib
 import uuid
 from collections import deque
 from datetime import datetime
@@ -27,8 +27,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .. import config as config_mod
+from .. import fileio
+from .. import i18n
 from .. import review as review_mod
-from .. import security, workspace
+from .. import security, themes as themes_mod, workspace
+from .. import update as update_mod
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
 from ..index import INDEX_VERSION
@@ -37,6 +40,12 @@ RECENT_FILE = USER_CONFIG.parent / "gui_recent.json"
 MAX_RECENT = 8
 MAX_MESSAGES = 600
 MAX_TERM_CHARS = 200_000
+# Live reasoning/content buffers for the stream drawer: keep the newest tail
+# only, so a runaway generation cannot grow process memory without bound.
+MAX_LIVE_CHARS = 200_000
+# Cap for the upgrade drawer's subprocess output (pedacito.update): keep the
+# newest tail so a chatty pip/pipx cannot grow process memory without bound.
+MAX_UPDATE_OUTPUT = 100_000
 QUESTION_TIMEOUT = 900.0
 # How long a gated tool call waits for a human answer before the run is
 # allowed to continue with a clean denial (the modal never leaves a worker
@@ -44,7 +53,7 @@ QUESTION_TIMEOUT = 900.0
 PERMISSION_TIMEOUT = 120.0
 
 # Job kinds that drive the Engine V2 loop (and thus the activity telemetry).
-RUN_KINDS = ("task", "explain", "auto", "new")
+RUN_KINDS = ("task", "explain", "auto", "new", "arena")
 # Harness event kind -> the phase the ACTIVITY & PLAN panel should show.
 EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
                "edit_intents": "edit", "incremental_edit": "edit",
@@ -180,11 +189,16 @@ class Bus:
 
     def wait(self, after: int, timeout: float = 15.0) -> tuple[list[dict], bool]:
         """Events newer than `after`, blocking up to `timeout` seconds when
-        there are none. The flag is True when `after` fell off the buffer, so
-        the consumer must resynchronise from a snapshot."""
+        there are none. The flag is True when `after` fell off the buffer or
+        exceeds the current sequence (e.g., server restarted on the same port),
+        so the consumer must resynchronise from a snapshot."""
         with self._cond:
+            if after > self.seq:
+                return [], True
             if not self.closed and self.seq <= after:
                 self._cond.wait(timeout)
+            if after > self.seq:
+                return [], True
             if not self._events:
                 return [], False
             oldest = self._events[0]["seq"]
@@ -299,6 +313,18 @@ class Job:
         self.active = True
         self.cancelled = False
         self.client = None          # set by jobs.session, for Stop
+        # Instant stream cancellation: Stop sets this token, and the LLM
+        # client checks it on every SSE line (and closes the live socket).
+        self.cancel_event = threading.Event()
+        self.stop_reason = ""
+        # Live streaming buffer for the Activity drawer. `llm_stream` events
+        # append deltas here; /api/state carries the snapshot on every poll.
+        self.live_reasoning = ""
+        self.live_content = ""
+        self.live_tokens = 0
+        self.live_tok_per_sec = 0.0
+        self.stream_phase = ""
+        self.live_updated = 0.0
         # A completed `new` job reports the project it created, so the page
         # can adopt the workspace without a manual refresh (see end_job).
         self.project_root = ""
@@ -378,6 +404,7 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
         if not specialties:
             choices = cal.get("card_choices") or {}
             specialties = choices.get("specialties") or ()
+        is_img = bool(cal.get("is_image_model"))
         out.append({
             "name": name,
             "model": str(body.get("model")
@@ -387,12 +414,32 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
             "tier": tier,
             "specialties": [str(t) for t in specialties],
             "is_hosted": bool(cal.get("is_hosted")),
+            "is_image_model": is_img,
+            "modality": "image" if is_img else "text",
             "calibrated": bool(cal.get("calibrated")),
             "calibrated_at": str(cal.get("calibrated_at") or ""),
             "calibrated_age_days": int(cal.get("calibrated_age_days") or 0),
             "calibrated_stale": bool(cal.get("calibrated_stale")),
             "card_score": float(cal.get("card_score") or 0.0),
             "active": bool(cfg is not None and name == cfg.active_profile),
+            # Resolved auto-tuning numbers for the active profile (the only
+            # profile config.load has actually tuned); data for the model
+            # card, never new chrome.
+            "auto_tune": bool(getattr(cfg, "auto_tune", False))
+            if cfg is not None and name == cfg.active_profile else False,
+            "context_tokens": (int(getattr(cfg, "context_tokens", 0) or 0)
+                               if cfg is not None
+                               and name == cfg.active_profile else 0),
+            "context_origin": (
+                str((getattr(cfg, "sources", None) or {}).get(
+                    "context_tokens", "default"))
+                if cfg is not None and name == cfg.active_profile else ""),
+            "timeout": (float(getattr(cfg, "timeout", 0) or 0)
+                        if cfg is not None
+                        and name == cfg.active_profile else 0.0),
+            "max_concurrency": (
+                int(getattr(cfg, "max_concurrency", 0) or 0)
+                if cfg is not None and name == cfg.active_profile else 0),
         })
     return out
 
@@ -410,6 +457,7 @@ class State:
         # by (mtime, size) so a polling /api/state does not re-read the file.
         self._user_cfg = None
         self._user_cfg_stamp = None
+        self._user_raw_prefs = None
         # The full global config for a project-less session (profiles, model,
         # toggles). Separate from `_user_cfg` because that one is cosmetic and
         # may be a partial load; this is what /api/state reports and what a
@@ -436,6 +484,16 @@ class State:
         self.model_checked = False
         self.model_status = ""
         self.model_ok: bool | None = None
+        # Latest profile-name -> available|unavailable|offline|unknown map,
+        # computed from the /api/servers poll (never a new probe). The profile
+        # switch guard reads it; the topbar picker gets it from the response.
+        self.profile_availability: dict[str, str] = {}
+
+        # Last detected project test command for the topbar's Post-edit
+        # verify tooltip. /api/state polls once a second, so the walk of
+        # test-file globs and runner probes is cached briefly by
+        # (root, test_command).
+        self._detect_test: tuple[str, str, str, float] = ("", "", "", 0.0)
 
         self.messages: list[dict] = []
         self._mid = 0
@@ -484,6 +542,15 @@ class State:
         # show the scorecard and the Open Generated Project button without a
         # second model call.
         self.benchmark: dict | None = None
+
+        # Context-aware auto-update (pedacito.update): the startup check's
+        # notice (None until a check lands) and the live upgrade subprocess.
+        # The banner is data-driven from these; nothing here blocks startup.
+        self.update: dict | None = None
+        self.update_run: dict = {"running": False, "ok": None, "code": None,
+                                 "output": "", "command": [], "detail": "",
+                                 "cancelling": False}
+        self.update_cancel: threading.Event | None = None
 
         # Engine V2 telemetry for the ACTIVITY & PLAN panel (see
         # `note_event` and `engine`): the live phase, the last gather step
@@ -562,8 +629,49 @@ class State:
         with self.lock:
             self.index_meta = meta
 
+    def _raw_user_prefs(self, stamp: tuple) -> dict[str, str]:
+        """Fault-tolerant TOML read of cosmetic user preferences (`gui_theme`,
+        `language`) when full `config_mod.load()` fails (for example, a stale
+        `default_profile` pointing at a deleted profile). Cached by `stamp` so
+        polling never re-parses disk."""
+        with self.lock:
+            cached = self._user_raw_prefs
+            if cached is not None and cached[0] == stamp:
+                return dict(cached[1])
+        prefs: dict[str, str] = {}
+        try:
+            data = tomllib.loads(USER_CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            for key in ("gui_theme", "language"):
+                for container in (data.get("universal"), data):
+                    if isinstance(container, dict):
+                        val = container.get(key)
+                        if isinstance(val, str) and val.strip():
+                            prefs[key] = val.strip().lower()
+                            break
+        with self.lock:
+            self._user_raw_prefs = (stamp, prefs)
+        return dict(prefs)
+
+    def _themes_json_css_scheme(self) -> str:
+        """Built-in CSS scheme active in `themes.json` (or project pin), or ''
+        when the active theme is a custom palette or unavailable."""
+        try:
+            active = str(
+                themes_mod.get_active_theme_name(self.root) or ""
+            ).strip().lower()
+        except Exception:
+            return ""
+        if active in config_mod._ENUM_FIELDS["gui_theme"]:
+            return active
+        return ""
+
     def user_theme(self) -> str:
-        """The saved `gui_theme`, even with no project open.
+        """The saved `gui_theme`, even with no project open or when an
+        unrelated error (such as a deleted `default_profile`) prevents full
+        config loading.
 
         A project-less GUI has no cfg until something loads one, and the
         topbar picker used to reset to the built-in default on every reload.
@@ -571,19 +679,35 @@ class State:
         upgrade write) and cache it by (mtime, size); `gui_theme` is purely
         cosmetic, so this never touches STATE.cfg or a running job.
         """
+        valid_schemes = config_mod._ENUM_FIELDS["gui_theme"]
         with self.lock:
             cfg = self.cfg
         if cfg is not None:
-            return str(getattr(cfg, "gui_theme", "") or "slate")
+            theme = str(getattr(cfg, "gui_theme", "") or "slate")
+            src = (getattr(cfg, "sources", None) or {}).get("gui_theme", "")
+            if theme != "slate" or (src and src != "default"):
+                return theme
+            return self._themes_json_css_scheme() or "slate"
         try:
             st = USER_CONFIG.stat()
             stamp = (st.st_mtime_ns, st.st_size)
         except OSError:
-            return "slate"
+            return self._themes_json_css_scheme() or "slate"
         with self.lock:
-            if self._user_cfg is not None and self._user_cfg_stamp == stamp:
-                return str(getattr(self._user_cfg, "gui_theme",
-                                   "") or "slate")
+            cached_hit = self._user_cfg_stamp == stamp
+            cached_cfg = self._user_cfg if cached_hit else None
+        if cached_hit:
+            if cached_cfg is not None:
+                theme = str(getattr(cached_cfg, "gui_theme", "") or "slate")
+                src = (getattr(cached_cfg, "sources", None) or {}).get(
+                    "gui_theme", "")
+                if theme != "slate" or (src and src != "default"):
+                    return theme
+                return self._themes_json_css_scheme() or "slate"
+            raw = self._raw_user_prefs(stamp).get("gui_theme", "")
+            if raw in valid_schemes:
+                return raw
+            return self._themes_json_css_scheme() or "slate"
         try:
             cfg = config_mod.load(root=None, require_hardware=False,
                                   warn_budgets=False,
@@ -593,8 +717,56 @@ class State:
         with self.lock:
             self._user_cfg = cfg
             self._user_cfg_stamp = stamp
-        return str(getattr(cfg, "gui_theme", "") or "slate") if cfg \
-            else "slate"
+        if cfg is not None:
+            theme = str(getattr(cfg, "gui_theme", "") or "slate")
+            src = (getattr(cfg, "sources", None) or {}).get("gui_theme", "")
+            if theme != "slate" or (src and src != "default"):
+                return theme
+            return self._themes_json_css_scheme() or "slate"
+        raw = self._raw_user_prefs(stamp).get("gui_theme", "")
+        if raw in valid_schemes:
+            return raw
+        return self._themes_json_css_scheme() or "slate"
+
+    def user_language(self) -> str:
+        """The saved `language`, even with no project open or when full
+        config loading hits an unrelated ConfigError.
+
+        Mirrors `user_theme()`: reads `STATE.cfg` when loaded, otherwise
+        caches USER_CONFIG by (mtime, size) without hardware probes so a
+        polling /api/state never re-reads disk.
+        """
+        with self.lock:
+            cfg = self.cfg
+        if cfg is not None:
+            return i18n.normalize_lang(getattr(cfg, "language", "") or "en")
+        try:
+            st = USER_CONFIG.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return i18n.detect_lang()
+        with self.lock:
+            cached_hit = self._user_cfg_stamp == stamp
+            cached_cfg = self._user_cfg if cached_hit else None
+        if cached_hit:
+            if cached_cfg is not None:
+                return i18n.normalize_lang(
+                    getattr(cached_cfg, "language", "") or "en")
+            raw = self._raw_user_prefs(stamp).get("language", "")
+            return i18n.normalize_lang(raw) if raw else i18n.detect_lang()
+        try:
+            cfg = config_mod.load(root=None, require_hardware=False,
+                                  warn_budgets=False,
+                                  upgrade_user_config=False)
+        except (config_mod.ConfigError, OSError):
+            cfg = None
+        with self.lock:
+            self._user_cfg = cfg
+            self._user_cfg_stamp = stamp
+        if cfg is not None:
+            return i18n.normalize_lang(getattr(cfg, "language", "") or "en")
+        raw = self._raw_user_prefs(stamp).get("language", "")
+        return i18n.normalize_lang(raw) if raw else i18n.detect_lang()
 
     def set_profile(self, name: str | None) -> None:
         """Remember the profile picked in the topbar for a project-less GUI.
@@ -645,6 +817,32 @@ class State:
             self._global_cfg = cfg
             self._global_cfg_stamp = stamp
         return cfg
+
+    def detected_test_command(self) -> str:
+        """The project's detected test command (no run), for the GUI's
+        Post-edit verify tooltip. Empty without a project or a detectable
+        runner. Cached briefly so the once-a-second /api/state poll does not
+        re-walk the test tree."""
+        with self.lock:
+            root, cfg = self.root, self.cfg
+        if root is None:
+            return ""
+        explicit = str(getattr(cfg, "test_command", "") or "")
+        key = (str(root), explicit)
+        now = time.time()
+        with self.lock:
+            cached = self._detect_test
+        if cached[0] == key[0] and cached[1] == key[1] \
+                and now - cached[3] < 10.0:
+            return cached[2]
+        try:
+            from .. import testsel
+            cmd = str(testsel.detect_test_command(root, cfg) or "")
+        except Exception:
+            cmd = ""
+        with self.lock:
+            self._detect_test = (key[0], key[1], cmd, now)
+        return cmd
 
     def scratchpad_path(self) -> Path:
         """A per-user, project-less workspace for New-mode prompt refinement.
@@ -819,19 +1017,22 @@ class State:
                          for m in rec["messages"]],
         }
 
-    def _write_thread_file(self, payload: dict) -> None:
+    def _write_thread_file(self, payload: dict, root: Path | None = None,
+                           *, use_state_root: bool = False) -> None:
         """Persist one thread payload atomically (temp file + rename, so a
-        crash mid-save cannot truncate a conversation). Writes to the scope
-        that is current at call time: the project's folder, or the per-user
-        `threads/global/` when no project is open."""
-        path = threads_dir(self.root) / (payload["id"] + ".json")
+        crash mid-save cannot truncate a conversation). Writes to the snapshotted
+        `root` (or the current `self.root` when `use_state_root` is True)."""
+        if use_state_root:
+            with self.lock:
+                root = self.root
+        path = threads_dir(root) / (payload["id"] + ".json")
         with self._thread_io:            # serialize writers; never hold `lock` during I/O
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(payload["id"] + ".json.tmp")
-                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                               encoding="utf-8")
-                os.replace(tmp, path)
+                fileio.write_bytes(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, indent=1).encode(
+                        "utf-8"))
             except OSError as exc:
                 sys.stderr.write("[gui] could not save thread %s: %s\n" % (path, exc))
 
@@ -841,17 +1042,19 @@ class State:
         Streaming appends are throttled to ~1/s; the save on job end is forced.
         The thread follows the scope: switching projects, or opening one from
         the project-less scope, never moves these files."""
-        rec = self.threads.get(self.thread_id)
-        if rec is None:
-            return
         now = time.monotonic()
-        if not force and (now - self._last_thread_save) < 1.0:
-            return
         with self.lock:
+            tid = self.thread_id
+            rec = self.threads.get(tid)
+            if rec is None:
+                return
+            if not force and (now - self._last_thread_save) < 1.0:
+                return
             self._last_thread_save = now
             rec["updated_at"] = time.time()
+            root = self.root
             payload = self._thread_payload_locked(rec)
-        self._write_thread_file(payload)
+        self._write_thread_file(payload, root=root)
 
     def rename_thread(self, tid: str, title: str) -> str | None:
         """Give a thread a hand-picked name and mark it `title_custom`, so no
@@ -869,8 +1072,9 @@ class State:
                 return None
             rec["title"] = title
             rec["title_custom"] = True
+            root = self.root
             payload = self._thread_payload_locked(rec)
-        self._write_thread_file(payload)
+        self._write_thread_file(payload, root=root)
         self.bus.publish("status")
         return title
 
@@ -1002,6 +1206,9 @@ class State:
         with self.lock:
             job.active = False
             self.llm_call = {}      # no request outlives its job's indicator
+            if job.cancelled:
+                job.stop_reason = job.stop_reason or "Stopped by user"
+                job.stream_phase = "stopped"
             if error:
                 self.error = error
             if job.kind in RUN_KINDS:
@@ -1013,10 +1220,56 @@ class State:
 
     # --- engine telemetry ---------------------------------------------------------
 
+    def note_llm_stream(self, f: dict) -> None:
+        """Fold one throttled `llm_stream` delta into the active job's live
+        drawer and push it to SSE listeners. The full snapshot also rides on
+        /api/state, so a polling client and a late page load both see it."""
+        d_reasoning = str(f.get("delta_reasoning") or "")
+        d_content = str(f.get("delta_content") or "")
+        try:
+            tokens = int(f.get("tokens_so_far") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+        try:
+            speed = float(f.get("tok_per_sec") or 0.0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        phase = str(f.get("phase") or "")
+        with self.lock:
+            job = self.job if self.job is not None and self.job.active else None
+            if job is None:
+                return
+            if d_reasoning:
+                job.live_reasoning = (
+                    job.live_reasoning + d_reasoning)[-MAX_LIVE_CHARS:]
+            if d_content:
+                job.live_content = (
+                    job.live_content + d_content)[-MAX_LIVE_CHARS:]
+            if phase:
+                job.stream_phase = phase
+            if tokens:
+                job.live_tokens = tokens
+            if speed:
+                job.live_tok_per_sec = speed
+            job.live_updated = time.time()
+            payload = {
+                "job": job.id,
+                "phase": job.stream_phase,
+                "delta_reasoning": d_reasoning,
+                "delta_content": d_content,
+                "tokens": job.live_tokens,
+                "tok_per_sec": round(job.live_tok_per_sec, 1),
+                "updated": job.live_updated,
+            }
+        self.bus.publish("stream", **payload)
+
     def note_event(self, kind: str, f: dict) -> None:
         """Fold one harness event (the agent's EventLog listener) into the
         activity telemetry: the live phase and a recent tool-action feed.
         Only a phase change or a recorded action pings the page."""
+        if kind == "llm_stream":
+            self.note_llm_stream(f)
+            return
         if kind == "llm_start":
             # Heartbeat on: a request just left for the model. The page's
             # timer ticks from `started` until the matching `call` lands.
@@ -1026,6 +1279,17 @@ class State:
                     "model": str(f.get("model") or ""),
                     "phase": str(f.get("phase") or ""),
                     "started": time.time()}
+                job = (self.job if self.job is not None and self.job.active
+                       else None)
+                if job is not None:
+                    # Each request gets a fresh drawer buffer; the previous
+                    # call's reasoning/output is already in the transcript.
+                    job.live_reasoning = ""
+                    job.live_content = ""
+                    job.live_tokens = 0
+                    job.live_tok_per_sec = 0.0
+                    job.stream_phase = ""
+                    job.live_updated = time.time()
             self.bus.publish("status")
             return
         if kind == "call":
@@ -1051,6 +1315,10 @@ class State:
             action = {"tool": "edit-intents",
                       "detail": ", ".join(str(x)
                                           for x in (f.get("files") or []))[:120],
+                      "ok": True}
+        elif kind == "pinned_context":
+            action = {"tool": "pinned-context",
+                      "detail": str(f.get("summary") or "")[:120],
                       "ok": True}
         elif kind == "verify":
             action = {"tool": "verify",
@@ -1098,6 +1366,69 @@ class State:
         if ping:
             self.bus.publish("status")
 
+    # --- auto-update notice & upgrade run (pedacito.update) ---------------------
+
+    def note_update(self, info: dict | None) -> None:
+        """Publish the startup/manual check's result; the banner renders from
+        `status().update`. A disabled or offline check simply clears it."""
+        with self.lock:
+            self.update = dict(info) if info else None
+            payload = dict(self.update) if self.update else None
+        self.bus.publish("update", update=payload)
+
+    def note_startup_update(self, info: dict | None) -> None:
+        """The startup daemon's callback. The check began before any project
+        was open (cfg=None), so it passed the global opt-out gate; a project
+        opened since may opt out, and open_project already cleared the
+        banner. A late result must not re-show it there."""
+        if info and not update_mod.updates_enabled(self.cfg):
+            info = None
+        self.note_update(info)
+
+    def update_run_start(self, command: list[str]) -> threading.Event:
+        cancel = threading.Event()
+        with self.lock:
+            self.update_cancel = cancel
+            self.update_run = {"running": True, "ok": None, "code": None,
+                               "output": "", "command": list(command),
+                               "detail": "", "cancelling": False}
+            payload = dict(self.update_run)
+        self.bus.publish("update_run", **payload)
+        return cancel
+
+    def cancel_update_run(self) -> bool:
+        """Ask the running upgrade worker to stop. False when idle, so the
+        route can answer 409 without pretending a cancel happened."""
+        with self.lock:
+            if not self.update_run.get("running") or self.update_cancel is None:
+                return False
+            event = self.update_cancel
+            self.update_run["cancelling"] = True
+            payload = dict(self.update_run)
+        event.set()
+        self.bus.publish("update_run", **payload)
+        return True
+
+    def note_update_output(self, line: str) -> None:
+        """One subprocess line into the upgrade drawer (capped tail buffer)."""
+        with self.lock:
+            out = self.update_run["output"] + line + "\n"
+            if len(out) > MAX_UPDATE_OUTPUT:
+                out = out[-MAX_UPDATE_OUTPUT:]
+            self.update_run["output"] = out
+        self.bus.publish("update_output", line=line)
+
+    def update_run_done(self, code: int, detail: str = "") -> None:
+        with self.lock:
+            self.update_cancel = None
+            self.update_run["running"] = False
+            self.update_run["code"] = code
+            self.update_run["ok"] = code == 0
+            self.update_run["detail"] = detail
+            self.update_run["cancelling"] = False
+            payload = dict(self.update_run)
+        self.bus.publish("update_run", **payload)
+
     def engine(self) -> dict:
         """Engine V2 state for the ACTIVITY & PLAN panel: the live phase,
         step/call counters, read spans in the ledger, the requirement ledger,
@@ -1110,7 +1441,7 @@ class State:
             actions = [dict(a) for a in self.actions][-12:]
             steps = self.gather_steps
             specialist = dict(self.specialist)
-            stats = dict(client.stats) if client is not None else {}
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
             if job is None:
                 phase = self.phase or "idle"
             else:
@@ -1518,9 +1849,27 @@ class State:
             idx = self.idx
             return f"{self.index_gen}:{len(idx.files) if idx else 0}"
 
+    def usage_snapshot(self) -> dict:
+        """Fast in-memory usage snapshot for SSE `usage` events (no disk I/O)."""
+        with self.lock:
+            client = self.client
+            if client is None and self.job is not None \
+                    and self.job.client is not None:
+                client = self.job.client
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
+        return {
+            "calls": stats.get("calls", 0),
+            "tokens_in": stats.get("prompt_tokens", 0),
+            "tokens_out": stats.get("completion_tokens", 0),
+            "cache_hit": cache_hit_ratio(stats) if stats else 0.0,
+            "cost": stats.get("cost", 0.0),
+            "seconds": stats.get("seconds", 0.0),
+        }
+
     def status(self) -> dict:
         """The JSON payload the page polls to update itself."""
         theme = self.user_theme()       # disk read/cache outside the lock
+        lang = self.user_language()     # disk read/cache outside the lock
         with self.lock:
             cfg, client, idx = self.cfg, self.client, self.idx
             root = self.root
@@ -1528,6 +1877,34 @@ class State:
             # No project open: the topbar still offers every global profile,
             # the selected model, and the auto-route/thinking toggles.
             cfg = self.global_config()
+        # Workspace security is a disk scan, so it stays outside the state
+        # lock and behind a short cache; a run/ack/fix clears the cache.
+        try:
+            security_payload = security.security_status(
+                root, cfg, use_cache=True)
+        except Exception:
+            security_payload = security.security_status(None, cfg)
+        # Runner detection walks test files, so it runs here, outside the
+        # state lock; the value only feeds the topbar tooltip/assist.
+        detected_cmd = self.detected_test_command()
+        # Model card calibration, recent projects, backup listing, and
+        # config existence are disk reads -- run them outside `self.lock`.
+        calibration: dict = {}
+        if cfg is not None:
+            try:
+                from .. import modelcard
+                calibration = modelcard.calibration_map(cfg)
+                active = cfg.active_profile or ""
+                if active not in calibration:
+                    calibration[active] = modelcard.profile_calibration(cfg)
+            except Exception:
+                calibration = {}
+        details = profile_catalog(cfg, calibration)
+        recent = load_recent()
+        snapshots = [p.name for p in
+                     (workspace.list_backups(root)[:8] if root else [])]
+        needs_setup = not USER_CONFIG.exists()
+        engine_payload = self.engine()
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -1538,7 +1915,7 @@ class State:
                 # (no project, so STATE.client stays None); the panel keeps
                 # showing that client's last-call numbers after the job.
                 client = self.job.client
-            stats = dict(client.stats) if client is not None else {}
+            stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
             # Live telemetry for the footer: the worker client's snapshot,
             # overridden by the specialist's own last-call numbers while a
             # specialist holds the card (the shared ledger keeps the session
@@ -1565,22 +1942,11 @@ class State:
                             telemetry[k] = st[k]
                     except Exception:
                         pass
-            calibration: dict = {}
-            if cfg is not None:
-                try:
-                    from .. import modelcard
-                    calibration = modelcard.calibration_map(cfg)
-                    active = cfg.active_profile or ""
-                    if active not in calibration:
-                        calibration[active] = modelcard.profile_calibration(cfg)
-                except Exception:
-                    calibration = {}
             profile_models = {}
             if cfg:
                 for name, body in (cfg.profiles or {}).items():
                     model = body.get("model") if isinstance(body, dict) else ""
                     profile_models[name] = str(model or cfg.model or "")
-            details = profile_catalog(cfg, calibration)
             no_project = self.root is None
             return {
                 "root": str(self.root) if self.root else "",
@@ -1608,6 +1974,12 @@ class State:
                                   and cfg.scout_profile in (cfg.profiles or {})
                                   and cfg.scout_profile != cfg.active_profile
                                   else ""),
+                # Split-stage hybrid routing: the Options bar's Architect
+                # toggle + selector read these (the model itself rides in
+                # profile_models, like every other profile's model).
+                "hybrid_routing": bool(cfg.hybrid_routing) if cfg else False,
+                "architect_provider": (cfg.architect_provider if cfg else ""),
+                "architect_model": (cfg.architect_model if cfg else ""),
                 "model": cfg.model if cfg else "",
                 "base_url": cfg.base_url if cfg else "",
                 "review_default": bool(cfg.review) if cfg else True,
@@ -1622,7 +1994,16 @@ class State:
                 "job": ({"id": job.id, "kind": job.kind, "title": job.title,
                          "started": job.started,
                          "cancelled": job.cancelled,
-                         "project_root": job.project_root} if job else None),
+                         "stop_reason": job.stop_reason,
+                         "project_root": job.project_root,
+                         # Live reasoning/output drawer snapshot. Fields stay
+                         # present (empty/0) when the job has not streamed yet.
+                         "live_reasoning": job.live_reasoning,
+                         "live_content": job.live_content,
+                         "live_tokens": job.live_tokens,
+                         "live_tok_per_sec": round(job.live_tok_per_sec, 1),
+                         "stream_phase": job.stream_phase,
+                         "live_updated": job.live_updated} if job else None),
                 # Live LLM heartbeat ({provider, model, phase, started} while
                 # a request is in flight, else {}): the pulsing indicator.
                 "llm_call": dict(self.llm_call),
@@ -1639,7 +2020,7 @@ class State:
                 # live permission broker: the modal's payload (or null)
                 "pending_permission": (dict(self.pending_permission)
                                         if self.pending_permission else None),
-                "recent": load_recent(),
+                "recent": recent,
                 # the chat thread currently open, plus the project's history
                 # (see `_load_threads`), so the page can offer "switch back"
                 "active_thread_id": self.thread_id,
@@ -1648,17 +2029,60 @@ class State:
                 "thread_title_custom": bool((self.threads.get(self.thread_id) or
                                              {}).get("title_custom")),
                 "threads": self._threads_summary_locked(),
-                "needs_setup": not USER_CONFIG.exists(),
+                "needs_setup": needs_setup,
                 "context_tokens": cfg.context_tokens if cfg else 0,
                 "context_origin": (cfg.sources.get("context_tokens", "default")
                                    if cfg else ""),
+                # Auto-tune data for the model card: the resolved timeout and
+                # the per-field provenance, shown in the existing chip title.
+                "auto_tune": bool(getattr(cfg, "auto_tune", False))
+                if cfg else False,
+                "timeout": float(getattr(cfg, "timeout", 0) or 0)
+                if cfg else 0.0,
+                "tuning_sources": {
+                    key: (cfg.sources.get(key, "default") if cfg else "")
+                    for key in ("context_tokens", "max_gathered_chars",
+                                "flat_map_token_budget", "timeout",
+                                "max_concurrency")},
                 "json_mode": cfg.json_mode if cfg else "",
                 "gui_theme": theme,
+                "language": lang,
+                "llm_reply_language": (
+                    str(getattr(cfg, "llm_reply_language", "match_ui")
+                        or "match_ui")
+                    if cfg else "match_ui"),
                 "disable_thinking": bool(cfg.disable_thinking) if cfg else False,
+                "reasoning_effort": (str(getattr(cfg, "reasoning_effort",
+                                                 "default") or "default")
+                                     if cfg else "default"),
+                "model_class": (config_mod.capability_profile(cfg)
+                                if cfg else ""),
+                "reasoning_capable": bool(cfg) and (
+                    config_mod.is_local_moe(cfg)
+                    or str(getattr(cfg, "reasoning_effort", "default"))
+                    in ("low", "medium", "high")),
+                "max_concurrency": (int(getattr(cfg, "max_concurrency", 0) or 0)
+                                    if cfg else 0),
+                "auto_evict_servers": (bool(cfg.auto_evict_servers)
+                                       if cfg else True),
                 "allow_steering": bool(cfg.allow_steering) if cfg else False,
+                # Non-blocking security banner: unacknowledged secrets and
+                # unignored .env files, masked and fingerprint-only.
+                "security": security_payload,
+                # Context-aware auto-update: the check's notice (or null),
+                # the live upgrade run, and the effective opt-out state.
+                "update": dict(self.update) if self.update else None,
+                "update_run": dict(self.update_run),
+                "check_for_updates": update_mod.updates_enabled(cfg),
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),
+                # Post-edit verify: auto_verify is a COMMAND string, so the
+                # topbar checkbox is on exactly when it is non-empty. The
+                # detected command feeds the tooltip and the enable-assist.
+                "auto_verify": (str(getattr(cfg, "auto_verify", "") or "")
+                                if cfg else ""),
+                "detected_test_command": detected_cmd,
                 "usage": {
                     "calls": stats.get("calls", 0),
                     "tokens_in": stats.get("prompt_tokens", 0),
@@ -1675,12 +2099,10 @@ class State:
                 "planner_profile": (str((getattr(cfg, "roles", None) or {})
                                         .get("planner") or "")
                                     if cfg else ""),
-                "snapshots": [p.name for p in
-                              (workspace.list_backups(self.root)[:8]
-                               if self.root else [])],
+                "snapshots": snapshots,
                 "plan_file": (cfg.auto_plan_file if cfg else "PLAN.md"),
                 "last_auto": dict(self.last_auto),
-                "engine": self.engine(),
+                "engine": engine_payload,
             }
 
     def review_meta_brief(self) -> dict | None:
@@ -1718,17 +2140,27 @@ def install_runner() -> None:
         deadline = time.time() + float(timeout or 1800)
         while not rv.done.wait(0.5):
             if time.time() > deadline:
-                STATE._finish_review(
-                    rv, "timeout",
-                    "Review window timed out; nothing was written.",
-                    discard=on_discard is not None)
+                with STATE.apply_lock:
+                    with STATE.lock:
+                        already = bool(rv.outcome)
+                    if not already:
+                        STATE._finish_review(
+                            rv, "timeout",
+                            "Review window timed out; nothing was written.",
+                            discard=on_discard is not None)
                 break
             if job is not None and job.cancelled:
-                STATE._finish_review(rv, "cancelled",
-                                     "Cancelled; nothing was written.",
-                                     discard=on_discard is not None)
+                with STATE.apply_lock:
+                    with STATE.lock:
+                        already = bool(rv.outcome)
+                    if not already:
+                        STATE._finish_review(
+                            rv, "cancelled",
+                            "Cancelled; nothing was written.",
+                            discard=on_discard is not None)
                 break
-        return rv.outcome, rv.detail
+        with STATE.lock:
+            return rv.outcome, rv.detail
 
     review_mod.RUNNER = runner
 

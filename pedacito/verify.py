@@ -1918,6 +1918,49 @@ def _quoted_literals(text: str) -> list[str]:
     return out
 
 
+_REPLACE_VERB_RE = re.compile(r"\breplace\b", re.IGNORECASE)
+_REPLACE_GAP_RE = re.compile(r"^[\s,]*(?:with|by)\b", re.IGNORECASE)
+
+
+def _replace_pairs(text: str) -> tuple[list[str], list[str]]:
+    """The (from, to) quoted copy of every `replace "X" with "Y"` pair.
+
+    Only the explicit "replace" verb qualifies: "change"/"rename" do not
+    say which side is the old copy. The verb must sit OUTSIDE quoted copy,
+    the from-side is the first quote after it and the to-side the next,
+    joined by a short "with"/"by" gap -- so `replace the bio text with
+    "new"` (an unquoted from-side) stays a plain insertion (BUG-009)."""
+    spans: list[tuple[int, int, str]] = []
+    for rx in _QUOTED_LITERAL_RES:
+        for m in rx.finditer(text or ""):
+            lit = m.group(1).strip()
+            if len(lit) >= 2:
+                spans.append((m.start(), m.end(), lit))
+    spans.sort(key=lambda s: (s[0], s[0] - s[1]))
+    ordered: list[tuple[int, int, str]] = []
+    end = -1
+    for s, e, lit in spans:
+        if s >= end:            # a quote inside a wider quoted run is copy
+            ordered.append((s, e, lit))
+            end = e
+    froms: list[str] = []
+    tos: list[str] = []
+    for vm in _REPLACE_VERB_RE.finditer(text or ""):
+        if any(s <= vm.start() < e for s, e, _lit in ordered):
+            continue
+        after = [sp for sp in ordered if sp[0] >= vm.end()]
+        if len(after) < 2:
+            continue
+        (_s1, e1, lit1), (s2, _e2, lit2) = after[0], after[1]
+        gap = text[e1:s2]
+        if lit1 != lit2 and len(gap) <= 40 and _REPLACE_GAP_RE.match(gap):
+            if lit1 not in froms:
+                froms.append(lit1)
+            if lit2 not in tos:
+                tos.append(lit2)
+    return froms, tos
+
+
 def _literal_in(text: str, literal: str) -> bool:
     """True when `literal` appears in `text` (HTML entities normalised)."""
     if not literal:
@@ -2011,6 +2054,13 @@ class Requirement:
     # an unrelated neighbor, while the user's literal copy cannot.
     literals: list[str] = field(default_factory=list)
     literal_remove: bool = False
+    # The quoted copy a `replace "X" with "Y"` clause swaps OUT (X) and IN
+    # (Y). X must be absent from the final text like a removal; Y must be
+    # present like an insertion. Without this split the coverage pass
+    # demanded the replaced-away copy back and seeded a follow-up that
+    # undid a successful edit (BUG-009).
+    replace_from: list[str] = field(default_factory=list)
+    replace_to: list[str] = field(default_factory=list)
     # Literals the last coverage pass found missing/present when they should
     # be the opposite; rendered by check_coverage and the repair prompt.
     missing_literals: list[str] = field(default_factory=list)
@@ -2063,6 +2113,14 @@ class Requirement:
             span = (rel, 0, 0)
             if span not in self.edit_spans:
                 self.edit_spans.append(span)
+
+    def literal_must_go(self, lit: str) -> bool:
+        """True when this quoted copy must be ABSENT from the final text:
+        a removal clause's copy, or the from-side of a replace pair. The
+        to-side of a replace stays an insertion even when the same clause
+        also carries a removal verb."""
+        return lit in self.replace_from or (
+            self.literal_remove and lit not in self.replace_to)
 
     def search_term(self) -> str:
         """The most specific term to grep/find when this requirement has no
@@ -2345,10 +2403,12 @@ def _requirements_from_task(task: str, limit: int = 16) -> list[Requirement]:
             constraint = _is_constraint_clause(p) and not edit_outranks
             kind = ("constraint" if constraint
                     else _clause_kind(p, task_kind))
+            rep_from, rep_to = _replace_pairs(p)
             reqs.append(Requirement(
                 p, terms, kind, req_id=f"R{len(reqs) + 1}",
                 literals=literals,
-                literal_remove=bool(_REMOVE_LITERAL_RE.search(p))))
+                literal_remove=bool(_REMOVE_LITERAL_RE.search(p)),
+                replace_from=rep_from, replace_to=rep_to))
     # BUG-203/212/223: the old default cap of five silently truncated a six-
     # bullet repair (and a three-clause task the splitter expanded to eleven
     # sentences), so the tail clauses never existed for coverage or provenance
@@ -2693,11 +2753,6 @@ class RequirementTracker:
         return out
 
 
-def requirement_tracker(task: str, limit: int = 16) -> RequirementTracker:
-    """Convenience constructor for the run-scoped state machine."""
-    return RequirementTracker(task, limit)
-
-
 def _same_file(a: str, b: str) -> bool:
     a, b = fileio.path_key(a or ""), fileio.path_key(b or "")
     return bool(a and b and (a == b or a.endswith("/" + b)
@@ -2796,9 +2851,10 @@ def _unaddressed(task: str, reply: str, edits,
         # Quoted copy is checked against the FINAL edited text, not just the
         # replacement hunk. A clause that inserts "Here's a bit about me..."
         # is satisfied only when that string exists on the page; a clause that
-        # removes "Our Mission" is satisfied only when it is gone. Generic
-        # terms can match a neighbor, which is exactly how a multi-clause
-        # layout brief ended after its first edit.
+        # removes "Our Mission" -- or replaces it with "About Us" -- is
+        # satisfied only when the old copy is gone AND the new copy landed.
+        # Generic terms can match a neighbor, which is exactly how a
+        # multi-clause layout brief ended after its first edit.
         req.missing_literals = []
         if req.literals:
             after_text = "\n".join(
@@ -2812,14 +2868,17 @@ def _unaddressed(task: str, reply: str, edits,
                     (getattr(e, "replace", "") or "") for e in edits)
             missing: list[str] = []
             for lit in req.literals:
-                if not after_text:
-                    missing.append(lit)
-                elif req.literal_remove:
-                    # Stem-tolerant: "lifelong tinker" must still count as
-                    # present against "and lifelong tinkerer." on the page.
-                    if _literal_in(after_text, lit) \
-                            or _literal_fuzzy_in(after_text, lit):
+                if req.literal_must_go(lit):
+                    # The copy being removed/replaced must be GONE; judge it
+                    # with the same stem tolerance as a removal ("lifelong
+                    # tinker" ~ "lifelong tinkerer"). With no after-text the
+                    # disk re-check (unmet_requirements) owns it: absence
+                    # cannot be proven from an empty hunk (BUG-009).
+                    if after_text and (_literal_in(after_text, lit)
+                                       or _literal_fuzzy_in(after_text, lit)):
                         missing.append(lit)
+                elif not after_text:
+                    missing.append(lit)
                 elif not _literal_in(after_text, lit):
                     missing.append(lit)
             if missing:
@@ -2859,12 +2918,19 @@ def check_coverage(task: str, reply: str, edits,
     out: list[Finding] = []
     for req in _unaddressed(task, reply, edits, tracker):
         if getattr(req, "missing_literals", None):
-            verb = "still present" if req.literal_remove else "missing"
-            out.append(Finding(
-                "coverage", "warn", "",
-                f"required literal text is {verb} in the edited file: "
-                + ", ".join(f'"{lit}"' for lit in req.missing_literals)
-                + f" -- the clause '{req.text}' is not finished"))
+            # One verb per literal: the from-side of a replace (or a removal)
+            # is "still present", an insertion that never landed is "missing"
+            # -- a mixed clause names both groups honestly (BUG-009).
+            gone = [l for l in req.missing_literals if req.literal_must_go(l)]
+            owed = [l for l in req.missing_literals
+                    if not req.literal_must_go(l)]
+            for verb, group in (("missing", owed), ("still present", gone)):
+                if group:
+                    out.append(Finding(
+                        "coverage", "warn", "",
+                        f"required literal text is {verb} in the edited file: "
+                        + ", ".join(f'"{lit}"' for lit in group)
+                        + f" -- the clause '{req.text}' is not finished"))
         elif getattr(req, "prose_only", False):
             out.append(Finding(
                 "coverage", "warn", "",
@@ -2891,7 +2957,8 @@ def coverage_seeds(task: str, reply: str, edits,
 def unmet_requirements(root, task: str, edits,
                        tracker: RequirementTracker | None = None
                        ) -> list[Requirement]:
-    """Removal clauses whose quoted copy is still ON DISK after the batch.
+    """Removal and replace clauses whose quoted copy is still ON DISK after
+    the batch.
 
     `_unaddressed` judges literals against the edits' after-text only: a
     removal whose file was never touched looks satisfied because no
@@ -2899,7 +2966,9 @@ def unmet_requirements(root, task: str, edits,
     file the batch touched plus every existing file the clause names -- and
     returns deep-copied requirements annotated with `literal_hits`
     ((rel, line, line_text)) naming each line still carrying the copy, so the
-    follow-up can point at the exact line instead of re-guessing."""
+    follow-up can point at the exact line instead of re-guessing. For a
+    replace clause only the from-side is re-checked: the to-side is an
+    insertion the after-text check already owns (BUG-009)."""
     if tracker is None or tracker.task != task:
         tracker = RequirementTracker(task)
     else:
@@ -2909,7 +2978,8 @@ def unmet_requirements(root, task: str, edits,
                for e in edits if getattr(e, "ok", True)]
     out: list[Requirement] = []
     for req in tracker.items:
-        if not (req.literals and req.literal_remove):
+        gone_lits = [l for l in req.literals if req.literal_must_go(l)]
+        if not gone_lits:
             continue
         cands = list(dict.fromkeys(touched))
         for m in _FILE_TOKEN_RE.finditer(req.text):
@@ -2918,7 +2988,7 @@ def unmet_requirements(root, task: str, edits,
                 cands.append(rel)
         hits: list[tuple] = []
         missing: list[str] = []
-        for lit in req.literals:
+        for lit in gone_lits:
             found = False
             for rel in cands:
                 p = root / rel
@@ -2948,10 +3018,10 @@ def unmet_requirements(root, task: str, edits,
 
 def merge_unmet(base: list[Requirement],
                 on_disk: list[Requirement]) -> list[Requirement]:
-    """Merge disk-verified unmet removal clauses into the coverage seeds. A
-    clause already in `base` gains the disk location (its text is annotated
-    with the exact file:line still carrying the copy); a clause the edit
-    evidence alone considered addressed is appended. Both lists hold
+    """Merge disk-verified unmet removal/replace clauses into the coverage
+    seeds. A clause already in `base` gains the disk location (its text is
+    annotated with the exact file:line still carrying the copy); a clause the
+    edit evidence alone considered addressed is appended. Both lists hold
     deep-copied requirements, so annotating them never touches the run's
     authoritative tracker."""
     out = list(base)

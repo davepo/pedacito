@@ -27,10 +27,12 @@ from .. import fileio, gitinfo
 from .. import index as index_mod
 from .. import loop, scaffold, steering, workspace
 from .. import plan as plan_mod
+from .. import security as security_mod
+from .. import update as update_mod
 from ..agent import Agent
 from ..config import ConfigError
-from ..llm import LLMClient, LLMError
-from .core import STATE, Job, RUN_KINDS, args_for, remember_recent
+from ..llm import CancelledError, LLMClient, LLMError
+from .core import STATE, Job, args_for, remember_recent
 
 MAX_TEXT_CHARS = 60000
 _EDIT_BLOCK_RE = re.compile(
@@ -41,6 +43,15 @@ _EDIT_BLOCK_RE = re.compile(
 # how to populate it instead of being left on a dead "no index" banner.
 EMPTY_INDEX_MESSAGE = ("Index ready (0 files in workspace — run a Task or Auto "
                        "prompt to create files).")
+
+
+def _uninterruptible(fn, *args, **kwargs):
+    """Run a cleanup step to completion even if Stop injects KeyboardInterrupt."""
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except KeyboardInterrupt:
+            continue
 
 
 # --- running jobs -------------------------------------------------------------
@@ -73,11 +84,18 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                 STATE.add_message(
                     "system", "Stopped. Anything already written can be "
                     "undone with Restore (project menu).", kind="cancelled")
+            except CancelledError:
+                # A streamed call aborted through its cancel_event (the clean
+                # path Stop uses); show the user-facing stop state instead of
+                # an opaque transport error.
+                job.stop_reason = job.stop_reason or "Stopped by user"
+                job.stream_phase = "stopped"
+                STATE.add_message(
+                    "system", "Stopped by user. Anything already written can "
+                    "be undone with Restore (project menu).",
+                    kind="cancelled")
             except (ConfigError, LLMError) as e:
                 err = str(e)
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
             except SystemExit as e:
                 # index.build signals a fatal condition (e.g. the model cannot
@@ -85,30 +103,19 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
                 # this handler it would kill the worker thread silently and
                 # leave the page stuck with no error shown.
                 err = str(e).strip() or "The job stopped before finishing."
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
             except Exception as e:  # surface it in the UI, keep the server up
                 traceback.print_exc()
                 err = f"{type(e).__name__}: {e}"
-                if job.kind in RUN_KINDS:
-                    STATE.add_message("assistant", err, kind="error",
-                                      level="warn")
                 STATE.add_message("error", err)
         except KeyboardInterrupt:
             pass            # a Stop that arrived after the job body finished
         finally:
-            job.telemetry = events_mod.end_run()
-            while True:     # a late Stop must not leave the job slot taken
-                try:
-                    STATE.end_job(job, err)
-                    break
-                except KeyboardInterrupt:
-                    continue
+            job.telemetry = _uninterruptible(events_mod.end_run)
+            _uninterruptible(STATE.end_job, job, err)
             # the turn is over: the thread on disk must match what the user
             # just saw, including anything the throttled saves held back
-            STATE.save_active_thread(force=True)
+            _uninterruptible(STATE.save_active_thread, force=True)
 
     job.thread = threading.Thread(target=worker, daemon=True,
                                   name=f"pedacito-gui-job-{job.id}")
@@ -119,13 +126,31 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
 def stop_job() -> bool:
     """Ask the running job to stop. The model client is told to drop an
     in-flight stream, and a KeyboardInterrupt (what Ctrl-C does on the command
-    line) is raised in the worker thread."""
+    line) is raised in the worker thread.
+
+    The job's `cancel_event` is set first: the LLM transport checks it on every
+    SSE line and closes the live socket, so a 3,000-token generation stops
+    within milliseconds instead of finishing.
+    """
     with STATE.lock:
         job = STATE.job
         if job is None or not job.active or job.cancelled:
             return False
         job.cancelled = True
+        job.stop_reason = "Stopped by user"
+        job.stream_phase = "stopped"
+        event = getattr(job, "cancel_event", None)
+        if event is not None:
+            try:
+                event.set()
+            except Exception:
+                pass
         client = getattr(job, "client", None) or STATE.client
+        if client is not None and hasattr(client, "cancel_event"):
+            try:
+                client.cancel_event = event
+            except Exception:
+                pass
         thread = job.thread
         if thread is not None and thread.is_alive() and thread.ident:
             ctypes.pythonapi.PyThreadState_SetAsyncExc(
@@ -135,7 +160,8 @@ def stop_job() -> bool:
             client.cancel()
     except Exception:
         pass
-    STATE.bus.publish("job", job=job.id, state="stopping", kind=job.kind)
+    STATE.bus.publish("job", job=job.id, state="stopping", kind=job.kind,
+                      reason=job.stop_reason)
     return True
 
 
@@ -216,14 +242,44 @@ class _Feed:
             self.activity(f"specialist router: {f.get('profile', '?')} "
                           f"({f.get('model', '?')}) for "
                           f"'{f.get('specialty', '?')}'")
+        elif kind == "hybrid_stage":
+            self.activity(str(f.get("label") or
+                              f"Hybrid Stage {f.get('stage', '?')}: "
+                              f"{f.get('model', '?')}"))
+        elif kind == "arena_stage":
+            phase = str(f.get("phase") or "")
+            if phase == "start":
+                self.activity(str(f.get("label") or
+                                  f"Arena {f.get('side', '?')}: "
+                                  f"{f.get('model', '?')}"))
+            elif phase == "done":
+                self.activity(
+                    f"arena {str(f.get('side', '?')).upper()} finished: "
+                    f"{'edits landed' if f.get('ok') else 'no edits'} "
+                    f"({f.get('files_changed', 0)} file(s), "
+                    f"{f.get('elapsed_sec', 0)}s)")
+            elif phase in ("arena_start", "arena_done"):
+                self.activity(str(f.get("label") or "arena"))
         elif kind == "model_swap":
             self.activity(f"model swap: {f.get('unloaded') or '-'} -> "
                           f"{f.get('loaded', '?')} ({f.get('elapsed_s', 0)}s)")
         elif kind == "call":
-            STATE.bus.publish("usage", usage=STATE.status()["usage"])
+            STATE.bus.publish("usage", usage=STATE.usage_snapshot())
         elif kind == "complex_auto":
             self.activity(str(f.get("text") or
                               "Auto-enabled Complex scaffolding."))
+        elif kind == "security_redacted":
+            # Auto-redaction happened inside the LLM transport: surface the
+            # notification in the page, never the raw secret.
+            message = str(f.get("message") or
+                          "Auto-redacted secrets before sending.")
+            self.activity("[security] " + message)
+            STATE.bus.publish("security", message=message)
+        elif kind == "security_notice":
+            # A post-run scan found something: the banner refreshes from
+            # /api/state (the cache was invalidated by the scan).
+            STATE.bus.publish("security",
+                              message=str(f.get("message") or ""))
 
 
 @contextmanager
@@ -233,6 +289,11 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
     job.client = client
     feed = _Feed(client, job)
     saved_cb, saved_echo = client.stream_callback, client.echo_stream
+    saved_cancel = getattr(client, "cancel_event", _MISSING)
+    try:
+        client.cancel_event = job.cancel_event
+    except Exception:
+        pass
     client.stream_callback = feed.token
     elog = events_mod.get(root, cfg)
     elog.listeners.append(feed.event)
@@ -245,7 +306,8 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
         events_mod.attach(client, elog)
     held = False
     had = {k: cfg.__dict__.get(k, _MISSING)
-           for k in ("_steer", "_interactive", "_ask_user")}
+           for k in ("_steer", "_interactive", "_ask_user", "_cancel_event")}
+    cfg._cancel_event = job.cancel_event
     if interactive:
         cfg._interactive = True
         cfg._ask_user = STATE.ask_user
@@ -261,18 +323,29 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
                 raise ConfigError(str(e)) from e
         yield feed
     finally:
-        client.stream_callback, client.echo_stream = saved_cb, saved_echo
-        try:
-            elog.listeners.remove(feed.event)
-        except ValueError:
-            pass
-        for k, v in had.items():
-            if v is _MISSING:
-                cfg.__dict__.pop(k, None)
-            else:
-                cfg.__dict__[k] = v
+        def _restore_session() -> None:
+            client.stream_callback, client.echo_stream = saved_cb, saved_echo
+            try:
+                if saved_cancel is _MISSING:
+                    if hasattr(client, "cancel_event"):
+                        delattr(client, "cancel_event")
+                else:
+                    client.cancel_event = saved_cancel
+            except Exception:
+                pass
+            try:
+                elog.listeners.remove(feed.event)
+            except ValueError:
+                pass
+            for k, v in had.items():
+                if v is _MISSING:
+                    cfg.__dict__.pop(k, None)
+                else:
+                    cfg.__dict__[k] = v
+
+        _uninterruptible(_restore_session)
         if held:
-            workspace.release_lock(root)
+            _uninterruptible(workspace.release_lock, root)
 
 
 _MISSING = object()
@@ -300,6 +373,27 @@ def _global_project(profile: str = "") -> SimpleNamespace:
     cfg = STATE.global_config(profile=profile or None)
     return SimpleNamespace(root=None, args=None, cfg=cfg,
                            client=LLMClient(cfg), idx=None, agent=None)
+
+
+def _evict_other_servers(cfg) -> None:
+    """Unload models resident on OTHER local servers before a run.
+
+    The handshake is a no-op with one server, with `auto_evict_servers` off,
+    or when every other server is asleep. It runs in the job's worker thread,
+    so a slow unload never blocks the page."""
+    try:
+        from .. import servers
+        result = servers.evict_other_local_servers(
+            getattr(cfg, "active_profile", "") or cfg.base_url, cfg)
+    except Exception:
+        return
+    evicted = [r for r in result.get("evicted", []) if r]
+    if evicted:
+        names = ", ".join(str(r.get("server") or r.get("base_url") or "?")
+                          for r in evicted)
+        STATE.add_message(
+            "system", f"Unloaded {names} from another local server so this "
+                      "run can use the VRAM/RAM.", kind="servers")
 
 
 def _swap_index(idx) -> None:
@@ -337,10 +431,54 @@ def _prose(reply: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _is_image_item(a) -> bool:
+    if not isinstance(a, dict):
+        return False
+    return (
+        a.get("kind") == "image"
+        or str(a.get("mime") or "").lower().startswith("image/")
+        or (bool(a.get("data_b64") or a.get("data_url")) and "text" not in a)
+    )
+
+
+def _attachment_summary(a: dict) -> dict:
+    """Lightweight attachment metadata for saved chat history (never raw base64)."""
+    if _is_image_item(a):
+        out: dict = {
+            "name": str(a.get("name") or "image"),
+            "kind": "image",
+            "mime": str(a.get("mime") or "image/png"),
+            "width": int(a.get("width") or 0),
+            "height": int(a.get("height") or 0),
+            "bytes": int(a.get("bytes") or 0),
+        }
+        thumb = a.get("thumb")
+        if isinstance(thumb, str) and thumb.startswith("data:image/") and len(thumb) <= 40_000:
+            out["thumb"] = thumb
+        return out
+    return {"name": str(a.get("name", "")), "chars": len(str(a.get("text", "")))}
+
+
+def _extract_images(opts: dict) -> list[dict]:
+    """Return validated image attachments from `opts['images']` (or fallback from
+    `opts['attachments']` if called directly without server pre-splitting)."""
+    from .. import imagegen as imagegen_mod
+
+    imgs = list(opts.get("images") or ())
+    if imgs:
+        return imgs
+    raw = [a for a in (opts.get("attachments") or ()) if _is_image_item(a)]
+    if not raw:
+        return []
+    return imagegen_mod.normalize_image_attachments(raw)
+
+
 def compose(text: str, attachments: list | None) -> str:
-    """The typed text plus any attached files, capped to a sane size."""
+    """The typed text plus any attached text files, capped to a sane size."""
     parts = [(text or "").strip()]
     for a in attachments or []:
+        if _is_image_item(a):
+            continue
         name = str(a.get("name") or "attachment")
         body = str(a.get("text") or "").strip()
         if body:
@@ -354,13 +492,13 @@ def compose(text: str, attachments: list | None) -> str:
 
 
 def _echo_user(mode: str, text: str, attachments: list | None,
-               opts: dict | None = None) -> None:
+               opts: dict | None = None, images: list | None = None) -> None:
     if opts is not None and opts.get("_echoed"):
         return                      # already recorded synchronously by spawn
     shown = text if len(text) <= 4000 else text[:4000] + "\n[...]"
+    combined = list(attachments or ()) + list(images or ())
     STATE.add_message("user", shown, mode=mode, attachments=[
-        {"name": str(a.get("name", "")), "chars": len(str(a.get("text", "")))}
-        for a in attachments or []])
+        _attachment_summary(a) for a in combined if isinstance(a, dict)])
 
 
 def echo_submission(mode: str, body: dict) -> None:
@@ -371,13 +509,14 @@ def echo_submission(mode: str, body: dict) -> None:
     even while the model is still warming up."""
     text = str(body.get("text") or "")
     attachments = body.get("attachments") or []
+    images = body.get("images") or []
     plan_file = str(body.get("plan_file") or "").strip()
-    if not text.strip() and not attachments and not (
+    if not text.strip() and not attachments and not images and not (
             mode == "auto" and plan_file):
         return
     shown = text or (f"plan: {plan_file}" if mode == "auto" and plan_file
                      else "")
-    _echo_user(mode, shown, attachments)
+    _echo_user(mode, shown, attachments, images=images)
 
 
 # --- project ------------------------------------------------------------------
@@ -410,6 +549,10 @@ def open_project(path: str, profile: str, announce: bool = True) -> None:
         STATE.review = None
         STATE.plan_path = None
         STATE.last_auto = {}
+        # A project that opts out of update checks must not keep showing the
+        # startup check's banner (pedacito.update).
+        if not update_mod.updates_enabled(cfg):
+            STATE.update = None
     STATE.apply_index(idx)
     remember_recent(str(root))
     _probe_server(client, cfg)
@@ -502,7 +645,7 @@ def run_calibrate(job: Job, opts: dict) -> None:
     lands in the chat when it finishes. Hosted profiles are refused (the
     endpoint checks too; this keeps a direct job call honest)."""
     from .. import config as config_mod
-    from .. import modelcard
+    from .. import imagegen, modelcard
     from . import settings_api
     name = str(opts.get("profile") or "").strip()
     quick = str(opts.get("mode") or "quick") != "full"
@@ -514,11 +657,33 @@ def run_calibrate(job: Job, opts: dict) -> None:
     cfg = config_mod.load(root=root, profile=name or None,
                           require_hardware=False, warn_budgets=False)
     label = name or cfg.active_profile or "the current config"
+    if imagegen.profile_is_image_model(cfg):
+        STATE.add_message(
+            "system", f"Probing image profile '{label}' \u2014 {cfg.model} at "
+            f"{cfg.base_url} (1-call image check).", kind="calibrating")
+        card = modelcard.calibrate_image_model(cfg, verbose=True)
+        path = modelcard.save_card(card)
+        m = card.get("measured") or {}
+        if m.get("image_ok"):
+            STATE.add_message(
+                "system", f"Image profile '{label}' verified \u2014 "
+                f"{m.get('width', 0)}x{m.get('height', 0)} {m.get('format', '')} "
+                f"in {m.get('latency_s', '?')}s. Card saved to {path}.",
+                kind="calibrated")
+        else:
+            STATE.add_message(
+                "system", f"Image probe for '{label}' failed. "
+                f"Card saved to {path}.", kind="calibrated")
+        return
     STATE.add_message(
         "system", f"Calibrating '{label}' \u2014 {cfg.model} at {cfg.base_url} "
         f"({'quick' if quick else 'full'} suite). Progress streams to the "
         "TERMINAL tab.", kind="calibrating")
+    cfg._cancel_event = job.cancel_event
     client = LLMClient(cfg)
+    client.cancel_event = job.cancel_event
+    with STATE.lock:
+        job.client = client
     client.check(warn=False)
     client.warmup()
     card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
@@ -542,6 +707,7 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
     (polling /api/state) can show live progress, and the `calibration` map
     marks each profile done."""
     from .. import config as config_mod
+    from .. import imagegen
     from .. import llm as llm_mod
     from .. import modelcard, roles
     quick = str(opts.get("mode") or "quick") != "full"
@@ -576,10 +742,28 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
         for n, cfg in todo:
             if job.cancelled:
                 break
+            if imagegen.profile_is_image_model(cfg):
+                with STATE.lock:
+                    job.title = (f"probing image {n} "
+                                 f"({done + 1}/{len(todo)})")
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                path = modelcard.save_card(card)
+                done += 1
+                m = card.get("measured") or {}
+                status = (f"verified ({m.get('latency_s', '?')}s)"
+                          if m.get("image_ok") else "probe failed")
+                STATE.add_message(
+                    "system", f"Image probe of '{n}' finished \u2014 "
+                    f"{status}. Card saved to {path}.", kind="calibrated")
+                continue
             with STATE.lock:
                 job.title = (f"calibrating {n} "
                              f"({done + 1}/{len(todo)})")
+            cfg._cancel_event = job.cancel_event
             client = LLMClient(cfg)
+            client.cancel_event = job.cancel_event
+            with STATE.lock:
+                job.client = client
             try:
                 client.check(warn=False)
                 client.warmup()
@@ -610,6 +794,7 @@ def run_benchmark(job: Job, opts: dict) -> None:
     ``STATE.benchmark`` for the Benchmarks dialog and summarised in chat.
     """
     from .. import benchmarks
+    from .. import config as config_mod
 
     profile = str(opts.get("profile") or "").strip()
     benchmark_id = str(opts.get("benchmark_id") or "").strip()
@@ -617,6 +802,14 @@ def run_benchmark(job: Job, opts: dict) -> None:
     with STATE.lock:
         current_root = STATE.root
         STATE.benchmark = None
+    cfg = config_mod.load(
+        root=Path(current_root).expanduser() if current_root else None,
+        profile=profile or None, require_hardware=False, warn_budgets=False)
+    cfg._cancel_event = job.cancel_event
+    client = LLMClient(cfg)
+    client.cancel_event = job.cancel_event
+    with STATE.lock:
+        job.client = client
     activity = STATE.add_message(
         "activity", f"Benchmark `{benchmark_id}` on profile "
         f"'{profile or 'default'}' starting\u2026", job=job.id)
@@ -627,8 +820,11 @@ def run_benchmark(job: Job, opts: dict) -> None:
 
     result = benchmarks.run_benchmark(
         profile=profile or "", benchmark_id=benchmark_id,
-        base_dir=base_dir, config_root=current_root,
-        current_root=current_root, log=log, job_id=job.id)
+        base_dir=base_dir, cfg=cfg, client=client,
+        config_root=current_root, current_root=current_root,
+        log=log, job_id=job.id)
+    if job.cancelled:
+        raise CancelledError(job.stop_reason or "Stopped by user")
     data = result.to_dict()
     with STATE.lock:
         STATE.benchmark = data
@@ -753,24 +949,139 @@ def restore_snapshot(name: str = "") -> tuple[bool, str]:
 
 # --- the four ways of working ----------------------------------------------------
 
+def _apply_security_choices(cfg, opts: dict) -> None:
+    """Carry the GUI preflight's three-way choice into this run.
+
+    `acknowledge_secrets` sends the request as-is (and persists the
+    fingerprints); `redact_secrets` replaces every detected secret before
+    the request leaves. Reset on every run so one choice never leaks into
+    the next prompt.
+    """
+    try:
+        cfg._outbound_acknowledge_secrets = bool(
+            opts.get("acknowledge_secrets"))
+        cfg._outbound_redact_secrets = bool(opts.get("redact_secrets"))
+    except Exception:
+        pass
+
+
+def _set_pinned_refs(cfg, opts: dict) -> None:
+    """Attach the composer's explicit pinned context to this run.
+
+    The prompt's own `@file`/`@symbol` mentions are parsed by the agent; this
+    list carries the Pinned pills (and API clients' `pinned` payload) so a
+    pin survives even when the visible prompt text no longer shows the token.
+    """
+    values = opts.get("pinned") or []
+    if isinstance(values, dict):
+        values = [values]
+    refs: list[str] = []
+    for value in values if isinstance(values, (list, tuple, set)) else [values]:
+        if isinstance(value, dict):
+            value = (value.get("insert") or value.get("label")
+                     or value.get("path") or value.get("file") or "")
+        text = str(value or "").strip().lstrip("@").strip()
+        if text and text not in refs:
+            refs.append(text)
+    try:
+        cfg._pinned_refs = refs
+    except Exception:
+        pass
+
+
+def _apply_hybrid_opts(cfg, opts: dict) -> None:
+    """The Options bar's split-stage hybrid choices for this run: the
+    Architect toggle plus its provider/model selector. Selecting a model
+    arms hybrid even without the explicit flag; a provider-only selection
+    takes the model from that profile's body. Session-scoped: run_task
+    restores the previous values when the job ends."""
+    if not any(k in opts for k in ("hybrid", "architect_provider",
+                                   "architect_model")):
+        return
+    cfg.hybrid_routing = bool(opts.get("hybrid"))
+    provider = str(opts.get("architect_provider") or "").strip()
+    model = str(opts.get("architect_model") or "").strip()
+    if provider and not model:
+        body = (cfg.profiles or {}).get(provider) or {}
+        model = str(body.get("model") or "").strip()
+    cfg.architect_provider = provider
+    cfg.architect_model = model
+    if model and model != cfg.model:
+        cfg.hybrid_routing = True
+
+
+def run_arena(job: Job, opts: dict) -> None:
+    """The 2-model sandbox arena: one prompt, two contestants, each in an
+    isolated copy of the workspace. The real project stays untouched until
+    the user applies a winner from the scorecard."""
+    from .. import arena as arena_mod
+    p = _project(need_index=False)
+    prompt = compose(opts.get("text", ""), opts.get("attachments"))
+    if not prompt:
+        raise ConfigError("Describe the task both contestants should run.")
+    model_a = opts.get("model_a") or opts.get("a") or ""
+    model_b = opts.get("model_b") or opts.get("b") or ""
+    if not model_a or not model_b:
+        raise ConfigError("Pick two contestants (profile or provider:model).")
+    _echo_user("arena", opts.get("text", "") or prompt,
+               opts.get("attachments"), opts)
+    cfg, root = p.cfg, p.root
+    _evict_other_servers(cfg)
+    with session(p, job, interactive=False, lock=True) as feed:
+        state = arena_mod.run_arena_comparison(root, prompt, model_a, model_b,
+                                               cfg)
+        feed.end_stream()
+        ca = state["contestants"]["a"]
+        cb = state["contestants"]["b"]
+        STATE.add_message(
+            "assistant",
+            f"Arena finished: A ({ca['model']}) "
+            f"{'landed edits' if ca['ok'] else 'no edits'} in "
+            f"{ca['elapsed_sec']}s; B ({cb['model']}) "
+            f"{'landed edits' if cb['ok'] else 'no edits'} in "
+            f"{cb['elapsed_sec']}s. Compare the runs and apply a winner.",
+            kind="arena", arena_id=state["arena_id"])
+
+
+def _security_post_run(root, cfg, files=None) -> None:
+    """Refresh and announce the non-blocking workspace security banner."""
+    try:
+        status = security_mod.security_status(
+            root, cfg, files=files, use_cache=False)
+        security_mod.clear_security_cache(root)
+        if status.get("secrets_found") or status.get("env_unignored"):
+            STATE.bus.publish("security", security=status)
+    except Exception:
+        pass
+
+
 def run_task(job: Job, opts: dict) -> None:
     """`ask`: gather, edit, and review or write. `write` is "review" (sign off
     in the page) or "apply" (write now, backups first)."""
     _ensure_index(job)
     p = _project()
+    images = _extract_images(opts)
     task = compose(opts.get("text", ""), opts.get("attachments"))
+    if not task and images:
+        task = "Inspect the attached image(s)."
     if not task:
         raise ConfigError("Describe the change you want first.")
     _echo_user("task", opts.get("text", "") or task, opts.get("attachments"),
-               opts)
+               opts, images=images)
     write = opts.get("write", "review")
     reviewing, apply = write == "review", write == "apply"
     plan_pref = opts.get("plan", "auto")
     steps = int(opts.get("steps") or 0)
     cfg, client, root = p.cfg, p.client, p.root
+    _apply_security_choices(cfg, opts)
+    _set_pinned_refs(cfg, opts)
 
+    _evict_other_servers(cfg)
     saved_steps = cfg.max_steps
     saved_creative = cfg.creative_mode
+    saved_hybrid = (cfg.hybrid_routing, cfg.architect_provider,
+                    cfg.architect_model)
+    _apply_hybrid_opts(cfg, opts)
     if steps > 0:
         cfg.max_steps = steps
     if "creative" in opts:
@@ -790,8 +1101,14 @@ def run_task(job: Job, opts: dict) -> None:
                     with STATE.lock:
                         STATE.plan_path = Path(path)
 
-                code = plan_mod.run_planned(root, cfg, client, idx, task,
-                                            apply=apply, on_plan=_bind_plan)
+                if images:
+                    cfg._task_images = list(images)
+                try:
+                    code = plan_mod.run_planned(root, cfg, client, idx, task,
+                                                apply=apply, on_plan=_bind_plan)
+                finally:
+                    if images and hasattr(cfg, "_task_images"):
+                        delattr(cfg, "_task_images")
                 _note_plan_dir(root, started)
                 if apply:
                     _refresh_index(p)
@@ -804,7 +1121,8 @@ def run_task(job: Job, opts: dict) -> None:
                     plan=True, stats=_usage_stats(client))
                 return
             tr = loop.run_task(root, cfg, client, p.agent, idx, task,
-                               apply=apply, review=reviewing)
+                               apply=apply, review=reviewing,
+                               images=images or None)
             _swap_index(tr.idx)
             if apply:
                 # Pick up anything the run created beyond its edit results
@@ -816,6 +1134,9 @@ def run_task(job: Job, opts: dict) -> None:
     finally:
         cfg.max_steps = saved_steps
         cfg.creative_mode = saved_creative
+        (cfg.hybrid_routing, cfg.architect_provider,
+         cfg.architect_model) = saved_hybrid
+        _security_post_run(root, cfg)
 
 
 def _now() -> float:
@@ -887,7 +1208,12 @@ def run_explain(job: Job, opts: dict) -> None:
     With no project open this becomes the standalone Ask: answer the prompt
     directly with the selected global profile instead of refusing. The state
     payload marks the session as the scratchpad until a project is opened."""
+    from .. import imagegen as imagegen_mod
+
+    images = _extract_images(opts)
     question = compose(opts.get("text", ""), opts.get("attachments"))
+    if not question and images:
+        question = "Describe the attached image(s)."
     if not question:
         raise ConfigError("Ask a question first.")
     with STATE.lock:
@@ -897,17 +1223,20 @@ def run_explain(job: Job, opts: dict) -> None:
     else:
         p = _project()
     _echo_user("explain", opts.get("text", "") or question,
-               opts.get("attachments"), opts)
+               opts.get("attachments"), opts, images=images)
+    _set_pinned_refs(p.cfg, opts)
+    _evict_other_servers(p.cfg)
     with session(p, job, interactive=False, lock=False) as feed:
         p.client.warmup()
         if p.agent is not None:
             answer = explain_mod.answer(p.agent, question, verbose=True,
-                                        stream=True)
+                                        stream=True, images=images or None)
         else:
             p.client.site = "answer"
+            user_content = imagegen_mod.make_multimodal_content(question, images)
             answer = p.client.chat(
                 [{"role": "system", "content": SCRATCH_SYSTEM},
-                 {"role": "user", "content": question}],
+                 {"role": "user", "content": user_content}],
                 max_tokens=p.cfg.max_tokens_answer, stream=True)
     text = (answer or "").strip()
     if not text and feed.stream_mid:
@@ -981,17 +1310,30 @@ def run_auto(job: Job, opts: dict) -> None:
     Plan-only keeps the user's real settings."""
     _ensure_index(job)
     p = _project()
+    images = _extract_images(opts)
     goal = compose(opts.get("text", ""), opts.get("attachments"))
     plan_file = (opts.get("plan_file") or "").strip()
     if not goal and not plan_file:
         raise ConfigError("Give a goal, attach a spec, or choose a plan file.")
+    cfg, client, root = p.cfg, p.client, p.root
+    plan_target = plan_file or cfg.auto_plan_file
+    try:
+        plan_path = security_mod.resolve_safe_path(root, plan_target)
+    except (security_mod.SecurityError, OSError, ValueError) as exc:
+        raise ConfigError(f"Invalid plan file path `{plan_target}`: {exc}") from exc
+    if (security_mod.is_sensitive_path(plan_path)
+            or security_mod.is_sensitive_rel(root, plan_target)):
+        raise ConfigError(
+            f"Refusing sensitive plan file `{plan_target}` (secret/credential "
+            "material cannot be used as a plan).")
     _echo_user("auto", opts.get("text", "") or goal or f"plan: {plan_file}",
                opts.get("attachments"), opts)
     # Applying is the default: the GUI behaves like `pedacito auto --apply`
     # unless the user explicitly ticked "Plan only".
     apply = not auto_plan_only(opts)
     ns = SimpleNamespace(
-        task=goal or None, spec=None, plan=plan_file or None, apply=apply,
+        task=goal or None, spec=None,
+        plan=str(plan_path) if plan_file else None, apply=apply,
         verify=(opts.get("verify") or None),
         repair=_int_or_none(opts.get("repair")),
         diagnostics=bool(opts.get("diagnostics")),
@@ -1006,12 +1348,10 @@ def run_auto(job: Job, opts: dict) -> None:
         force_auto=bool(opts.get("force_auto")))
     with STATE.lock:
         STATE.last_auto = {"text": opts.get("text", ""), "plan_file": plan_file}
-    cfg, client, root = p.cfg, p.client, p.root
-    plan_path = Path(plan_file) if plan_file else root / cfg.auto_plan_file
-    if not plan_path.is_absolute():
-        plan_path = (root / plan_path).resolve()
-    with STATE.lock:
         STATE.plan_path = plan_path
+    _apply_security_choices(cfg, opts)
+    _set_pinned_refs(cfg, opts)
+    _evict_other_servers(cfg)
     # Snapshot the backup names before the run so the files this run writes
     # can be reported afterwards. Forcing cfg.backup on while applying makes
     # the loop take its usual pre-edit snapshot of every file it touches,
@@ -1032,12 +1372,16 @@ def run_auto(job: Job, opts: dict) -> None:
         cfg.backup = True
         for name in auto_optins:
             setattr(cfg, name, True)
+    if images:
+        cfg._task_images = list(images)
     try:
         with session(p, job, interactive=False, lock=apply) as feed:
             client.warmup()
             code = cli_mod._cmd_auto(ns, cfg, client, STATE.idx, root)
             feed.end_stream()
     finally:
+        if images and hasattr(cfg, "_task_images"):
+            delattr(cfg, "_task_images")
         cfg.creative_mode = saved_creative
         if apply:
             cfg.backup = saved_backup
@@ -1076,6 +1420,7 @@ def run_auto(job: Job, opts: dict) -> None:
             level="ok" if code == 0 else "warn", auto=True,
             files=changed, changed=changed, git=git_status,
             stats=_usage_stats(client))
+    _security_post_run(root, cfg, files=changed or None)
 
 
 def _int_or_none(value) -> int | None:
@@ -1098,6 +1443,7 @@ def run_new(job: Job, opts: dict) -> None:
     every progress event and streamed token lands in the new project's
     session while it is being built. A preview writes nothing, stays unbound,
     and keeps the old workspace."""
+    images = _extract_images(opts)
     spec_text = compose(opts.get("text", ""), opts.get("attachments"))
     project = (opts.get("project") or "").strip()
     if not project:
@@ -1106,7 +1452,7 @@ def run_new(job: Job, opts: dict) -> None:
         raise ConfigError("Describe the project (or attach a spec file).")
     target = Path(project).expanduser().resolve()
     _echo_user("new", opts.get("text", "") or spec_text,
-               opts.get("attachments"), opts)
+               opts.get("attachments"), opts, images=images)
     mode = opts.get("build", "build")         # build | preview | plan | review
     # The composer's profile picker wins for a no-project New; fall back to
     # the topbar's remembered selection when the request omits it.
@@ -1123,6 +1469,7 @@ def run_new(job: Job, opts: dict) -> None:
             parent = parent.parent
         args = args_for(str(parent), profile)
         cfg = cli_mod._config(args)
+        _apply_security_choices(cfg, opts)
         if "creative" in opts:
             cfg.creative_mode = bool(opts.get("creative"))
         client = LLMClient(cfg)
@@ -1139,6 +1486,7 @@ def run_new(job: Job, opts: dict) -> None:
         job.project_root = str(target)
         with STATE.lock:
             cfg, client = STATE.cfg, STATE.client
+        _apply_security_choices(cfg, opts)
         if "creative" in opts:
             cfg.creative_mode = bool(opts.get("creative"))
         client.check(warn=False)
@@ -1158,19 +1506,24 @@ def run_new(job: Job, opts: dict) -> None:
     p = SimpleNamespace(cfg=cfg, client=client, root=target)
     with session(p, job, interactive=False, lock=False) as feed:
         client.warmup()
-        if mode != "preview":
-            workspace.log_event(target, "command: gui new")
-        code = scaffold.run_new(
-            target, cfg, client, spec,
-            apply=mode in ("build",), review=mode == "review",
-            plan_only=mode == "plan", force=bool(opts.get("force")),
-            verbose=True, complex=bool(opts.get("complex")),
-            verify=opts.get("verify") or cfg.auto_verify,
-            repair_rounds=_int_or(opts.get("repair"), cfg.auto_repair_rounds),
-            max_tasks=_int_or(opts.get("max_tasks"), cfg.auto_max_tasks),
-            max_minutes=_int_or(opts.get("max_minutes"), cfg.auto_max_minutes),
-            keep_going=bool(opts.get("keep_going")),
-            auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps))
+        if images:
+            cfg._task_images = list(images)
+        try:
+            code = scaffold.run_new(
+                target, cfg, client, spec,
+                apply=mode in ("build",), review=mode == "review",
+                plan_only=mode == "plan", force=bool(opts.get("force")),
+                verbose=True, complex=bool(opts.get("complex")),
+                verify=opts.get("verify") or cfg.auto_verify,
+                repair_rounds=_int_or(opts.get("repair"), cfg.auto_repair_rounds),
+                max_tasks=_int_or(opts.get("max_tasks"), cfg.auto_max_tasks),
+                max_minutes=_int_or(opts.get("max_minutes"), cfg.auto_max_minutes),
+                keep_going=bool(opts.get("keep_going")),
+                auto_install=bool(opts.get("auto_install") or cfg.auto_install_deps),
+                log_command="" if mode == "preview" else "command: gui new")
+        finally:
+            if images and hasattr(cfg, "_task_images"):
+                delattr(cfg, "_task_images")
         feed.end_stream()
     if mode == "preview":
         STATE.add_message(
@@ -1198,6 +1551,7 @@ def run_new(job: Job, opts: dict) -> None:
                  else "no index yet")
         STATE.add_message("system", f"Opened {target} \u2014 {state}.",
                           kind="opened", needs_index=idx is None)
+    _security_post_run(target, cfg)
 
 
 # --- plan files -----------------------------------------------------------------

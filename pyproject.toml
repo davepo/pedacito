@@ -1,6 +1,6 @@
 [project]
 name = "pedacito"
-version = "0.2.0"
+version = "0.3.1"
 description = "Local-first AI coding harness and multi-model specialist orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"   # tomllib
@@ -32,6 +32,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/davepo/pedacito"
+Website = "https://www.pedacito.dev"
 Repository = "https://github.com/davepo/pedacito"
 Issues = "https://github.com/davepo/pedacito/issues"
 
@@ -85,8 +86,18 @@ packages = ["pedacito", "pedacito.gui"]
 # The browser GUI's page, stylesheet and scripts are served from the package.
 [tool.setuptools.package-data]
 "pedacito.gui" = ["static/*"]
+"pedacito" = ["locales/*.json"]
 
-# `pedacito how` reads these two files at runtime. Keep them in a normal
-# (non-editable) install as well as in a checkout.
+# `pedacito how` reads these files at runtime. Keep them in a normal
+# (non-editable) install as well as in a checkout. The modular guides keep
+# their docs/ path so links inside the installed README resolve too.
 [tool.setuptools.data-files]
-"share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md"]
+"share/pedacito" = ["README.md", "QUICKSTART.md", "MODEL_GUIDE.md",
+                    "TECHNIQUES.md", "CHANGELOG.md", "RELEASE.md",
+                    "LICENSE", "README.es.md", "QUICKSTART.es.md",
+                    "MODEL_GUIDE.es.md", "TECHNIQUES.es.md"]
+"share/pedacito/docs" = ["docs/*.md"]
+"share/pedacito/docs/es" = ["docs/es/*.md"]
+# README links docs/assets/*.png; ship them beside the guides so the
+# screenshots also render in an installed wheel.
+"share/pedacito/docs/assets" = ["docs/assets/*.png"]

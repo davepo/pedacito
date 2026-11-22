@@ -16,6 +16,7 @@ Usage
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
     pedacito rename old_name new_name        # rename a symbol across files, no model call
+    pedacito update --run                    # check PyPI and upgrade this install
 
 Run as `pedacito <command> ...` or `python -m pedacito <command> ...`; `pdc`
 is a shorthand alias accepting the same commands. `main()` is the entry point.
@@ -25,23 +26,29 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from . import __version__
+from . import checkpoints as checkpoints_mod
 from . import config
 from . import config_editor
 from . import discovery
 from . import events as events_mod
+from . import fileio
 from . import hooks as hooks_mod
+from . import i18n
 from . import index as index_mod
 from . import llm as llm_mod
 from . import loop
 from . import modelcard
 from . import profiles as profiles_mod
 from . import roles as roles_mod
+from . import update as update_mod
 from . import workspace
 from .agent import Agent
 from .config import (Config, ConfigError, REFERENCE_TEMPLATE, TEMPLATE,
@@ -129,6 +136,24 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--max-cost", type=float, default=None, metavar="USD",
                    help="stop before the next call once the estimated spend "
                         "reaches this (needs price_*_per_mtok in config)")
+    p.add_argument("--image", action="append", default=[], metavar="FILE",
+                   help=i18n.t("cli.opt.image"))
+    p.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                   default=argparse.SUPPRESS,
+                   help=i18n.t("cli.opt.lang"))
+
+
+def _load_cli_images(args) -> list[dict]:
+    """Load and validate any --image paths passed on the CLI."""
+    paths = list(getattr(args, "image", None) or ())
+    if not paths:
+        return []
+    from . import imagegen
+    if len(paths) > imagegen.MAX_IMAGE_ATTACHMENTS:
+        raise ValueError(
+            f"Too many --image attachments ({len(paths)}; max {imagegen.MAX_IMAGE_ATTACHMENTS})."
+        )
+    return [imagegen.load_image_attachment(p) for p in paths]
 
 
 def _root(args) -> Path:
@@ -153,18 +178,84 @@ def _matcher(args, root: Path) -> Matcher:
     return m
 
 
+def _fallback_profile_for_tui(root: Path, explicit: str | None) -> str:
+    """When `default_profile` points at a deleted profile, pick a valid
+    remaining profile (preferring a non-image profile) so `pedacito tui` can
+    still launch and let the user switch profiles interactively."""
+    import tomllib
+    from . import imagegen
+
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    proj = find_project_config(root) if root else None
+    if proj is not None:
+        candidates.append(proj)
+    candidates.append(config.USER_CONFIG)
+
+    profiles: dict[str, dict] = {}
+    order: list[str] = []
+    for path in candidates:
+        if not path or not path.is_file():
+            continue
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw = data.get("profiles") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for pname, body in raw.items():
+                if isinstance(body, dict) and pname not in profiles:
+                    profiles[pname] = body
+                    order.append(pname)
+    if not order:
+        return ""
+    for pname in order:
+        body = profiles[pname]
+        if not imagegen.is_image_model(
+            str(body.get("model", "") or ""),
+            modality=str(body.get("modality", "") or "") or None,
+        ):
+            return pname
+    return order[0]
+
+
 def _config(args) -> Config:
     """Load the Config from files/profile, then apply command-line overrides."""
     # `config` must be able to inspect a file that lacks the mandatory vram_gb.
-    cfg = load_config(root=_root(args), explicit=getattr(args, "config", None),
-                      profile=getattr(args, "profile", None),
-                      require_hardware=(getattr(args, "cmd", "") not in
-                                        ("config", "tui")))
+    cmd = getattr(args, "cmd", "")
+    root_dir = _root(args)
+    explicit = getattr(args, "config", None)
+    requested_profile = getattr(args, "profile", None)
+    try:
+        cfg = load_config(root=root_dir, explicit=explicit,
+                          profile=requested_profile,
+                          require_hardware=(cmd not in ("config", "tui")))
+    except ConfigError as exc:
+        if (cmd == "tui" and not requested_profile
+                and not os.environ.get("PEDACITO_PROFILE")
+                and "(from default_profile)" in str(exc)):
+            fallback = _fallback_profile_for_tui(root_dir, explicit)
+            if fallback:
+                print(f"[warning] default_profile no longer exists; "
+                      f"using '{fallback}' instead (run /profile to switch)",
+                      file=sys.stderr)
+                cfg = load_config(root=root_dir, explicit=explicit,
+                                  profile=fallback, require_hardware=False)
+            else:
+                raise
+        else:
+            raise
     # BUG-1007: "pre-existing" means "red before THIS run started" — a
     # failure the run itself just wrote into the ledger must never come back
     # labelled a baseline. Process start, not config-load time, so an
     # in-chat config reload cannot launder the run's own fresh failures.
     cfg._run_started = _PROCESS_START
+    cli_lang = getattr(args, "lang", None)
+    if cli_lang:
+        cfg.language = i18n.normalize_lang(cli_lang)
+        cfg.sources["language"] = "--lang"
+    i18n.set_current_lang(i18n.detect_lang(cli_lang, cfg))
     if getattr(args, "no_refs", False):
         cfg.include_references = False
     if getattr(args, "jsonl", False) or getattr(args, "rpc", False) or \
@@ -177,6 +268,21 @@ def _config(args) -> Config:
             raise ConfigError(f"--role {spec!r}: use ROLE=PROFILE with ROLE "
                               f"one of {', '.join(roles_mod.ROLES)}")
         cfg.roles = {**(cfg.roles or {}), role.strip(): prof.strip()}
+    worker_profile = (cfg.roles or {}).get("worker")
+    if worker_profile:
+        # The worker is the default client, not a side client: derive its
+        # config before anything builds the LLMClient, or --role worker=
+        # would be parsed and then silently ignored.
+        derived = roles_mod.derive_config(cfg, worker_profile)
+        if derived is None:
+            print(f"[roles] role 'worker' names unknown profile "
+                  f"'{worker_profile}'; using the active profile",
+                  file=sys.stderr)
+        else:
+            derived.roles = dict(cfg.roles or {})
+            derived.sources["active_profile"] = (
+                f"--role worker={worker_profile}")
+            cfg = derived
     if getattr(args, "auto_route", False):
         cfg.auto_route_specialties = True
         cfg.sources["auto_route_specialties"] = "--auto-route"
@@ -878,6 +984,173 @@ def _strict_replay_error(args, client) -> str:
     return ""
 
 
+# `pdc ask --json`: one verdict object, and a diff capped at this many
+# characters so a giant generated file cannot flood an automation log.
+ASK_JSON_DIFF_LIMIT = 200_000
+
+
+def _ask_verify_command(args, cfg) -> str:
+    """Apply `--verify-cmd` to the live config for THIS run only and return
+    the effective command. The override carries a `sources` entry like any
+    other flag; no config file is ever written."""
+    cmd = getattr(args, "verify_cmd", None)
+    if cmd is not None:
+        cfg.auto_verify = str(cmd)
+        cfg.sources["auto_verify"] = "--verify-cmd"
+    return str(getattr(cfg, "auto_verify", "") or "").strip()
+
+
+def _ask_workspace_snapshot(root):
+    """A temporary copy of the snapshot-tracked workspace for `--json`.
+
+    Returns a `TemporaryDirectory` (caller cleans it up) or None. The
+    checkpoint walker already excludes `.pedacito`, `.git`, dependency trees
+    and build output, so the resulting diff is exactly the project's source;
+    the copy lives under `.pedacito/` and therefore never appears in it.
+    """
+    import shutil
+    import tempfile
+    holder = None
+    try:
+        files = checkpoints_mod.iter_workspace_files(root)
+        state = index_mod.state_dir(root)
+        state.mkdir(parents=True, exist_ok=True)
+        holder = tempfile.TemporaryDirectory(prefix="ask-json-",
+                                             dir=str(state))
+        base = Path(holder.name)
+        for rel, src in files:
+            dest = base / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        return holder
+    except Exception:                        # reporting must never fail a run
+        if holder is not None:
+            holder.cleanup()
+        return None
+
+
+def _ask_result_changes(tr, applied: bool) -> tuple[list[str], str]:
+    """Files and unified diffs from a TaskResult's applied edit results.
+    Empty for a dry run or a result shape without edit records."""
+    if not applied or tr is None:
+        return [], ""
+    files, diffs = [], []
+    for r in (getattr(tr, "results", None) or []):
+        if not getattr(r, "ok", False):
+            continue
+        rel = str(getattr(r, "file", "") or "")
+        if rel:
+            files.append(rel)
+        text = str(getattr(r, "diff", "") or "")
+        if text:
+            diffs.append(text)
+    if not files:
+        files = [str(f) for f in (getattr(tr, "changed", []) or [])
+                 if str(f).strip()]
+    return files, "\n".join(diffs)
+
+
+def _ask_diff_since(root, holder) -> tuple[list[str], str]:
+    """(changed paths, combined unified diff) since the snapshot `holder`.
+    Best-effort: reporting must never turn a finished task into a failed one."""
+    if holder is None:
+        return [], ""
+    try:
+        before = checkpoints_mod._snapshot_map(Path(holder.name))
+        after = dict(checkpoints_mod.iter_workspace_files(root))
+        changed = checkpoints_mod._changed_paths(before, after)
+        parts = []
+        for rel in changed:
+            rec = checkpoints_mod._diff_pair(rel, before.get(rel),
+                                             after.get(rel))
+            if rec.get("diff"):
+                parts.append(rec["diff"])
+        return changed, "\n".join(parts)
+    except Exception:
+        return [], ""
+
+
+def _ask_json_report(cfg, summary, *, ok: bool, files_changed, diff: str,
+                     verify_passed) -> dict:
+    """The exact `pdc ask --json` object. Every string passes the same
+    redaction as logs/session files, so a secret the task text carried into
+    an applied edit cannot come back out on stdout."""
+    summary = summary or {}
+
+    def clean(value) -> str:
+        return loop.safe_text(str(value or ""), cfg)
+
+    diff_text = clean(diff)
+    truncated = len(diff_text) > ASK_JSON_DIFF_LIMIT
+    provider = (summary.get("provider")
+                or getattr(cfg, "active_profile", "")
+                or str(getattr(cfg, "provider", "") or ""))
+    return {
+        "ok": bool(ok),
+        "model": clean(summary.get("model") or getattr(cfg, "model", "")),
+        "provider": clean(provider),
+        # Turns = model calls, exactly `events.RunTelemetry.summary()["calls"]`:
+        # every gather step, answer, planning and repair request counts once.
+        "turns": int(summary.get("calls") or 0),
+        "elapsed_sec": float(summary.get("elapsed_s") or 0.0),
+        "tokens": {
+            "prompt": int(summary.get("prompt_tokens") or 0),
+            "completion": int(summary.get("completion_tokens") or 0),
+            "tok_per_sec": float(summary.get("tok_per_sec") or 0.0),
+        },
+        "files_changed": sorted({clean(f) for f in (files_changed or [])
+                                 if str(f).strip()}),
+        "verify_passed": None if verify_passed is None
+        else bool(verify_passed),
+        "diff": diff_text[:ASK_JSON_DIFF_LIMIT],
+        "diff_truncated": truncated,
+    }
+
+
+def _ask_task_ok(args, cfg, tr, verify_passed, verify_ran: bool) -> bool:
+    """Task success for the JSON verdict. It is deliberately not the process
+    exit code: without `--strict` a red impacted-test gate still exits 0 but
+    is not a successful task."""
+    if tr is None:
+        return False
+    if getattr(tr, "ok", None) is False:
+        return False
+    if getattr(tr, "fabricated", False):
+        return False
+    if (getattr(tr, "tests_ok", None) is False
+            and not getattr(tr, "tests_preexisting_only", False)):
+        return False
+    if verify_ran and verify_passed is False:
+        return False
+    if (getattr(args, "apply", False) and not _wants_review(args, cfg)
+            and not getattr(tr, "applied", False)
+            and not loop._is_noop(getattr(tr, "reply", "") or "")):
+        if (getattr(tr, "results", []) or getattr(tr, "unaccepted", None)):
+            return False
+    return True
+
+
+def _ask_verify_outcome(root, cfg, command: str, tr, *,
+                        applied: bool) -> tuple[bool | None, bool]:
+    """Run the effective verify command once after an applied task.
+    Returns (verify_passed, ran). With no command, the run's own impacted-test
+    verdict is the verification outcome -- None when no check ran."""
+    if not command or not applied:
+        return getattr(tr, "tests_ok", None), False
+    print(f"\n[verify: running `{command}`]", file=sys.stderr)
+    try:
+        ok, out = loop.run_verify(root, command, cfg=cfg)
+    except Exception as e:                   # a bad command is a failed check
+        print(f"  [verify: could not run ({type(e).__name__}: {e})]",
+              file=sys.stderr)
+        return False, True
+    print(f"[verify: {'passed' if ok else 'FAILED'}]", file=sys.stderr)
+    if not ok and out:
+        tail = "\n".join(f"    {ln}" for ln in out.splitlines()[-8:])
+        print(tail, file=sys.stderr)
+    return bool(ok), True
+
+
 def _strict_task_error(args, tr) -> str:
     """The --strict failure text for one task result, or '' when the gate
     passes or is disabled: a failed edit block (a partial application) or
@@ -1069,9 +1342,19 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
                          verify_final=verify_final)
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
-    # run of main.py) and feed a failure back for repair.
+    # run of main.py) and feed a failure back for repair. With --verify-final
+    # the loop already ran that exact command once after the last task and fed
+    # any failure to its repair rounds: when it ended green, run it no more.
+    # A RED final check keeps this pass -- including a run stopped before the
+    # check came due, where the loop only ran it "for the record" without
+    # repair and left repair and exit-code responsibility here. The smoke run
+    # is a separate check and survives either way.
     smoke = bool(cfg.auto_smoke)
-    if args.apply and (verify or smoke):
+    final_ran = bool(verify_final
+                     and getattr(cfg, "_verify_final_ran", False))
+    final_ok = bool(getattr(cfg, "_verify_final_ok", False))
+    post_verify = "" if (final_ran and final_ok) else verify
+    if args.apply and (post_verify or smoke):
         skip = {".pedacito", "__pycache__", ".venv", "venv",
                 "node_modules", ".git"}
         # Prune skipped dirs and virtualenvs (any name, via pyvenv.cfg) while
@@ -1085,13 +1368,14 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         py_rels.sort()
         v_ok, v_out = scaffold.verify_and_fix(
             client, cfg, idx, py_rels, root.name, None,
-            explicit_cmd=verify,
+            explicit_cmd=post_verify,
             rounds=int(cfg.auto_verify_rounds or 0),
             smoke=smoke,
             smoke_timeout=int(cfg.auto_smoke_timeout or 20),
             verbose=True)
         if v_ok:
-            note, ran = scaffold.verify_receipt(root, verify, smoke, v_ok, v_out)
+            note, ran = scaffold.verify_receipt(root, post_verify, smoke,
+                                                v_ok, v_out)
             print(f"  {note}", file=sys.stderr)
             workspace.log_event(root, note, "INFO" if ran else "WARN")
         else:
@@ -1101,6 +1385,11 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
             workspace.log_event(root, f"verify failed: {v_out[:200]}", "ERROR")
             if code == 0:
                 code = 1
+    elif args.apply and final_ran and final_ok and verify:
+        # The whole-goal check ran (and passed) inside the loop: say so
+        # instead of silently dropping the post-run verify line.
+        print("  verify: passed (--verify-final ran once inside the loop)",
+              file=sys.stderr)
     if args.apply:
         # The run wrote files (tasks, repairs, installs): leave the saved
         # index in line with the tree so the next session -- and a GUI
@@ -1111,7 +1400,7 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     return code
 
 
-def _cmd_explain(args, client, agent) -> int:
+def _cmd_explain(args, client, agent, images: list[dict] | None = None) -> int:
     """`pedacito explain`: answer questions about the indexed project in prose
     (no edits). `main()` has already checked that an index exists."""
     from . import explain
@@ -1120,7 +1409,7 @@ def _cmd_explain(args, client, agent) -> int:
 
     def ask(q: str) -> str:
         print("\n--- looking things up ---", file=sys.stderr)
-        return explain.answer(agent, q)
+        return explain.answer(agent, q, images=images)
 
     if question:
         print(ask(question))
@@ -1202,6 +1491,142 @@ def _cmd_diagnose(args) -> int:
     return 0 if ok else 1
 
 
+def _cmd_profile(args) -> int:
+    """`pedacito profile [--show | --run | --reset]`.
+
+    --show  print the hardware snapshot, the last cached speed probe and the
+            active tuning (default when no action flag is given)
+    --run   force one speed/prefill probe of the active model, then show it
+    --reset drop cached measurements and turn off an explicit auto_tune
+            opt-in in the selected config file
+    """
+    from . import profiler
+    action = ("run" if getattr(args, "run", False)
+              else "reset" if getattr(args, "reset", False) else "show")
+    cfg = None
+    try:
+        cfg = _light_config(args)
+    except ConfigError as exc:
+        if action != "reset":
+            print(f"Config error: {exc}", file=sys.stderr)
+            return 2
+    if action == "reset":
+        path = profiler.reset()
+        changed = _disable_auto_tune_opt_in(args, cfg)
+        print(f"Dropped cached profiling measurements ({path}).")
+        if changed:
+            print(f"Set auto_tune = false in {changed}.")
+        else:
+            print("No explicit auto_tune = true was found in the selected "
+                  "config file.")
+        return 0
+    if cfg is None:
+        print("Config error: no usable configuration.", file=sys.stderr)
+        return 2
+    probe = None
+    if action == "run":
+        from . import servers
+        if not servers.is_local_url(cfg.base_url):
+            print(f"{profiler.HOSTED_PROBE_REFUSAL}: {cfg.model} on "
+                  f"{cfg.base_url} (speed probes are local-only).",
+                  file=sys.stderr)
+            return 1
+        print(f"Probing {cfg.model} on {cfg.base_url} "
+              "(one prefill, one tiny completion)...", file=sys.stderr)
+        probe = profiler.probe_model_speed(cfg.base_url, cfg.model, cfg,
+                                           force=True)
+        if not probe.get("ok"):
+            print("Probe failed: " + str(probe.get("detail")
+                                         or "the server did not answer"),
+                  file=sys.stderr)
+            return 1
+    report = profiler.build_report(cfg, probe=probe, fetch_metadata=True)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=1, default=str))
+    else:
+        print(profiler.format_profile_report(report))
+    return 0
+
+
+def _disable_auto_tune_opt_in(args, cfg=None) -> str:
+    """Turn an explicit auto_tune = true off in the selected config file.
+
+    The selected profile (--profile, else the active profile) is tried first;
+    when it does not carry the key, the global/universal scope is tried. Only
+    a value already true is touched. Returns the path that changed, or "".
+    """
+    path = Path(args.config) if getattr(args, "config", None) else USER_CONFIG
+    profile = str(getattr(args, "profile", "") or
+                  (getattr(cfg, "active_profile", "") if cfg else "") or "")
+    return config_editor.disable_auto_tune_opt_in(path, profile)
+
+
+def _cmd_models_show(args) -> int:
+    """`pedacito models` (no action): tuned numbers for the active profile."""
+    from . import profiler
+    try:
+        cfg = _light_config(args)
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+    report = profiler.build_report(cfg, fetch_metadata=True)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=1, default=str))
+        return 0
+    print(profiler.format_profile_report(report))
+    if cfg.profiles:
+        print("\nProfiles")
+        for name in sorted(cfg.profiles):
+            body = cfg.profiles.get(name) or {}
+            model = str(body.get("model") or cfg.model or "")
+            marker = "* " if name == cfg.active_profile else "  "
+            print(f"  {marker}{name:<20} {model}")
+    return 0
+
+
+def _cmd_update(args) -> int:
+    """`pedacito update [--run]`: check PyPI for a newer Pedacito release and
+    optionally run the upgrade command for the detected install method.
+    Honors check_for_updates: disabled prints the manual command and exits 0
+    with zero network calls; offline exits 1; --run returns the upgrade's
+    own exit code."""
+    try:
+        cfg = _light_config(args)
+    except ConfigError:
+        cfg = None
+    info = update_mod.check_for_update(cfg, manual=True)
+    if info["detail"] == "disabled":
+        print("Update checks are disabled (check_for_updates = false). "
+              "No network call was made.")
+        print(info["instructions"])
+        return 0
+    if not info["ok"]:
+        print("Could not reach PyPI (offline?). Nothing was changed.",
+              file=sys.stderr)
+        print("Manual upgrade: " + info["instructions"])
+        return 1
+    print(f"Installed: {info['current']}    Latest: {info['latest']}")
+    print(f"Install method: {info['method']}")
+    if not info["update_available"]:
+        print("You are up to date.")
+        return 0
+    print(info["instructions"])
+    if not getattr(args, "run", False):
+        print("Run `pedacito update --run` to upgrade.")
+        return 0
+    if info["command"] is None:
+        return 0                        # editable/source: instructions only
+    print("Running: " + " ".join(info["command"]), file=sys.stderr)
+    code = update_mod.run_upgrade(info["command"],
+                                  on_line=lambda ln: print(ln, flush=True))
+    if code == 0:
+        print(f"Upgrade finished (exit 0). Restart Pedacito to run "
+              f"{info['latest']}.")
+    else:
+        print(f"Upgrade failed (exit {code}).", file=sys.stderr)
+    return code
+
+
 def _light_config(args) -> Config:
     """Config for commands that never talk to a model (no vram_gb needed)."""
     return load_config(root=_root(args), explicit=getattr(args, "config", None),
@@ -1209,9 +1634,60 @@ def _light_config(args) -> Config:
                        require_hardware=False, warn_budgets=False)
 
 
+def _cmd_image(args) -> int:
+    """`pedacito image PROMPT ...`: generate one image and save it."""
+    import json as _json
+    from . import imagegen, security
+
+    cfg = _light_config(args)
+    root = _root(args)
+    prompt = str(getattr(args, "prompt", "") or "").strip()
+    if not prompt:
+        print(i18n.t("cli.image.empty_prompt"), file=sys.stderr)
+        return 2
+    try:
+        res = imagegen.generate_image(
+            cfg, prompt,
+            output_path=getattr(args, "out", None),
+            size=getattr(args, "size", "") or "",
+            steps=getattr(args, "steps", 0) or 0,
+            cfg_scale=getattr(args, "cfg_scale", None),
+            seed=getattr(args, "seed", None),
+            negative_prompt=getattr(args, "negative", "") or "",
+            profile=getattr(args, "profile", None),
+            root=root,
+        )
+    except (imagegen.ImageGenError, security.SecurityError) as exc:
+        if getattr(args, "json", False):
+            print(_json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            print(i18n.t("cli.error", message=str(exc)), file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(_json.dumps(res, default=str))
+        return 0
+
+    dims = (f"{res['width']}x{res['height']}"
+            if res.get("width") and res.get("height")
+            else str(res.get("format") or ""))
+    model_str = str(res.get("model") or "")
+    if res.get("profile"):
+        model_str = f"{res['profile']} ({model_str})" if model_str else res["profile"]
+    print(i18n.t(
+        "cli.image.saved",
+        path=res.get("rel_path") or res.get("path", ""),
+        dims=dims,
+        elapsed=f"{float(res.get('elapsed_s') or 0.0):.2f}s",
+        model=model_str,
+    ))
+    return 0
+
+
 def _cmd_calibrate(args, cfg) -> int:
     """`pedacito calibrate`: run the scripted mini-suite against the configured
     model and save its model card."""
+    from . import imagegen
     if getattr(args, "all", False):
         return _calibrate_all(args)
     if not llm_mod._is_local_server(cfg):
@@ -1222,6 +1698,13 @@ def _cmd_calibrate(args, cfg) -> int:
     if existing and not args.recalibrate:
         print(modelcard.render(existing))
         print("\nA fresh card exists; pass --recalibrate to measure again.")
+        return 0
+    if imagegen.profile_is_image_model(cfg):
+        card = modelcard.calibrate_image_model(cfg, verbose=True)
+        path = modelcard.save_card(card)
+        print()
+        print(modelcard.render(card))
+        print(f"\nSaved to {path}.")
         return 0
     client = LLMClient(cfg)
     client.check()
@@ -1242,6 +1725,7 @@ def _calibrate_all(args) -> int:
     profiles are skipped (provider-table defaults), fresh cards are skipped
     unless --recalibrate, each card is saved as soon as it finishes, and the
     model is unloaded between profiles so one card's VRAM fits the next."""
+    from . import imagegen
     base = _light_config(args)
     all_names = list(base.profiles or {})
     names = [n for n in all_names
@@ -1276,6 +1760,17 @@ def _calibrate_all(args) -> int:
     done = 0
     try:
         for n, cfg in todo:
+            if imagegen.profile_is_image_model(cfg):
+                print(f"\n=== probing image profile '{n}' ({cfg.model}) [image] ===",
+                      file=sys.stderr)
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                path = modelcard.save_card(card)
+                done += 1
+                m = card.get("measured") or {}
+                status = (f"verified ({m.get('latency_s', '?')}s)"
+                          if m.get("image_ok") else "probe failed")
+                print(f"Saved image card for '{n}' ({status}) to {path}")
+                continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
             client = LLMClient(cfg)
@@ -1355,10 +1850,15 @@ def _scan_filter(models: list[dict], args) -> list[dict]:
 
 def _interactive_pick(label: str, base_url: str, models: list[dict]) -> list[dict]:
     """Let the user pick models from one server's list."""
+    from . import imagegen
     print(f"\n{label}  {base_url}  ({len(models)} model(s))")
     for i, m in enumerate(models, 1):
         mark = "*" if m.get("loaded") else " "
         bits = [f"{i:>2}) {mark} {m['id']}"]
+        if imagegen.is_image_model(m["id"], labels=m.get("labels"),
+                                   recipe=m.get("recipe"),
+                                   modality=m.get("modality")):
+            bits.append("[image]")
         if m.get("size_bytes"):
             bits.append(f"{m['size_bytes'] / (1024 ** 3):.1f} GB")
         print("  " + "  ".join(bits))
@@ -1405,16 +1905,19 @@ def _write_config_backup(target: Path, text: str) -> None:
             Path(str(target) + ".bak").write_bytes(target.read_bytes())
         except OSError:
             pass
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, target)
+    fileio.write_bytes(target, text.encode("utf-8"))
 
 
 def _scan_cfg(model: dict) -> Config:
     """A Config for one scanned model, with identity only (no card applied)."""
+    from . import imagegen
     cfg = Config()
     cfg.base_url = model["base_url"]
     cfg.model = model["id"]
+    if imagegen.is_image_model(model["id"], labels=model.get("labels"),
+                               recipe=model.get("recipe"),
+                               modality=model.get("modality")):
+        cfg.modality = "image"
     if model.get("vram_gb"):
         cfg.vram_gb = int(model["vram_gb"])
     if model.get("tier"):
@@ -1427,6 +1930,7 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     """Calibrate the selected models, loaded first, skipping fresh cards. Each
     card is saved as soon as it finishes, so Ctrl-C keeps the cards done so
     far."""
+    from . import imagegen
     order = sorted(models, key=lambda m: (0 if m.get("loaded") else 1))
     todo: list[Config] = []
     for m in order:
@@ -1442,6 +1946,11 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     done = 0
     try:
         for cfg in todo:
+            if imagegen.profile_is_image_model(cfg):
+                card = modelcard.calibrate_image_model(cfg, verbose=True)
+                modelcard.save_card(card)
+                done += 1
+                continue
             client = LLMClient(cfg)
             client.check()
             client.warmup()
@@ -1502,7 +2011,12 @@ def _scan_hosted(args, urls: list[str]) -> list[dict]:
 
 def _to_scan_entry(m: dict) -> dict:
     """The keys `upsert_profiles` writes for one scanned model."""
+    from . import imagegen
+    is_img = imagegen.is_image_model(m["id"], labels=m.get("labels"),
+                                     recipe=m.get("recipe"),
+                                     modality=m.get("modality"))
     entry: dict = {"model": m["id"], "base_url": m["base_url"],
+                   "modality": "image" if is_img else None,
                    "server_label": m.get("server_label", ""),
                    "tier": m.get("tier") or "",
                    "vram_gb": m.get("vram_gb"),
@@ -1814,6 +2328,98 @@ def _cmd_reset(args) -> int:
     print("Code and project config were left untouched. "
           "Run `pedacito index PROJ` when you want a fresh map.",
           file=sys.stderr)
+    return 0
+
+
+def _cmd_checkpoints(args) -> int:
+    """`pedacito checkpoints`: list the time-travel tree for a project."""
+    root = _root(args)
+    if not root.is_dir():
+        print(f"checkpoints: no such project directory: {root}",
+              file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        items = checkpoints_mod.list_checkpoints(root)
+        payload = {
+            "head_id": checkpoints_mod.head_id(root),
+            "checkpoints": [dict(cp) for cp in items],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    limit = int(getattr(args, "limit", 0) or 0)
+    print(checkpoints_mod.render_list(root, limit=limit))
+    return 0
+
+
+def _cmd_checkout(args) -> int:
+    """`pedacito checkout <id>`: restore a whole checkpoint or one file."""
+    root = _root(args)
+    if not root.is_dir():
+        print(f"checkout: no such project directory: {root}", file=sys.stderr)
+        return 2
+    try:
+        checkpoint_id = checkpoints_mod.resolve_id(root, args.id)
+    except checkpoints_mod.CheckpointError as e:
+        print(f"checkout: {e}", file=sys.stderr)
+        print(f"  known ids: try `pedacito checkpoints {root}`.",
+              file=sys.stderr)
+        return 2
+    files = list(getattr(args, "files", None) or []) or None
+    try:
+        result = checkpoints_mod.restore_checkpoint(
+            root, checkpoint_id, files=files)
+    except (checkpoints_mod.CheckpointError, OSError) as e:
+        print(f"checkout: {e}", file=sys.stderr)
+        return 1
+    for rel in result["restored"]:
+        print(f"  restored {rel}", file=sys.stderr)
+    for rel in result["deleted"]:
+        print(f"  deleted  {rel}", file=sys.stderr)
+    for rel in result["skipped"]:
+        print(f"  skipped  {rel}", file=sys.stderr)
+    print(f"checkout: {result['files']} file(s) restored from "
+          f"{checkpoint_id}; head is now {checkpoint_id}", file=sys.stderr)
+    if result.get("safety_id"):
+        print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
+    return 0
+
+
+def _cmd_undo(args) -> int:
+    """`pedacito undo`: restore the state immediately before the last run.
+
+    Prefers the checkpoint tree (the active checkpoint's parent). A project
+    from before the checkpoint system falls back to its newest backup
+    snapshot, exactly like `pedacito restore`.
+    """
+    root = _root(args)
+    if not root.is_dir():
+        print(f"undo: no such project directory: {root}", file=sys.stderr)
+        return 2
+    if getattr(args, "list", False):
+        return _cmd_checkpoints(args)
+    result = checkpoints_mod.undo_last_run(root)
+    if not result.get("ok"):
+        # Old workspaces only have .pedacito/backups/<stamp>/ snapshots.
+        snapshots = workspace.list_backups(root)
+        if not snapshots:
+            print(f"undo: {result.get('detail') or 'nothing to undo.'}",
+                  file=sys.stderr)
+            return 1
+        snapshot = snapshots[0]
+        restored = workspace.restore(root, snapshot)
+        for rel in restored:
+            print(f"  restored {rel}", file=sys.stderr)
+        print(f"undo: restored {len(restored)} file(s) from "
+              f"{snapshot.name}", file=sys.stderr)
+        return 0
+    for rel in result["restored"]:
+        print(f"  restored {rel}", file=sys.stderr)
+    for rel in result["deleted"]:
+        print(f"  deleted  {rel}", file=sys.stderr)
+    print(f"undo: back to {result['undone_to']} "
+          f"({result['files']} file(s) restored)", file=sys.stderr)
+    if result.get("safety_id"):
+        print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
     return 0
 
 
@@ -2591,14 +3197,55 @@ def main(argv=None) -> int:
             workspace.release_lock(_LOCKED.pop())
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _preparse_lang(argv=None) -> str:
+    """Resolve the active CLI language before `build_parser()` runs, so
+    `pdc --lang es --help` and `pdc <subcmd> --lang es --help` print
+    localized descriptions and help text."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    cli_lang = None
+    i = 0
+    while i < len(raw_argv):
+        tok = str(raw_argv[i])
+        if tok == "--lang" and i + 1 < len(raw_argv):
+            cli_lang = raw_argv[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--lang="):
+            cli_lang = tok.split("=", 1)[1]
+        i += 1
+    cfg_stub = None
+    if cli_lang is None and not os.environ.get("PEDACITO_LANG") \
+            and not os.environ.get("PEDACITO_LANGUAGE"):
+        try:
+            if USER_CONFIG.is_file():
+                cfg_stub = load_config(root=None, require_hardware=False,
+                                       warn_budgets=False,
+                                       upgrade_user_config=False)
+        except Exception:
+            cfg_stub = None
+    lang = i18n.detect_lang(cli_lang, cfg=cfg_stub)
+    i18n.set_current_lang(lang)
+    return lang
+
+
+def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     """The full CLI parser, split out from dispatch so tests can enumerate
     the real subcommand set (the `how` index drift guard)."""
-    ap = argparse.ArgumentParser(prog="pedacito", description=__doc__,
+    active_lang = i18n.normalize_lang(
+        lang if lang is not None else i18n.get_current_lang())
+    i18n.set_current_lang(active_lang)
+    t = lambda key, **kw: i18n.t(key, lang=active_lang, **kw)  # noqa: E731
+    desc = t("cli.description") if active_lang == "es" else __doc__
+    ap = argparse.ArgumentParser(prog="pedacito", description=desc,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}",
+                    help=t("cli.opt.version"))
+    ap.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES, default=None,
+                    help=t("cli.opt.lang"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_index = sub.add_parser("index", help="build or refresh the index")
+    p_index = sub.add_parser("index", help=t("cli.cmd.index"))
     _add_common(p_index)
     p_index.add_argument("--no-summaries", action="store_true",
                          help="static index only; instant, no LLM calls")
@@ -2607,14 +3254,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="discard cached summaries and regenerate with the "
                               "current model")
 
-    p_map = sub.add_parser("map", help="print the current index")
+    p_map = sub.add_parser("map", help=t("cli.cmd.map"))
     _add_common(p_map)
     p_map.add_argument("--tier", choices=["auto", "cards", "dirs", "flat", "ranked"],
                        default="auto")
     p_map.add_argument("-t", "--task", default="",
                        help="rank the map for this task (as `ask` would see it)")
 
-    p_conf = sub.add_parser("config", help="show, create, or test the config file")
+    p_conf = sub.add_parser("config", help=t("cli.cmd.config"))
+    p_conf.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                        default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_conf.add_argument("--init", action="store_true",
                         help=f"write a starter config to {USER_CONFIG}")
     p_conf.add_argument("--path", metavar="FILE", help="write --init here instead")
@@ -2646,7 +3295,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--config", metavar="FILE")
 
     p_how = sub.add_parser(
-        "how", help="ask how to use pedacito (smart built-in help)")
+        "how", help=t("cli.cmd.how"))
+    p_how.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                       default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_how.add_argument("question", nargs="*",
                        help="your question; omit for an interactive prompt")
     p_how.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
@@ -2684,6 +3335,34 @@ def build_parser() -> argparse.ArgumentParser:
                              "have no original to restore)")
     p_rest.add_argument("--config", metavar="FILE")
 
+    p_undo = sub.add_parser(
+        "undo", help="restore the state immediately before the last run")
+    p_undo.add_argument("paths", nargs="*", default=["."],
+                        help="the project (default: current directory)")
+    p_undo.add_argument("--root", default=None)
+    p_undo.add_argument("--list", action="store_true",
+                        help="show the checkpoint tree instead")
+
+    p_cps = sub.add_parser(
+        "checkpoints", help="list time-travel checkpoints (and the active head)")
+    p_cps.add_argument("paths", nargs="*", default=["."],
+                       help="the project (default: current directory)")
+    p_cps.add_argument("--root", default=None)
+    p_cps.add_argument("--limit", type=int, default=0,
+                       help="show only the newest N checkpoints")
+    p_cps.add_argument("--json", action="store_true",
+                       help="print structured metadata")
+
+    p_checkout = sub.add_parser(
+        "checkout", help="restore the whole workspace or one file from a checkpoint")
+    p_checkout.add_argument("id", help="checkpoint id (a unique prefix works)")
+    p_checkout.add_argument("paths", nargs="*", default=["."],
+                            help="the project (default: current directory)")
+    p_checkout.add_argument("--root", default=None)
+    p_checkout.add_argument("--file", action="append", dest="files",
+                            metavar="PATH",
+                            help="restore only this file; repeatable")
+
     p_wt = sub.add_parser(
         "worktree",
         help="create/list/remove an isolated git worktree for risky runs")
@@ -2710,15 +3389,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_cost)
     p_cost.add_argument("--tps", type=float, default=25.0, help="your tokens/sec")
 
-    p_ask = sub.add_parser("ask", help="run one task")
+    p_ask = sub.add_parser("ask", help=t("cli.cmd.ask"),
+                           description=t("cli.cmd.ask_desc"))
     _add_common(p_ask)
-    p_ask.add_argument("-t", "--task", required=True)
-    p_ask.add_argument("--apply", action="store_true", help="write edits to disk")
+    p_ask.add_argument("-t", "--task", required=True, help=t("cli.opt.task"))
+    p_ask.add_argument("--apply", action="store_true", help=t("cli.opt.apply"))
     p_ask.add_argument("--review", action="store_true",
-                       help="open a side-by-side review page and apply from there")
+                       help=t("cli.opt.review"))
     p_ask.add_argument("--no-review", dest="no_review", action="store_true",
-                       help="never open the reviewer, even if config enables it")
-    p_ask.add_argument("--reindex", action="store_true", help="force a fresh index first")
+                       help=t("cli.opt.no_review"))
+    p_ask.add_argument("--reindex", action="store_true", help=t("cli.opt.reindex"))
     p_ask.add_argument("--continue", dest="continue_", action="store_true",
                        help="resume the newest ask checkpoint as context")
     p_ask.add_argument("--plan", action="store_true",
@@ -2744,9 +3424,24 @@ def build_parser() -> argparse.ArgumentParser:
                        help="after applied web edits, run the headless DOM "
                             "smoke check (needs allow_shell and Playwright); "
                             "flips verify_dom for this run")
+    p_ask.add_argument("--json", action="store_true",
+                       help="emit exactly one machine-readable summary object "
+                            "on stdout at run end (all human output moves to "
+                            "stderr); implies --no-review and never prompts. "
+                            "turns = model calls from the run's telemetry")
+    p_ask.add_argument("--verify-cmd", metavar="COMMAND", default=None,
+                       help="run this verification command once after an "
+                            "applied task; overrides auto_verify for this run "
+                            "only (in memory, never written to a config file)")
+    p_ask.add_argument("--save-trajectory", dest="save_trajectory",
+                       action="store_true",
+                       help="save this run's full ChatML transcript to "
+                            ".pedacito/trajectories/ (redacted, local only) "
+                            "for SFT/GRPO dataset filtering; same as "
+                            "record_trajectories = true for this run only")
 
     p_explain = sub.add_parser(
-        "explain", help="answer questions about an indexed project's code")
+        "explain", help=t("cli.cmd.explain"))
     _add_common(p_explain)
     p_explain.add_argument("-q", "--question", dest="question_opt", metavar="TEXT",
                            help="your question; omit for an interactive prompt")
@@ -2760,6 +3455,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--spec", metavar="FILE", default=None,
                        help="a larger spec document (.md/.txt); may be combined "
                             "with -t, or piped in via stdin")
+    p_new.add_argument("--image", action="append", default=[], metavar="FILE",
+                       help=t("cli.opt.image"))
     p_new.add_argument("--plan-only", dest="plan_only", action="store_true",
                        help="stop after the plan + header skeleton; implement "
                            "later with ordinary `ask --apply` runs")
@@ -2786,8 +3483,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--max-tasks", type=int, default=None,
                        help="(with --complex) stop after attempting this many tasks")
     p_new.add_argument("--max-minutes", type=int, default=None,
-                       help="(with --complex) stop before starting a task once "
-                            "this many minutes have elapsed (0 = no limit)")
+                       help="wall-clock minute cap for the whole run: stops "
+                            "between calls/files once this many minutes have "
+                            "elapsed (0 = no limit; default: auto_max_minutes)")
     p_new.add_argument("--keep-going", action="store_true",
                        help="(with --complex) continue past failed tasks "
                             "instead of stopping")
@@ -2876,7 +3574,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="assume yes: skip interactive confirmations, "
                              "including the Task-vs-Auto nudge")
 
-    p_chat = sub.add_parser("chat", help="interactive session")
+    p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
     p_chat.add_argument("--apply", action="store_true")
     p_chat.add_argument("--review", action="store_true")
@@ -2889,8 +3587,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "newline-delimited JSON (see `pedacito rpc`)")
 
     p_tui = sub.add_parser(
-        "tui", help="split-screen terminal UI with live activity, plan and "
-                    "telemetry panes")
+        "tui", help=t("cli.cmd.tui"))
     _add_common(p_tui, paths_nargs="?", dest="project")
     p_tui.add_argument("-t", "--task", default="",
                        help="run this task immediately after the screen opens")
@@ -2951,9 +3648,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_models = sub.add_parser(
-        "models", help="discover model servers, write profiles, calibrate")
-    p_models.add_argument("action", choices=["scan"],
-                          help="'scan' finds local servers and sets up profiles")
+        "models", help=t("cli.cmd.models"))
+    p_models.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                          default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    p_models.add_argument("action", nargs="?", default="show",
+                          choices=["scan", "show"],
+                          help="'scan' finds local servers and sets up "
+                               "profiles; 'show' (default) prints the active "
+                               "profile's snapshot and auto-tuned numbers")
+    p_models.add_argument("--json", action="store_true",
+                          help="with show: print structured JSON")
     p_models.add_argument("--url", action="append", default=[], metavar="URL",
                           help="server base url to probe; repeatable")
     p_models.add_argument("--api-key-env", metavar="VAR",
@@ -2979,7 +3683,9 @@ def build_parser() -> argparse.ArgumentParser:
                                "(default: the user config)")
 
     p_profiles = sub.add_parser(
-        "profiles", help="list model profiles and their measured scores")
+        "profiles", help=t("cli.cmd.profiles"))
+    p_profiles.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                            default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_profiles.add_argument("--recommend", action="store_true",
                             help="suggest a profile per role, with reasons")
     p_profiles.add_argument("--apply-roles", dest="apply_roles",
@@ -2991,6 +3697,24 @@ def build_parser() -> argparse.ArgumentParser:
                             help="with --apply-roles: do not ask for confirmation")
     p_profiles.add_argument("--config", metavar="FILE")
     p_profiles.add_argument("--profile", metavar="NAME")
+
+    p_profile = sub.add_parser(
+        "profile",
+        help="show the hardware snapshot, speed probe and active auto-tune")
+    prof_action = p_profile.add_mutually_exclusive_group()
+    prof_action.add_argument("--show", action="store_true",
+                             help="print the snapshot, last probe and tuning "
+                                  "(the default)")
+    prof_action.add_argument("--run", action="store_true",
+                             help="force one speed/prefill probe of the active "
+                                  "model")
+    prof_action.add_argument("--reset", action="store_true",
+                             help="drop cached measurements and set an "
+                                  "explicit auto_tune = true to false")
+    p_profile.add_argument("--json", action="store_true",
+                           help="print structured JSON (show/run)")
+    p_profile.add_argument("--config", metavar="FILE")
+    p_profile.add_argument("--profile", metavar="NAME")
 
     p_reset = sub.add_parser(
         "reset", help="wipe this project's Pedacito state (index, plans, "
@@ -3251,20 +3975,75 @@ def build_parser() -> argparse.ArgumentParser:
         p_bench.add_argument(flag)
     p_bench.add_argument("--root", default=None)
 
-    p_gui = sub.add_parser("gui", help="open the browser control panel")
+    p_gui = sub.add_parser("gui", help=t("cli.cmd.gui"))
     p_gui.add_argument("project", nargs="?", default=None,
                        help="project folder to open at startup")
     p_gui.add_argument("--profile", metavar="NAME",
                        help="model profile for that project")
     p_gui.add_argument("--port", type=int, default=0)
     p_gui.add_argument("--no-open", dest="open_browser", action="store_false")
+    p_gui.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                       default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+
+    p_image = sub.add_parser(
+        "image", help=t("cli.cmd.image"))
+    p_image.add_argument("prompt", help=t("cli.image.opt.prompt"))
+    p_image.add_argument("--out", metavar="FILE", default=None,
+                         help=t("cli.image.opt.out"))
+    p_image.add_argument("--size", metavar="WxH", default="",
+                         help=t("cli.image.opt.size"))
+    p_image.add_argument("--steps", type=int, default=0, metavar="N",
+                         help=t("cli.image.opt.steps"))
+    p_image.add_argument("--cfg-scale", dest="cfg_scale", type=float,
+                         default=None, metavar="F",
+                         help=t("cli.image.opt.cfg_scale"))
+    p_image.add_argument("--seed", type=int, default=None, metavar="N",
+                         help=t("cli.image.opt.seed"))
+    p_image.add_argument("--negative", metavar="TEXT", default="",
+                         help=t("cli.image.opt.negative"))
+    p_image.add_argument("--profile", metavar="NAME", default=None)
+    p_image.add_argument("--root", metavar="DIR", default=None)
+    p_image.add_argument("--config", metavar="FILE", default=None)
+    p_image.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                         default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    p_image.add_argument("--json", action="store_true",
+                         help=t("cli.image.opt.json"))
+
+    p_update = sub.add_parser("update", help=t("cli.cmd.update"))
+    p_update.add_argument("--run", action="store_true",
+                          help="run the detected upgrade command (pipx/pip); "
+                               "editable installs get git instructions")
+    p_update.add_argument("--config",
+                          help="config file to read check_for_updates from")
+    p_update.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                          default=argparse.SUPPRESS, help=t("cli.opt.lang"))
 
     return ap
 
 
 def _main(argv=None) -> int:
     _configure_stdio()
-    args = build_parser().parse_args(argv)
+    active_lang = _preparse_lang(argv)
+    args = build_parser(lang=active_lang).parse_args(argv)
+    if getattr(args, "lang", None):
+        i18n.set_current_lang(args.lang)
+    ask_json = bool(getattr(args, "cmd", "") == "ask"
+                    and getattr(args, "json", False))
+    if ask_json and getattr(args, "jsonl", False):
+        print("ERROR: --json and --jsonl are mutually exclusive: --json "
+              "prints exactly one summary object at run end, --jsonl streams "
+              "one event per line. Pick one.", file=sys.stderr)
+        return 2
+    # `ask --json` owns stdout for its single closing object. Point every
+    # human line (indexing, progress, diffs, warnings) at stderr from the
+    # start, reusing the same redirect the --jsonl path uses further down.
+    json_stdout = sys.stdout
+    if ask_json:
+        args.no_review = True
+        args.review = False
+        if hasattr(args, "review_plan"):
+            args.review_plan = False
+        sys.stdout = sys.stderr
     # A command whose positional is optional (`rpc`) parses it as one string;
     # every consumer below expects a list of paths.
     if isinstance(getattr(args, "paths", None), str):
@@ -3285,7 +4064,7 @@ def _main(argv=None) -> int:
             print(f"Setup failed: {e}", file=sys.stderr)
             return 2
         except KeyboardInterrupt:
-            print("\nSetup cancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.setup_cancelled"), file=sys.stderr)
             return 130
         return 0
 
@@ -3301,28 +4080,38 @@ def _main(argv=None) -> int:
         return _cmd_worktree(args)
     if args.cmd == "diagnose":
         return _cmd_diagnose(args)
-    # `models scan` discovers servers and writes profiles, so it must run
-    # before _config() (a first-run machine may have no valid config yet).
+    # `update` needs no model, index or vram budget -- and must work on a
+    # machine with no config at all (the opt-out then comes from env/user cfg).
+    if args.cmd == "update":
+        return _cmd_update(args)
+    # `models` and `profile` read hardware/measurement state and must work on
+    # a machine with no valid config (they only inspect the active profile).
     if args.cmd == "models":
-        return _cmd_models_scan(args)
+        if getattr(args, "action", "show") == "scan":
+            return _cmd_models_scan(args)
+        return _cmd_models_show(args)
+    if args.cmd == "profile":
+        return _cmd_profile(args)
     if args.cmd == "profiles":
         try:
             return _cmd_profiles(args, _light_config(args))
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
              "skills": _cmd_skills,
              "rename": _cmd_rename,
+             "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
+             "checkout": _cmd_checkout,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
-             "mcp": _cmd_mcp}
+             "mcp": _cmd_mcp, "image": _cmd_image}
     if args.cmd in light:
         try:
             return light[args.cmd](args)
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
 
     # `how` needs a model connection but no project, index or vram budget.
@@ -3337,7 +4126,7 @@ def _main(argv=None) -> int:
             print(f"\nERROR: {e}", file=sys.stderr)
             return 1
         except KeyboardInterrupt:
-            print("\nCancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.cancelled"), file=sys.stderr)
             return 130
 
     # `bench --list`/`--recent` need no model or vram; a real run loads the
@@ -3346,10 +4135,10 @@ def _main(argv=None) -> int:
         try:
             return _cmd_bench(args)
         except ConfigError as e:
-            print(f"Config error: {e}", file=sys.stderr)
+            print(i18n.t("cli.config_error", message=str(e)), file=sys.stderr)
             return 2
         except KeyboardInterrupt:
-            print("\nCancelled.", file=sys.stderr)
+            print("\n" + i18n.t("cli.cancelled"), file=sys.stderr)
             return 130
 
     # `explain` never builds an index; check before touching config or server.
@@ -3387,6 +4176,11 @@ def _main(argv=None) -> int:
         if args.cmd == "tui":
             from . import tui as tui_mod
             root = _root(args)
+            try:
+                cli_images = _load_cli_images(args)
+            except (OSError, ValueError) as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
             if getattr(args, "no_think", False):
                 cfg.disable_thinking = True
                 cfg.sources["disable_thinking"] = "--no-think"
@@ -3406,11 +4200,15 @@ def _main(argv=None) -> int:
                     root, cfg, headless=headless, stdin=sys.stdin,
                     stdout=sys.stdout, apply=bool(getattr(args, "apply", True)),
                     initial_task=str(getattr(args, "task", "") or ""),
-                    width=width, height=height)
+                    initial_images=cli_images,
+                    width=width, height=height,
+                    lang=getattr(args, "lang", None))
                 return session.run()
             return tui_mod.run_tui(
                 root, cfg, initial_task=str(getattr(args, "task", "") or ""),
-                headless=headless, stdin=sys.stdin, stdout=sys.stdout)
+                initial_images=cli_images,
+                headless=headless, stdin=sys.stdin, stdout=sys.stdout,
+                lang=getattr(args, "lang", None))
 
         if args.cmd == "calibrate":
             return _cmd_calibrate(args, cfg)
@@ -3568,14 +4366,20 @@ def _main(argv=None) -> int:
         # exist yet, and the skeleton gets its own in-memory index.
         if args.cmd == "new":
             from . import scaffold
+            try:
+                cli_images = _load_cli_images(args)
+            except (OSError, ValueError) as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
             root = Path(args.project).expanduser().resolve()
-            workspace.log_event(root, "command: " + " ".join(sys.argv))
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
             # One run-scoped collector covers refine + plan + skeleton +
             # implementation, so the closing line aggregates the whole build.
             events_mod.begin_run()
+            if cli_images:
+                cfg._task_images = cli_images
             try:
                 if getattr(args, "refine", False):
                     spec.text = _refine_task_text(cfg, client, root, spec.text,
@@ -3602,8 +4406,11 @@ def _main(argv=None) -> int:
                     keep_going=args.keep_going,
                     design=bool(getattr(args, "design", False)),
                     auto_install=bool(getattr(args, "auto_install", False)
-                                      or cfg.auto_install_deps))
+                                      or cfg.auto_install_deps),
+                    log_command="command: " + " ".join(sys.argv))
             finally:
+                if cli_images and hasattr(cfg, "_task_images"):
+                    delattr(cfg, "_task_images")
                 run_summary = events_mod.end_run()
             line = events_mod.run_line(run_summary)
             if line:
@@ -3639,8 +4446,13 @@ def _main(argv=None) -> int:
                 idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
                 limit=int(cfg.refresh_summaries))
         agent = Agent(idx, client, cfg)
+        # Quiet release check on a daemon thread (pedacito.update): warms the
+        # 24 h cache for `pdc update`; never blocks the task, silent when
+        # offline or opted out.
+        update_mod.check_for_update_async(cfg)
         from . import steering
-        if args.cmd in ("ask", "chat") and steering.Steering.available():
+        if args.cmd in ("ask", "chat") and steering.Steering.available() \
+                and not getattr(args, "json", False):
             cfg._interactive = True
             cfg._ask_user = steering.terminal_question
         elog = events_mod.get(_root(args), cfg)
@@ -3682,8 +4494,14 @@ def _main(argv=None) -> int:
         locals_ref = {"cfg": cfg, "client": client, "agent": agent, "idx": idx,
                       "resume_context": resume_context}
 
+        try:
+            cli_images = _load_cli_images(args)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
         if args.cmd == "explain":
-            return _cmd_explain(args, client, agent)
+            return _cmd_explain(args, client, agent, images=cli_images or None)
 
         def _run_task_inner(task: str, apply=None, refine=None, plan=None):
             """Execute one task end to end through the shared inner loop.
@@ -3708,10 +4526,16 @@ def _main(argv=None) -> int:
             else:
                 want_plan = bool(plan)
             if want_plan and not _wants_review(args, cfg):
-                code = plan_mod.run_planned(
-                    root, cfg, client, idx, task, apply=want_apply,
-                    confirm=_confirm_plan if getattr(args, "review_plan", False)
-                    else None, strict=bool(getattr(args, "strict", False)))
+                if cli_images:
+                    cfg._task_images = list(cli_images)
+                try:
+                    code = plan_mod.run_planned(
+                        root, cfg, client, idx, task, apply=want_apply,
+                        confirm=_confirm_plan if getattr(args, "review_plan", False)
+                        else None, strict=bool(getattr(args, "strict", False)))
+                finally:
+                    if cli_images and hasattr(cfg, "_task_images"):
+                        delattr(cfg, "_task_images")
                 fresh = index_mod.Index.load(root)
                 if fresh is not None:
                     idx = fresh
@@ -3728,7 +4552,8 @@ def _main(argv=None) -> int:
                     return tr
                 return code
             tr = loop.run_task(root, cfg, client, agent, idx, task,
-                               apply=want_apply, review=_wants_review(args, cfg))
+                               apply=want_apply, review=_wants_review(args, cfg),
+                               images=cli_images or None)
             locals_ref["last_result"] = tr
             idx = tr.idx
             agent.index = idx
@@ -3773,6 +4598,7 @@ def _main(argv=None) -> int:
             print("  [running as a single-pass Task (ask)]", file=sys.stderr)
 
         if args.cmd == "ask":
+            json_mode = bool(getattr(args, "json", False))
             ask_task = args.task
             if getattr(args, "max_minutes", None) is not None:
                 # BUG-218: a per-task wall-clock cap the caller can set
@@ -3785,24 +4611,101 @@ def _main(argv=None) -> int:
                 # `ask --verify-dom` as standing alone); allow_shell stays the
                 # boundary for gates armed by config or task text instead.
                 cfg._dom_user_consent = True
+            # --verify-cmd is an in-memory `auto_verify` override for this run
+            # (source: --verify-cmd); no config file is written.
+            verify_cmd = _ask_verify_command(args, cfg)
+            if getattr(args, "save_trajectory", False):
+                # One-run override; the config key itself is untouched.
+                cfg._save_trajectory = True
+                cfg.sources["record_trajectories"] = "--save-trajectory"
+            if verify_cmd and loop._task_named_tests(verify_cmd):
+                cfg._tests_user_consent = True
+            if json_mode:
+                # One run-scoped collector covers refine + the task, so turns/
+                # elapsed/tokens are exactly this run's model calls.
+                events_mod.begin_run()
             if getattr(args, "refine", False):
                 ask_task = _refine_task_text(cfg, client, root, ask_task,
                                              "ask")
+            run_summary: dict = {}
+            snapshot = _ask_workspace_snapshot(root) if json_mode else None
+            state = {"changed": None, "diff": "", "verify": None,
+                     "verify_ran": False, "emitted": False}
+
+            def _changes():
+                """Applied file changes, from the edit results when the run
+                applied them and from the pre-run workspace snapshot for the
+                planned path (which returns no per-edit records)."""
+                if state["changed"] is None:
+                    snap_changed, snap_diff = _ask_diff_since(root, snapshot)
+                    tr_now = locals_ref.get("last_result")
+                    res_changed, res_diff = _ask_result_changes(
+                        tr_now, bool(getattr(tr_now, "applied", False)))
+                    state["changed"] = sorted(set(snap_changed)
+                                              | set(res_changed))
+                    state["diff"] = res_diff or snap_diff
+                return state["changed"], state["diff"]
+
+            def _finish(code, ok=None):
+                """Emit the one --json object (once) and return the exit code;
+                exit-code semantics stay exactly as they were."""
+                if json_mode and not state["emitted"]:
+                    state["emitted"] = True
+                    try:
+                        changed, diff = _changes()
+                        tr_now = locals_ref.get("last_result")
+                        if ok is None:
+                            ok = _ask_task_ok(args, cfg, tr_now,
+                                              state["verify"],
+                                              state["verify_ran"])
+                        payload = _ask_json_report(
+                            cfg, run_summary, ok=ok, files_changed=changed,
+                            diff=diff, verify_passed=state["verify"])
+                        json_stdout.write(
+                            json.dumps(payload, ensure_ascii=False) + "\n")
+                        json_stdout.flush()
+                    finally:
+                        if snapshot is not None:
+                            snapshot.cleanup()
+                return code
+
             try:
-                run(ask_task)
-                try:
-                    save_checkpoint(ask_task)
-                except (OSError, ValueError):
-                    pass                 # checkpointing must not lose the task
+                outcome = run(ask_task)
+            except KeyboardInterrupt:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+                print("\nCancelled. Nothing further was applied; "
+                      "`pedacito restore` undoes anything already written.",
+                      file=sys.stderr)
+                return _finish(130, ok=False)
+            except LLMError:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+                _finish(1, ok=False)
+                raise
+            else:
+                if json_mode:
+                    run_summary.update(events_mod.end_run())
+            try:
+                save_checkpoint(ask_task)
+            except (OSError, ValueError):
+                pass                 # checkpointing must not lose the task
             except KeyboardInterrupt:
                 print("\nCancelled. Nothing further was applied; "
                       "`pedacito restore` undoes anything already written.",
                       file=sys.stderr)
-                return 130
+                return _finish(130, ok=False)
             print("\n" + _usage_line(client), file=sys.stderr)
             from . import replay as replay_mod
             replay_mod.report(client)
             tr = locals_ref.get("last_result")
+            changed, diff = _changes() if snapshot is not None else ([], "")
+            applied_work = bool(
+                getattr(args, "apply", False)
+                and (bool(changed) or getattr(tr, "applied", False)
+                     or (isinstance(outcome, int) and outcome == 0)))
+            state["verify"], state["verify_ran"] = _ask_verify_outcome(
+                root, cfg, verify_cmd, tr, applied=applied_work)
             note = _red_verdict_note(args, tr)
             if note:
                 print("\n" + note, file=sys.stderr)
@@ -3811,7 +4714,7 @@ def _main(argv=None) -> int:
             if strict:
                 print(f"ERROR: {strict}", file=sys.stderr)
                 elog.emit("exit", code=1)
-                return 1
+                return _finish(1, ok=False)
             # BUG-212: reserve exit 0 for runs that landed work. An --apply
             # run whose every edit block failed used to exit 0 with only
             # [FAIL] lines as the signal; an autonomous caller had no cheap
@@ -3828,7 +4731,7 @@ def _main(argv=None) -> int:
                           "(failed tasks, or --strict rejected a task's "
                           "edits/tests)", file=sys.stderr)
                     elog.emit("exit", code=1)
-                    return 1
+                    return _finish(1, ok=False)
                 if (getattr(args, "apply", False)
                         and not getattr(tr, "applied", False)
                         and not loop._is_noop(getattr(tr, "reply", "") or "")):
@@ -3838,22 +4741,26 @@ def _main(argv=None) -> int:
                               f"{len(results)} edit block(s) failed; zero "
                               "files were changed", file=sys.stderr)
                         elog.emit("exit", code=1)
-                        return 1
+                        return _finish(1, ok=False)
                     if getattr(tr, "unaccepted", None):
                         print("ERROR: NOTHING APPLIED: no task clause was "
                               "addressed by an edit", file=sys.stderr)
                         elog.emit("exit", code=1)
-                        return 1
+                        return _finish(1, ok=False)
             elog.emit("exit", code=0)
-            return 0
+            return _finish(0)
 
         if args.cmd == "auto":
             # One run-scoped collector covers refine + planning + every task
             # + post-run verification; the closing line aggregates the run.
             events_mod.begin_run()
+            if cli_images:
+                cfg._task_images = list(cli_images)
             try:
                 code = _cmd_auto(args, cfg, client, idx, root)
             finally:
+                if cli_images and hasattr(cfg, "_task_images"):
+                    delattr(cfg, "_task_images")
                 run_summary = events_mod.end_run()
             line = events_mod.run_line(run_summary)
             if line:

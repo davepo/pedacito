@@ -22,9 +22,13 @@ def test_provider_lookup_by_host():
         "https://dashscope.aliyuncs.com/compatible-mode/v1").cache_mode \
         == "explicit"
     anth = providers.provider_for("https://api.anthropic.com/v1")
-    assert anth.cache_mode == "unsupported"
+    assert anth.cache_mode == "explicit"
+    assert anth.max_markers == 4 and anth.min_tokens == 1024
+    assert anth.ttls == ("5m", "1h")
+    assert anth.usage_read == ("cache_read_input_tokens",)
+    assert anth.usage_write == ("cache_creation_input_tokens",)
     assert anth.omit_temperature and anth.json_mode == "schema"
-    assert not anth.native_tool_choice
+    assert anth.native_tool_choice
     # an unknown host gets the safe implicit fallback (never forced markers)
     assert providers.provider_for("http://localhost:1234/v1").cache_mode \
         == "implicit"
@@ -33,7 +37,7 @@ def test_provider_lookup_by_host():
 def test_cache_mode_setting_beats_the_table():
     cfg = Config()
     cfg.base_url = "https://api.anthropic.com/v1"
-    assert providers.cache_mode_for(cfg) == "unsupported"
+    assert providers.cache_mode_for(cfg) == "explicit"
     cfg.prompt_cache = "explicit"
     assert providers.cache_mode_for(cfg) == "explicit"
     cfg.prompt_cache = "off"
@@ -121,9 +125,9 @@ def test_cache_key_is_stable_and_differs_across_projects():
 
 def test_claude_quirks_apply_only_for_anthropic_and_users_can_override(
         tmp_path, monkeypatch):
-    """C4: api.anthropic.com gets json_mode='schema' and tool_mode='grammar'
-    from the provider table (never json_object, never forced tool_choice), and
-    an explicit user value still wins."""
+    """C4: api.anthropic.com gets json_mode='schema' from the provider table
+    (never json_object), a forced native tool_choice is accepted so tool_mode
+    stays at its default, and an explicit user value still wins."""
     from pedacito import config as config_mod
     monkeypatch.setattr(config_mod, "USER_CONFIG", tmp_path / "none.toml")
     proj = tmp_path / "p"

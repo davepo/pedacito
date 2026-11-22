@@ -23,13 +23,14 @@ import re
 import secrets
 import threading
 import webbrowser
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler
 from itertools import accumulate
 from pathlib import Path
 
-from . import fileio
+from . import fileio, security
 from .index import state_dir
 from .local_server import LocalHTTPServer
 
@@ -37,6 +38,7 @@ REVIEW_DIR = "reviews"
 CONTEXT = 4          # unchanged lines kept either side of a change
 COLLAPSE_OVER = 10   # runs of unchanged lines longer than this get folded
 TOKEN_RE = re.compile(r"\w+|\s+|.")
+MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
 
 
 @dataclass
@@ -202,10 +204,15 @@ def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
     if backup_dir is None or not Path(backup_dir).is_dir():
         return out
     for src in sorted(Path(backup_dir).rglob("*")):
-        if not src.is_file():
+        if src.is_symlink() or not src.is_file():
             continue
         rel = src.relative_to(backup_dir).as_posix()
-        cur = root / rel
+        try:
+            cur = security.resolve_safe_path(root, rel)
+        except (security.SecurityError, OSError, ValueError):
+            continue
+        if cur.is_symlink():
+            continue
         if not cur.is_file():
             # Backed up but gone from the tree: the run deleted (or renamed
             # away) this file. Show the deletion instead of skipping it.
@@ -482,7 +489,7 @@ if (write) {
 
 if (cancel) {
   cancel.addEventListener('click', function () {
-    post('/cancel', {}).then(function () {
+    post('/cancel', { nonce: window.NONCE }).then(function () {
       finish('Discarded', 'No files were changed.');
     }).catch(function () { finish('Discarded', 'No files were changed.'); });
   });
@@ -644,11 +651,16 @@ def request_allowed(handler, post: bool) -> bool:
 
 
 def read_json_body(handler) -> dict:
-    """Parse the request body as a JSON object; {} when absent or malformed."""
+    """Parse the request body as a JSON object; {} when absent, oversized, or malformed."""
     try:
         n = max(0, int(handler.headers.get("Content-Length") or 0))
-        body = json.loads(handler.rfile.read(n) or b"{}")
     except ValueError:
+        return {}
+    if n > MAX_JSON_BODY_BYTES:
+        return {}
+    try:
+        body = json.loads(handler.rfile.read(n) or b"{}")
+    except (ValueError, UnicodeDecodeError):
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -666,6 +678,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -683,36 +697,49 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(403, b'{"ok":false}', "application/json")
             return
         path = self.path.split("?")[0]
-        body = read_json_body(self)
-
-        if path == "/cancel":
-            self.server.outcome = ("cancelled", "No files were changed.")
-            if self.server.on_discard is not None:
-                try:
-                    self.server.on_discard()
-                except Exception as e:          # never hang the review loop
-                    self.server.outcome = ("cancelled", f"Discard failed: {e}")
-            self._send(200, b'{"ok":true}', "application/json")
-            self.server.done.set()
-            return
-
-        if path != "/apply":
+        if path not in ("/apply", "/cancel"):
             self._send(404, b'{"ok":false}', "application/json")
             return
+        body = read_json_body(self)
 
-        if body.get("nonce") != self.server.nonce:
+        raw_nonce = body.get("nonce")
+        expected_nonce = getattr(self.server, "nonce", None)
+        valid_nonce = (isinstance(raw_nonce, str)
+                       and isinstance(expected_nonce, str)
+                       and secrets.compare_digest(raw_nonce, expected_nonce))
+        if not valid_nonce:
             self._send(403, json.dumps({
                 "ok": False,
                 "detail": "This review is no longer valid. Re-run the task."
             }).encode(), "application/json")
             return
 
-        ok, detail = self.server.writer()
-        self._send(200, json.dumps({"ok": ok, "detail": detail}).encode(),
-                   "application/json")
-        if ok:
-            self.server.outcome = ("applied", detail)
-            self.server.done.set()
+        lock = getattr(self.server, "lock", None) or nullcontext()
+        with lock:
+            if self.server.done.is_set():
+                self._send(409, json.dumps({
+                    "ok": False,
+                    "detail": "This review has already been decided."
+                }).encode(), "application/json")
+                return
+
+            if path == "/cancel":
+                self.server.outcome = ("cancelled", "No files were changed.")
+                if self.server.on_discard is not None:
+                    try:
+                        self.server.on_discard()
+                    except Exception as e:          # never hang the review loop
+                        self.server.outcome = ("cancelled", f"Discard failed: {e}")
+                self.server.done.set()
+                self._send(200, b'{"ok":true}', "application/json")
+                return
+
+            ok, detail = self.server.writer()
+            if ok:
+                self.server.outcome = ("applied", detail)
+                self.server.done.set()
+            self._send(200, json.dumps({"ok": ok, "detail": detail}).encode(),
+                       "application/json")
 
 
 def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
@@ -740,9 +767,29 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     if not diffs:
         return False, ("Not written: this review contains no applicable "
                        "changes. Re-run the task to rebuild the review.")
+    root = Path(root)
+    safe_targets: dict[int, Path] = {}
+    for idx, fd in enumerate(diffs):
+        if Path(fd.rel).is_absolute():
+            return False, f"Not written: unsafe path {fd.rel!r} (must be relative)."
+        try:
+            safe_targets[idx] = security.resolve_safe_path(root, fd.rel)
+        except (security.SecurityError, OSError, ValueError) as exc:
+            return False, f"Not written: unsafe path {fd.rel!r}: {exc}"
+        for old in fd.renames_from:
+            old_rel = old.strip()
+            if not old_rel:
+                continue
+            if Path(old_rel).is_absolute():
+                return False, f"Not written: unsafe path {old_rel!r} (must be relative)."
+            try:
+                security.resolve_safe_path(root, old_rel)
+            except (security.SecurityError, OSError, ValueError) as exc:
+                return False, f"Not written: unsafe path {old_rel!r}: {exc}"
+
     stale = []
-    for fd in diffs:
-        p = root / fd.rel
+    for idx, fd in enumerate(diffs):
+        p = safe_targets[idx]
         if not p.exists():
             if fd.deleted:
                 continue         # already gone: the deletion's end state
@@ -756,21 +803,24 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         return False, ("Not written: " + ", ".join(stale) +
                        ". Re-run the task to rebuild the review.")
 
-    for fd in diffs:
-        p = root / fd.rel
+    for idx, fd in enumerate(diffs):
+        p = safe_targets[idx]
         if not fd.sha and p.exists() and _digest(p) != _sha(fd.after_text):
             return False, (f"Not written: {fd.rel} was created by something "
                            "else while this review was open. Re-run the task "
                            "to rebuild the review.")
 
     default_style = fileio.TextStyle()
-    existed_at_check = {fd.rel: (root / fd.rel).exists() for fd in diffs}
+    existed_at_check = {idx: safe_targets[idx].exists() for idx in range(len(diffs))}
     written = []
     deleted: list[str] = []
-    for fd in diffs:
+    for idx, fd in enumerate(diffs):
         if fd.removed_source:
             continue
-        p = root / fd.rel
+        try:
+            p = security.resolve_safe_path(root, fd.rel)
+        except (security.SecurityError, OSError, ValueError) as exc:
+            return False, f"Not written: unsafe path {fd.rel!r}: {exc}"
         if fd.deleted:
             # Sign-off on a deletion: back the exact bytes up, then unlink.
             if p.is_file() and p.resolve().is_relative_to(root.resolve()):
@@ -782,7 +832,7 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         try:
             if p.exists():
                 original, style = fileio.read(p, errors="replace")
-            elif existed_at_check[fd.rel]:
+            elif existed_at_check[idx]:
                 raise FileNotFoundError
             else:
                 original, style = "", default_style     # new file
@@ -793,7 +843,7 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
                            ". Re-run the task to rebuild the review.")
         if backup_dir is not None and original:
             dest = backup_dir / fd.rel
-            if not dest.exists():
+            if not dest.exists() and not dest.is_symlink():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 fileio.write(dest, original, style)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -802,11 +852,15 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
 
     removed = []
     rename_notes = []
-    root_resolved = root.resolve()
 
     def _remove_rename_source(old: str, expect_sha: str) -> None:
-        op = root / old
-        if not op.is_file() or not op.resolve().is_relative_to(root_resolved):
+        if not old or Path(old).is_absolute():
+            return
+        try:
+            op = security.resolve_safe_path(root, old)
+        except (security.SecurityError, OSError, ValueError):
+            return
+        if not op.is_file():
             return
         try:
             cur = _digest(op)
@@ -879,29 +933,35 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
                       on_discard=on_discard, diffs=diffs, task=task,
                       clause_texts=clause_texts)
     srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
-    srv.page = page
-    srv.nonce = nonce
-    srv.writer = writer
-    srv.on_discard = on_discard
-    srv.done = threading.Event()
-    srv.outcome = ("timeout", "Review window timed out; nothing was written.")
-    url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
-    if on_url:
-        on_url(url)
-    if open_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+    thread = None
     try:
-        srv.done.wait(timeout)
-    except KeyboardInterrupt:
-        srv.outcome = ("cancelled", "Interrupted; nothing was written.")
-    srv.shutdown()
-    srv.server_close()
-    return srv.outcome
+        srv.page = page
+        srv.nonce = nonce
+        srv.writer = writer
+        srv.on_discard = on_discard
+        srv.lock = threading.Lock()
+        srv.done = threading.Event()
+        srv.outcome = ("timeout", "Review window timed out; nothing was written.")
+        url = f"http://127.0.0.1:{srv.server_address[1]}/"
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        if on_url:
+            on_url(url)
+        if open_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        try:
+            srv.done.wait(timeout)
+        except KeyboardInterrupt:
+            srv.outcome = ("cancelled", "Interrupted; nothing was written.")
+        return srv.outcome
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        if thread is not None:
+            thread.join(timeout=2)
 
 
 def new_nonce() -> str:

@@ -73,6 +73,24 @@ def _py_files(files: list[str] | None) -> list[str]:
     return [f for f in (files or []) if f.lower().endswith((".py", ".pyi"))]
 
 
+def _project_py_files(root: Path) -> list[str]:
+    """Project Python files, using the same ignore rules as the index.
+
+    A project-wide check must never lint Pedacito's own state directory:
+    checkpoints and backups are full copies of old sources, so a stale error
+    there would make `pedacito diagnose` red forever even after the live file
+    was fixed.
+    """
+    from .select import Matcher, select as select_files
+
+    try:
+        found = select_files([str(root)], root, Matcher.from_files(root),
+                             exts={".py", ".pyi"})
+    except Exception:
+        return []
+    return [p.relative_to(root).as_posix() for p in found if p.is_file()]
+
+
 def _js_files(files: list[str] | None) -> list[str]:
     return [f for f in (files or [])
             if f.lower().endswith((".js", ".jsx", ".mjs", ".cjs", ".ts",
@@ -98,20 +116,22 @@ def detect(root, files: list[str] | None = None) -> list[Check]:
         _has(root, n) for n in ("pyproject.toml", "setup.py", "setup.cfg",
                                 "requirements.txt", "Pipfile"))
     if python_project:
-        targets = py_targets or ["."]
-        if _which("ruff"):
+        targets = py_targets or _project_py_files(root)
+        if targets and _which("ruff"):
             checks.append(Check("ruff", ["ruff", "check", "--output-format",
                                          "concise", *targets]))
-        elif _which("pyflakes"):
+        elif targets and _which("pyflakes"):
             checks.append(Check("pyflakes", ["pyflakes", *targets]))
-        elif _which("flake8"):
+        elif targets and _which("flake8"):
             checks.append(Check("flake8", ["flake8", *targets]))
         # a type checker only when the project configured one (an unconfigured
         # run on a whole tree is mostly noise a small model then chases)
-        if _py_typechecker_configured(root, "mypy") and _which("mypy"):
+        if targets and _py_typechecker_configured(root, "mypy") \
+                and _which("mypy"):
             checks.append(Check("mypy", ["mypy", "--no-error-summary",
                                          "--no-color-output", *targets]))
-        elif _py_typechecker_configured(root, "pyright") and _which("pyright"):
+        elif targets and _py_typechecker_configured(root, "pyright") \
+                and _which("pyright"):
             checks.append(Check("pyright", ["pyright", *targets]))
 
     if _has(root, "package.json"):

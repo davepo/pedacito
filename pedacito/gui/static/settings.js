@@ -4,10 +4,13 @@
 (function () {
   'use strict';
   var PDC = window.PDC, h = PDC.h;
+  var t = function (key, vars, fb) {
+    return (PDC.t ? PDC.t(key, vars, fb) : (fb !== undefined ? fb : key));
+  };
 
   var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'timeout',
     'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review',
-    'scout_profile', 'specialties', 'enforce_json_schema'];
+    'scout_profile', 'specialties', 'enforce_json_schema', 'language', 'llm_reply_language'];
   // Profile overrides that the editor surfaces up front, in their own boxed
   // group: how the model thinks, plans, and lands edits (see modelcard.choose
   // \u2014 these are exactly the keys a calibration writes into a profile).
@@ -20,7 +23,8 @@
   // Model discovery lives outside X: its state survives switching tabs, and a
   // scan is read-only, so re-rendering must not throw the results away.
   var SCAN = { busy: false, rows: [], err: '', custom: '', vram: '',
-               pick: {}, name: {}, def: '', importing: false };
+               pick: {}, name: {}, def: '', importing: false,
+               collapsed: false, collapsedGroups: {} };
   // Same for the Auto-Tune wizard: the answers and the preview survive
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
@@ -43,6 +47,9 @@
              probed: false, verified: false, err: '', models: [],
              pick: {}, name: {}, def: '', search: '', importing: false,
              modal: null, body: null };
+  // Updates tab: the last GET/POST /api/update answer. Kept outside X so
+  // switching to another tab and back does not fire another check.
+  var UPD = { data: null, loaded: false, busy: false, err: '' };
 
   PDC.openSettings = function (opts) {
     opts = opts || {};
@@ -50,9 +57,19 @@
           tab: opts.tab || 'discovery', profile: opts.profile || '',
           target: opts.target || '', pending: {}, models: [],
           search: opts.search || '', focusSearch: !!opts.search };
-    X.modal = PDC.modal('Settings', h('div', { class: 'tip', text: 'Loading\u2026' }), [{ label: 'Close' }]);
+    UPD = { data: null, loaded: false, busy: false, err: '' };
+    X.modal = PDC.modal(t('gui.settings', null, 'Settings'), h('div', { class: 'tip', text: t('common.loading', null, 'Loading\u2026') }), [{ label: t('common.close', null, 'Close') }]);
     X.body = X.modal.body;
     PDC.api('/api/settings').then(function (d) { X.data = d; pickDefaults(); render(); });
+  };
+
+  PDC.rerenderSettings = function () {
+    if (!X || !X.data || !X.body || !document.body.contains(X.body)) return;
+    if (X.modal && X.modal.el) {
+      var titleEl = X.modal.el.querySelector('.modal-head h3, .modal-head b, header h3');
+      if (titleEl) titleEl.textContent = t('gui.settings', null, 'Settings');
+    }
+    render();
   };
 
   function file() { return X.data[X.which]; }
@@ -83,17 +100,19 @@
   // the built-in default.
   function control(item, value, onchange, placeholder, inheritLabel) {
     var t = item.type, el;
-    if (item.name === 'scout_profile') {
-      // Scout/architect routing: pick the fast profile that answers gather's
-      // lookup steps. The server-side schema is cached across projects, so
-      // the profile choices are read here from the settings payload instead.
+    if (item.name === 'scout_profile' || item.name === 'architect_provider') {
+      // Scout/architect routing and the hybrid Stage-1 planner: pick a
+      // profile by name. The server-side schema is cached across projects,
+      // so the profile choices are read here from the settings payload.
       var names = [];
       ['user', 'project'].forEach(function (k) {
         var pf = (X.data && X.data[k] && X.data[k].profiles) || {};
         Object.keys(pf).forEach(function (n) { if (names.indexOf(n) < 0) names.push(n); });
       });
       if (value && names.indexOf(value) < 0) names.push(value);
-      var sopts = [['', 'None (use active profile)']]
+      var noneLabel = item.name === 'architect_provider'
+        ? 'None (single-model runs)' : 'None (use active profile)';
+      var sopts = [['', noneLabel]]
         .concat(names.map(function (n) { return [n, n]; }));
       if (inheritLabel) sopts = [['__inherit__', inheritLabel]].concat(sopts);
       el = h('select', {}, sopts.map(function (o) { return h('option', { value: o[0], text: o[1] }); }));
@@ -220,38 +239,72 @@
     var d = X.data, f = file();
     var body = PDC.clear(X.body);
     var which = h('div', { class: 'row', style: 'margin-bottom:10px' },
-      h('b', { text: 'Editing:' }),
-      radio('user', 'User config'), radio('project', 'This project (.pedacito.toml)', !d.project_open),
+      h('b', { text: t('settings.editing', null, 'Editing:') }),
+      radio('user', t('settings.user_config', null, 'User config')), radio('project', t('settings.project_config', null, 'This project (.pedacito.toml)'), !d.project_open),
       h('span', { class: 'mono muted small-text grow', text: f.available ? f.path : '' }));
     body.appendChild(which);
     if (!f.available) { body.appendChild(h('div', { class: 'note-box', text: f.error })); return; }
     if (X.which === 'user' && !f.exists) { body.appendChild(wizard()); return; }
     if (X.which === 'project' && !f.exists) {
-      body.appendChild(h('div', { class: 'note-box', text: 'This project has no config file yet. Saving a setting creates .pedacito.toml in the project root (it layers on top of your user config).' }));
+      body.appendChild(h('div', { class: 'note-box', text: t('settings.no_project_config', null, 'This project has no config file yet. Saving a setting creates .pedacito.toml in the project root (it layers on top of your user config).') }));
     }
     if (f.error) body.appendChild(h('div', { class: 'note-box err', text: f.error }));
     if (X.which === 'project' && f.exists && f.trusted === false) {
       body.appendChild(h('div', { class: 'note-box' },
-        'This project config is not trusted yet, so its execution settings (' + f.exec_fields.join(', ') + ') are ignored until you approve it. ',
-        h('button', { class: 'small', text: 'Review & trust\u2026', onclick: trust })));
+        t('settings.untrusted_project', { fields: f.exec_fields.join(', ') }, 'This project config is not trusted yet, so its execution settings (' + f.exec_fields.join(', ') + ') are ignored until you approve it. '),
+        h('button', { class: 'small', text: t('settings.review_trust', null, 'Review & trust\u2026'), onclick: trust })));
     }
     var tabs = h('div', { class: 'stabs' });
-    [['discovery', 'Model discovery'], ['profiles', 'Profiles'], ['all', 'All settings'],
-     ['autotune', 'Auto-Tune'], ['mcp', 'MCP Servers'], ['raw', 'Raw file / reset']].forEach(function (t) {
-      tabs.appendChild(h('button', { class: X.tab === t[0] ? 'on' : '', text: t[1], onclick: function () { X.tab = t[0]; X.pending = {}; render(); } }));
+    [['discovery', t('settings.tab.discovery', null, 'Model discovery')],
+     ['profiles', t('settings.tab.profiles', null, 'Profiles')],
+     ['all', t('settings.tab.all', null, 'All settings')],
+     ['autotune', t('settings.tab.autotune', null, 'Auto-Tune')],
+     ['mcp', t('settings.tab.mcp', null, 'MCP Servers')],
+     ['updates', t('settings.tab.updates', null, 'Updates')],
+     ['raw', t('settings.tab.raw', null, 'Raw file / reset')]].forEach(function (tb) {
+      tabs.appendChild(h('button', { class: X.tab === tb[0] ? 'on' : '', text: tb[1], onclick: function () { X.tab = tb[0]; X.pending = {}; render(); } }));
     });
     body.appendChild(tabs);
-    body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px' },
-      h('span', { class: 'muted', text: 'Quick links:' }),
-      h('button', { class: 'ghost small', text: 'Skills library & creator\u2026',
-        title: 'browse built-in, user and project skills; write or auto-draft custom ones',
+    var langSel = h('select', { class: 'small', title: t('settings.language_hint', null, 'Choose the language for menus and messages.') },
+      h('option', { value: 'en', text: 'English (en)' }),
+      h('option', { value: 'es', text: 'Espa\u00f1ol (es)' }));
+    langSel.value = (PDC.lang === 'es') ? 'es' : 'en';
+    langSel.addEventListener('change', function () {
+      if (PDC.setLang) PDC.setLang(langSel.value, true);
+    });
+    var replyVal = (d.resolved && d.resolved.llm_reply_language && d.resolved.llm_reply_language.value) || 'match_ui';
+    var replySel = h('select', { class: 'small', title: t('settings.llm_reply_language_hint', null, 'Language the model writes its prose explanations in.') },
+      h('option', { value: 'match_ui', text: t('settings.reply_lang.match_ui', null, 'Match UI (match_ui)') }),
+      h('option', { value: 'auto', text: t('settings.reply_lang.auto', null, 'Auto (auto)') }),
+      h('option', { value: 'en', text: 'English (en)' }),
+      h('option', { value: 'es', text: 'Espa\u00f1ol (es)' }));
+    replySel.value = replyVal;
+    replySel.addEventListener('change', function () {
+      save({ file: 'user', profile: null, changes: { llm_reply_language: replySel.value }, removes: [] }, '/api/settings/set');
+    });
+    body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px;gap:8px;flex-wrap:wrap' },
+      h('span', { class: 'muted', text: t('settings.language', null, 'Interface language') + ':' }), langSel,
+      h('span', { class: 'muted', text: t('settings.llm_reply_language', null, 'Model reply language') + ':' }), replySel,
+      h('span', { class: 'muted', style: 'margin-left:auto', text: t('settings.quick_links', null, 'Quick links:') }),
+      h('button', { class: 'ghost small', text: t('gui.menu.skills', null, 'Skills library & creator\u2026'),
+        title: t('gui.menu.skills_title', null, 'browse built-in, user and project skills; write or auto-draft custom ones'),
         onclick: function () { if (PDC.skillsDialog) PDC.skillsDialog(); } })));
     if (X.tab === 'discovery') body.appendChild(discoveryTab());
     else if (X.tab === 'profiles') body.appendChild(profilesTab());
     else if (X.tab === 'all') body.appendChild(allTab());
     else if (X.tab === 'autotune') body.appendChild(autotuneTab());
     else if (X.tab === 'mcp') body.appendChild(mcpTab());
+    else if (X.tab === 'updates') body.appendChild(updatesTab());
     else body.appendChild(rawTab());
+    // Project links live below every tab and stay interface furniture: they
+    // are never part of a task prompt or sent to a model.
+    body.appendChild(h('div', { class: 'muted small-text', style: 'margin-top:14px' },
+      h('span', { text: 'Web: ' }),
+      h('a', { href: 'https://www.pedacito.dev', target: '_blank', rel: 'noopener',
+        style: 'color:inherit', text: 'pedacito.dev' }),
+      h('span', { text: ' \u00b7 Contact: ' }),
+      h('a', { href: 'mailto:contact@pedacito.dev', style: 'color:inherit',
+        text: 'contact@pedacito.dev' })));
   }
   function radio(which, label, disabled) {
     return h('label', { class: 'chk' }, h('input', { type: 'radio', name: 'which', checked: X.which === which, disabled: !!disabled,
@@ -592,6 +645,7 @@
       var sub = (p.model || '(no model set)') + (p.base_url ? ' @ ' + p.base_url : '');
       var cal = ((X.data && X.data.calibration) || {})[n] || {};
       var hosted = !!cal.is_hosted;
+      var isImg = !!cal.is_image_model;
       // Two-part card: the identity block (name + pills over the model line)
       // shrinks and ellipsises; the action buttons never wrap mid-label.
       var row = h('div', { class: 'prow' },
@@ -600,14 +654,16 @@
             h('b', { class: 'prow-name ellip', text: n, title: 'open this profile', style: 'cursor:pointer', onclick: function () { gotoProfile(n); } }),
             n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
             n === defName ? h('span', { class: 'tag', text: 'default' }) : null,
+            isImg ? h('span', { class: 'tag image', text: '\uD83C\uDFA8 image' }) : null,
             hosted ? h('span', { class: 'tag hosted', text: '\u2601 hosted' }) : null),
           h('div', { class: 'prow-sub mono ellip', text: sub, title: sub }),
           h('div', { class: 'prow-cal small-text ' + (hosted ? 'muted' : cal.calibrated ? (cal.calibrated_stale ? 'stale' : 'ok') : 'muted'),
             text: calLine(cal), title: calTitle(cal) })),
         h('span', { class: 'prow-actions' },
-          h('button', { class: 'small', text: 'Calibrate', disabled: hosted,
+          h('button', { class: 'small', text: isImg ? t('settings.profile.probe_image', null, 'Probe image') : 'Calibrate', disabled: hosted,
             title: hosted ? 'Calibration disabled for hosted models'
-                          : 'Measure this model and store the scores in its model card',
+                          : (isImg ? t('settings.profile.probe_image_title', null, 'Run a fast 1-call image check to verify endpoint readiness and latency')
+                                   : 'Measure this model and store the scores in its model card'),
             onclick: function () { calibrate(n, 'quick'); } }),
           n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
             : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
@@ -628,6 +684,13 @@
   // The calibration line under each profile row: when it was measured, the
   // score and the specialties the card tagged -- or the honest empty state.
   function calLine(cal) {
+    if (cal.is_image_model) {
+      if (cal.calibrated && (cal.image_ok || cal.card_score > 0)) {
+        var lat = cal.image_latency_s ? ' (' + Number(cal.image_latency_s).toFixed(1) + 's)' : '';
+        return t('gui.cal.image_verified', { latency: lat }, '\uD83C\uDFA8 Image \u00B7 \u2713 Verified' + lat);
+      }
+      return t('gui.cal.image_badge', null, '\uD83C\uDFA8 Image');
+    }
     if (cal.is_hosted) return '\u2601 Hosted API \u2014 uses provider-table defaults automatically';
     if (!cal.calibrated) return 'Not calibrated yet';
     var line = 'Calibrated on ' + cal.calibrated_at + ' (score: ' + Number(cal.card_score || 0).toFixed(2);
@@ -638,6 +701,13 @@
     return line;
   }
   function calTitle(cal) {
+    if (cal.is_image_model) {
+      return cal.calibrated
+        ? t('gui.cal.image_verified_tip', { at: cal.calibrated_at || '' },
+            'Image generation model \u2014 verified ' + (cal.calibrated_at || '') + '.')
+        : t('gui.cal.image_tip', null,
+            'Image generation model \u2014 run Probe image to verify endpoint readiness.');
+    }
     if (cal.is_hosted) return 'Calibration disabled for hosted models';
     if (!cal.calibrated) return 'Run Calibrate to measure this model and tune its defaults';
     var bits = ['score ' + Number(cal.card_score || 0).toFixed(2),
@@ -668,6 +738,37 @@
     if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
     if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
     if (!SCAN.rows.length) return box;
+    var n = pickedRows().length;
+    box.appendChild(h('div', { class: 'row scan-header' },
+      h('span', { class: 'scan-header-title grow', text: t('settings.scan.header', { total: SCAN.rows.length, selected: n }, 'Scanned models (' + SCAN.rows.length + ') \u00b7 ' + n + ' selected') }),
+      h('button', {
+        id: 'scanCollapseBtn',
+        type: 'button',
+        class: 'small ghost',
+        'aria-expanded': SCAN.collapsed ? 'false' : 'true',
+        text: SCAN.collapsed
+          ? '\u25B8 ' + t('settings.scan.show_list', null, 'Show list')
+          : '\u25BE ' + t('settings.scan.hide_list', null, 'Hide list'),
+        onclick: function () { SCAN.collapsed = !SCAN.collapsed; render(); }
+      }),
+      h('button', {
+        id: 'scanCloseBtn',
+        type: 'button',
+        class: 'small ghost',
+        title: t('settings.scan.close_title', null, 'Dismiss scanned models list'),
+        text: '\u2715 ' + t('settings.scan.close', null, 'Close'),
+        onclick: function () {
+          SCAN.rows = [];
+          SCAN.pick = {};
+          SCAN.name = {};
+          SCAN.def = '';
+          SCAN.err = '';
+          SCAN.collapsed = false;
+          SCAN.collapsedGroups = {};
+          render();
+        }
+      })));
+    if (SCAN.collapsed) return box;
     // pick whole sets at once: with 15+ GGUFs on one server you tick the two
     // you want by unselecting everything, not by hunting fourteen checkboxes
     box.appendChild(h('div', { class: 'row', style: 'margin:10px 0 4px' },
@@ -681,15 +782,28 @@
     SCAN.rows.forEach(function (r, i) {
       var k = rowKey(r);
       var skey = normUrl(r.server_url);
+      var grpCollapsed = !!SCAN.collapsedGroups[skey];
       if (skey !== last) {
         last = skey;
         var grp = groupRows(skey);
         tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7' },
           h('div', { class: 'row sg-group' },
-            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url }),
+            h('button', {
+              type: 'button',
+              class: 'small ghost scan-fold',
+              'aria-expanded': grpCollapsed ? 'false' : 'true',
+              title: t('settings.scan.toggle_group', null, "Expand or collapse this server's models"),
+              text: grpCollapsed ? '\u25B8' : '\u25BE',
+              onclick: function () {
+                SCAN.collapsedGroups[skey] = !SCAN.collapsedGroups[skey];
+                render();
+              }
+            }),
+            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url + (grpCollapsed ? '  (' + grp.length + ')' : '') }),
             h('button', { class: 'small ghost', text: 'select all', onclick: function () { setPicks(grp, true); } }),
             h('button', { class: 'small ghost', text: 'unselect', onclick: function () { setPicks(grp, false); } })))));
       }
+      if (grpCollapsed) return;
       var name = h('input', { type: 'text', class: 'mono', value: SCAN.name[k] === undefined ? r.suggested_profile_name : SCAN.name[k], disabled: r.already_imported });
       name.addEventListener('input', function () {
         var fixed = sanitizeName(name.value);
@@ -705,18 +819,19 @@
         h('td', { class: 'mono small-text', text: r.model_id, title: r.model_id }),
         h('td', { class: 'small-text', text: r.context_length ? PDC.fmtInt(r.context_length) : '\u2014' }),
         h('td', { class: 'small-text muted', text: fmtSize(r.size_bytes) + (r.quant ? ' ' + r.quant : '') }),
-        h('td', {}, r.already_imported ? h('span', { class: 'tag', text: 'already imported' })
+        h('td', {},
+          r.is_image_model ? h('span', { class: 'tag image', text: '\uD83C\uDFA8 image' }) : null,
+          r.already_imported ? h('span', { class: 'tag', text: 'already imported' })
           : r.loaded ? h('span', { class: 'tag act', text: 'loaded' }) : null)));
     });
     box.appendChild(h('table', { class: 'scan-table' }, h('thead', {}, head), tbody));
-    var n = pickedRows().length;
     box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
       h('button', { class: 'primary', text: SCAN.importing ? 'Importing\u2026' : 'Import Selected (' + n + ')', disabled: !n || SCAN.importing, onclick: doImport }),
       h('span', { class: 'muted small-text grow', text: 'each import becomes an editable profile, so you can tune per-model limits afterwards' })));
     return box;
   }
   function doScan() {
-    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; render();
+    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; SCAN.collapsed = false; SCAN.collapsedGroups = {}; render();
     var body = {};
     var extra = (SCAN.custom || '').trim();
     if (extra) body.urls = [extra];
@@ -754,6 +869,7 @@
       SCAN.name[k] = pname;
       return { profile_name: pname, base_url: r.server_url,
         model: r.model_id, context_length: r.context_length || 0, vram_gb: vram,
+        is_image_model: !!r.is_image_model,
         set_default: SCAN.def === k };
     });
     var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
@@ -768,6 +884,7 @@
         var k = rowKey(r);
         if (done[SCAN.name[k] || r.suggested_profile_name]) { r.already_imported = true; SCAN.pick[k] = false; if (SCAN.def === k) SCAN.def = ''; }
       });
+      SCAN.collapsed = true;
       X.data = j; pickDefaults(); render();
       PDC.toast((j.imported || []).length + ' profile(s) imported' + ((j.skipped || []).length ? ', ' + j.skipped.length + ' already there' : '') + (j.default_profile ? '; default is "' + j.default_profile + '"' : ''));
       PDC.refreshState();
@@ -780,13 +897,18 @@
       PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + (p.model || '') + ') is a hosted provider model and uses provider-table defaults automatically.', true);
       return;
     }
-    PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
-      ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
-      : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.'), 'Run it').then(function (ok) {
+    var msg = cal.is_image_model
+      ? t('gui.cal.probe_image_confirm', { name: name },
+          'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
+      : 'Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
+          ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
+          : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.');
+    var okLabel = cal.is_image_model ? t('gui.cal.probe_image', null, 'Probe image') : 'Run it';
+    PDC.confirm(msg, okLabel).then(function (ok) {
       if (!ok) return;
       PDC.api('/api/models/calibrate', { profile: name, mode: mode }).then(function (j) {
         if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-        PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+        PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
         PDC.refreshState();
       });
     });
@@ -1495,6 +1617,109 @@
     return box;
   }
 
+  // ----- updates ---------------------------------------------------------------------
+  // R5.2: GET /api/update is the last known answer (cache included);
+  // POST /api/update/check is the synchronous manual check, which bypasses
+  // the 24 h cache. With the opt-out set the server answers "disabled"
+  // without a network call, so the button stays disabled and the reason is
+  // on screen.
+  function loadUpdateState() {
+    if (UPD.busy) return;
+    UPD.busy = true;
+    PDC.api('/api/update').then(function (j) {
+      UPD.busy = false; UPD.loaded = true; UPD.data = j; UPD.err = ''; render();
+    }, function () {
+      UPD.busy = false; UPD.loaded = true;
+      UPD.err = 'The GUI server did not answer.';
+      render();
+    });
+  }
+
+  function checkUpdateNow() {
+    UPD.busy = true; UPD.err = ''; render();
+    PDC.api('/api/update/check', {}).then(function (j) {
+      UPD.busy = false; UPD.loaded = true;
+      UPD.data = UPD.data || {};
+      if (j && j.update) {
+        UPD.data.update = j.update;
+        if (j.update.detail === 'disabled') UPD.data.check_for_updates = false;
+      }
+      render();
+      PDC.refreshState();              // the banner reads the same notice
+    }, function () {
+      UPD.busy = false; UPD.err = 'The GUI server did not answer.'; render();
+    });
+  }
+
+  function checkedAtText(sec) {
+    if (!sec) return '';
+    try { return new Date(sec * 1000).toLocaleString(); }
+    catch (e) { return ''; }
+  }
+
+  function updatesTab() {
+    if (!UPD.loaded && !UPD.busy) loadUpdateState();
+    var data = UPD.data || {};
+    var info = data.update || null;
+    var enabled = data.check_for_updates !== false;
+    var installed = (info && info.current) || data.current || 'unknown';
+    var latest = (!enabled || !(info && info.ok)) ? '\u2014' : info.latest;
+    var when = checkedAtText(info && info.checked_at);
+    var source;
+    if (!enabled) {
+      source = 'Update checks are disabled, so no answer was requested (no network call).';
+    } else if (!info) {
+      source = 'No check has landed in this session yet.';
+    } else if (info.detail === 'offline') {
+      source = 'PyPI was unreachable (offline); nothing was changed.';
+    } else if (info.detail === 'disabled') {
+      source = 'Update checks are disabled, so no answer was requested (no network call).';
+    } else if (info.ok && info.cached) {
+      source = '24 h cache' + (when ? ' \u2014 checked ' + when : '') + '.';
+    } else if (info.ok) {
+      source = 'fresh check' + (when ? ' \u2014 checked ' + when : '') + '.';
+    } else {
+      source = 'No answer yet.';
+    }
+    var status;
+    if (!enabled) {
+      status = 'Enable check_for_updates to see whether a newer release exists.';
+    } else if (info && info.ok && info.update_available) {
+      status = 'Pedacito v' + info.latest + ' is available \u2014 you have ' + installed + '.';
+    } else if (info && info.ok) {
+      status = 'You are up to date.';
+    } else if (info && info.detail === 'offline') {
+      status = 'Could not reach PyPI. Try again when online.';
+    } else {
+      status = 'Run a manual check to compare with the latest release.';
+    }
+    return h('div', {},
+      h('div', { class: 'note-box' },
+        h('b', { text: 'Release updates' }),
+        h('div', { class: 'small-text',
+          text: 'The manual check asks the public PyPI metadata for pedacito now (one anonymous GET, 2 s timeout) and stores the answer in the same 24 h cache the startup check uses. The Update banner reads the same notice.' })),
+      !enabled ? h('div', { class: 'note-box' },
+        h('b', { text: 'Update checks are turned off' }),
+        h('div', { class: 'small-text',
+          text: 'check_for_updates = false is set in the user config (or PEDACITO_CHECK_FOR_UPDATES=false is exported). No network call is made and no upgrade command can start while this is off. Set check_for_updates = true in [universal] (or remove the environment override), then reopen Settings.' })) : null,
+      h('div', { class: 'form', style: 'margin-top:10px' },
+        h('label', { text: 'Installed' }), h('div', { class: 'mono', text: installed }),
+        h('label', { text: 'Latest' }), h('div', { class: 'mono', text: latest }),
+        h('label', { text: 'Answer source' }), h('div', { class: 'small-text', text: source })),
+      h('div', { class: 'row', style: 'margin-top:12px' },
+        h('button', { class: 'primary', text: UPD.busy ? 'Checking\u2026' : 'Check for updates',
+          disabled: !enabled || UPD.busy,
+          title: enabled ? 'ask PyPI now, bypassing the 24 h cache' : 'update checks are disabled',
+          onclick: checkUpdateNow }),
+        h('span', { class: 'muted small-text grow', text: status })),
+      info && enabled && info.ok && info.update_available && info.instructions
+        ? h('div', { class: 'note-box', style: 'margin-top:10px' },
+            h('b', { text: 'Upgrade' }),
+            h('div', { class: 'small-text', text: info.instructions }))
+        : null,
+      UPD.err ? h('div', { class: 'note-box err', text: UPD.err }) : null);
+  }
+
   // ----- all settings ----------------------------------------------------------------
   function allTab() {
     var f = file();
@@ -1502,9 +1727,9 @@
     var targetSel = h('select', {}, targets.map(function (t) { return h('option', { value: t[0], text: t[1] }); }));
     targetSel.value = X.target;
     targetSel.addEventListener('change', function () { X.target = targetSel.value; X.pending = {}; render(); });
-    var search = h('input', { type: 'text', placeholder: 'search settings\u2026', value: X.search, class: 'grow' });
+    var search = h('input', { type: 'text', placeholder: t('settings.search_ph', null, 'search settings\u2026'), value: X.search, class: 'grow' });
     var holder = h('div');
-    var saveBtn = h('button', { id: 'savePending', class: 'primary', text: 'No changes', disabled: true, onclick: function () { commit(X.target || null); } });
+    var saveBtn = h('button', { id: 'savePending', class: 'primary', text: t('settings.no_changes', null, 'No changes'), disabled: true, onclick: function () { commit(X.target || null); } });
     var cur = X.target ? (f.profiles[X.target] || {}) : (f.settings || {});
     function fill() {
       PDC.clear(holder);

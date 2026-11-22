@@ -19,6 +19,9 @@ The docs and the built-in `how` index must keep pace with the code:
 * the creative/design pass (--creative, /creative, the ✨ Creative
   composer toggle, the 🌐 Live Preview tab, hosted sampling omission)
   stays documented in both guides and in the how-cards.
+* the docs ownership split (docs/ is canonical reference, the root guides
+  are canonical walkthroughs, README indexes both) stays pinned in README,
+  docs/ARCHITECTURE.md, each root guide and CHANGELOG.
 """
 from __future__ import annotations
 
@@ -31,11 +34,27 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import how_index, skills
+from pedacito import how_index, llm, profiler, skills
 from pedacito.cli import build_parser
+from pedacito.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
-README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def _readme_corpus() -> str:
+    """The user-facing reference: README.md plus the modular guides in docs/.
+    The README is a summary; the detailed reference lives in docs/."""
+    paths = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    return "\n\n".join(p.read_text(encoding="utf-8") for p in paths)
+
+
+def _doc_text(doc_name: str) -> str:
+    if doc_name == "README.md":
+        return _readme_corpus()
+    return (ROOT / doc_name).read_text(encoding="utf-8")
+
+
+README = _readme_corpus()
 QUICKSTART = (ROOT / "QUICKSTART.md").read_text(encoding="utf-8")
 MODEL_GUIDE = (ROOT / "MODEL_GUIDE.md").read_text(encoding="utf-8")
 
@@ -72,7 +91,7 @@ def _norm(text: str) -> str:
 
 @pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
 def test_every_cli_subcommand_is_documented(doc_name):
-    text = (ROOT / doc_name).read_text(encoding="utf-8")
+    text = _doc_text(doc_name)
     missing = [name for name in _subcommand_names()
                if not _mentioned(text, name)]
     assert not missing, f"{doc_name} does not mention: {missing}"
@@ -91,8 +110,41 @@ def test_stale_benchmark_phrase_is_gone_from_gui_scripts():
         assert STALE_PHRASE not in path.read_text(encoding="utf-8"), path
 
 
+def test_hosted_probe_claim_matches_the_code(monkeypatch):
+    """R2.1: "Probes never run for hosted endpoints" is a behavioral claim.
+
+    The explicit paths force the probe, so pin the documented sentence to a
+    stubbed LLMClient: a forced probe on a hosted URL must build no client at
+    all, which means no request can be sent.
+    """
+    config_doc = _norm((ROOT / "docs" / "CONFIG.md").read_text(
+        encoding="utf-8"))
+    assert "Probes never run for hosted endpoints" in config_doc
+
+    built: list[str] = []
+
+    class RecordingClient:
+        def __init__(self, cfg):
+            built.append(str(cfg.base_url))
+            raise AssertionError("hosted endpoint must not build a client")
+
+    monkeypatch.setattr(llm, "LLMClient", RecordingClient)
+    out = profiler.probe_model_speed(
+        "https://api.deepseek.com/v1", "hosted-model", Config(),
+        force=True, context_window=8192)
+    assert built == []
+    assert out["ok"] is False
+    assert out.get("refused") is True
+    assert "hosted" in str(out.get("detail") or "").lower()
+    # The automatic post-load path makes the same promise.
+    assert profiler.maybe_probe_async(
+        Config(), base_url="https://api.deepseek.com/v1",
+        model="hosted-model") is None
+    assert built == []
+
+
 def test_bundled_skills_are_valid_and_loadable(tmp_path):
-    assert len(skills.BUNDLED) == 18
+    assert len(skills.BUNDLED) == 19
     for name, (desc, body, triggers) in skills.BUNDLED.items():
         assert skills._NAME_RE.match(name), name
         assert desc.strip(), name
@@ -112,13 +164,14 @@ def test_bundled_skills_are_valid_and_loadable(tmp_path):
 
 
 def test_second_eight_bodies_stay_crisp():
-    """The domain checklists added in the 8->16 pass keep the <=550-char
-    body budget, and every built-in declares usable triggers."""
+    """The domain checklists added in the 8->16 pass, and later bundled
+    additions, keep the <=550-char body budget, and every built-in declares
+    usable triggers."""
     second = ("fastapi-rest-endpoint", "canvas-svg-2d-3d",
               "sqlite-sql-migrations", "async-concurrency-safety",
               "security-ssrf-xss-hardening", "i18n-localization-catalog",
               "parser-lexer-state-machine", "performance-memory-profiling")
-    for name in second:
+    for name in second + ("safe-git-commit",):
         desc, body, triggers = skills.BUNDLED[name]
         assert len(body) <= skills.MAX_BUILTIN_BODY_CHARS, \
             f"{name}: {len(body)} chars"
@@ -126,7 +179,7 @@ def test_second_eight_bodies_stay_crisp():
 
 
 def test_readme_names_every_bundled_skill():
-    assert "Eighteen starters" in README
+    assert "Nineteen starters" in README
     for name in skills.BUNDLED:
         assert f"`{name}`" in README, f"README does not name skill {name}"
 
@@ -169,13 +222,20 @@ FEATURE_NEEDLES = [
     ("send_temperature_to_hosted", "hosted temperature opt-in"),
     ("hosted_temperature", "hosted temperature pin"),
     ("presence_penalty", "the local repetition nudge"),
+    ("check_for_updates", "the update opt-out setting"),
+    ("/update", "TUI update slash command"),
+    ("update --run", "CLI update --run"),
+    ("--lang", "CLI language flag"),
+    ("/lang", "TUI language slash command"),
+    ("EN | ES", "GUI language switcher"),
+    ("llm_reply_language", "model reply language setting"),
 ] + [(label, "Project ▾ upkeep dialog") for label in PROJECT_MENU_LABELS]
 
 
 @pytest.mark.parametrize("doc_name", ["README.md", "QUICKSTART.md"])
 @pytest.mark.parametrize("needle,feature", FEATURE_NEEDLES)
 def test_new_features_are_documented(doc_name, needle, feature):
-    text = _norm((ROOT / doc_name).read_text(encoding="utf-8"))
+    text = _norm(_doc_text(doc_name))
     assert needle in text, f"{doc_name} missing {feature}: {needle!r}"
 
 
@@ -285,6 +345,27 @@ def test_how_cards_cover_the_new_features():
     assert "send_temperature_to_hosted" in hosted["settings"]
     assert "hosted_temperature" in hosted["settings"]
     assert "presence_penalty" in hosted["summary"] + " ".join(hosted["steps"])
+    # The context-aware auto-update pass: CLI card, GUI topic, TUI notes.
+    upd = cards["update"]
+    assert "--run" in upd["usage"]
+    assert any(f["flag"] == "--run" for f in upd["flags"])
+    assert "check_for_updates" in " ".join(upd["notes"])
+    assert "/update" in " ".join(cards["tui"]["notes"])
+    upd_topic = topics["update-pedacito"]
+    assert "check_for_updates" in upd_topic["settings"]
+    assert upd_topic["cli"] == ["update"]
+    assert "Restart Pedacito" in " ".join(upd_topic["steps"])
+    # The bilingual UI pass: flag, TUI notes and the language-switch topic.
+    assert any(f["flag"].startswith("--lang") for f in how_index.COMMON_FLAGS)
+    assert any(f["flag"].startswith("--lang") for f in cards["gui"]["flags"])
+    tui_notes = " ".join(cards["tui"]["notes"])
+    assert "/lang" in tui_notes and "F3" in tui_notes
+    lang_topic = topics["language-switch"]
+    lang_steps = " ".join(lang_topic["steps"])
+    for needle in ("EN | ES", "F3", "/lang", "--lang", "PEDACITO_LANG"):
+        assert needle in lang_steps, needle
+    assert "language" in lang_topic["settings"]
+    assert "llm_reply_language" in lang_topic["settings"]
 
 
 def test_how_topic_references_resolve():
@@ -311,7 +392,253 @@ def test_how_topic_references_resolve():
     ("how do I preview my html page in the gui?", "live-preview"),
     ("why does pedacito not send temperature to my hosted api?",
      "hosted-sampling"),
+    ("how do I update pedacito to a newer release?", "update-pedacito"),
+    ("how do I switch the interface language to spanish?", "language-switch"),
+    ("how do I generate an image with a local image model?",
+     "image-generation"),
 ])
 def test_new_topics_are_retrievable(question, topic):
     ids = [m["id"] for m in how_index.search(question)["gui"]]
     assert topic in ids, (question, ids)
+
+
+def test_image_generation_is_discoverable_from_how():
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    assert "image" in cards
+    assert "--out FILE" in {f["flag"] for f in cards["image"]["flags"]}
+    assert "/image" in cards["tui"]["keywords"]
+    assert "/image" in " ".join(cards["tui"]["notes"])
+    topics = {t["id"]: t for t in how_index.GUI_TOPICS}
+    assert "image" in topics["image-generation"]["cli"]
+    assert "allow_image_gen" in topics["image-generation"]["settings"]
+    cli_ids = [c["name"] for c in how_index.search("pedacito image prompt")["cli"]]
+    assert "image" in cli_ids
+    gui_ids = [m["id"] for m in how_index.search("generate image")["gui"]]
+    assert "image-generation" in gui_ids
+
+
+# --- preview isolation (R4.3) ------------------------------------------------
+# Project pages render inside the GUI origin but must not script it. Both
+# preview iframes are sandboxed without `allow-same-origin`; the preview CSP is
+# eval-free while the GUI's own page CSP stays as it was.
+
+GUI_STATIC = ROOT / "pedacito" / "gui" / "static"
+GUI_SERVER = ROOT / "pedacito" / "gui" / "server.py"
+
+
+def test_both_preview_iframes_are_script_sandboxed():
+    js = (GUI_STATIC / "app.js").read_text(encoding="utf-8")
+    tags = re.findall(r"<iframe\b[^>]*>", js, flags=re.S)
+    previews = [tag for tag in tags
+                if "live-preview-frame" in tag or "runner-frame" in tag]
+    assert len(previews) == 2, previews
+    for tag in previews:
+        assert 'sandbox="allow-scripts"' in tag, tag
+        # allow-same-origin would cancel the isolation: the preview would be
+        # back in the GUI origin and could drive the agent API.
+        assert "allow-same-origin" not in tag, tag
+    # New tab remains the deliberate full-origin escape hatch.
+    assert "onClick=${openPreviewTab}" in js
+    assert "onClick=${openRunnerPreview}" in js
+
+
+def test_preview_csp_is_eval_free_and_the_gui_csp_is_unchanged():
+    src = GUI_SERVER.read_text(encoding="utf-8")
+    preview = re.search(r"^PREVIEW_CSP = \((.*?)\)\n", src,
+                        flags=re.M | re.S)
+    assert preview, "PREVIEW_CSP is missing from gui/server.py"
+    block = preview.group(1)
+    assert "unsafe-eval" not in block
+    assert "script-src 'self' 'unsafe-inline'" in block
+    # Project assets are served through the preview constant, not their own
+    # inline policy that could drift back to eval.
+    assert 'send_header("Content-Security-Policy", PREVIEW_CSP)' in src
+    gui = re.search(r"^CSP = \((.*?)\)\n", src, flags=re.M | re.S)
+    assert gui, "the GUI's own CSP is missing"
+    assert "unsafe-eval" not in gui.group(1)
+    assert "script-src 'self'" in gui.group(1)
+
+
+def test_lemonade_pinning_and_effort_spelling_are_documented():
+    """The pin surface and the `default`/`off` reconciliation stay in the
+    user-facing docs, not only in the plan file."""
+    config = _norm((ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8"))
+    guide = _norm((ROOT / "MODEL_GUIDE.md").read_text(encoding="utf-8"))
+    for text in (config, guide):
+        assert "internal/pin" in text
+        assert "/servers pin" in text
+        assert "shipped spelling of the plan's `off`" in text
+
+
+# --- project website and contact ---------------------------------------------
+# The website and contact address are interface furniture and docs, never
+# prompt or telemetry content. Pin the places that name them so a doc or GUI
+# edit cannot silently drop the only private reporting address.
+
+def test_security_reporting_names_the_contact_address():
+    text = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    section = text.split("## Reporting a vulnerability", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    assert "contact@pedacito.dev" in section
+    # The private-report path stays explicit: email or advisory, not a public
+    # issue.
+    assert "private security advisory" in section
+    assert "public issue" in section
+
+
+def test_trajectory_flag_is_documented_as_not_trust_gated():
+    """record_trajectories is a local-only logging flag (like log_sessions),
+    not an EXEC_FIELDS setting: SECURITY.md must not tell users to run
+    `pedacito trust` before a project file can set it, and the trust list
+    must not grow to include it."""
+    from pedacito.config import EXEC_FIELDS
+    assert "record_trajectories" not in EXEC_FIELDS
+    text = (ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    section = text.split("## Trajectory export", 1)[1].split("\n## ", 1)[0]
+    assert "after `pedacito trust`" not in section
+    assert "without `pedacito trust`" in section
+    trust = text.split("### Project config is not trusted by default",
+                       1)[1].split("\n### ", 1)[0]
+    assert "record_trajectories" not in trust
+
+
+def test_readme_names_the_project_website_and_contact():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "https://www.pedacito.dev" in readme
+    assert "contact@pedacito.dev" in readme
+
+
+def test_settings_dialog_links_to_the_project_website_and_contact():
+    js = (GUI_STATIC / "settings.js").read_text(encoding="utf-8")
+    assert "https://www.pedacito.dev" in js
+    assert "mailto:contact@pedacito.dev" in js
+    assert "rel: 'noopener'" in js
+    assert "target: '_blank'" in js
+
+
+def test_tui_help_names_the_project_website_and_contact():
+    from pedacito import tui
+    assert ("Web: https://www.pedacito.dev \u00b7 "
+            "Contact: contact@pedacito.dev") in tui.HELP_TEXT
+
+
+# --- docs ownership (R5.5) ----------------------------------------------------
+# docs/ is the canonical reference, the three root guides are the canonical
+# task-oriented guides, README is the index and CHANGELOG is the history. Pin
+# the links both ways and the shared decision paragraph so neither set can
+# silently drift into a copy of the other.
+
+ROOT_GUIDES = ("QUICKSTART.md", "MODEL_GUIDE.md", "TECHNIQUES.md")
+DOCS_SET = ("INSTALLATION", "ARCHITECTURE", "USAGE", "CONFIG",
+            "SKILLS_AND_TOOLS", "SECURITY", "CONTRIBUTING")
+
+
+def _ownership_paragraph(text: str) -> str:
+    start = text.index("**Docs ownership.**")
+    return _norm(text[start:].split("\n\n", 1)[0]).replace("](../", "](")
+
+
+@pytest.mark.parametrize("guide", ROOT_GUIDES)
+def test_root_guide_links_into_docs(guide):
+    text = (ROOT / guide).read_text(encoding="utf-8")
+    linked = re.findall(r"\]\((docs/[A-Za-z]+\.md)", text)
+    assert linked, f"{guide} links into no docs/ page"
+    for rel in linked:
+        assert (ROOT / rel).is_file(), f"{guide} links to missing {rel}"
+
+
+def test_readme_indexes_the_root_guides_and_docs():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for guide in ROOT_GUIDES:
+        assert f"]({guide})" in readme, f"README does not link {guide}"
+    for name in DOCS_SET:
+        assert f"](docs/{name}.md" in readme, f"README does not link {name}"
+
+
+def test_ownership_decision_is_echoed_in_architecture():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    arch = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert "**Docs ownership.**" in readme
+    assert _ownership_paragraph(readme) == _ownership_paragraph(arch)
+
+
+def test_changelog_records_the_ownership_split_under_0_3_1():
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = text.split("## v0.3.1", 1)[1].split("\n## ", 1)[0]
+    assert "Docs Ownership" in section
+    assert "canonical" in section
+
+
+# --- CLI-at-a-glance + install/teering claims (WP-12) -------------------------
+# docs/USAGE.md's table is the canonical index of subcommands; docs/INSTALLATION
+# and docs/CONFIG.md must not drift from the behaviour the code actually ships.
+
+def test_usage_at_a_glance_table_lists_every_cli_subcommand():
+    """Every parser subcommand is named in the `### The CLI at a glance` table,
+    so a new subcommand cannot ship without its one-line reference there."""
+    text = (ROOT / "docs" / "USAGE.md").read_text(encoding="utf-8")
+    section = text.split("### The CLI at a glance", 1)[1].split("\n## ", 1)[0]
+    missing = [name for name in _subcommand_names()
+               if not _mentioned(section, name)]
+    assert not missing, f"USAGE.md CLI table does not mention: {missing}"
+
+
+def test_installation_no_longer_claims_nvidia_vram_counter_reads():
+    """The install guide once described reading NVIDIA VRAM counters; that
+    claim was removed because telemetry stays local and quiet."""
+    text = (ROOT / "docs" / "INSTALLATION.md").read_text(encoding="utf-8")
+    assert "does not read NVIDIA VRAM counters" not in text
+
+
+def test_config_names_the_local_moe_tier():
+    text = (ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8")
+    assert "local-moe" in text
+
+
+# --- v0.3.1: native Anthropic caching + multimodal input + TUI composer --------
+
+_CONFIG_DOCS = ("docs/CONFIG.md", "docs/es/CONFIG.md")
+_INPUT_DOCS = ("docs/USAGE.md", "docs/es/USAGE.md", "QUICKSTART.md",
+               "QUICKSTART.es.md")
+
+
+@pytest.mark.parametrize("rel", _CONFIG_DOCS)
+def test_config_docs_cover_anthropic_native(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    assert "anthropic_native" in text
+    assert "cache_read_input_tokens" in text
+    assert "cache_creation_input_tokens" in text
+    assert Config().anthropic_native is True
+
+
+@pytest.mark.parametrize("rel", _INPUT_DOCS)
+def test_input_docs_cover_image_input_and_multiline(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    for needle in ("--image", "/attach", "@image.png", "Shift+Enter",
+                   "Ctrl+J", "?2004h"):
+        assert needle in text, f"{rel} does not mention {needle}"
+
+
+def test_how_index_knows_image_input_and_attach():
+    flags = {f["flag"].split()[0] for f in how_index.COMMON_FLAGS}
+    assert "--image" in flags
+    cards = {c["name"]: c for c in how_index.CLI_COMMANDS}
+    assert any(f["flag"].startswith("--image") for f in cards["new"]["flags"])
+    tui_text = " ".join(map(str, cards["tui"]["notes"]))
+    assert "/attach" in tui_text and "Shift+Enter" in tui_text
+    topic = next(t for t in how_index.GUI_TOPICS if t["id"] == "image-input")
+    assert "📎 Attach" in " ".join(topic["steps"])
+    hits = how_index.search("how do I attach an image to my task")
+    assert "image-input" in [g["id"] for g in hits["gui"]]
+    assert "anthropic_native" in {s["key"] for s in how_index.settings_dictionary()}
+
+
+def test_readmes_and_changelog_list_v0_3_1_highlights():
+    for rel in ("README.md", "README.es.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "anthropic_native" in text and "/attach" in text, rel
+    section = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = section.split("## v0.3.1", 1)[1].split("\n## ", 1)[0]
+    for needle in ("anthropic_native", "--image", "/attach", "Lemonade",
+                   "bracketed paste"):
+        assert needle in section

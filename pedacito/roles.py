@@ -54,6 +54,15 @@ def derive_config(cfg, profile: str):
         new.sources[key] = f"role profile '{profile}'"
     new.active_profile = profile
     new.active_tier = tier or cfg.active_tier
+    # A tiered MoE profile gets its output/timeout/stream floors BEFORE
+    # auto_fit, so the window clamp sees the real budgets rather than raising
+    # them back above a small context afterwards.
+    config_mod.apply_local_moe_defaults(new)
+    try:
+        from . import profiler
+        profiler.apply_auto_tune(new)
+    except Exception:
+        pass
     # a different server/model: it must re-derive hosted-ness and its budgets
     new._hosted_server = config_mod.is_hosted(new)
     if new._hosted_server and "json_mode" not in merged:
@@ -73,7 +82,11 @@ def client_for(cfg, role: str, default):
         return default
     cache = cfg.__dict__.setdefault("_role_clients", {})
     if role in cache:
-        return cache[role] or default
+        cached = cache[role]
+        if cached is not None:
+            _share_ledger(default, cached)
+            return cached
+        return default
     from .llm import LLMClient, LLMError
     new_cfg = derive_config(cfg, str(name))
     if new_cfg is None:
@@ -83,6 +96,7 @@ def client_for(cfg, role: str, default):
         return default
     try:
         client = LLMClient(new_cfg)
+        _share_ledger(default, client)
         client.check(warn=False)
         client.warmup()
     except LLMError as e:
@@ -93,9 +107,6 @@ def client_for(cfg, role: str, default):
         return default
     client.active_model_role = {"profile": str(name), "model": new_cfg.model,
                                 "role": str(role), "specialty": ""}
-    # one usage ledger: the dedicated client reports into the worker's sink
-    if hasattr(default, "on_call"):
-        client.on_call = default.on_call
     cache[role] = client
     return client
 
@@ -114,7 +125,11 @@ def scout_client(cfg, default):
         return default
     cache = cfg.__dict__.setdefault("_scout_clients", {})
     if name in cache:
-        return cache[name] or default
+        cached = cache[name]
+        if cached is not None:
+            _share_ledger(default, cached)
+            return cached
+        return default
     from .llm import LLMClient, LLMError
     new_cfg = derive_config(cfg, name)
     if new_cfg is None:
@@ -124,6 +139,7 @@ def scout_client(cfg, default):
         return default
     try:
         client = LLMClient(new_cfg)
+        _share_ledger(default, client)
         client.check(warn=False)
         client.warmup()
     except LLMError as e:
@@ -134,11 +150,52 @@ def scout_client(cfg, default):
         return default
     client.active_model_role = {"profile": str(name), "model": new_cfg.model,
                                 "role": "scout", "specialty": ""}
-    # one usage ledger: the scout reports into the worker's sink
-    if hasattr(default, "on_call"):
-        client.on_call = default.on_call
     cache[name] = client
     return client
+
+
+def resolve_model_config(cfg, provider: str, model: str):
+    """A config copy pointed at an explicit (provider, model) pair.
+
+    `provider` names a profile in [profiles.*] (by its name or its `provider`
+    label), or a base URL ("http://127.0.0.1:1234/v1"); empty keeps the active
+    endpoint. `model` overrides the model id. Shared by split-stage hybrid
+    routing (the Stage-1 architect) and the sandbox arena's contestants.
+    Returns None when `model` is empty -- there is nothing to resolve."""
+    from . import config as config_mod
+    provider = str(provider or "").strip()
+    model = str(model or "").strip()
+    if not model:
+        return None
+    new = None
+    if provider:
+        profiles = getattr(cfg, "profiles", None) or {}
+        name = provider if provider in profiles else next(
+            (n for n, body in profiles.items()
+             if str((body or {}).get("provider", "") or "").strip()
+             == provider), "")
+        if name:
+            new = derive_config(cfg, name)
+        elif "://" in provider:
+            new = copy.copy(cfg)
+            new.sampler = dict(cfg.sampler or {})
+            new.sources = dict(cfg.sources or {})
+            new.base_url = provider
+    if new is None:
+        new = copy.copy(cfg)
+        new.sampler = dict(cfg.sampler or {})
+        new.sources = dict(cfg.sources or {})
+    new.model = model
+    new.sources["model"] = f"selected model '{model}'"
+    # A different endpoint/model re-derives hosted-ness and its budgets.
+    new._hosted_server = config_mod.is_hosted(new)
+    if new._hosted_server:
+        new.json_mode = "object"
+    try:
+        config_mod.auto_fit(new, verbose=False)
+    except Exception:
+        pass
+    return new
 
 
 # ------------------------------------------------- specialist routing (#50)
@@ -457,15 +514,20 @@ def select_coding_fallback(cfg, exclude=()) -> str:
 
 
 def _share_ledger(default, client) -> None:
-    """One usage ledger and one budget: the specialist reports into the
-    worker's stats dict under the same lock, and into its on_call sink, so
-    tokens/cost merge into the main totals (warmup included)."""
+    """One usage ledger, one budget, one cancellation token, and shared
+    streaming callbacks: the role/scout/specialist reports into the worker's
+    stats dict under the same lock, honours its cancel_event, and forwards
+    its live stream/start/call callbacks (warmup included)."""
     if hasattr(default, "stats") and hasattr(client, "stats"):
         client.stats = default.stats
     if hasattr(default, "_stats_lock") and hasattr(client, "_stats_lock"):
         client._stats_lock = default._stats_lock
-    if hasattr(default, "on_call"):
-        client.on_call = default.on_call
+    if hasattr(default, "cancel_event"):
+        client.cancel_event = default.cancel_event
+    for attr in ("on_call", "stream_callback", "on_stream",
+                 "on_stream_event", "on_start", "echo_stream"):
+        if hasattr(default, attr):
+            setattr(client, attr, getattr(default, attr))
 
 
 def switch_specialist_client(cfg, default, name: str):
@@ -517,19 +579,34 @@ def switch_specialist_client(cfg, default, name: str):
                   f"({str(e).splitlines()[0][:100]}); using the worker model",
                   file=sys.stderr)
             cache[name] = None
+            if handoff and holder != name:
+                cfg.__dict__.pop("_specialist_on_worker_server", None)
+                if hasattr(default, "warmup"):
+                    try:
+                        default.warmup()
+                    except Exception:
+                        pass
             return default
         cache[name] = client
-    elif handoff and holder != name:
-        # cached client, but the card changed hands since: hand off again
-        victim = cache.get(holder) if holder else default
-        unloaded = llm_mod.unload_model(victim or default)
-        try:
-            client.warmup()
-        except llm_mod.LLMError as e:
-            print(f"[specialist router] profile '{name}' failed to reload "
-                  f"({str(e).splitlines()[0][:100]}); using the worker model",
-                  file=sys.stderr)
-            return default
+    else:
+        _share_ledger(default, client)
+        if handoff and holder != name:
+            # cached client, but the card changed hands since: hand off again
+            victim = cache.get(holder) if holder else default
+            unloaded = llm_mod.unload_model(victim or default)
+            try:
+                client.warmup()
+            except llm_mod.LLMError as e:
+                print(f"[specialist router] profile '{name}' failed to reload "
+                      f"({str(e).splitlines()[0][:100]}); using the worker model",
+                      file=sys.stderr)
+                cfg.__dict__.pop("_specialist_on_worker_server", None)
+                if hasattr(default, "warmup"):
+                    try:
+                        default.warmup()
+                    except Exception:
+                        pass
+                return default
     client.active_model_role = {"profile": str(name), "model": new_cfg.model,
                                 "role": "specialist", "specialty": ""}
     if handoff:

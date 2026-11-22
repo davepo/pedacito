@@ -176,6 +176,12 @@ def test_post_from_foreign_origin_is_403(gui_broker):
     status, body = gui_broker.post("/api/clear", {},
                                    headers={"Origin": "https://evil.example.com"})
     assert status == 403 and body["ok"] is False
+    # Origin: null -- a sandboxed preview iframe (no allow-same-origin) sends
+    # this, and it must not be able to drive the agent API either.
+    for origin in ("null", "NULL"):
+        status, body = gui_broker.post("/api/clear", {},
+                                       headers={"Origin": origin})
+        assert status == 403 and body["ok"] is False, origin
     # Referer: a classic cross-site form/post fingerprint
     status, body = gui_broker.post("/api/clear", {},
                                    headers={"Referer": "https://evil.example.com/pwn"})

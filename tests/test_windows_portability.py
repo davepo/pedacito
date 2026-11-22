@@ -774,9 +774,11 @@ def _pretend_windows(monkeypatch, k32):
                         lambda k: getattr(k, "last_error", 0))
     # pathlib chooses WindowsPath from os.name; keep the REAL filesystem's
     # path class so registry records still land in tmp_path. `state_dir`
-    # re-wraps its root with index's own Path, so patch that namespace too.
+    # re-wraps its root with index's own Path, and fileio re-wraps the final
+    # path again for its atomic write, so patch those namespaces too.
     monkeypatch.setattr(processes, "Path", _REAL_PATH)
     monkeypatch.setattr(index, "Path", _REAL_PATH)
+    monkeypatch.setattr(fileio, "Path", _REAL_PATH)
     runs: list[list[str]] = []
 
     def fake_run(argv, **_kw):

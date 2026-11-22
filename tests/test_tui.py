@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import cli, events, security, workspace
+from pedacito import config as config_mod
+from pedacito import profiler
 from pedacito import tui as tui_mod
 from pedacito.config import Config
 from pedacito.tui import TuiSession, parse_escape_sequence, run_tui
@@ -140,6 +142,97 @@ def test_tui_frame_and_telemetry_bar_rendering(tmp_path):
         session.close()
 
 
+class _TrackingLock:
+    """The session's RLock with an entry counter (the append path is what a
+    background worker races with the renderer)."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.entries = 0
+
+    def __enter__(self):
+        self.entries += 1
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self._lock.__exit__(*exc)
+
+
+def test_tui_append_takes_the_write_lock(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    tracking = _TrackingLock(session._write_lock)
+    session._write_lock = tracking
+    try:
+        session._append("worker line")
+        assert tracking.entries >= 1
+        assert session.transcript[-1] == ("system", "worker line")
+    finally:
+        session.close()
+
+
+def test_tui_append_after_close_is_a_safe_noop(tmp_path):
+    """A startup update check or probe daemon can finish after Ctrl+C
+    teardown; it must not mutate the torn-down transcript."""
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    session.close()
+    before = list(session.transcript)
+    session._append("late worker line")
+    session._append_many("late worker line")
+    assert session.transcript == before
+    assert session.activity == []
+
+
+def test_tui_effort_command_sets_reports_aliases_and_rejects(tmp_path):
+    """`/effort` dispatch + handler: no argument reports the live value,
+    valid levels set the config and source label, aliases collapse to
+    default, and a bad level prints usage without changing anything."""
+    cfg = _cfg(reasoning_effort="medium")
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    text = lambda: "\n".join(line for _kind, line in session.transcript)
+    try:
+        session.handle_line("/effort")
+        assert "Reasoning effort: medium" in text()
+
+        session.handle_line("/effort high")
+        assert cfg.reasoning_effort == "high"
+        assert cfg.sources["reasoning_effort"] == "tui /effort"
+        assert "sent as reasoning_effort" in text()
+
+        session.handle_line("/effort off")
+        assert cfg.reasoning_effort == "default"
+        assert "no field is sent at default" in text()
+
+        before = cfg.reasoning_effort
+        session.handle_line("/effort banana")
+        assert cfg.reasoning_effort == before
+        assert "Usage: /effort default|low|medium|high" in text()
+    finally:
+        session.close()
+
+
+def test_tui_servers_pin_parses_target_model_and_state(tmp_path, monkeypatch):
+    session = TuiSession(tmp_path, _cfg(), headless=True,
+                         stdout=io.StringIO())
+    calls = []
+
+    def fake_pin(target, model="", pinned=True, config=None):
+        calls.append((target, model, pinned))
+        return {"ok": True, "action": "pin" if pinned else "unpin",
+                "server": target, "model": model or "resident",
+                "pinned": pinned, "detail": "done"}
+
+    monkeypatch.setattr(tui_mod.servers_mod, "pin_server_model", fake_pin)
+    try:
+        session._servers("pin lemonade qwen3-8b")
+        session._servers("unpin lemonade")
+        assert calls == [("lemonade", "qwen3-8b", True),
+                         ("lemonade", "", False)]
+    finally:
+        session.close()
+
+
 def test_tui_slash_commands_end_to_end(tmp_path):
     cfg = _cfg()
     script = "\n".join([
@@ -179,6 +272,79 @@ def test_tui_slash_commands_end_to_end(tmp_path):
         encoding="utf-8")
     assert cfg.disable_thinking is True
     assert cfg.auto_route_specialties is True
+
+
+def test_tui_verify_detects_sets_reports_and_clears(tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "node --test"}}\n', encoding="utf-8")
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        def transcript():
+            return "\n".join(line for _kind, line in session.transcript)
+
+        session._slash("/verify status")
+        text = transcript()
+        assert "Post-edit verify (auto_verify): OFF" in text
+        assert "Static gate (static_gate): ON" in text
+        assert "Repair rounds (auto_repair_rounds): 2" in text
+        assert "Scoped tests:" in text and "test_timeout (300 s)" in text
+        assert "Green ratchet (auto_green_ratchet): ON" in text
+        assert "interface lock (interface_lock): ON" in text
+
+        session._slash("/verify on")
+        assert cfg.auto_verify == "npm test"
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "detected npm test" in transcript()
+
+        session._slash("/verify status")
+        assert "Post-edit verify (auto_verify): ON \u2014 npm test" in transcript()
+
+        session._slash("/verify off")
+        assert cfg.auto_verify == ""
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "OFF \u2014 auto_verify cleared" in transcript()
+
+        # Registered for completion and documented in /help.
+        assert "/verify" in tui_mod._SLASH_COMMANDS
+        assert "/verify [on|off|status]" in tui_mod.HELP_TEXT
+    finally:
+        session.close()
+
+
+def test_tui_verify_on_without_a_detectable_command_stays_empty(tmp_path):
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        session._slash("/verify on")
+        text = "\n".join(line for _kind, line in session.transcript)
+        assert cfg.auto_verify == ""
+        assert cfg.sources["auto_verify"] == "tui /verify"
+        assert "no test command detected" in text
+        assert "syntax/AST" in text
+        assert "static and interface-contract gates" in text
+        assert "scoped impacted tests" in text
+    finally:
+        session.close()
+
+
+def test_tui_verify_never_writes_config_files(tmp_path):
+    config_file = tmp_path / ".pedacito.toml"
+    config_file.write_text(
+        '[universal]\nmodel = "unchanged"\n', encoding="utf-8")
+    before = config_file.read_bytes()
+    cfg = _cfg()
+    session = TuiSession(tmp_path, cfg, headless=True,
+                         stdout=io.StringIO())
+    try:
+        session._slash("/verify on")
+        session._slash("/verify status")
+        session._slash("/verify off")
+    finally:
+        session.close()
+    assert config_file.read_bytes() == before
 
 
 def test_tui_task_execution_updates_activity_and_telemetry(
@@ -567,6 +733,86 @@ def test_mouse_toggle_and_sidebar_wheel_scrolling(tmp_path):
         session.close()
 
 
+def test_tui_profile_run_refuses_hosted_endpoint(tmp_path, monkeypatch):
+    from pedacito import profiler
+    cfg = _cfg(base_url="https://api.deepseek.com/v1",
+               model="deepseek-chat")
+    calls = []
+    monkeypatch.setattr(profiler, "probe_model_speed",
+                        lambda *a, **k: calls.append((a, k)))
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    try:
+        session.handle_line("/profile run")
+        assert calls == []
+        system = [text for kind, text in session.transcript
+                  if kind == "system"]
+        assert any("hosted model" in text and "refusing to probe" in text
+                   for text in system)
+        assert not any(kind == "error" for kind, _ in session.transcript)
+    finally:
+        session.close()
+
+
+def test_tui_profile_run_probes_local_endpoint(tmp_path, monkeypatch):
+    from pedacito import profiler
+    cfg = _cfg(base_url="http://127.0.0.1:1234/v1", model="local-model")
+    calls = []
+
+    def fake_probe(base_url, model, config, **kw):
+        calls.append((base_url, model, kw.get("force")))
+        return {"ok": True, "base_url": base_url, "model": model,
+                "prefill_tok_per_s": 800.0, "generation_tok_per_s": 40.0,
+                "cached": False, "measured_at": 0.0}
+
+    monkeypatch.setattr(profiler, "probe_model_speed", fake_probe)
+    monkeypatch.setattr(
+        profiler, "build_report",
+        lambda cfg, **kw: {"ok": True, "model": cfg.model, "snapshot": {},
+                           "current": {}, "tuning": {}, "auto_tune": False})
+    session = TuiSession(tmp_path, cfg, headless=True, stdout=io.StringIO())
+    try:
+        session.handle_line("/profile run")
+        assert calls == [("http://127.0.0.1:1234/v1", "local-model", True)]
+        assert any("Hardware snapshot" in text
+                   for _, text in session.transcript)
+    finally:
+        session.close()
+
+
+def test_tui_profile_reset_writes_auto_tune_false(tmp_path, monkeypatch):
+    """R3.7: /profile reset must write the same file change as the CLI."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        'default_profile = "x"\n'
+        "[profiles.x]\n"
+        'base_url = "http://127.0.0.1:1234/v1"\n'
+        'model = "local-model"\n'
+        "vram_gb = 24\n"
+        "auto_tune = true\n", encoding="utf-8")
+    monkeypatch.setattr(profiler, "apply_auto_tune",
+                        lambda *a, **k: {"ok": True, "applied": False})
+    monkeypatch.setattr(profiler, "reset",
+                        lambda: tmp_path / "profiler.json")
+    cfg = config_mod.load(root=tmp_path, explicit=cfg_path, profile="x",
+                          require_hardware=False, warn_budgets=False)
+    assert cfg.auto_tune is True
+    assert cfg._config_path == str(cfg_path)
+    session = TuiSession(tmp_path, cfg, client=FakeClient(), headless=True,
+                         stdout=io.StringIO())
+    try:
+        session.handle_line("/profile reset")
+        text = "\n".join(line for _kind, line in session.transcript)
+        assert f"Set auto_tune = false in {cfg_path}" in text
+        assert "auto_tune is off for this session." in text
+        assert cfg.auto_tune is False
+        assert "auto_tune = false" in cfg_path.read_text(encoding="utf-8")
+        again = config_mod.load(root=tmp_path, explicit=cfg_path, profile="x",
+                                require_hardware=False, warn_budgets=False)
+        assert again.auto_tune is False
+    finally:
+        session.close()
+
+
 def test_synchronized_redraw_keeps_partial_prompt_and_cursor(tmp_path):
     class TtyInput(io.StringIO):
         def isatty(self):
@@ -592,3 +838,272 @@ def test_synchronized_redraw_keeps_partial_prompt_and_cursor(tmp_path):
         assert "\x1b[24;24H" in text
     finally:
         session.close()
+
+
+def test_tui_alt_screen_off_resets_scroll_region_before_leaving_alt_screen(tmp_path):
+    """DECSTBM (`\\x1b[r`) always homes the cursor to (1, 1); emitting it after
+    `\\x1b[?1049l` clobbers the cursor position restored on the main screen."""
+    seq = tui_mod._ALT_SCREEN_OFF
+    assert "\x1b[r" in seq
+    assert "\x1b[?1049l" in seq
+    assert seq.index("\x1b[r") < seq.index("\x1b[?1049l")
+    assert seq.index("\x1b[?2026l") < seq.index("\x1b[?1049l")
+    assert seq.index("\x1b[0m") < seq.index("\x1b[?1049l")
+
+    after = seq.split("\x1b[?1049l", 1)[1]
+    # Only cursor visibility restore (`?25h`) may follow leaving the alt screen;
+    # nothing after `?1049l` may move the cursor or reset scroll margins.
+    assert after == "\x1b[?25h"
+    assert not re.search(r"\x1b\[[0-9;]*[HfABCDEFGJKr]", after)
+
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    out = TtyOutput()
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=out, width=80, height=24)
+    session._prepare_terminal()
+    out.truncate(0)
+    out.seek(0)
+    session.close()
+    teardown = out.getvalue()
+    assert "\x1b[?1049l" in teardown
+    assert teardown.index("\x1b[r") < teardown.index("\x1b[?1049l")
+    assert teardown.split("\x1b[?1049l", 1)[1] == "\x1b[?25h"
+
+
+def test_bracketed_paste_sequences_and_handle_paste(tmp_path):
+    assert "\x1b[?2004h" in tui_mod._ALT_SCREEN_ON
+    assert "\x1b[?2004l" in tui_mod._ALT_SCREEN_OFF
+    assert (tui_mod._ALT_SCREEN_OFF.index("\x1b[?2004l")
+            < tui_mod._ALT_SCREEN_OFF.index("\x1b[?1049l"))
+    assert parse_escape_sequence("\x1b[200~") == ("PASTE_START", 6)
+    assert parse_escape_sequence("\x1b[201~") == ("PASTE_END", 6)
+
+    submitted: list[str] = []
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    session.handle_line = lambda line: (submitted.append(line) or True)
+    try:
+        # Multi-line paste normalizes \r\n and \r, keeps \t and \n, strips escapes,
+        # and never triggers submit.
+        raw_paste = "def foo():\r\n\t\x1b[31mreturn\x1b[0m \x1b]0;evil\x071\r# done"
+        session.handle_paste(raw_paste)
+        assert submitted == []
+        assert session.input_buf == "def foo():\n\treturn 1\n# done"
+        assert session.cursor_pos == len(session.input_buf)
+
+        # Bracketed paste through feed_keys also inserts without submitting.
+        session.input_buf = ""
+        session.cursor_pos = 0
+        session.feed_keys(["\x1b[200~alpha\r\nbeta\x1b[201~"])
+        assert submitted == []
+        assert session.input_buf == "alpha\nbeta"
+    finally:
+        session.close()
+
+
+def test_bracketed_paste_in_interactive_reader_loop(tmp_path):
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    submitted: list[str] = []
+    out = TtyOutput()
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=out, width=80, height=24)
+
+    def capture(line: str) -> bool:
+        submitted.append(line)
+        session._quit = True
+        return False
+
+    session.handle_line = capture
+    # Pre-seed raw buffer with a bracketed multi-line paste followed by Enter.
+    session._raw_buf = "\x1b[200~first line\r\nsecond line\x1b[201~\r"
+    try:
+        assert session.run() == 0
+        assert submitted == ["first line\nsecond line"]
+        text = out.getvalue()
+        assert "\x1b[?2004h" in text
+        assert "\x1b[?2004l" in text
+        assert text.index("\x1b[?2004l") < text.index("\x1b[?1049l")
+    finally:
+        session.close()
+
+
+def test_multiline_keys_and_backslash_continuation(tmp_path):
+    assert parse_escape_sequence("\x1b[13;2u") == ("SHIFT_ENTER", 7)
+    assert parse_escape_sequence("\x1b[27;2;13~") == ("SHIFT_ENTER", 10)
+    assert parse_escape_sequence("\x1b\r") == ("ALT_ENTER", 2)
+    assert parse_escape_sequence("\x1b\n") == ("ALT_ENTER", 2)
+    assert parse_escape_sequence("\n") == ("CTRL_J", 1)
+    assert parse_escape_sequence("\r") == ("ENTER", 1)
+
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+    class TtyOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    submitted: list[str] = []
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(),
+                         stdin=TtyInput(""), stdout=TtyOutput(),
+                         width=100, height=24)
+    session.handle_line = lambda line: (submitted.append(line) or True)
+    try:
+        session.feed_keys("line1")
+        session.handle_key("SHIFT_ENTER")
+        session.feed_keys("line2")
+        session.handle_key("ALT_ENTER")
+        session.feed_keys("line3")
+        session.handle_key("CTRL_J")
+        session.feed_keys("line4\\")
+        # Lone trailing backslash + ENTER in interactive mode inserts newline.
+        session.handle_key("ENTER")
+        assert submitted == []
+        assert session.input_buf == "line1\nline2\nline3\nline4\n"
+
+        session.feed_keys("line5")
+        session.handle_key("ENTER")
+        assert submitted == ["line1\nline2\nline3\nline4\nline5"]
+        assert session.input_buf == ""
+    finally:
+        session.close()
+
+
+def test_multiline_navigation_home_end_and_line_kills(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=100, height=24, stdout=io.StringIO())
+    try:
+        session.command_history = ["older cmd"]
+        session._history_pos = 1
+        session.input_buf = "long first line\nhi\nanother long line"
+        # Place cursor at col 10 on line 2 ("another lo|ng line")
+        session.cursor_pos = len("long first line\nhi\n") + 10
+
+        # UP moves to line 1 ("hi"), clamping to end of line 1 (col 2),
+        # while remembering preferred col 10.
+        session.handle_key("UP")
+        assert session.cursor_pos == len("long first line\n") + 2
+
+        # Second UP moves to line 0, restoring target col 10!
+        session.handle_key("UP")
+        assert session.cursor_pos == 10
+
+        # UP on logical line 0 steps into command history.
+        session.handle_key("UP")
+        assert session.input_buf == "older cmd"
+
+        # DOWN restores the multi-line draft.
+        session.handle_key("DOWN")
+        assert session.input_buf == "long first line\nhi\nanother long line"
+
+        # HOME / END operate on the current logical line.
+        session.cursor_pos = len("long first line\n") + 1  # middle of "hi"
+        session.handle_key("HOME")
+        assert session.cursor_pos == len("long first line\n")
+        session.handle_key("END")
+        assert session.cursor_pos == len("long first line\nhi")
+
+        # CTRL_U kills to start of current logical line only.
+        session.handle_key("CTRL_U")
+        assert session.input_buf == "long first line\n\nanother long line"
+        assert session.cursor_pos == len("long first line\n")
+
+        # CTRL_K kills to end of current logical line only.
+        session.cursor_pos = 4  # "long| first line"
+        session.handle_key("CTRL_K")
+        assert session.input_buf == "long\n\nanother long line"
+        assert session.cursor_pos == 4
+    finally:
+        session.close()
+
+
+def test_multiline_rendering_height_scroll_and_cursor_position(tmp_path):
+    session = TuiSession(tmp_path, _cfg(), client=FakeClient(), headless=True,
+                         width=80, height=24, stdout=io.StringIO())
+    try:
+        # 3-line draft: frame height stays exactly 24, cursor on row 2.
+        session.input_buf = "first\nsecond\nthird"
+        # Put cursor on line index 1 ("se|cond", col 2 -> offset 6 + 2 = 8).
+        session.cursor_pos = 8
+        frame3 = session.render_frame(80, 24)
+        lines3 = frame3.splitlines()
+        assert len(lines3) == 24
+        assert lines3[21].startswith("pdc tui (default) > first")
+        assert lines3[22].startswith("  \u2502 second")
+        assert lines3[23].startswith("  \u2502 third")
+        # Prompt occupies 1-based rows 22, 23, 24; row 2 of prompt is row 23.
+        # Prefix "  │ " has len 4, cursor at col 2 -> 1-based col 7.
+        assert session._cursor_screen_position(80, 24) == (23, 7)
+
+        # 8-line draft: capped at MAX_PROMPT_ROWS (6), frame height still 24,
+        # and scroll indicator [L8/8] shown when cursor is at the end.
+        session.input_buf = "\n".join(f"row{i}" for i in range(1, 9))
+        session.cursor_pos = len(session.input_buf)
+        frame8 = session.render_frame(80, 24)
+        lines8 = frame8.splitlines()
+        assert len(lines8) == 24
+        prompt_rows, cur_row, _cur_col = session._prompt_lines(80)
+        assert len(prompt_rows) == tui_mod.MAX_PROMPT_ROWS == 6
+        assert cur_row == 5
+        assert "[L8/8]" in lines8[18]
+        assert "row8" in lines8[23]
+
+        # Moving cursor to line 1 scrolls the prompt window to the top.
+        session.cursor_pos = 0
+        frame8_top = session.render_frame(80, 24)
+        lines8_top = frame8_top.splitlines()
+        assert len(lines8_top) == 24
+        assert "[L1/8]" in lines8_top[18]
+        assert "row1" in lines8_top[18]
+
+        # Help and keys text invariants.
+        assert ("Web: https://www.pedacito.dev \u00b7 "
+                "Contact: contact@pedacito.dev") in tui_mod.HELP_TEXT
+        assert "Shift+Enter" in tui_mod.KEYS_TEXT
+        assert "Bracketed paste" in tui_mod.KEYS_TEXT
+        assert "Shift+Enter" in tui_mod.KEYS_TEXT_ES
+    finally:
+        session.close()
+
+
+def test_tui_starts_cleanly_when_default_profile_was_deleted(
+        tmp_path, monkeypatch, capsys):
+    """A stale `default_profile` pointing at a deleted profile must not block
+    `pedacito tui` from starting when other valid profiles exist."""
+    cfg_path = tmp_path / "user_config.toml"
+    cfg_path.write_text(
+        'default_profile = "deleted-profile"\n'
+        '[universal]\n'
+        'vram_gb = 16\n'
+        '\n'
+        '[profiles.sdxl]\n'
+        'model = "SDXL-Turbo"\n'
+        'modality = "image"\n'
+        '\n'
+        '[profiles.coder]\n'
+        'model = "qwen3-14b"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    monkeypatch.delenv("PEDACITO_PROFILE", raising=False)
+    args = cli.build_parser().parse_args(["tui", str(tmp_path), "--headless"])
+    cfg = cli._config(args)
+    assert cfg.active_profile == "coder"
+    assert cfg.model == "qwen3-14b"
+    err = capsys.readouterr().err
+    assert "default_profile no longer exists" in err
+    assert "coder" in err

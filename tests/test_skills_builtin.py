@@ -22,11 +22,11 @@ NEW = {
 }
 
 
-def test_catalog_lists_all_eighteen_with_one_line_summaries(tmp_path):
+def test_catalog_lists_all_nineteen_with_one_line_summaries(tmp_path):
     cat = skills.catalog(tmp_path, Config(), limit=10000)
     for name in skills.BUNDLED:
         assert f"- {name}:" in cat
-    assert len(skills.names(tmp_path, Config())) == 18
+    assert len(skills.names(tmp_path, Config())) == 19
     # One line per skill: the body never leaks into the catalog.
     assert all(line.startswith("- ") for line in cat.splitlines()[1:])
     assert "SEARCH" not in cat
@@ -59,3 +59,25 @@ def test_unknown_skill_lists_the_new_names(tmp_path):
     assert info is None and "ERROR" in text
     for name in NEW:
         assert name in text
+
+
+def test_safe_git_commit_loads_selects_and_appears_in_the_catalog(tmp_path):
+    text, info = skills.load(tmp_path, Config(), "safe-git-commit")
+    assert info is not None and info["source"] == "bundled"
+    assert text.startswith("SKILL safe-git-commit (bundled):")
+    out = tools.dispatch(
+        types.SimpleNamespace(root=tmp_path), Config(),
+        {"action": "skill", "symbol": "safe-git-commit"})
+    assert out.startswith("SKILL safe-git-commit (bundled):")
+    picked = {row["name"] for row in skills.select_skills(
+        tmp_path, "commit my changes with a good message", Config())}
+    assert "safe-git-commit" in picked
+    cat = skills.catalog(tmp_path, Config(), limit=10000)
+    assert "- safe-git-commit:" in cat
+
+
+def test_catalog_and_selection_stay_empty_with_skills_disabled(tmp_path):
+    cfg = Config()
+    cfg.use_skills = False
+    assert skills.catalog(tmp_path, cfg, limit=10000) == ""
+    assert skills.select_skills(tmp_path, "commit my changes", cfg) == []

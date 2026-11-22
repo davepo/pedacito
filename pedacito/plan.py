@@ -71,12 +71,28 @@ def requirement_titles(task: str, limit: int = 16) -> list[str]:
     return [text for text, _terms in reqs][:limit]
 
 
+def _is_refined_spec(task: str) -> bool:
+    """True for the sectioned spec produced by `--refine`.
+
+    That text is one task already: its OBJECTIVE / FILES / CONTRACTS /
+    REQUIREMENTS headings are structure, not separate plan steps. Mining
+    them with requirement_titles produced steps literally named "OBJECTIVE"
+    and "INTERFACE CONTRACTS", then ran each one against the same file.
+    """
+    text = (task or "").lstrip()
+    return (text.startswith("OBJECTIVE\n")
+            and "\nREQUIREMENTS\n" in text
+            and "\nVERIFICATION\n" in text)
+
+
 def should_plan(task: str, idx, cfg) -> bool:
     """Whether to auto-plan: enough files named, or enough requirements.
     With auto-planning off, a wide-enough task is still planned unless the
     user explicitly set `plan_threshold` (the model card's 0 for a strong
     model does not count as an opt-out -- it measured skill on small probes,
     not window capacity on a five-file task)."""
+    if _is_refined_spec(task):
+        return False
     n = int(getattr(cfg, "plan_threshold", 0) or 0)
     try:
         named = len(rank.task_files(idx, task))

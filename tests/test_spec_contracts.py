@@ -366,3 +366,90 @@ def test_gui_refine_route(tmp_path, monkeypatch):
     status, j = route({}, {"prompt": "anything"})
     assert status == 200 and j["ok"] is True
     assert "OBJECTIVE" in j["refined"]
+
+
+# ---------------------------------------------- single-pass cache & ignore ---
+
+def test_verify_cross_file_contracts_parses_each_file_at_most_once(
+        tmp_path, monkeypatch):
+    """Per-call verification caching must parse each .py and .js/.ts file at
+    most once during `verify_cross_file_contracts` (and `verify_frontend_contracts`)."""
+    import ast
+    from collections import Counter
+    from pedacito import chunker_ts
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .core import run\n", encoding="utf-8")
+    (pkg / "core.py").write_text(
+        "class Engine:\n    def step(self, x):\n        return x + 1\n\n"
+        "def run(n):\n    return Engine().step(n)\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        "from pkg.core import run\nresult = run(1)\n", encoding="utf-8")
+    (tmp_path / "test_app.py").write_text(
+        "from pkg.core import Engine, run\n"
+        "def test_ok():\n    e = Engine()\n    assert e.step(1) == run(1)\n",
+        encoding="utf-8")
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><html><body><div id='root'></div>"
+        "<script type='module' src='./main.js'></script></body></html>\n",
+        encoding="utf-8")
+    (tmp_path / "util.js").write_text(
+        "export class Store {\n  load() { return 1; }\n}\n"
+        "export function double(n) { return n * 2; }\n", encoding="utf-8")
+    (tmp_path / "main.js").write_text(
+        "import { Store, double } from './util.js';\n"
+        "const store = new Store();\n"
+        "const val = double(store.load());\n"
+        "document.getElementById('root').textContent = String(val);\n",
+        encoding="utf-8")
+
+    py_counts: Counter[str] = Counter()
+    real_ast_parse = ast.parse
+
+    def counting_ast_parse(source, *args, **kwargs):
+        py_counts[str(source)] += 1
+        return real_ast_parse(source, *args, **kwargs)
+
+    ts_counts: Counter[str] = Counter()
+    real_ts_parse = spec._ts_parse
+
+    def counting_ts_parse(text, suffix):
+        ts_counts[text] += 1
+        return real_ts_parse(text, suffix)
+
+    monkeypatch.setattr(spec.ast, "parse", counting_ast_parse)
+    monkeypatch.setattr(spec, "_ts_parse", counting_ts_parse)
+
+    errs = spec.verify_cross_file_contracts(tmp_path)
+    assert errs == []
+    assert len(py_counts) == 4
+    assert all(count == 1 for count in py_counts.values()), dict(py_counts)
+    if chunker_ts.TS_AVAILABLE:
+        assert len(ts_counts) == 2
+        assert all(count == 1 for count in ts_counts.values()), dict(ts_counts)
+
+    # Same single-pass guarantee across all 4 JS passes of verify_frontend_contracts.
+    ts_counts.clear()
+    fe_errs = spec.verify_frontend_contracts(tmp_path)
+    assert fe_errs == []
+    if chunker_ts.TS_AVAILABLE:
+        assert len(ts_counts) == 2
+        assert all(count == 1 for count in ts_counts.values()), dict(ts_counts)
+
+
+def test_iter_code_files_respects_gitignore_and_pedacitoignore(tmp_path):
+    (tmp_path / ".gitignore").write_text("vendor/\nignored_file.py\n",
+                                         encoding="utf-8")
+    (tmp_path / ".pedacitoignore").write_text("generated/\n", encoding="utf-8")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "third_party.py").write_text(
+        "from nonexistent import broken\n", encoding="utf-8")
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "generated" / "gen.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "ignored_file.py").write_text("y = 2\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("def ok():\n    return 1\n",
+                                     encoding="utf-8")
+
+    found = spec._iter_code_files(tmp_path, spec.PY_EXTS)
+    assert found == ["app.py"]

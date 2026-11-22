@@ -14,26 +14,37 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from types import SimpleNamespace
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from .. import __version__ as PED_VERSION
+from .. import checkpoints as checkpoints_mod
+from .. import i18n
 from .. import review as review_mod
-from .. import security, workspace
+from .. import prompts as prompts_mod
+from .. import runner as runner_mod
+from .. import security, themes as themes_mod, workspace
+from .. import update as update_mod
+from .. import config as config_mod
 from ..config import ConfigError
 from ..local_server import LocalHTTPServer
-from ..select import Matcher, is_venv_dir
+from ..select import Matcher, is_venv_dir, suggest_context
 from . import jobs, settings_api
 from .core import (STATE, install_permission_broker, install_runner,
                    install_tee, uninstall_permission_broker,
                    uninstall_runner, uninstall_tee)
 
 STATIC = Path(__file__).parent / "static"
-MAX_BODY = 12 * 1024 * 1024
+MAX_BODY = 60 * 1024 * 1024
 MAX_VIEW_BYTES = 600_000
+MAX_PREVIEW_ASSET_BYTES = 25 * 1024 * 1024
 MAX_SCAN_FILES = 4000          # workspace scan cap for the Files tab
 MAX_BACKUPS = 20
 
@@ -50,6 +61,22 @@ CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; img-src 'self' data:; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
+# The GUI frames project pages with `sandbox="allow-scripts"` (no
+# `allow-same-origin`), and the response CSP itself enforces `sandbox
+# allow-scripts allow-forms allow-modals;` (no `allow-same-origin`), so a
+# previewed page runs in an opaque origin even when opened in a new tab. Its
+# CSP is separate from the app's own: inline scripts still work (static pages
+# keep them inline) but eval is refused. A POST from the sandbox arrives with
+# `Origin: null`, which `security.post_origin_allowed` rejects.
+PREVIEW_CSP = ("sandbox allow-scripts allow-forms allow-modals; "
+               "default-src 'self' data: blob:; "
+               "style-src 'self' 'unsafe-inline'; "
+               "script-src 'self' 'unsafe-inline'; "
+               "img-src 'self' data: blob:; "
+               "media-src 'self' data: blob:; "
+               "connect-src 'self' data: blob:; "
+               "frame-ancestors 'self'")
+
 # The cake emoji as an SVG favicon. The page declares it as a data: URI, but
 # browsers still probe /favicon.ico on their own; answering with the same SVG
 # keeps the console free of 404s.
@@ -59,6 +86,10 @@ FAVICON_SVG = (
 ).encode("utf-8")
 
 _SERVER: LocalHTTPServer | None = None
+# The args `run()` was started with, so the post-upgrade Restart button can
+# re-exec the same GUI (same port, project and profile) in place.
+_RUN_ARGS = SimpleNamespace(port=0, open_browser=True, project=None,
+                            profile=None)
 
 
 # --- helpers ------------------------------------------------------------------
@@ -75,21 +106,27 @@ def _within(root: Path, rel: str) -> Path | None:
 
 
 def index_html(data: bytes) -> bytes:
-    """The page HTML with the saved theme already on <html>, so a reload
-    with no project open paints in the user's colorscheme instead of
-    flashing the default until /api/state answers. theme.js still lets a
-    browser-local pick override it."""
+    """The page HTML with the saved language and theme already on <html>,
+    so a reload with no project open paints in the user's language and
+    colorscheme instead of flashing defaults until /api/state answers.
+    theme.js still lets a browser-local pick override them."""
     theme = STATE.user_theme()
-    if not theme or theme == "slate":
+    lang = i18n.normalize_lang(STATE.user_language())
+    need_theme = bool(theme and theme != "slate")
+    need_lang = bool(lang and lang != "en")
+    if not need_theme and not need_lang:
         return data
     text = data.decode("utf-8", errors="replace")
     marker = '<html lang="en">'
     if marker not in text:
         return data
-    # `theme` is a closed enum from config.py; still escape defensively.
-    safe = (str(theme).replace("&", "&amp;").replace('"', "&quot;")
-            .replace("<", "&lt;").replace(">", "&gt;"))
-    text = text.replace(marker, f'<html lang="en" data-theme="{safe}">', 1)
+    attrs = f'lang="{lang}"'
+    if need_theme:
+        # `theme` is a closed enum from config.py; still escape defensively.
+        safe = (str(theme).replace("&", "&amp;").replace('"', "&quot;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+        attrs += f' data-theme="{safe}"'
+    text = text.replace(marker, f'<html {attrs}>', 1)
     return text.encode("utf-8")
 
 
@@ -156,12 +193,15 @@ def read_project_file(rel: str) -> dict:
                 f"`{rel}` is a sensitive file (secret/credential material is "
                 "never previewed without an explicit approval).")
     size = p.stat().st_size
-    data = p.read_bytes()[:MAX_VIEW_BYTES]
+    with p.open("rb") as fh:
+        chunk = fh.read(MAX_VIEW_BYTES + 1)
+    truncated = len(chunk) > MAX_VIEW_BYTES
+    data = chunk[:MAX_VIEW_BYTES]
     if b"\x00" in data[:4096]:
         return {"path": rel, "binary": True, "size": size, "text": ""}
     return {"path": rel, "binary": False, "size": size,
             "text": data.decode("utf-8", errors="replace"),
-            "truncated": size > MAX_VIEW_BYTES}
+            "truncated": truncated}
 
 
 def project_files() -> dict:
@@ -298,9 +338,280 @@ def _snapshot(q, body=None):
     return 200, STATE.snapshot()
 
 
+# --- auto-update (pedacito.update): notice, manual check, upgrade, restart ----
+
+# A pipx/pip upgrade that has not finished in ten minutes is stuck; the GUI
+# kills it rather than leaving the drawer spinning forever.
+UPDATE_RUN_TIMEOUT = 600.0
+
+
+@get("/api/update")
+def _update_get(q, body=None):
+    with STATE.lock:
+        info = dict(STATE.update) if STATE.update else None
+        run = dict(STATE.update_run)
+        cfg = STATE.cfg
+    return 200, {"ok": True, "update": info, "update_run": run,
+                 "check_for_updates": update_mod.updates_enabled(cfg),
+                 "current": PED_VERSION}
+
+
+@post("/api/update/check")
+def _update_check(q, body=None):
+    """Manual 'check now': bypasses the 24 h cache. Synchronous but bounded
+    (2 s network timeout); with the opt-out set it makes no network call."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    info = update_mod.check_for_update(cfg, manual=True)
+    STATE.note_update(info)
+    return 200, {"ok": True, "update": info}
+
+
+@post("/api/update/run")
+def _update_run(q, body=None):
+    """Run the detected upgrade command in the background, streaming its
+    output into the drawer. Editable installs and the opt-out get the manual
+    instructions instead (ok=False); a second click while running is a 409."""
+    with STATE.lock:
+        cfg = STATE.cfg
+        if STATE.update_run["running"]:
+            return 409, {"ok": False,
+                         "detail": "An upgrade is already running."}
+        STATE.update_run["running"] = True
+        info = STATE.update
+    started_worker = False
+    try:
+        if not update_mod.updates_enabled(cfg):
+            method = update_mod.detect_install_method(query_pipx=False)
+            _cmd, instructions = update_mod.upgrade_command(method)
+            return 200, {"ok": False, "detail": instructions}
+        method = (info or {}).get("method") or update_mod.detect_install_method()
+        command, instructions = update_mod.upgrade_command(method)
+        if command is None:
+            return 200, {"ok": False, "detail": instructions}
+        cancel = STATE.update_run_start(command)
+
+        def worker():
+            started = time.monotonic()
+            code = update_mod.run_upgrade(
+                command, on_line=STATE.note_update_output,
+                timeout=UPDATE_RUN_TIMEOUT, cancel=cancel)
+            detail = ""
+            if code != 0:
+                if cancel.is_set():
+                    why = "Upgrade cancelled"
+                elif time.monotonic() - started >= UPDATE_RUN_TIMEOUT:
+                    why = "Upgrade timed out"
+                else:
+                    why = f"Upgrade failed (exit {code})"
+                detail = f"{why}. {instructions}"
+            STATE.update_run_done(code, detail)
+
+        threading.Thread(target=worker, name="pedacito-gui-update-run",
+                         daemon=True).start()
+        started_worker = True
+        return 202, {"ok": True, "running": True, "command": command}
+    finally:
+        if not started_worker:
+            with STATE.lock:
+                STATE.update_run["running"] = False
+
+
+@post("/api/update/cancel")
+def _update_cancel(q, body=None):
+    """Stop the running upgrade, including any children it spawned. A stale
+    click after the upgrade finished is a 409, not a silent no-op."""
+    if not STATE.cancel_update_run():
+        return 409, {"ok": False, "detail": "No upgrade is running."}
+    return 200, {"ok": True, "cancelling": True}
+
+
+def _restart_argv() -> list[str]:
+    """The same GUI on the same port, project and profile."""
+    args = _RUN_ARGS
+    argv = [sys.executable, "-m", "pedacito", "gui", "--port", str(args.port)]
+    if not args.open_browser:
+        argv.append("--no-open")
+    if args.project:
+        argv.append(str(args.project))
+        if args.profile:
+            argv += ["--profile", str(args.profile)]
+    return argv
+
+
+def _close_for_restart() -> None:
+    """Tear down MCP/LSP subprocesses and close the listening HTTP socket
+    before spawning or re-execing on the same port."""
+    from .. import lsp, mcp
+    for fn in (mcp.close_all, lsp.close_all):
+        try:
+            fn()
+        except Exception:
+            pass
+    shutdown_server()
+    if _SERVER is not None:
+        try:
+            _SERVER.server_close()
+        except Exception:
+            pass
+
+
+def _restart_process(argv: list[str], ready=None, outcome=None) -> dict:
+    """Replace this GUI with the freshly upgraded one. Windows has no execv
+    semantics (the call returns and the old interpreter keeps running), so
+    spawn the replacement and hard-exit; POSIX replaces the process in place.
+
+    On Windows the spawn can fail (missing interpreter, blocked exec). In that
+    case report it through `outcome` and return without shutting the current
+    server down, so the old GUI keeps serving. `ready` is set once the spawn
+    has succeeded or failed, letting the route answer with the real result."""
+    result = outcome if outcome is not None else {}
+    with STATE.lock:
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        result.update(ok=False,
+                      detail="A job is running. Stop it before restarting.")
+        if ready is not None:
+            ready.set()
+        return result
+    time.sleep(0.5)          # let the HTTP answer reach the page first
+    if os.name == "nt":
+        try:
+            subprocess.Popen(argv)
+        except OSError as exc:
+            result.update(ok=False,
+                          detail="Could not start the restarted Pedacito: "
+                                 f"{type(exc).__name__}: {str(exc)[:200]}")
+            if ready is not None:
+                ready.set()
+            return result
+        result.update(ok=True, detail="")
+        if ready is not None:
+            ready.set()
+            time.sleep(0.2)      # let the route's answer flush first
+        _close_for_restart()
+        os._exit(0)
+        return result
+    if ready is not None:
+        ready.set()
+    _close_for_restart()
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        result.update(ok=False,
+                      detail="Could not restart Pedacito: "
+                             f"{type(exc).__name__}: {str(exc)[:200]}")
+        return result
+    return result
+
+
+@post("/api/update/restart")
+def _update_restart(q, body=None):
+    """After a successful upgrade, re-exec this GUI on the SAME port so the
+    open page reconnects to the new version. Only offered when the run's
+    exit code was 0. On Windows the replacement is spawned before this route
+    answers, so a Popen failure returns its detail and leaves the old GUI
+    running."""
+    with STATE.lock:
+        ok = bool(STATE.update_run.get("ok"))
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        return 409, {"ok": False,
+                     "detail": "A job is running. Stop it before restarting."}
+    if not ok:
+        return 409, {"ok": False,
+                     "detail": "No successful upgrade to restart into."}
+    argv = _restart_argv()
+    if os.name == "nt":
+        ready = threading.Event()
+        outcome: dict = {}
+        threading.Thread(target=_restart_process, args=(argv,),
+                         kwargs={"ready": ready, "outcome": outcome},
+                         name="pedacito-gui-restart", daemon=True).start()
+        if not ready.wait(5.0):
+            return 500, {"ok": False,
+                         "detail": "The restart did not start in time."}
+        if not outcome.get("ok", True):
+            return 500, {"ok": False,
+                         "detail": outcome.get("detail")
+                                   or "Could not restart Pedacito."}
+        return 200, {"ok": True, "detail": "Restarting Pedacito…"}
+    threading.Thread(target=_restart_process, args=(argv,),
+                     name="pedacito-gui-restart", daemon=True).start()
+    return 200, {"ok": True, "detail": "Restarting Pedacito…"}
+
+
 @get("/api/files")
 def _files(q, body=None):
     return 200, project_files()
+
+
+def _active_context():
+    """(root, index) for read-only context endpoints, lock-safe when present."""
+    lock = getattr(STATE, "lock", None)
+    if lock is not None:
+        with lock:
+            return getattr(STATE, "root", None), getattr(STATE, "idx", None)
+    return getattr(STATE, "root", None), getattr(STATE, "idx", None)
+
+
+@get("/api/context/suggest")
+def _context_suggest(q, body=None):
+    """Fast `@` autocomplete: workspace files + indexed AST symbols.
+
+    `?q=` is the partial token after `@`. The endpoint is synchronous and
+    zero-LLM (the composer calls it on every keystroke), so it must answer
+    from the warm index rather than rebuilding or probing anything.
+    """
+    query = (q.get("q") or q.get("query") or [""])[0]
+    root, idx = _active_context()
+    items = suggest_context(idx if idx is not None else root, query, limit=20)
+    return 200, {
+        "ok": True,
+        "query": query,
+        "items": items,
+        "suggestions": items,
+        "files": [x for x in items if x.get("kind") == "file"],
+        "symbols": [x for x in items if x.get("kind") == "symbol"],
+    }
+
+
+@get("/api/rules")
+def _rules_get(q, body=None):
+    """Read the active project's persistent rules (`.pedacito/rules.md`)."""
+    root, _idx = _active_context()
+    if root is None:
+        raise ConfigError("No project is open.")
+    text = prompts_mod.load_project_rules(root)
+    path = prompts_mod.project_rules_path(root)
+    return 200, {
+        "ok": True,
+        "path": ".pedacito/rules.md",
+        "exists": bool(path is not None and path.is_file()),
+        "text": text,
+    }
+
+
+@post("/api/rules")
+def _rules_post(q, body):
+    """Save (or clear, with empty text) `.pedacito/rules.md`."""
+    root, _idx = _active_context()
+    if root is None:
+        raise ConfigError("No project is open.")
+    body = body or {}
+    text = body.get("text")
+    if text is None:
+        text = body.get("content")
+    try:
+        path = prompts_mod.save_project_rules(root, str(text or ""))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"Could not save project rules: {e}") from e
+    return 200, {
+        "ok": True,
+        "path": ".pedacito/rules.md",
+        "exists": path.is_file(),
+        "text": prompts_mod.load_project_rules(root),
+    }
 
 
 @get("/api/backups")
@@ -309,9 +620,378 @@ def _backups(q, body=None):
     return 200, {"backups": backup_snapshots()}
 
 
+# --- time-travel checkpoints --------------------------------------------------
+
+def _reindex_after_restore(restored, deleted) -> None:
+    """Keep an open index in step with files a checkpoint restore touched."""
+    try:
+        from .. import index as index_mod
+        with STATE.lock:
+            idx, cfg = STATE.idx, STATE.cfg
+        if idx is None or cfg is None:
+            return
+        for rel in restored:
+            idx = index_mod.reindex_file(idx, rel, cfg, save=False)
+        for rel in deleted:
+            idx.forget(rel)
+        idx.save()
+        with STATE.lock:
+            STATE.idx = idx
+            STATE.index_gen += 1
+        STATE.apply_index(idx)
+    except Exception:
+        pass
+
+
+@get("/api/checkpoints")
+def _checkpoints_list(q, body=None):
+    """The checkpoint tree for the active workspace."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        items = checkpoints_mod.list_checkpoints(root)
+        head = checkpoints_mod.head_id(root)
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {
+        "ok": True,
+        "root": str(root),
+        "head_id": head,
+        "checkpoints": [dict(cp) for cp in items],
+        "count": len(items),
+    }
+
+
+@get("/api/checkpoints/diff")
+def _checkpoints_diff(q, body=None):
+    """Unified diff for one checkpoint, against its parent or the live tree."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    checkpoint_id = str(q.get("id", [""])[0] or "")
+    against = str(q.get("against", ["workspace"])[0] or "workspace").lower()
+    if not checkpoint_id:
+        return 400, {"ok": False, "detail": "An id is required."}
+    if against not in ("parent", "workspace"):
+        return 400, {"ok": False,
+                     "detail": "against must be 'parent' or 'workspace'."}
+    try:
+        out = checkpoints_mod.diff_checkpoint(root, checkpoint_id,
+                                              against=against)
+    except checkpoints_mod.CheckpointError as e:
+        return 404, {"ok": False, "detail": str(e)}
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    out["ok"] = True
+    return 200, out
+
+
+@post("/api/checkpoints/create")
+def _checkpoints_create(q, body):
+    """Record a manual named checkpoint (the header's pin button)."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    label = str(body.get("label") or body.get("name")
+                or "manual checkpoint")
+    try:
+        cp = checkpoints_mod.create_checkpoint(root, label, mode="manual")
+    except (checkpoints_mod.CheckpointError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+    STATE.add_message("system", f"Checkpoint {cp['id']} recorded.",
+                      kind="checkpoint")
+    return 200, {"ok": True, "checkpoint": cp}
+
+
+@post("/api/checkpoints/restore")
+def _checkpoints_restore(q, body):
+    """Restore the whole workspace, or named files, from one checkpoint."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    with STATE.lock:
+        busy = STATE.job is not None and STATE.job.active
+    if busy:
+        return 409, {"ok": False,
+                     "detail": "A job is running. Wait for it or press Stop."}
+    checkpoint_id = str(body.get("id") or body.get("checkpoint") or "")
+    if not checkpoint_id:
+        return 400, {"ok": False, "detail": "A checkpoint id is required."}
+    files = body.get("files")
+    if files is None and body.get("file"):
+        files = [body.get("file")]
+    if isinstance(files, str):
+        files = [files]
+    try:
+        workspace.acquire_lock(root)
+    except workspace.ProjectBusy as e:
+        return 409, {"ok": False, "detail": str(e)}
+    try:
+        try:
+            out = checkpoints_mod.restore_checkpoint(root, checkpoint_id,
+                                                     files=files)
+        except checkpoints_mod.CheckpointError as e:
+            return 404, {"ok": False, "detail": str(e)}
+        except OSError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        _reindex_after_restore(out.get("restored") or [],
+                               out.get("deleted") or [])
+    finally:
+        workspace.release_lock(root)
+    detail = (f"Restored {out['files']} file(s) from {out['checkpoint']}."
+              + (f" Removed {len(out['deleted'])} created file(s)."
+                 if out.get("deleted") else ""))
+    STATE.add_message("system", detail, kind="restored")
+    out["detail"] = detail
+    return 200, out
+
+
+# --- 2-model sandbox arena ------------------------------------------------------
+
+@post("/api/arena/run")
+def _arena_run(q, body):
+    """Start an arena comparison: {"text", "model_a", "model_b"} (contestants
+    are profile names, 'provider:model' strings or {provider, model} dicts).
+    Both runs happen in isolated sandboxes; the workspace is not touched."""
+    body = body or {}
+    return _busy_reply(jobs.spawn(
+        "arena", "arena comparison",
+        lambda job: jobs.run_arena(job, {**body, "_echoed": True}),
+        echo=lambda: jobs.echo_submission("arena", body)))
+
+
+@get("/api/arena/last")
+def _arena_last(q, body=None):
+    """The stored comparison (scorecard + diffs) for the open project."""
+    from .. import arena as arena_mod
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    return 200, {"ok": True, "arena": arena_mod.last_arena(root)}
+
+
+@post("/api/arena/apply")
+def _arena_apply(q, body):
+    """Adopt a winner's sandbox into the workspace between two checkpoints.
+    Synchronous (file copies only, no model calls); refuses while a job runs."""
+    from .. import arena as arena_mod
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    body = body or {}
+    with STATE.lock:
+        job = STATE.job
+    if job is not None and job.active:
+        return 409, {"ok": False, "detail": "A job is running. Wait for it "
+                     "or press Stop."}
+    arena_id = str(body.get("arena_id") or "").strip()
+    if not arena_id:
+        state = arena_mod.last_arena(root)
+        arena_id = str((state or {}).get("arena_id") or "")
+    if not arena_id:
+        return 400, {"ok": False, "detail": "No arena to apply -- run one first."}
+    winner = str(body.get("winner") or "a").strip().lower()
+    try:
+        workspace.acquire_lock(root)
+    except workspace.ProjectBusy as e:
+        return 409, {"ok": False, "detail": str(e)}
+    try:
+        try:
+            out = arena_mod.apply_arena_winner(root, arena_id, winner)
+        except arena_mod.ArenaError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        except (checkpoints_mod.CheckpointError, OSError) as e:
+            return 400, {"ok": False, "detail": str(e)}
+        deleted = out.get("deleted") or []
+        _reindex_after_restore([f for f in out.get("files_changed") or []
+                                if f not in deleted], deleted)
+    finally:
+        workspace.release_lock(root)
+    detail = (f"Arena winner applied: {out['model']} "
+              f"({len(out['files_changed'])} file(s) changed).")
+    STATE.add_message("system", detail, kind="arena")
+    out["detail"] = detail
+    return 200, out
+
+
+# --- live runner / preview ----------------------------------------------------
+
+@get("/api/runner/targets")
+def _runner_targets(q, body=None):
+    """Detected web previews and runnable commands for the workspace."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        targets = runner_mod.detect_runnable_targets(root)
+    except OSError as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, {"ok": True, **targets}
+
+
+@post("/api/runner/exec")
+def _runner_exec(q, body):
+    """Run one detected target or a custom command; never uses a shell."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    command = body.get("command") or body.get("cmd")
+    target_id = str(body.get("id") or body.get("target") or "")
+    if not command and target_id:
+        try:
+            targets = runner_mod.detect_runnable_targets(root)
+        except OSError as e:
+            return 400, {"ok": False, "detail": str(e)}
+        for target in targets["commands"]:
+            if target.get("id") == target_id:
+                command = target
+                break
+        if not command:
+            return 404, {"ok": False,
+                         "detail": f"No runnable target {target_id!r}."}
+    timeout = body.get("timeout") or runner_mod.DEFAULT_TIMEOUT
+    try:
+        result = runner_mod.run_project_command(root, command,
+                                                timeout=timeout)
+    except (OSError, ValueError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+    return 200, result
+
+
 @get("/api/file")
 def _file(q, body=None):
     return 200, read_project_file(q.get("path", [""])[0])
+
+
+_IMAGE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+
+def _opt_int(val):
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+@post("/api/image/generate")
+def _image_generate(q, body):
+    """Generate one image using a configured image profile and save it inside
+    the active workspace (or scratchpad `.pedacito/images/` when no project is
+    open)."""
+    from .. import config as config_mod
+    from .. import imagegen
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return 400, {"ok": False, "detail": "Prompt is required."}
+    negative = str(body.get("negative_prompt") or "").strip()
+    output_path = str(body.get("output_path") or "").strip() or None
+    size = str(body.get("size") or "").strip()
+    steps = _opt_int(body.get("steps")) or 0
+    cfg_scale = _opt_float(body.get("cfg_scale"))
+    seed = _opt_int(body.get("seed"))
+    profile = str(body.get("profile") or "").strip() or None
+
+    root = _effective_root()
+    if STATE.root is None and output_path:
+        # When no project is open, keep generated files inside scratchpad
+        # `.pedacito/images/` so `/api/image/file` containment stays strict.
+        cleaned = output_path.lstrip("/\\")
+        if not cleaned.startswith(".pedacito/images/"):
+            output_path = str(Path(".pedacito") / "images" / Path(cleaned).name)
+
+    with STATE.lock:
+        cfg = STATE.cfg
+    if cfg is None:
+        cfg = config_mod.load(root=root, require_hardware=False,
+                              warn_budgets=False)
+
+    try:
+        res = imagegen.generate_image(
+            cfg, prompt,
+            output_path=output_path,
+            size=size,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            negative_prompt=negative,
+            profile=profile,
+            root=root,
+        )
+    except security.SecurityError as e:
+        return 403, {"ok": False, "detail": str(e)}
+    except imagegen.ImageGenError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+    rel_path = str(res.get("rel_path") or "")
+    url = "/api/image/file?path=" + quote(rel_path, safe="/")
+    return 200, {
+        "ok": True,
+        "path": str(res.get("path") or ""),
+        "rel_path": rel_path,
+        "url": url,
+        "width": int(res.get("width") or 0),
+        "height": int(res.get("height") or 0),
+        "bytes": int(res.get("bytes") or 0),
+        "elapsed_s": float(res.get("elapsed_s") or 0.0),
+        "model": str(res.get("model") or ""),
+        "profile": str(res.get("profile") or ""),
+    }
+
+
+@get("/api/image/file")
+def _image_file(q, body=None):
+    """Serve a generated image (PNG/JPEG/WebP only) strictly contained to
+    `STATE.root` (or scratchpad `.pedacito/images/` when no project is open)."""
+    from .. import imagegen
+
+    rel = str((q.get("path") or [""])[0] or "").strip()
+    if not rel:
+        return 400, {"ok": False, "detail": "Missing path parameter."}
+    with STATE.lock:
+        proj_root = STATE.root
+    try:
+        if proj_root is not None:
+            dest = security.resolve_safe_path(proj_root, rel)
+        else:
+            scratch = STATE.scratchpad_path()
+            images_dir = (scratch / ".pedacito" / "images").resolve()
+            dest = security.resolve_safe_path(scratch, rel)
+            if not dest.is_relative_to(images_dir):
+                raise security.SecurityError(
+                    "Image path must be inside .pedacito/images/ when no project is open.")
+    except security.SecurityError as e:
+        return 403, {"ok": False, "detail": str(e)}
+
+    if not dest.is_file():
+        return 404, {"ok": False, "detail": "Image not found."}
+    try:
+        data = dest.read_bytes()
+    except OSError as e:
+        return 500, {"ok": False, "detail": str(e)}
+
+    fmt, _w, _h = imagegen.sniff_image_format(data)
+    ctype = _IMAGE_MIME.get(fmt)
+    if not ctype:
+        return 415, {"ok": False,
+                     "detail": "Unsupported file type; only PNG, JPEG and WebP images are served."}
+    return 200, data, ctype
 
 
 @get("/api/preview")
@@ -359,6 +1039,100 @@ def _plan(q, body=None):
 @get("/api/settings")
 def _settings(q, body=None):
     return 200, settings_api.payload()
+
+
+# --- non-blocking secret & credential guard ------------------------------------
+
+def _security_cfg():
+    """The live config (global fallback when no project is open)."""
+    return _how_config()
+
+
+@get("/api/security/status")
+def _security_status(q, body=None):
+    """Unacknowledged secrets and unignored sensitive files, masked."""
+    root = _project_root()
+    return 200, security.security_status(root, _security_cfg(),
+                                         use_cache=False)
+
+
+@post("/api/security/scan")
+def _security_scan(q, body):
+    """Preflight for an outbound prompt.
+
+    The page asks this before a run: `needs_confirmation` is True only when
+    the endpoint is external, the workspace policy is "warn", and the text
+    carries unacknowledged secrets. Localhost/LAN providers never trigger a
+    pause even when the prompt contains a key.
+    """
+    from .. import llm as llm_mod
+    root = _project_root()
+    cfg = _security_cfg()
+    parts = [str(body.get("text") or "")]
+    # Attachments are composed into the same outbound prompt; scan them too so
+    # a pasted `.env` cannot bypass the preflight.
+    for attachment in body.get("attachments") or []:
+        if isinstance(attachment, dict):
+            attached = str(attachment.get("text") or "")
+            if attached:
+                parts.append(attached)
+    text = "\n\n".join(part for part in parts if part)
+    prompt = security.unacknowledged_findings(
+        security.scan_text_for_secrets(text, "<prompt>"), root)
+    status = security.security_status(root, cfg, use_cache=False)
+    external = llm_mod.is_external_provider(cfg)
+    mode = security.outbound_mode(cfg)
+    out = {
+        **status,
+        "ok": True,
+        "external_provider": external,
+        "workspace_findings": status.get("findings", []),
+        "findings": [finding.to_dict() for finding in prompt],
+        "prompt_findings": [finding.to_dict() for finding in prompt],
+        "needs_confirmation": bool(prompt) and external and mode == "warn",
+    }
+    return 200, out
+
+
+@post("/api/security/ack")
+def _security_ack(q, body):
+    """Persist SHA-256 fingerprints only; the API never sees a raw secret."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    cfg = _security_cfg()
+    values = body.get("fingerprints") or []
+    if not isinstance(values, list):
+        values = [values]
+    if body.get("all"):
+        status = security.security_status(root, cfg, use_cache=False)
+        values = values + [f["fingerprint"] for f in status.get("findings", [])]
+    acknowledged = security.acknowledge_findings(root, values)
+    security.clear_security_cache(root)
+    return 200, {
+        "ok": True,
+        "acknowledged": sorted(acknowledged),
+        **security.security_status(root, cfg, use_cache=False),
+    }
+
+
+@post("/api/security/gitignore")
+def _security_gitignore(q, body):
+    """Append the missing `.env` patterns to the workspace `.gitignore`."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    patterns = body.get("patterns")
+    if not isinstance(patterns, list) or not patterns:
+        patterns = [".env", ".env.*"]
+    added = security.ensure_gitignore_entries(root, patterns)
+    security.clear_security_cache(root)
+    cfg = _security_cfg()
+    return 200, {
+        "ok": True,
+        "added": added,
+        **security.security_status(root, cfg, use_cache=False),
+    }
 
 
 @get("/api/mcp/tools")
@@ -592,6 +1366,7 @@ def _project_reset(q, body):
         return 200, out
     with STATE.lock:
         STATE.idx = None
+        STATE.agent = None
         STATE.plan_path = None
         STATE.last_backup_dir = None
     STATE.apply_index(None)
@@ -681,7 +1456,8 @@ def _skills_get(q, body=None):
 
     With no project open this reads the built-in library plus the user's
     global folder (and any skill saved into the scratchpad project)."""
-    return 200, _skills_payload(_effective_root(), str(q.get("task", "")))
+    task = (q.get("task") or [""])[0]
+    return 200, _skills_payload(_effective_root(), str(task or ""))
 
 
 @post("/api/skills")
@@ -865,6 +1641,209 @@ def _procs_post(q, body):
     return 400, {"ok": False, "detail": f"unknown procs action {action!r}"}
 
 
+# --- model-server lifecycle and hardware ------------------------------------
+
+def _servers_config():
+    """The config the server manager should inspect: the open project's live
+    config, else the user's global selection (never a hardware probe)."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    return cfg if cfg is not None else STATE.global_config()
+
+
+def _profile_availability(config, states) -> dict:
+    """Profile name -> available|unavailable|offline|unknown.
+
+    Pure bookkeeping over the server states the caller just fetched: this
+    adds no probe and never contacts a hosted endpoint. A profile is matched
+    to a state by its normalized effective base_url; a hosted (non-local)
+    profile is always "unknown", as is a local profile whose URL is not a
+    configured server or whose server returned no model list. Only a positive
+    answer with a non-empty list that lacks the model becomes "unavailable" --
+    the state the GUI disables and the switch guard refuses.
+    """
+    from .. import servers
+    out: dict[str, str] = {}
+    if config is None:
+        return out
+    by_url: dict[str, dict] = {}
+    for state in states or []:
+        if not isinstance(state, dict):
+            continue
+        url = servers.normalize_url(str(state.get("base_url") or ""))
+        if not url:
+            continue
+        # Duplicate spellings are already deduped by configured_local_servers;
+        # if a caller hands us both, an online row wins over an offline one.
+        if url not in by_url or (state.get("online")
+                                 and not by_url[url].get("online")):
+            by_url[url] = state
+    for name, body in (getattr(config, "profiles", None) or {}).items():
+        body = body if isinstance(body, dict) else {}
+        base = str(body.get("base_url")
+                   or getattr(config, "base_url", "") or "")
+        if not base or not servers.is_local_url(base):
+            out[str(name)] = "unknown"
+            continue
+        model = str(body.get("model")
+                    or getattr(config, "model", "") or "").strip()
+        state = by_url.get(servers.normalize_url(base))
+        if state is None:
+            out[str(name)] = "unknown"
+        elif not state.get("online"):
+            out[str(name)] = "offline"
+        else:
+            models = state.get("models")
+            if not isinstance(models, (list, tuple, set)):
+                models = []
+            if not model or not models:
+                out[str(name)] = "unknown"
+            elif model in [str(m) for m in models]:
+                out[str(name)] = "available"
+            else:
+                out[str(name)] = "unavailable"
+    return out
+
+
+def _server_payload(config, memory=None) -> dict:
+    from .. import profiler
+    from .. import servers
+    # snapshot() is a superset of get_hardware_memory(): same RAM/VRAM shape,
+    # plus nvidia-smi / vm_stat / winapi numbers and a source per number.
+    # That is what fills the NVIDIA and macOS/Windows live telemetry bar.
+    snap = memory if memory is not None else profiler.snapshot()
+    out = servers.server_summary(config, memory=snap)
+    out["memory"] = snap
+    out["hardware"] = snap
+    out["vram"] = snap["vram"]
+    out["ram"] = snap["ram"]
+    out["badge"] = servers.memory_badge(snap)
+    out["snapshot"] = snap
+    # Availability rides this existing poll: no extra interval, no extra
+    # network call, and hosted endpoints are classified before any matching.
+    availability = _profile_availability(config, out.get("servers") or [])
+    out["profile_availability"] = availability
+    with STATE.lock:
+        STATE.profile_availability = dict(availability)
+    return out
+
+
+@get("/api/servers")
+def _servers_get(q, body=None):
+    """Live VRAM/RAM plus every configured local server's online state and
+    resident model(s). Never errors when a server is asleep."""
+    try:
+        return 200, _server_payload(_servers_config())
+    except Exception as e:
+        from .. import profiler
+        return 200, {"ok": False, "detail": f"{type(e).__name__}: {e}",
+                     "memory": profiler.snapshot(),
+                     "servers": []}
+
+
+def _server_target(body):
+    return (body.get("server") or body.get("name")
+            or body.get("profile") or body.get("base_url") or "")
+
+
+@post("/api/servers/load")
+def _servers_load(q, body):
+    """Load a model on one configured local server and return fresh
+    hardware + server telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    result = servers.load_server_model(target, model, config)
+    payload = _server_payload(config)
+    payload.update(result)
+    return (200 if result.get("ok") else 502), payload
+
+
+@post("/api/servers/unload")
+def _servers_unload(q, body):
+    """Unload a model (or every resident model) from one server, or from all
+    local servers when no target is named. Returns updated telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    if target:
+        result = servers.unload_server_model(target, model, config)
+        results = [result]
+    else:
+        results = servers.unload_all_local_servers(config)
+        result = {"ok": all(r.get("ok") for r in results),
+                  "action": "unload", "server": "all",
+                  "detail": f"{sum(1 for r in results if r.get('ok'))} of "
+                            f"{len(results)} server(s) acknowledged"}
+    payload = _server_payload(config)
+    payload.update(result)
+    payload["results"] = results
+    return (200 if result.get("ok") or not results else 502), payload
+
+
+@post("/api/servers/pin")
+def _servers_pin(q, body):
+    """Pin or unpin a loaded Lemonade model and return fresh telemetry."""
+    from .. import servers
+    config = _servers_config()
+    target = _server_target(body)
+    model = str(body.get("model") or "").strip()
+    pinned = bool(body.get("pinned", True))
+    kind = str(body.get("kind") or "").strip()
+    result = servers.pin_server_model(target, model, pinned, config, kind=kind)
+    payload = _server_payload(config)
+    payload.update(result)
+    return (200 if result.get("ok") else 502), payload
+
+
+@post("/api/servers/auto-evict")
+def _servers_auto_evict(q, body):
+    """Toggle the auto-unload-other-servers handshake and apply it live."""
+    enabled = bool(body.get("enabled", body.get("auto_evict_servers", True)))
+    with STATE.lock:
+        cfg = STATE.cfg
+        if cfg is not None:
+            cfg.auto_evict_servers = enabled
+    try:
+        settings_api.apply_changes("user", None,
+                                   {"auto_evict_servers": enabled}, [])
+    except ConfigError:
+        pass
+    return 200, {"ok": True, "auto_evict_servers": enabled}
+
+
+@post("/api/effort")
+def _effort(q, body):
+    """Set reasoning_effort for the live run and persist it as a user setting.
+
+    Local-MoE and reasoning-capable hosted models both read the key; the
+    transport omits it for "default" and for models without the control."""
+    from .. import config as config_mod
+    level = str(body.get("level",
+                         body.get("reasoning_effort", "default"))).strip().lower()
+    if level not in ("default", "low", "medium", "high"):
+        return 400, {"ok": False,
+                     "detail": "reasoning effort must be default, low, "
+                               "medium or high"}
+    with STATE.lock:
+        cfg = STATE.cfg
+        if cfg is not None:
+            cfg.reasoning_effort = level
+            cfg.sources["reasoning_effort"] = "GUI Effort selector"
+    try:
+        settings_api.apply_changes("user", None,
+                                   {"reasoning_effort": level}, [])
+    except ConfigError:
+        # A scratchpad/no-config session still gets the live switch; the
+        # setting is persisted as soon as a config file exists.
+        pass
+    return 200, {"ok": True, "reasoning_effort": level,
+                 "model_class": (config_mod.capability_profile(cfg)
+                                 if cfg is not None else "")}
+
+
 @post("/api/project/check")
 def _project_check(q, body):
     """Run one on-demand project check: diagnose, webcheck or domcheck."""
@@ -957,6 +1936,39 @@ def _project_prune(q, body):
     }
 
 
+def _profile_switch_refusal(cfg, name: str):
+    """409 when the cached /api/servers map proved this profile's model gone.
+
+    Only "unavailable" is refused. "unknown" (no cache, hosted profile, an
+    unconfigured URL or an empty model list) and "offline" fail open, so a
+    sleeping server or a not-yet-polled page can never lock the picker."""
+    if not name or cfg is None:
+        return None
+    with STATE.lock:
+        state = (STATE.profile_availability or {}).get(name)
+    if state != "unavailable":
+        return None
+    from .. import servers
+    body = (cfg.profiles or {}).get(name) or {}
+    body = body if isinstance(body, dict) else {}
+    model = str(body.get("model") or getattr(cfg, "model", "") or "")
+    base = str(body.get("base_url") or getattr(cfg, "base_url", "") or "")
+    server = base or "its server"
+    if base:
+        try:
+            for candidate in servers.configured_local_servers(cfg):
+                if servers.normalize_url(
+                        candidate.get("base_url") or "") == \
+                        servers.normalize_url(base):
+                    server = str(candidate.get("name") or base)
+                    break
+        except Exception:
+            pass
+    return 409, {"ok": False, "detail": (
+        f"model {model or '(none)'} is not available on {server} \u2014 "
+        "it may have been deleted; update the profile in Settings")}
+
+
 @post("/api/profile")
 def _profile_switch(q, body):
     """Switch the active model profile.
@@ -979,6 +1991,9 @@ def _profile_switch(q, body):
             known = []
         if name and known and name not in known:
             return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+        refusal = _profile_switch_refusal(cfg, name)
+        if refusal:
+            return refusal
         if toggles:
             try:
                 settings_api.apply_changes("user", None, toggles, [])
@@ -996,6 +2011,9 @@ def _profile_switch(q, body):
     known = sorted(cfg.profiles) if cfg else []
     if name and known and name not in known:
         return 400, {"ok": False, "detail": f"no profile named {name!r}"}
+    refusal = _profile_switch_refusal(cfg, name)
+    if refusal:
+        return refusal
     if toggles:
         try:
             settings_api.apply_changes("user", None, toggles, [])
@@ -1027,6 +2045,47 @@ def _check_model(q, body):
     return _busy_reply(jobs.spawn("check", "checking model", jobs.check_model))
 
 
+def _split_attachments(body: dict) -> tuple[list[dict], list[dict]]:
+    """Separate text attachments from image attachments and validate all images.
+
+    Accepts image items inside `attachments` (with `kind == "image"`,
+    `mime` starting with `"image/"`, or `data_b64`/`data_url`) as well as a
+    top-level `images` list. Raises ValueError/OSError on invalid/oversize/excess
+    images so the route can return HTTP 400.
+    """
+    from .. import imagegen as imagegen_mod
+
+    text_items: list[dict] = []
+    raw_images: list[dict] = []
+    for item in body.get("attachments") or []:
+        if not isinstance(item, dict):
+            continue
+        is_img = (
+            item.get("kind") == "image"
+            or str(item.get("mime") or "").lower().startswith("image/")
+            or (bool(item.get("data_b64") or item.get("data_url"))
+                and "text" not in item)
+        )
+        if is_img:
+            raw_images.append(item)
+        else:
+            text_items.append(item)
+    extra_images = body.get("images") or []
+    if extra_images:
+        if not isinstance(extra_images, list):
+            raise ValueError("`images` must be a list.")
+        raw_images.extend(extra_images)
+    normalized = imagegen_mod.normalize_image_attachments(raw_images)
+    # Preserve optional lightweight UI thumbnail (capped at 40 KB) on each item
+    # for echo_submission without ever saving full raw base64 into history.
+    for norm, raw in zip(normalized, raw_images):
+        if isinstance(raw, dict):
+            thumb = raw.get("thumb")
+            if isinstance(thumb, str) and thumb.startswith("data:image/") and len(thumb) <= 40_000:
+                norm["thumb"] = thumb
+    return text_items, normalized
+
+
 @post("/api/run")
 def _run(q, body):
     mode = body.get("mode", "")
@@ -1036,16 +2095,22 @@ def _run(q, body):
            "new": (jobs.run_new, "creating project")}
     if mode not in fns:
         return 400, {"ok": False, "detail": f"unknown mode {mode!r}"}
+    try:
+        text_attachments, images = _split_attachments(body)
+    except (ValueError, OSError) as exc:
+        return 400, {"ok": False, "detail": str(exc)}
     fn, title = fns[mode]
-    opts = {**body, "_echoed": True}
+    opts = {**body, "attachments": text_attachments, "images": images,
+            "_echoed": True}
     if mode == "auto":
         # Auto applies by default (like `pedacito auto --apply`); only an
         # explicit "Plan only" request keeps it read-only.
         opts["plan_only"] = jobs.auto_plan_only(opts)
         opts["apply"] = not opts["plan_only"]
+    echo_body = {**body, "attachments": text_attachments, "images": images}
     return _busy_reply(jobs.spawn(
         mode, title, lambda job: fn(job, opts),
-        echo=lambda: jobs.echo_submission(mode, body)))
+        echo=lambda: jobs.echo_submission(mode, echo_body)))
 
 
 # Named aliases for the Ask, Auto and New modes, for API clients that address
@@ -1094,10 +2159,12 @@ def _refactor_rename(q, body):
     new = str(body.get("new") or "").strip()
     if not old or not new:
         return 400, {"ok": False, "detail": "Both `old` and `new` are required."}
-    root = STATE.root
+    with STATE.lock:
+        root = STATE.root
+        busy = STATE.job is not None and STATE.job.active
     if root is None:
         return 409, {"ok": False, "detail": "Open a workspace first."}
-    if STATE.job is not None and STATE.job.active:
+    if busy:
         return 409, {"ok": False, "detail": "An agent run is active; stop it "
                        "before renaming."}
     scope = str(body.get("file") or "").strip() or None
@@ -1113,19 +2180,35 @@ def _refactor_rename(q, body):
         fileio.backup_copy(path, state["dir"] / rel)
         return None
 
-    res = refactor_mod.rename_symbol_across_project(
-        root, old, new, scope_file=scope, dry_run=not apply_it,
-        before_write=_snapshot if apply_it else None)
-    if not res.get("ok"):
-        return 400, res
-    if state["dir"] is not None:
-        res["backup"] = str(state["dir"].relative_to(root))
-    if apply_it and res["files_modified"] and STATE.idx is not None:
-        # keep the GUI's index truthful after the rename (the next agent run
-        # rebuilds anyway; this only prevents stale search results)
-        from ..index import reindex_file
-        for rel in res["files_modified"]:
-            reindex_file(STATE.idx, rel, STATE.cfg, save=False)
+    lock_held = False
+    if apply_it:
+        try:
+            workspace.acquire_lock(root)
+            lock_held = True
+        except workspace.ProjectBusy as e:
+            return 409, {"ok": False, "detail": str(e)}
+    try:
+        res = refactor_mod.rename_symbol_across_project(
+            root, old, new, scope_file=scope, dry_run=not apply_it,
+            before_write=_snapshot if apply_it else None)
+        if not res.get("ok"):
+            return 400, res
+        if state["dir"] is not None:
+            res["backup"] = str(state["dir"].relative_to(root))
+        if apply_it and res["files_modified"]:
+            with STATE.lock:
+                idx, cfg = STATE.idx, STATE.cfg
+            if idx is not None:
+                from ..index import reindex_file
+                for rel in res["files_modified"]:
+                    idx = reindex_file(idx, rel, cfg, save=False)
+                with STATE.lock:
+                    STATE.idx = idx
+                    STATE.index_gen += 1
+                STATE.apply_index(idx)
+    finally:
+        if lock_held:
+            workspace.release_lock(root)
     return 200, res
 
 
@@ -1148,8 +2231,11 @@ def _steer(q, body):
 
 @post("/api/answer")
 def _answer(q, body):
-    ok = STATE.answer_question(int(body.get("qid") or 0),
-                               str(body.get("text", "")))
+    try:
+        qid = int(body.get("qid") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "qid must be an integer."}
+    ok = STATE.answer_question(qid, str(body.get("text", "")))
     return (200, {"ok": True}) if ok else (409, {"ok": False,
                                                   "detail": "No open question."})
 
@@ -1168,16 +2254,24 @@ def _permission_decide(q, body):
 
 @post("/api/review/decide")
 def _decide(q, body):
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
     files = body.get("files")
     ok, detail = STATE.decide_review(
-        int(body.get("id") or 0), str(body.get("action", "")),
+        rid, str(body.get("action", "")),
         list(files) if isinstance(files, list) else None)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
 @post("/api/review/rediff")
 def _rediff(q, body):
-    out = STATE.review_rediff(int(body.get("id") or 0), str(body.get("rel", "")),
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
+    out = STATE.review_rediff(rid, str(body.get("rel", "")),
                               str(body.get("text", "")))
     return (200, out) if out else (409, {"ok": False,
                                          "detail": "This file can't be edited."})
@@ -1369,12 +2463,26 @@ POST_ROUTES["/api/settings/setup"] = _settings_write(
         b.get("vram_gb")))
 POST_ROUTES["/api/settings/trust"] = _settings_write(
     lambda b: settings_api.trust_project_config())
-POST_ROUTES["/api/profiles/rename"] = _settings_write(
-    lambda b: settings_api.rename_profile(
-        b.get("file", "user"), str(b.get("old_name", "")),
-        str(b.get("new_name", ""))))
-POST_ROUTES["/api/settings/scout"] = _settings_write(
-    lambda b: settings_api.configure_scout(dict(b or {})))
+
+
+@post("/api/profiles/rename")
+def _profiles_rename(q, body):
+    """Rename a profile; `rename_profile` already reloads STATE synchronously."""
+    try:
+        return 200, {"ok": True, **settings_api.rename_profile(
+            body.get("file", "user"), str(body.get("old_name", "")),
+            str(body.get("new_name", "")))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/settings/scout")
+def _settings_scout(q, body):
+    """Save a Scout + Architect pairing; `configure_scout` already reloads STATE."""
+    try:
+        return 200, {"ok": True, **settings_api.configure_scout(dict(body or {}))}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
 
 
 @post("/api/settings/theme")
@@ -1386,6 +2494,79 @@ def _theme(q, body):
             str(body.get("gui_theme", "")))}
     except ConfigError as e:
         return 400, {"ok": False, "detail": str(e)}
+
+
+@get("/api/i18n")
+def _i18n_get(q, body=None):
+    """Active interface language, supported codes, and full flat catalogs."""
+    return 200, {
+        "ok": True,
+        "lang": STATE.user_language(),
+        "supported": list(i18n.SUPPORTED_LANGUAGES),
+        "catalogs": i18n.all_catalogs(),
+    }
+
+
+@post("/api/settings/language")
+def _settings_language(q, body):
+    """Persist the interface language in the user config. UI-only: no
+    project reload, no jobs touched."""
+    try:
+        res = settings_api.save_language(str((body or {}).get("language", "")))
+        return 200, {"ok": True, **res, "catalogs": i18n.all_catalogs()}
+    except ConfigError as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+def _themes_payload() -> dict:
+    data = themes_mod.list_themes(STATE.root)
+    # The nine CSS-native gui_theme schemes: the Theme Manager offers them
+    # alongside the engine presets, painted by their crafted app.css blocks.
+    data["css_schemes"] = list(config_mod._ENUM_FIELDS["gui_theme"])
+    return {"ok": True, **data}
+
+
+@get("/api/themes")
+def _themes(q, body=None):
+    """Every built-in and custom palette, plus the active theme's name."""
+    return 200, _themes_payload()
+
+
+@post("/api/themes/select")
+def _themes_select(q, body):
+    """Activate a theme. A project with an override updates that override."""
+    name = str((body or {}).get("name") or "").strip()
+    try:
+        themes_mod.set_active_theme(name, STATE.root)
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
+    return 200, _themes_payload()
+
+
+@post("/api/themes/save")
+def _themes_save(q, body):
+    """Validate, store and activate a user-created theme."""
+    body = body or {}
+    try:
+        themes_mod.save_custom_theme(str(body.get("name") or ""),
+                                     body.get("tokens"), STATE.root)
+        themes_mod.set_active_theme(str(body.get("name") or ""), STATE.root)
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
+    return 200, _themes_payload()
+
+
+@post("/api/themes/delete")
+def _themes_delete(q, body):
+    """Delete a custom theme; built-in presets are immutable."""
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        raise ConfigError("theme name is required")
+    if not themes_mod.delete_custom_theme(name):
+        if name in themes_mod.BUILTIN_THEMES:
+            raise ConfigError(f"{name!r} is a built-in theme and cannot be deleted")
+        raise ConfigError(f"no custom theme named {name!r}")
+    return 200, _themes_payload()
 
 
 @post("/api/settings/autotune")
@@ -1690,11 +2871,27 @@ class _Handler(BaseHTTPRequestHandler):
         and may run its own inline scripts/styles. Sensitive files are never
         previewed. Relative asset links inside the page resolve back through
         /preview/ as well."""
+        self._serve_project_asset(rel)
+
+    def _runner_preview(self, rel: str) -> None:
+        """The Run tab's preview endpoint, with the same path-traversal gate
+        as /preview/ but no HTML-page restriction: stylesheets, scripts,
+        images, fonts, JSON, wasm and media all load from the project root."""
+        self._serve_project_asset(rel)
+
+    def _serve_project_asset(self, rel: str) -> None:
         root = STATE.root
         if root is None:
             self._send(404, b"no project open", "text/plain")
             return
-        p = _within(root, unquote(rel))
+        # unquote once, then resolve through the security gate: a literal
+        # `..`, an encoded `%2e%2e`, a symlink out of the tree and an
+        # absolute path all fail here before any byte is read.
+        raw = unquote(str(rel or ""))
+        if "\x00" in raw:
+            self._send(404, b"not found", "text/plain")
+            return
+        p = _within(root, raw)
         if p is None or not p.is_file():
             self._send(404, b"not found", "text/plain")
             return
@@ -1705,12 +2902,20 @@ class _Handler(BaseHTTPRequestHandler):
                  or mimetypes.guess_type(p.name)[0]
                  or "application/octet-stream")
         if ctype.startswith("text/") or ctype.endswith("javascript") \
-                or ctype in ("image/svg+xml", "application/json"):
+                or ctype in ("image/svg+xml", "application/json",
+                             "application/wasm"):
             ctype += "; charset=utf-8"
         try:
-            data = p.read_bytes()
+            if p.stat().st_size > MAX_PREVIEW_ASSET_BYTES:
+                self._send(413, b"file too large", "text/plain")
+                return
+            with p.open("rb") as fh:
+                data = fh.read(MAX_PREVIEW_ASSET_BYTES + 1)
         except OSError:
             self._send(404, b"not found", "text/plain")
+            return
+        if len(data) > MAX_PREVIEW_ASSET_BYTES:
+            self._send(413, b"file too large", "text/plain")
             return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -1718,12 +2923,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
-        self.send_header("Content-Security-Policy",
-                         "default-src 'self' data: blob:; "
-                         "style-src 'self' 'unsafe-inline'; "
-                         "script-src 'self' 'unsafe-inline'; "
-                         "img-src 'self' data: blob:; "
-                         "frame-ancestors 'self'")
+        self.send_header("Content-Security-Policy", PREVIEW_CSP)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1761,6 +2961,9 @@ class _Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         if url.path == "/events":
             self._events(query)
+            return
+        if url.path.startswith("/api/runner/preview/"):
+            self._runner_preview(url.path[len("/api/runner/preview/"):])
             return
         if url.path.startswith("/preview/"):
             self._preview(url.path[len("/preview/"):])
@@ -1817,12 +3020,19 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _call(self, route, query, body) -> None:
         try:
-            code, obj = route(query, body) if body is not None else route(query)
+            res = route(query, body) if body is not None else route(query)
         except ConfigError as e:
-            code, obj = 400, {"ok": False, "detail": str(e)}
+            self._json(400, {"ok": False, "detail": str(e)})
+            return
         except Exception as e:
             print(f"[gui] {self.path}: {type(e).__name__}: {e}", file=sys.stderr)
-            code, obj = 500, {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+            self._json(500, {"ok": False, "detail": f"{type(e).__name__}: {e}"})
+            return
+        if isinstance(res, tuple) and len(res) == 3 and isinstance(res[1], (bytes, bytearray)):
+            code, raw, ctype = res
+            self._send(code, bytes(raw), str(ctype))
+            return
+        code, obj = res
         self._json(code, obj)
 
     def _events(self, query) -> None:
@@ -1877,12 +3087,19 @@ def run(port: int = 0, open_browser: bool = True, project: str | None = None,
         profile: str | None = None) -> None:
     """Start the GUI server; block until Ctrl-C or the page's Exit button.
     `project` (and `profile`) open that folder as soon as the server is up."""
+    global _RUN_ARGS
     srv = create_server(port)
+    _RUN_ARGS = SimpleNamespace(port=srv.server_address[1],
+                                open_browser=open_browser,
+                                project=project, profile=profile)
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"pedacito gui running at {url}  (Ctrl-C to stop)", file=sys.stderr)
     originals = install_tee()
     install_runner()
     install_permission_broker()
+    # Quiet release check on a daemon thread: never delays startup by a
+    # network round-trip, silent when offline or opted out (pedacito.update).
+    update_mod.check_for_update_async(on_done=STATE.note_startup_update)
     if project:
         path = str(Path(project).expanduser().resolve())
         STATE.set_root(path)     # report any existing index before the open job

@@ -60,6 +60,64 @@ PDC.fmtTokens = (n) => {
   return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 };
 
+// ------------------------------------------------------------------- i18n ----
+PDC.lang = (document.documentElement.lang === 'es') ? 'es' : 'en';
+PDC.i18n = { en: {}, es: {} };
+PDC.t = (key, vars, fallback) => {
+  const cat = PDC.i18n[PDC.lang] || {};
+  const en = PDC.i18n.en || {};
+  let text = (cat[key] !== undefined && cat[key] !== '') ? cat[key]
+    : (en[key] !== undefined && en[key] !== '') ? en[key]
+    : (fallback !== undefined ? fallback : key);
+  if (vars && typeof vars === 'object') {
+    text = String(text).replace(/\{([A-Za-z0-9_]+)\}/g, (m, k) => (
+      Object.prototype.hasOwnProperty.call(vars, k) && vars[k] !== undefined && vars[k] !== null
+        ? String(vars[k]) : m
+    ));
+  }
+  return text;
+};
+PDC.setLang = (lang, persist) => {
+  const code = (String(lang || '').trim().toLowerCase() === 'es') ? 'es' : 'en';
+  PDC.lang = code;
+  document.documentElement.lang = code;
+  try { localStorage.setItem('pedacito_lang', code); } catch (e) {}
+  emit();
+  if (typeof PDC.rerenderSettings === 'function') {
+    try { PDC.rerenderSettings(); } catch (e) {}
+  }
+  if (persist !== false) {
+    PDC.api('/api/settings/language', { language: code }).then((j) => {
+      if (j && j.catalogs) {
+        PDC.i18n = j.catalogs;
+        emit();
+        if (typeof PDC.rerenderSettings === 'function') {
+          try { PDC.rerenderSettings(); } catch (e) {}
+        }
+      }
+      if (j && !j.ok) PDC.toast(j.detail || PDC.t('errors.unknown', null, 'Something went wrong.'), true);
+    }, () => {});
+  }
+};
+function loadI18n() {
+  return PDC.api('/api/i18n').then((j) => {
+    if (!j || !j.ok) return;
+    if (j.catalogs) PDC.i18n = j.catalogs;
+    let saved = '';
+    try { saved = localStorage.getItem('pedacito_lang') || ''; } catch (e) {}
+    const serverLang = (j.lang === 'es' || j.lang === 'en') ? j.lang : 'en';
+    const next = (saved === 'en' || saved === 'es') ? saved : serverLang;
+    if (next !== PDC.lang) {
+      PDC.lang = next;
+      document.documentElement.lang = next;
+    }
+    emit();
+    if (typeof PDC.rerenderSettings === 'function') {
+      try { PDC.rerenderSettings(); } catch (e) {}
+    }
+  }, () => {});
+}
+
 // Built-in hosted-provider catalog. settings.js seeds its "Add Hosted
 // Provider" dialog from this immediately, so the provider selector renders
 // even before (or if) GET /api/providers/presets ever answers; the server's
@@ -96,11 +154,12 @@ PDC.FALLBACK_PROVIDER_CATALOG = [
 ];
 
 // ------------------------------------------------------------------- modal ---
+let modalSeq = 0;
 PDC.modal = (title, body, buttons, opts) => {
   opts = opts || {};
   const overlay = h('div', { class: 'overlay' });
   const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); if (opts.onClose) opts.onClose(); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const onKey = (e) => { if (e.key === 'Escape' && !opts.locked) close(); };
   const foot = h('div', { class: 'modal-foot' });
   (buttons || []).forEach((b) => {
     foot.appendChild(h('button', {
@@ -108,13 +167,21 @@ PDC.modal = (title, body, buttons, opts) => {
       onclick: () => { const keep = b.onclick && b.onclick(close); if (keep !== false && !b.stay) close(); }
     }));
   });
-  const box = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : '') },
-    h('div', { class: 'modal-head' }, h('h3', { text: title }),
-      h('button', { class: 'ghost', text: '\u2715', onclick: close })),
+  const titleId = 'modalTitle-' + (++modalSeq);
+  const box = h('div', {
+    class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : ''),
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-labelledby': titleId,
+  },
+    h('div', { class: 'modal-head' }, h('h3', { id: titleId, text: title }),
+      opts.locked ? null : h('button', { class: 'ghost', text: '\u2715', onclick: close })),
     h('div', { class: 'modal-body' }, body),
     (buttons && buttons.length) ? foot : null);
   overlay.appendChild(box);
-  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+  if (!opts.locked) {
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+  }
   document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
   return { close: close, box: box, body: box.querySelector('.modal-body') };
@@ -216,7 +283,7 @@ function showPermissionModal(pp) {
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
     btn('Deny & Redirect', 'deny', { danger: true }),
-  ], { narrow: true, onClose: () => { permModal = null; permShownId = ''; } });
+  ], { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
 }
 
 // ------------------------------------------------------- markdown to vnodes ---
@@ -294,7 +361,45 @@ function writeDraft(text) {
   } catch (e) {}
 }
 function clearDraft() { writeDraft(''); }
+// The dismissed update version survives reloads, beside the other
+// pedacito_* preferences. A strictly newer latest release re-shows the banner;
+// the same (or an older cached) latest stays hidden.
+const UPDATE_DISMISSED_KEY = 'pedacito_update_dismissed';
+function readUpdateDismissed() {
+  try { return localStorage.getItem(UPDATE_DISMISSED_KEY) || null; }
+  catch (e) { return null; }
+}
+function writeUpdateDismissed(version) {
+  try {
+    if (version) localStorage.setItem(UPDATE_DISMISSED_KEY, version);
+    else localStorage.removeItem(UPDATE_DISMISSED_KEY);
+  } catch (e) {}
+}
+const UPDATE_STAGE_RANK = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2,
+                            c: 3, rc: 3, pre: 3, preview: 3,
+                            post: 5, rev: 5, r: 5 };
+function updateVersionKey(text) {
+  const m = /^\s*v?(\d+(?:\.\d+)*)(?:[-_.]?(a|alpha|b|beta|c|rc|pre|preview|dev|post|rev|r)[-_.]?(\d*))?/i
+    .exec(String(text || ''));
+  if (!m) return null;
+  const rank = UPDATE_STAGE_RANK[(m[2] || '').toLowerCase()];
+  return [m[1].split('.').map(Number),
+          rank === undefined ? 4 : rank,
+          Number(m[3] || 0)];
+}
+function isNewerVersion(candidate, base) {
+  const a = updateVersionKey(candidate), b = updateVersionKey(base);
+  if (!a) return false;
+  if (!b) return true;
+  const n = Math.max(a[0].length, b[0].length);
+  for (let i = 0; i < n; i++) {
+    const x = a[0][i] || 0, y = b[0][i] || 0;
+    if (x !== y) return x > y;
+  }
+  return a[1] > b[1] || (a[1] === b[1] && a[2] > b[2]);
+}
 const savedDraft = readDraft();
+const savedUpdateDismissed = readUpdateDismissed();
 const savedMode = (() => {
   try { return localStorage.getItem('pedacito_mode') || 'task'; }
   catch (e) { return 'task'; }
@@ -306,6 +411,7 @@ const savedCreative = (() => {
 
 const S = {
   status: {},
+  profile_availability: {},               // profile -> available|unavailable|offline|unknown
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
   review: null, diff: null, diffRel: '', sel: {}, editing: false,
@@ -313,20 +419,32 @@ const S = {
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
         loading: false, backups: [], backupsAt: 0,
-        pages: [], page: '', previewRev: 0 },
+        pages: [], page: '', previewRev: 0,
+        targets: null, targetsAt: 0, runPage: '', runRev: 0, runCmd: '',
+        runCustom: '', runOut: null, runRunning: false },
+  cp: { items: [], head_id: '', loaded: false },
   mode: savedMode,
   creative: savedCreative,
   drafts: savedDraft ? { [savedMode]: savedDraft } : {}, attachments: [],
+  pinned: [],                              // explicit @file/@symbol picks (session)
   opts: (() => { try { return JSON.parse(localStorage.getItem('pedacito_opts') || '{}'); } catch (e) { return {}; } })(),
   ui: { diffOpen: false, wsCollapsed: false, termFollow: true, optsOpen: false,
         diffMode: localStorage.getItem('pedacito_diff_mode') || 'split',
         view: 'chat', folds: {}, planEditing: false, pendingProfile: null,
         refining: false, previousPrompt: null, switchingProfile: false,
         actionBusy: false, planGenerating: false, planGenFrom: null,
+        // `@` autocomplete: the open floating menu, its items and the
+        // [start,end) text range the chosen insert replaces.
+        suggest: null, suggestSeq: 0,
         // Task-vs-Auto suitability: the debounced /api/mode-check verdict for
         // the current Auto draft, the pre-run confirmation bar, and the draft
         // text the user already acknowledged with "Continue with Auto".
-        modeCheck: null, modeConfirm: null, autoAck: null },
+        modeCheck: null, modeConfirm: null, autoAck: null,
+        // Auto-update notice (pedacito.update): the dismissed version string
+        // (a newer release re-shows the banner), the upgrade output drawer,
+        // and manual instructions when no upgrade command can be run.
+        updateDismissed: savedUpdateDismissed,
+        updateDrawerOpen: false, updateManual: '', updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
 };
@@ -456,7 +574,9 @@ const OPTS = {
     { k: 'write', label: 'Writing', type: 'select', def: 'review', opts: [['review', 'Review before writing'], ['apply', 'Write directly (backup first)']] },
     { k: 'plan', label: 'Planning', type: 'select', def: 'auto', opts: [['auto', 'Automatic'], ['always', 'Always plan'], ['never', 'Never']], note: 'Planning runs only with direct writes.' },
     { k: 'steps', label: 'Max lookups (0 = config)', type: 'number', def: '' },
-    { k: 'reindex', label: 'Refresh index first', type: 'check', def: false }
+    { k: 'reindex', label: 'Refresh index first', type: 'check', def: false },
+    { k: 'hybrid', label: 'Hybrid Architect (a strong model plans, the editor implements)', type: 'check', def: false, span2: true },
+    { k: 'architect_provider', label: 'Architect profile (Stage 1 planner)', type: 'select', def: '', opts: [], span2: true }
   ],
   explain: [],
   auto: [
@@ -530,6 +650,7 @@ function adoptNewProject(root) {
 function applyStatus(s) {
   const prev = S.status;
   S.status = s;
+  if (prev && prev.root !== s.root && S.pinned.length) S.pinned = [];
   syncPermissionModal(s);               // live permission requests open the modal
   if (prev.active_thread_id && s.active_thread_id && s.active_thread_id !== prev.active_thread_id) {
     S.msgs = [];                       // a different conversation: the ids
@@ -555,7 +676,10 @@ function applyStatus(s) {
   if (s.plan) applyPlanPayload(s.plan);
   else if (j && (j.kind === 'auto' || j.kind === 'task')) loadPlan();
   if (j && j.id !== lastJobId) loadPlan();
-  if (!j && lastJobId) { collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups(); loadPreview(true); }
+  if (!j && lastJobId) {
+    collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups();
+    loadPreview(true); loadRunnerTargets(true); loadCheckpoints(true);
+  }
   if (!j && S.ui.planGenerating && !S.ui.planGenFrom) {
     S.ui.planGenerating = false;
     S.ui.planGenFrom = null;
@@ -567,24 +691,34 @@ function applyStatus(s) {
     S.ui.planGenFrom = null;
   }
   lastJobId = j ? j.id : 0;
-  if ((s.root || '') !== (prev.root || '')) loadPreview();  // project opened/switched
+  if ((s.root || '') !== (prev.root || '')) {
+    loadPreview();                              // project opened/switched
+    S.ws.targets = null; S.ws.runOut = null;
+    loadRunnerTargets(true);
+    S.cp.loaded = false;
+    loadCheckpoints(true);
+  }
   if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
     lastFilesSig = s.files_sig || '';
     if (S.ws.tab === 'files' && s.root) loadFiles();
     // Live Preview stays live WHILE a run writes: re-list pages and reload
     // the framed page whenever the workspace signature moves.
     if (S.ws.tab === 'preview' && s.root) loadPreview(true);
+    if (S.ws.tab === 'runner' && s.root) { loadRunnerTargets(true); S.ws.runRev++; emit(); }
   }
   if (S.ui.pendingProfile !== null && s.profile === S.ui.pendingProfile) S.ui.pendingProfile = null;
   // Colorscheme: config.toml (gui_theme) is the source of truth. On the
   // first poll the server wins only over an untouched browser (a browser-
   // local pick that could not be persisted \u2014 no user config file \u2014 must
-  // not be erased on every reload). Afterwards we follow the server only
-  // while nobody changed the theme here since the last known server value.
+  // not be erased on every reload). Afterwards a changed server value is a
+  // real Settings/config edit: follow it even while an engine palette is
+  // active, so the edit repaints (applyTheme clears the engine tokens). A
+  // browser-local pick that could not be persisted leaves the server value
+  // unchanged, so it is never overwritten here.
   if (typeof s.gui_theme === 'string' && s.gui_theme && s.gui_theme !== lastServerTheme) {
     let local = 'slate';
     try { local = localStorage.getItem('pedacito_theme') || 'slate'; } catch (err) {}
-    const follow = lastServerTheme === null ? local === 'slate' : local === lastServerTheme;
+    const follow = lastServerTheme === null ? local === 'slate' : true;
     if (follow) applyTheme(s.gui_theme, false);
     lastServerTheme = s.gui_theme;
   }
@@ -602,6 +736,60 @@ function collapseDone() {
   S.msgTick++;
 }
 function jobActive(id) { return !!(job() && job().id === id); }
+
+// Live "Thinking & Stream" drawer: while a Task/Auto/New/Refine job runs, the
+// throttled `llm_stream` SSE deltas are folded into job.live_reasoning and
+// job.live_content. The drawer shows the active phase, token count and speed,
+// with two auto-scrolling panes for the reasoning block and the raw output.
+function LiveStreamDrawer() {
+  const j = job();
+  const [open, setOpen] = useState(true);
+  const [tab, setTab] = useState('reasoning');
+  const paneRef = useRef(null);
+  const reasoning = (j && j.live_reasoning) || '';
+  const content = (j && j.live_content) || '';
+  const text = tab === 'reasoning' ? reasoning : content;
+  useEffect(() => {
+    const el = paneRef.current;
+    if (el && open) el.scrollTop = el.scrollHeight;
+  }, [text, tab, open, j && j.id]);
+  if (!j) return null;
+  const phase = j.stream_phase || '';
+  const stopped = !!j.cancelled;
+  const label = stopped ? 'Stopped by user'
+    : phase === 'reasoning' ? 'Thinking...'
+    : phase === 'content' ? 'Writing code...'
+    : 'Waiting for the model...';
+  const tokens = Number(j.live_tokens || 0);
+  const speed = Number(j.live_tok_per_sec || 0);
+  return html`
+    <div class=${'live-drawer' + (open ? ' open' : '') + (stopped ? ' stopped' : '')}
+         id="liveStreamDrawer">
+      <div class="live-head">
+        <button class="live-toggle" title=${open ? 'collapse live stream' : 'expand live stream'}
+                onClick=${() => setOpen(!open)}>${open ? '\u25BE' : '\u25B8'}</button>
+        <span class=${'live-phase ' + (stopped ? 'stopped' : phase || 'waiting')}>
+          <i class="live-dot"></i>${label}</span>
+        <span class="live-stat"><b>${PDC.fmtInt(tokens)}</b> tok</span>
+        <span class="live-stat"><b>${speed.toFixed(1)}</b> tok/s</span>
+        <span class="grow"></span>
+        ${stopped ? null : html`<button class="ghost small live-stop"
+          onClick=${() => stop()}>Stop</button>`}
+      </div>
+      ${open ? html`
+        <div class="live-tabs">
+          <button class=${'live-tab' + (tab === 'reasoning' ? ' on' : '')}
+                  onClick=${() => setTab('reasoning')}>Reasoning ${'<think>'}</button>
+          <button class=${'live-tab' + (tab === 'content' ? ' on' : '')}
+                  onClick=${() => setTab('content')}>Live Output</button>
+          <span class="muted small-text grow">${stopped ? 'Stopped by user' : 'auto-scrolling'}</span>
+        </div>
+        <pre class=${'live-pane ' + (tab === 'reasoning' ? 'reason-text' : 'output-text')}
+             ref=${paneRef}>${text || (tab === 'reasoning'
+               ? 'No reasoning yet. Models that expose hidden thinking stream it here.'
+               : 'Output starts as the model writes.')}</pre>` : null}
+    </div>`;
+}
 
 // ---- snapshot + SSE stream ----
 let es = null;
@@ -673,11 +861,11 @@ function loadSnapshot() {
     if (snap._status !== 200) return;
     S.msgs = (snap.messages || []).map((m) => ({ ...m, rev: 0 }));
     S.msgTick++;
-    S.status = snap.status || {};
-    syncPermissionModal(S.status);
-    lastJobId = S.status.job ? S.status.job.id : 0;
-    lastReviewKey = S.status.review ? S.status.review.id + ':' + S.status.review.outcome : '';
-    lastFilesSig = S.status.files_sig || '';
+    const status = snap.status || {};
+    lastJobId = status.job ? status.job.id : 0;
+    lastReviewKey = status.review ? status.review.id + ':' + status.review.outcome : '';
+    lastFilesSig = status.files_sig || '';
+    applyStatus(status);
     if (term) term.reset(snap.term || '');
     connect(snap.seq || 0);
     loadReview();
@@ -715,6 +903,37 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
+  on('stream', (e) => {
+    // Live token deltas from the model. Append locally so the drawer moves
+    // several times a second without a /api/state round trip; the poll
+    // snapshot remains authoritative after a reconnect.
+    const j = S.status.job;
+    if (!j || (e && e.job != null && e.job !== j.id)) return;
+    if (e.delta_reasoning) j.live_reasoning = (j.live_reasoning || '') + e.delta_reasoning;
+    if (e.delta_content) j.live_content = (j.live_content || '') + e.delta_content;
+    if (e.phase) j.stream_phase = e.phase;
+    if (e.tokens != null) j.live_tokens = e.tokens;
+    if (e.tok_per_sec != null) j.live_tok_per_sec = e.tok_per_sec;
+    emit();
+  });
+  on('security', (e) => {
+    if (e && e.message) PDC.toast(e.message);
+    refreshState();
+  });
+  // Auto-update: the check's notice and the upgrade run's start/end resync
+  // state; per-line subprocess output appends locally (like 'stream' does).
+  on('update', () => refreshState());
+  on('update_run', (e) => {
+    if (e && e.running) S.ui.updateRunHidden = false;  // a new run re-shows it
+    refreshState();
+  });
+  on('update_output', (e) => {
+    const r = S.status.update_run;
+    if (r && e && typeof e.line === 'string') {
+      r.output = ((r.output || '') + e.line + '\n').slice(-100000);
+      emit();
+    }
+  });
   on('job', (e) => {
     // A finished New job carries the project it created: adopt the workspace
     // (path box, Task mode, session view) right here, then resync everything.
@@ -800,6 +1019,40 @@ function setAutoRoute(on) {           // topbar toggle -> user config + reload
                    : 'Specialist auto-routing off: every task stays on the active profile.');
       refreshState();
     });
+}
+function setPostEditVerify(on) {      // topbar toggle -> user config + reload
+  const s = S.status || {};
+  let cmd = String(s.auto_verify || '').trim();
+  if (on && !cmd) cmd = String(s.detected_test_command || '').trim();
+  if (on && !cmd) {
+    // No runner is evident: leave auto_verify empty (the cheap gates still
+    // run) instead of writing a key that enables nothing.
+    emit();
+    PDC.toast('No test command detected, so auto_verify stays empty. Set test_command or auto_verify in config.toml; the syntax, static and contract gates and scoped impacted tests still run.', true);
+    return;
+  }
+  PDC.api('/api/settings/set', { file: 'user', changes: { auto_verify: on ? cmd : '' } })
+    .then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not change post-edit verification', true); return; }
+      S.status.auto_verify = on ? cmd : '';
+      emit();
+      if (!on) {
+        PDC.toast('Post-edit verify off: auto_verify cleared. The syntax, static and contract gates still run on every edit.');
+      } else {
+        PDC.toast('Post-edit verify on: ' + cmd + ' runs after each Auto task; failures feed the repair rounds.');
+      }
+      refreshState();
+    });
+}
+function setReasoningEffort(level) {  // composer Options bar -> live + user config
+  PDC.api('/api/effort', { level: level }).then((j) => {
+    if (!j.ok) { PDC.toast(j.detail || 'could not set reasoning effort', true); return; }
+    S.status.reasoning_effort = j.reasoning_effort || level;
+    emit();
+    PDC.toast(level === 'default'
+      ? 'Reasoning effort: default (no reasoning_effort field is sent)'
+      : 'Reasoning effort: ' + level + ' (sent as reasoning_effort to local-moe and reasoning APIs)');
+  });
 }
 
 // ---- chat threads (the project's saved conversations) ----
@@ -895,7 +1148,11 @@ PDC.startRun = (payload) => {
   });
 };
 const stick = { current: true };          // chat auto-follow flag
-function stop() { PDC.api('/api/stop', {}).then(refreshState); }
+function stop() {
+  const j = S.status.job;
+  if (j && !j.cancelled) { j.cancelled = true; emit(); }
+  PDC.api('/api/stop', {}).then(refreshState);
+}
 
 // ---- How / Help -------------------------------------------------------------
 function askHow(query) {
@@ -992,6 +1249,56 @@ function runAutoAnyway() {
   send(true);                              // POST /api/auto with force_auto
 }
 
+// ---- Non-blocking secret guard: preflight + 3-way choice --------------------
+// Before a request can leave for an external provider, POST /api/security/scan
+// returns only masked findings. Localhost/LAN endpoints never ask. The user
+// gets exactly the three choices the warning promises: acknowledge, redact,
+// or cancel. Acknowledged fingerprints persist server-side.
+function askSecurityChoice(scan) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const rows = (scan.findings || []).map((f) => h('li', {
+      key: f.fingerprint, class: 'security-row'
+    },
+      h('code', { text: f.file + ':' + f.line }),
+      h('span', { class: 'mask', text: '[' + f.kind + '] ' + f.masked_preview })));
+    const body = h('div', {},
+      h('p', { class: 'muted', style: 'margin-top:0',
+        text: 'These credentials are about to be sent to ' +
+          (scan.provider || 'an external provider') + ':' }),
+      h('ul', { class: 'security-list' }, rows),
+      h('p', { class: 'muted', text: 'Acknowledge & Send As-Is keeps the request unchanged and will not ask again for these keys. Redact Secrets & Send replaces each with <REDACTED_SECRET>.' }));
+    PDC.modal('Secrets detected in this request', body, [
+      { label: 'Cancel', onclick: () => done(null) },
+      { label: 'Redact Secrets & Send', primary: true, onclick: () => done('redact') },
+      { label: 'Acknowledge & Send As-Is', onclick: () => done('ack') }
+    ], { wide: true, onClose: () => done(null) });
+  });
+}
+
+async function securityPreflight(body) {
+  let scan = null;
+  try {
+    scan = await PDC.api('/api/security/scan', {
+      text: body.text || '', mode: body.mode || '',
+      attachments: (body.attachments || [])
+        .filter((a) => a && a.kind !== 'image')
+        .map((a) => ({ name: a.name, text: a.text }))
+    });
+  } catch (e) { return { send: true, choice: '' }; }
+  if (!scan || !scan.needs_confirmation) return { send: true, choice: '' };
+  const choice = await askSecurityChoice(scan);
+  if (!choice) return { send: false, choice: '' };
+  if (choice === 'ack') {
+    // Persist the prompt's fingerprints immediately: an acknowledged key
+    // must not be raised again, even if this run is interrupted.
+    const fps = (scan.findings || []).map((f) => f.fingerprint);
+    if (fps.length) PDC.api('/api/security/ack', { fingerprints: fps }).catch(() => {});
+  }
+  return { send: true, choice: choice };
+}
+
 async function send(forceAuto) {
   const s = S.status, j = s.job;
   const text = (S.drafts[S.mode] || '').trim();
@@ -1023,9 +1330,26 @@ async function send(forceAuto) {
   }
   const body = { mode: S.mode, text: text, attachments: S.attachments.slice() };
   OPTS[S.mode].forEach((d) => { body[d.k] = opt(S.mode, d.k); });
+  // Explicit context pins from the `@` picker ride as a request-level list so
+  // they survive edits to the prompt text. Prompt @mentions are parsed again
+  // server-side; duplicates collapse there.
+  if (S.pinned.length && (S.mode === 'task' || S.mode === 'auto'
+                          || S.mode === 'explain')) {
+    body.pinned = S.pinned.map((p) => p.insert || p.label)
+      .filter(Boolean).map((s) => String(s).replace(/^@/, ''));
+  }
   // The ✨ toggle forces Creative mode for this run; when off, the agent
   // still auto-detects design/UI tasks (creative_auto).
   if (S.mode === 'task' || S.mode === 'auto' || S.mode === 'new') body.creative = !!S.creative;
+  // Split-stage hybrid: the architect's model rides along from the selected
+  // profile; with the toggle off both architect fields clear so a previous
+  // run's planner never leaks into this one.
+  if (S.mode === 'task') {
+    const ap = body.hybrid ? (body.architect_provider || s.architect_provider || '') : '';
+    if (body.hybrid && !ap) { PDC.toast('Pick an Architect profile in Options first.', true); return; }
+    body.architect_provider = ap;
+    body.architect_model = ap ? ((s.profile_models || {})[ap] || '') : '';
+  }
   // Send the topbar's model selection explicitly so a no-project New/Ask uses
   // the profile the user just picked, even before /api/state catches up.
   body.profile = S.ui.pendingProfile !== null ? S.ui.pendingProfile : (s.profile || '');
@@ -1052,6 +1376,12 @@ async function send(forceAuto) {
     }
     if (forceAuto) body.force_auto = true;
   }
+  // Outbound secret preflight (external providers only): acknowledge, redact
+  // or cancel before any bytes leave the machine. Local endpoints skip it.
+  const pre = await securityPreflight(body);
+  if (!pre.send) return;
+  if (pre.choice === 'ack') body.acknowledge_secrets = true;
+  else if (pre.choice === 'redact') body.redact_secrets = true;
   // "Run Auto Anyway" addresses the Auto alias directly with force_auto:true;
   // every other run goes through the shared /api/run starter.
   const starter = (S.mode === 'auto' && forceAuto)
@@ -1082,14 +1412,108 @@ async function send(forceAuto) {
     }
   });
 }
+const MAX_IMAGE_ATTACH_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const ALLOWED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
+function makeImageThumb(dataUrl, maxDim) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+          const w = Math.max(1, Math.round((img.width || maxDim) * scale));
+          const h = Math.max(1, Math.round((img.height || maxDim) * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { resolve(''); return; }
+          ctx.drawImage(img, 0, 0, w, h);
+          const out = canvas.toDataURL('image/webp', 0.72) || canvas.toDataURL('image/jpeg', 0.72);
+          resolve(out && out.length <= 36000 ? out : '');
+        } catch (e) { resolve(''); }
+      };
+      img.onerror = () => resolve('');
+      img.src = dataUrl;
+    } catch (e) { resolve(''); }
+  });
+}
+
 function attachFiles(files) {
-  Array.prototype.forEach.call(files, (f) => {
+  let imgCount = S.attachments.filter((a) => a && a.kind === 'image').length;
+  Array.prototype.forEach.call(files || [], (f) => {
+    const mime = String(f.type || '').toLowerCase();
+    const isImage = ALLOWED_IMAGE_MIMES.has(mime) || /\.(png|jpe?g|webp|gif)$/i.test(f.name || '');
+    if (isImage) {
+      if (imgCount >= MAX_IMAGE_ATTACHMENTS) {
+        PDC.toast(PDC.t('gui.attach.image_limit', { max: MAX_IMAGE_ATTACHMENTS },
+          'Up to ' + MAX_IMAGE_ATTACHMENTS + ' images can be attached at once.'), true);
+        return;
+      }
+      if (f.size > MAX_IMAGE_ATTACH_BYTES) {
+        PDC.toast(PDC.t('gui.attach.image_too_large', { name: f.name || 'image', max: 10 },
+          (f.name || 'image') + ' is larger than 10 MB.'), true);
+        return;
+      }
+      imgCount += 1;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        if (!dataUrl.startsWith('data:')) return;
+        const comma = dataUrl.indexOf(',');
+        const dataB64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
+        const item = {
+          kind: 'image',
+          name: f.name || ('image.' + (mime.split('/')[1] || 'png')),
+          mime: ALLOWED_IMAGE_MIMES.has(mime) ? mime : 'image/png',
+          data_url: dataUrl,
+          data_b64: dataB64,
+          bytes: f.size || 0,
+          thumb: ''
+        };
+        S.attachments.push(item);
+        emit();
+        makeImageThumb(dataUrl, 72).then((thumb) => {
+          if (thumb) { item.thumb = thumb; emit(); }
+        });
+      };
+      reader.readAsDataURL(f);
+      return;
+    }
     if (f.size > 400000) { PDC.toast(f.name + ' is larger than 400 KB.', true); return; }
     f.text().then((t) => {
       if (t.indexOf('\u0000') >= 0) { PDC.toast(f.name + ' looks binary.', true); return; }
       S.attachments.push({ name: f.name, text: t }); emit();
     });
   });
+}
+
+function handlePromptPaste(e) {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const imgs = [];
+  if (cd.items && cd.items.length) {
+    for (let i = 0; i < cd.items.length; i += 1) {
+      const it = cd.items[i];
+      if (it && it.kind === 'file' && ALLOWED_IMAGE_MIMES.has(String(it.type || '').toLowerCase())) {
+        const file = it.getAsFile();
+        if (file) imgs.push(file);
+      }
+    }
+  } else if (cd.files && cd.files.length) {
+    for (let i = 0; i < cd.files.length; i += 1) {
+      const file = cd.files[i];
+      if (file && ALLOWED_IMAGE_MIMES.has(String(file.type || '').toLowerCase())) {
+        imgs.push(file);
+      }
+    }
+  }
+  if (imgs.length) {
+    e.preventDefault();
+    attachFiles(imgs);
+  }
 }
 
 // ---- review (staged diff) ----
@@ -1214,13 +1638,290 @@ function setPreviewPage(p) {
   emit();
 }
 function openPreviewTab() {
-  if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank');
+  if (S.ws.page) window.open(previewSrc(S.ws.page, S.ws.previewRev), '_blank', 'noopener,noreferrer');
 }
+
+// ---- live runner: detected commands + a static web preview ----
+function runnerSrc(page, rev) {
+  return '/api/runner/preview/' + String(page).split('/').map(encodeURIComponent).join('/')
+    + '?v=' + rev;
+}
+function loadRunnerTargets(force) {
+  if (!S.status.root) {
+    S.ws.targets = null; S.ws.runOut = null;
+    if (S.ws.runPage) { S.ws.runPage = ''; emit(); }
+    return Promise.resolve();
+  }
+  if (!force && S.ws.targets && Date.now() - S.ws.targetsAt < 4000) return Promise.resolve();
+  return PDC.api('/api/runner/targets').then((j) => {
+    if (j._status !== 200 || !j.ok) return;
+    S.ws.targets = j;
+    S.ws.targetsAt = Date.now();
+    const pages = (j.web || []).map((p) => p.path);
+    if (!S.ws.runPage || pages.indexOf(S.ws.runPage) < 0) {
+      S.ws.runPage = pages.indexOf('index.html') >= 0 ? 'index.html' : (pages[0] || '');
+      S.ws.runRev++;
+    }
+    const cmds = j.commands || [];
+    if (!S.ws.runCmd || !cmds.some((c) => c.id === S.ws.runCmd)) {
+      S.ws.runCmd = cmds.length ? cmds[0].id : '';
+    }
+    emit();
+  }, () => {});
+}
+function setRunPage(p) { S.ws.runPage = p; S.ws.runRev++; emit(); }
+function reloadRunnerPreview() { S.ws.runRev++; emit(); }
+function openRunnerPreview() {
+  if (S.ws.runPage) window.open(runnerSrc(S.ws.runPage, S.ws.runRev), '_blank', 'noopener,noreferrer');
+}
+function selectedRunnerCommand() {
+  const t = S.ws.targets || {};
+  return (t.commands || []).find((c) => c.id === S.ws.runCmd) || null;
+}
+function runProjectCommand() {
+  if (!S.status.root || S.ws.runRunning) return;
+  const custom = String(S.ws.runCustom || '').trim();
+  const target = selectedRunnerCommand();
+  const cmd = custom || (target && target.command) || '';
+  if (!cmd) { PDC.toast('Pick a detected command or type one first.', true); return; }
+  S.ws.runRunning = true; S.ws.runOut = null; emit();
+  PDC.api('/api/runner/exec', { command: cmd }).then((j) => {
+    S.ws.runRunning = false;
+    S.ws.runOut = j;
+    emit();
+    if (j.ok) PDC.toast('Run finished: ' + (j.command || cmd));
+  }, () => {
+    S.ws.runRunning = false;
+    PDC.toast('Runner request failed.', true);
+    emit();
+  });
+}
+function setPromptDraft(text, mode) {
+  if (mode) S.mode = mode;
+  S.drafts[S.mode] = text;
+  writeDraft(text);
+  try { localStorage.setItem('pedacito_mode', S.mode); } catch (e) {}
+  emit();
+  setTimeout(() => {
+    if (inputEl && S.mode !== 'how') {
+      inputEl.value = text;
+      inputEl.focus();
+      inputEl.selectionStart = inputEl.selectionEnd = text.length;
+    }
+  }, 30);
+}
+function fixRunnerCrash() {
+  const out = S.ws.runOut;
+  if (!out || out.ok) return;
+  const parts = [
+    'Fix this crash.', '',
+    'Command: ' + (out.command || '(unknown command)'),
+    'Exit code: ' + (out.exit_code == null ? '?' : out.exit_code),
+  ];
+  if (out.timed_out) parts.push('The command timed out.');
+  if (out.traceback_summary) {
+    parts.push('', 'Traceback:', String(out.traceback_summary));
+  } else if (out.stderr) {
+    parts.push('', 'stderr:', String(out.stderr).slice(-6000));
+  } else if (out.stdout) {
+    parts.push('', 'stdout:', String(out.stdout).slice(-4000));
+  }
+  parts.push('', 'Reproduce the failing command, find the cause, and fix it. '
+    + 'Re-run the command afterwards and report the result.');
+  setPromptDraft(parts.join('\n'), 'task');
+  PDC.toast('Crash context put in the Task composer.');
+}
+
+// ---- time-travel checkpoints ----
+function cpTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? String(ts) : d.toLocaleString();
+}
+function fetchCheckpoints() {
+  if (!S.status.root) {
+    S.cp = { items: [], head_id: '', loaded: true };
+    emit();
+    return Promise.resolve({ ok: true, checkpoints: [], head_id: '' });
+  }
+  return PDC.api('/api/checkpoints').then((j) => {
+    if (j._status === 200 && j.ok) {
+      S.cp.items = j.checkpoints || [];
+      S.cp.head_id = j.head_id || '';
+      S.cp.loaded = true;
+      emit();
+    }
+    return j;
+  }, () => ({ ok: false, checkpoints: [], head_id: '' }));
+}
+function loadCheckpoints(force) {
+  if (force || !S.cp.loaded) return fetchCheckpoints();
+  return Promise.resolve({ ok: true, checkpoints: S.cp.items, head_id: S.cp.head_id });
+}
+function restoreCheckpoint(id, files) {
+  return PDC.api('/api/checkpoints/restore', { id: id, files: files || null })
+    .then((j) => {
+      if (j.ok) {
+        PDC.toast(j.detail || 'Restored.');
+        refreshState(); loadFiles(true); loadRunnerTargets(true);
+        loadCheckpoints(true);
+      } else PDC.toast(j.detail || 'Restore failed.', true);
+      return j;
+    }, () => ({ ok: false, detail: 'Restore failed.' }));
+}
+function branchFromCheckpoint(cp) {
+  PDC.confirm('Branch from ' + cp.id + '?\n\nThe workspace is restored to '
+    + 'that checkpoint and the next prompt branches a new run from there. '
+    + 'Your current files are saved in a safety checkpoint first.', 'Branch', true)
+    .then((ok) => {
+      if (!ok) return;
+      restoreCheckpoint(cp.id, null).then((j) => {
+        if (!j.ok) return;
+        setPromptDraft('Branch from checkpoint ' + cp.id + ' (' + (cp.label || '') + '): ', 'task');
+        PDC.toast('Workspace restored \u2014 type the new prompt.');
+      });
+    });
+}
+function openCheckpointsDialog() {
+  const body = h('div', { class: 'cp-dialog' });
+  let selected = S.cp.head_id || '';
+  let against = 'parent';
+  let diff = null;
+
+  const loadDiff = () => {
+    if (!selected) { diff = null; renderBody(); return; }
+    diff = null;
+    renderBody();
+    PDC.api('/api/checkpoints/diff?id=' + encodeURIComponent(selected)
+      + '&against=' + against).then((j) => {
+      if (j._status !== 200) {
+        diff = null;
+        renderBody();
+        return;
+      }
+      diff = j;
+      renderBody();
+    });
+  };
+  function pick(cp) {
+    selected = cp.id;
+    loadDiff();
+  }
+  function renderBody() {
+    clear(body);
+    const cp = S.cp.items.find((c) => c.id === selected) || null;
+    const name = h('input', { type: 'text', class: 'grow cp-name',
+      placeholder: 'name this checkpoint (e.g. before refactor)' });
+    body.appendChild(h('div', { class: 'cp-tools' },
+      name,
+      h('button', { class: 'small primary', text: '+ Checkpoint', onclick: () => {
+        const label = String(name.value || '').trim();
+        if (!label) { PDC.toast('Name the checkpoint first.', true); return; }
+        PDC.api('/api/checkpoints/create', { label: label }).then((j) => {
+          PDC.toast(j.ok ? 'Checkpoint ' + j.checkpoint.id + ' recorded.'
+            : (j.detail || 'Could not create the checkpoint.'), !j.ok);
+          if (j.ok) { selected = j.checkpoint.id; fetchCheckpoints().then(loadDiff); }
+        });
+      } }),
+      h('button', { class: 'small', text: '\u21BB', title: 'reload the tree',
+        onclick: () => fetchCheckpoints().then(loadDiff) })));
+    if (!S.cp.items.length) {
+      body.appendChild(h('div', { class: 'tip', text: 'No checkpoints yet. '
+        + 'One is recorded automatically after every Task, Auto step and New '
+        + 'scaffold, or make one above.' }));
+      return;
+    }
+    if (!selected || !S.cp.items.some((c) => c.id === selected)) {
+      selected = S.cp.head_id || S.cp.items[S.cp.items.length - 1].id;
+    }
+    const list = h('div', { class: 'cp-list' });
+    S.cp.items.forEach((item) => {
+      const node = h('button', {
+        class: 'cp-node' + (item.id === selected ? ' on' : ''),
+        title: item.id,
+        onclick: () => pick(item),
+      });
+      node.appendChild(h('span', { class: 'cp-mark', text: item.head ? '\u25CF' : (item.parent_id ? '\u25CB' : '\u25C7') }));
+      node.appendChild(h('span', { class: 'cp-id mono', text: item.id }));
+      node.appendChild(h('span', { class: 'tag', text: item.mode || 'task' }));
+      node.appendChild(h('span', { class: 'cp-label ellip', text: item.label || '(untitled)' }));
+      node.appendChild(h('span', { class: 'muted small-text cp-meta',
+        text: (item.files_changed || []).length + ' file(s) \u00B7 ' + cpTime(item.timestamp) }));
+      if (item.parent_id) {
+        node.appendChild(h('span', { class: 'cp-parent muted small-text',
+          text: '\u21B3 ' + item.parent_id }));
+      }
+      list.appendChild(node);
+    });
+    body.appendChild(list);
+    if (!cp) return;
+    body.appendChild(h('div', { class: 'cp-actions' },
+      h('button', { class: 'small', text: against === 'parent'
+          ? 'Base: parent \u21C4' : 'Base: workspace \u21C4',
+        title: 'toggle the diff base',
+        onclick: () => { against = against === 'parent' ? 'workspace' : 'parent'; diff = null; loadDiff(); } }),
+      h('button', { class: 'small danger', text: '\u21BA Restore Entire Workspace',
+        onclick: () => {
+          PDC.confirm('Restore the whole workspace to ' + cp.id + '?\n\n'
+            + 'Dirty changes are saved in a safety checkpoint first. Files '
+            + 'created after that checkpoint are removed.', 'Restore', true)
+            .then((ok) => { if (ok) restoreCheckpoint(cp.id, null).then(loadDiff); });
+        } }),
+      h('button', { class: 'small primary', text: '\u2442 Branch Prompt From Here',
+        onclick: () => branchFromCheckpoint(cp) })));
+    if (!diff) {
+      body.appendChild(h('div', { class: 'tip', text: 'Loading diff\u2026' }));
+      return;
+    }
+    const files = h('div', { class: 'cp-files' });
+    const pre = h('pre', { class: 'cp-diff' });
+    const showFile = (f) => {
+      Array.from(files.children).forEach((row) => row.classList.remove('on'));
+      if (f && f.row) f.row.classList.add('on');
+      pre.textContent = f ? (f.diff || '(binary file or no textual diff)')
+        : (diff.diff || 'No differences against ' + against + '.');
+    };
+    files.appendChild(h('button', { class: 'cp-file-all small', text: 'All files ('
+      + (diff.changed_files || []).length + ')', onclick: () => showFile(null) }));
+    (diff.files || []).forEach((f) => {
+      const row = h('div', { class: 'cp-file' + (f.status === 'deleted' ? ' gone' : ''),
+        title: f.path, onclick: () => showFile(f) });
+      f.row = row;
+      row.appendChild(h('span', { class: 'cp-status ' + f.status, text: f.status }));
+      row.appendChild(h('span', { class: 'cp-path mono ellip', text: f.path }));
+      row.appendChild(h('span', { class: 'muted small-text',
+        text: '+' + (f.added || 0) + ' / -' + (f.removed || 0) }));
+      row.appendChild(h('button', { class: 'small', text: 'Restore Selected File',
+        onclick: (e) => {
+          e.stopPropagation();
+          PDC.confirm('Restore only \u201c' + f.path + '\u201d from ' + cp.id + '?',
+            'Restore file', true).then((ok) => {
+              if (ok) restoreCheckpoint(cp.id, [f.path]).then(loadDiff);
+            });
+        } }));
+      files.appendChild(row);
+    });
+    pre.textContent = diff.diff || 'No differences against ' + against + '.';
+    body.appendChild(files);
+    body.appendChild(pre);
+  }
+
+  S.cp.head_id = S.cp.head_id || '';
+  fetchCheckpoints().then(() => {
+    selected = selected || S.cp.head_id
+      || (S.cp.items.length ? S.cp.items[S.cp.items.length - 1].id : '');
+    loadDiff();
+  });
+  PDC.modal('Checkpoints / Undo', body,
+    [{ label: 'Close' }], { wide: true });
+}
+
 function setWsTab(t) {
   if (S.ws.tab === t && !S.ui.wsCollapsed) {      // the tab already showing:
     if (t === 'files') loadFiles(true);           // click again = rescan
     else if (t === 'backups') loadBackups(true);
     else if (t === 'preview') loadPreview(true);  // click again = reload page
+    else if (t === 'runner') { loadRunnerTargets(true); S.ws.runRev++; emit(); }
     return;
   }
   S.ws.tab = t;
@@ -1229,6 +1930,7 @@ function setWsTab(t) {
   if (t === 'files') loadFiles();
   if (t === 'backups') loadBackups();
   if (t === 'preview') loadPreview();
+  if (t === 'runner') loadRunnerTargets(true);
   if (t === 'logs' && term) { term.follow = S.ui.termFollow; term.schedule(); }
   emit();
 }
@@ -1343,11 +2045,18 @@ function calibrateProfile(name) {
     PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + model + ') is a hosted provider model and uses provider-table defaults automatically.', true);
     return;
   }
-  PDC.confirm('Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.', 'Run it').then((ok) => {
+  const promptMsg = cal.is_image_model
+    ? PDC.t('gui.cal.probe_image_confirm', { name: name },
+        'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
+    : 'Calibrate \u201c' + name + '\u201d?\n\nA short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.';
+  const okLabel = cal.is_image_model
+    ? PDC.t('gui.cal.probe_image', null, 'Probe image')
+    : 'Run it';
+  PDC.confirm(promptMsg, okLabel).then((ok) => {
     if (!ok) return;
     PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then((j) => {
       if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-      PDC.toast('Calibrating "' + name + '" \u2014 watch the Output tab.');
+      PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
       refreshState();
     });
   });
@@ -1560,6 +2269,195 @@ function openBenchmarks() {
 }
 PDC.openBenchmarks = openBenchmarks;
 
+// ------------------------------------------------------------------- arena ---
+// The 2-model sandbox arena: one prompt, two contestants, each in an isolated
+// copy of the workspace. The scorecard compares their diffs side by side; an
+// Apply button adopts the winner between two checkpoints (undoable).
+function openArena() {
+  const st = { jobId: 0, timer: 0, running: false, initialId: '', state: null };
+  const selA = h('select', { id: 'arenaA' });
+  const selB = h('select', { id: 'arenaB' });
+  const promptIn = h('textarea', { rows: 3, spellcheck: false,
+    placeholder: 'the task both contestants should run, e.g. add a --json flag to the CLI' });
+  const statusLine = h('div', { class: 'bench-status' });
+  const resultBox = h('div', { class: 'bench-result' });
+  const runBtn = h('button', { class: 'primary', text: 'Run Arena' });
+
+  const fillProfiles = () => {
+    const s = S.status || {};
+    const names = s.profiles || [];
+    const models = s.profile_models || {};
+    [selA, selB].forEach((sel, i) => {
+      clear(sel);
+      sel.appendChild(h('option', { value: '',
+        text: '(active' + (s.profile ? ': ' + s.profile : '') + ')' }));
+      names.forEach((n) => sel.appendChild(h('option', { value: n,
+        text: n + (models[n] ? ' \u00b7 ' + models[n] : '') })));
+      if (names.length > i) sel.value = names[i];
+    });
+  };
+  const spec = (sel) => sel.value || (S.status.profile || S.status.model || '');
+  const metric = (grid, label, value) => {
+    grid.appendChild(h('div', { class: 'bench-metric' },
+      h('span', { class: 'muted small-text', text: label }),
+      h('b', { text: value })));
+  };
+  const applyWinner = (side) => {
+    const state = st.state;
+    if (!state || state.winner) return;
+    PDC.api('/api/arena/apply', { arena_id: state.arena_id, winner: side }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not apply the winner', true); return; }
+      state.winner = side;
+      PDC.toast('Arena winner applied: ' + (j.model || side.toUpperCase())
+        + ' (' + (j.files_changed || []).length + ' file(s)). Undo via Checkpoints.');
+      scorecard(state);
+      PDC.refreshState();
+    });
+  };
+  const sideBox = (state, side) => {
+    const rec = (state.contestants || {})[side] || {};
+    const ok = !!rec.ok;
+    const won = state.winner === side;
+    const box = h('div', { class: 'bench-score arena-side ' + (ok ? 'ok' : 'bad') + (won ? ' won' : '') });
+    box.appendChild(h('div', { class: 'bench-score-head' },
+      h('span', { class: 'bench-big', text: side.toUpperCase() }),
+      h('b', { text: (rec.provider ? rec.provider + ' / ' : '') + (rec.model || '?') }),
+      h('span', { class: 'tag ' + (ok ? 'ok' : ''), text: ok ? 'EDITS LANDED' : 'NO EDITS' }),
+      won ? h('span', { class: 'tag ok', text: 'WINNER APPLIED' }) : null));
+    const grid = h('div', { class: 'bench-grid' });
+    metric(grid, 'Files changed', String((rec.files_changed || []).length));
+    metric(grid, 'Duration', Number(rec.elapsed_sec || 0).toFixed(1) + 's');
+    metric(grid, 'Speed', Number(rec.tok_per_sec || 0).toFixed(1) + ' tok/s');
+    metric(grid, 'Tokens', PDC.fmtInt(rec.total_tokens || 0));
+    box.appendChild(grid);
+    if (rec.summary) {
+      box.appendChild(h('div', { class: 'muted small-text arena-summary', text: rec.summary }));
+    }
+    const files = rec.files_changed || [];
+    if (files.length) {
+      box.appendChild(h('div', { class: 'bench-label', text: 'Changed files' }));
+      box.appendChild(h('div', { class: 'mono small-text arena-files', text: files.join('\n') }));
+    }
+    box.appendChild(h('div', { class: 'bench-label', text: 'Diff' }));
+    const pre = h('pre', { class: 'cp-diff arena-diff' });
+    pre.textContent = rec.diff || '(no file changes)';
+    box.appendChild(pre);
+    if (!state.winner) {
+      box.appendChild(h('div', { class: 'bench-actions' },
+        h('button', { class: 'primary', text: 'Apply ' + side.toUpperCase() + '\u2019s changes',
+          onclick: () => applyWinner(side) })));
+    }
+    return box;
+  };
+  const scorecard = (state) => {
+    clear(resultBox);
+    st.state = state;
+    if (!state) return;
+    resultBox.appendChild(h('div', { class: 'muted small-text',
+      text: 'Arena ' + state.arena_id + ' \u00b7 ' + (state.prompt || '') }));
+    resultBox.appendChild(h('div', { class: 'arena-grid' },
+      sideBox(state, 'a'), sideBox(state, 'b')));
+  };
+  const finish = (state) => {
+    st.running = false;
+    st.jobId = 0;
+    runBtn.disabled = false;
+    runBtn.textContent = 'Run Arena';
+    statusLine.textContent = 'Finished. Compare the two runs, then apply a winner.';
+    scorecard(state);
+  };
+  const poll = () => {
+    clearTimeout(st.timer);
+    PDC.api('/api/arena/last').then((j) => {
+      const state = j.ok ? j.arena : null;
+      if (state && state.arena_id && state.arena_id !== st.initialId) { finish(state); return; }
+      if (!st.jobId) return;
+      const job = S.status.job;
+      if (!job || job.id !== st.jobId) {
+        // The job slot freed: one last read covers the save-then-end race.
+        if (state && state.arena_id && state.arena_id !== st.initialId) { finish(state); return; }
+        st.running = false;
+        runBtn.disabled = false;
+        runBtn.textContent = 'Run Arena';
+        statusLine.textContent = 'The arena job ended without a result; see Activity/Chat for the error.';
+        return;
+      }
+      statusLine.textContent = 'Running\u2026 both contestants work in isolated sandboxes. Watch Activity for live progress.';
+      st.timer = setTimeout(poll, 1500);
+    }).catch(() => { st.timer = setTimeout(poll, 2500); });
+  };
+  const run = () => {
+    if (st.running) return;
+    const text = promptIn.value.trim();
+    if (!text) { PDC.toast('Describe the task both contestants should run.', true); return; }
+    const a = spec(selA), b = spec(selB);
+    if (!a || !b) { PDC.toast('Pick two contestants.', true); return; }
+    if (S.status.job) { PDC.toast('Another job is running. Wait for it or press Stop.', true); return; }
+    st.running = true;
+    st.initialId = (st.state || {}).arena_id || '';
+    runBtn.disabled = true;
+    runBtn.textContent = 'Running\u2026';
+    clear(resultBox);
+    statusLine.textContent = 'Starting\u2026';
+    PDC.api('/api/arena/run', { text: text, model_a: a, model_b: b }).then((j) => {
+      if (!j.ok) {
+        st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Arena';
+        statusLine.textContent = j.detail || 'Could not start the arena.';
+        PDC.toast(j.detail || 'arena did not start', true);
+        return;
+      }
+      st.jobId = j.job;
+      statusLine.textContent = 'Running\u2026 watch Activity for live progress.';
+      poll();
+    }).catch((e) => {
+      st.running = false; runBtn.disabled = false; runBtn.textContent = 'Run Arena';
+      statusLine.textContent = 'Could not start the arena: ' + e;
+    });
+  };
+  runBtn.addEventListener('click', run);
+
+  const body = h('div', { class: 'bench-wrap' },
+    h('div', { class: 'bench-intro' },
+      h('h4', { text: 'Run one prompt on two models, side by side' }),
+      h('div', { class: 'muted small-text', text: 'Each contestant works in an isolated sandbox copy of the workspace \u2014 the real project stays untouched until you apply a winner (checkpointed, undoable).' })),
+    h('div', { class: 'bench-form' },
+      h('label', { class: 'bench-field' }, h('span', { text: 'Contestant A' }), selA),
+      h('label', { class: 'bench-field' }, h('span', { text: 'Contestant B' }), selB)),
+    h('label', { class: 'bench-field' }, h('span', { text: 'Task prompt' }), promptIn),
+    h('div', { class: 'row gap bench-runrow' }, runBtn, statusLine),
+    resultBox);
+  PDC.modal('Model Arena (A/B)', body, [{ label: 'Close' }],
+    { wide: true, onClose: () => clearTimeout(st.timer) });
+  fillProfiles();
+  PDC.api('/api/arena/last').then((j) => {
+    if (j.ok && j.arena) {
+      st.initialId = j.arena.arena_id || '';
+      scorecard(j.arena);
+      statusLine.textContent = 'Last arena shown. Run a new one above.';
+    }
+  }).catch(() => {});
+}
+PDC.openArena = openArena;
+
+// The nine CSS-native gui_theme schemes (config.py's closed enum). Each has
+// a full crafted palette block in app.css -- ansi colors, terminal, code and
+// diff surfaces included -- and paints via the data-theme attribute. The
+// engine's inline ten-token derivation must never overpaint them.
+const CSS_SCHEMES = ['slate', 'light', 'daylight', 'nord', 'midnight',
+  'jazz_solo', 'trapper_keeper', 'memphis_arcade', 'windbreaker'];
+const CSS_SCHEME_META = {
+  slate: { label: 'Slate \u00b7 GitHub Dark', bg: '#0d1117', accent: '#58a6ff' },
+  light: { label: 'Light \u00b7 GitHub Light', bg: '#f6f8fa', accent: '#0969da' },
+  daylight: { label: 'Daylight \u00b7 warm paper', bg: '#fcfaf2', accent: '#b54900' },
+  nord: { label: 'Nord \u00b7 modern dark', bg: '#181825', accent: '#89b4fa' },
+  midnight: { label: 'Midnight \u00b7 high contrast', bg: '#05070a', accent: '#38bdf8' },
+  jazz_solo: { label: 'Jazz Cup \u00b7 1991 light', bg: '#f4f1ea', accent: '#009688' },
+  memphis_arcade: { label: 'Memphis Arcade \u00b7 dark', bg: '#121324', accent: '#00e5ff' },
+  trapper_keeper: { label: 'Trapper Keeper \u00b7 light', bg: '#eef2f9', accent: '#2541b2' },
+  windbreaker: { label: 'Windbreaker \u00b7 1992 dark', bg: '#191326', accent: '#00d2b8' },
+};
+function isCssScheme(name) { return CSS_SCHEMES.indexOf(name) >= 0; }
+
 // The GUI colorscheme. The browser always gets it at once (localStorage, so
 // theme.js can apply it before first paint); `userPick` additionally persists
 // it as gui_theme in the user config through /api/settings/theme — purely
@@ -1568,11 +2466,15 @@ PDC.openBenchmarks = openBenchmarks;
 let lastServerTheme = null;
 function applyTheme(t, userPick) {
   if (!t) return;
+  // A CSS-native scheme is taking over: drop any engine inline tokens and
+  // cache so the crafted app.css block paints -- and survives the next reload.
+  clearThemeTokens();
   if (t === 'slate') document.documentElement.removeAttribute('data-theme');
   else document.documentElement.setAttribute('data-theme', t);
+  document.documentElement.dataset.themeName = t;
   try { localStorage.setItem('pedacito_theme', t); } catch (err) {}
-  const sel = $('theme');
-  if (sel && Array.prototype.some.call(sel.options, (o) => o.value === t)) sel.value = t;
+  const btn = $('themeBtn');
+  if (btn) btn.title = 'theme: ' + t + ' \u2014 open the Theme Manager';
   if (!userPick) return;
   PDC.api('/api/settings/theme', { gui_theme: t }).then((j) => {
     if (j && j.ok) {
@@ -1581,6 +2483,406 @@ function applyTheme(t, userPick) {
     } else PDC.toast('Theme kept in this browser (config not written): ' + ((j && j.detail) || 'server error'), true);
   }).catch(() => PDC.toast('Theme kept in this browser (server unreachable).', true));
 }
+// ----------------------------------------------------- unified theme engine ---
+// The ten-token schema in pedacito/themes.py drives every CSS variable below.
+// Presets and user palettes arrive from /api/themes; the modal edits a local
+// draft and applies it live before anything is saved.
+const THEME_FIELDS = [
+  ['bg', 'Background'], ['surface', 'Surface'],
+  ['surface_alt', 'Surface alt'], ['text', 'Text'], ['muted', 'Muted text'],
+  ['accent', 'Accent'], ['border', 'Border'], ['success', 'Success'],
+  ['warning', 'Warning'], ['danger', 'Danger'],
+];
+const THEME_TOKEN_KEYS = THEME_FIELDS.map((f) => f[0]);
+
+function themeContrast(hex) {
+  const raw = String(hex || '').replace('#', '');
+  if (raw.length !== 6) return '#ffffff';
+  const r = parseInt(raw.slice(0, 2), 16);
+  const g = parseInt(raw.slice(2, 4), 16);
+  const b = parseInt(raw.slice(4, 6), 16);
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.55
+    ? '#111111' : '#ffffff';
+}
+
+function themeCssProperties(t) {
+  const mix = (a, b, pct) => 'color-mix(in srgb, ' + a + ' ' + pct + '%, ' + b + ')';
+  return {
+    '--bg': t.bg, '--surface': t.surface, '--surface-alt': t.surface_alt,
+    '--text': t.text, '--muted': t.muted, '--accent': t.accent,
+    '--border': t.border, '--success': t.success, '--warning': t.warning,
+    '--danger': t.danger,
+    '--panel': t.surface, '--panel2': t.surface_alt, '--panel3': t.surface_alt,
+    '--line': t.border, '--line2': t.border, '--soft': t.surface_alt,
+    '--ok': t.success, '--err': t.danger, '--warn': t.warning,
+    '--accent-soft': mix(t.accent, t.surface, 22),
+    '--accent-fg': themeContrast(t.accent),
+    '--danger-fg': themeContrast(t.danger),
+    '--add-bg': t.success, '--del-bg': t.danger,
+    '--term-bg': t.bg, '--term-text': t.text, '--code-bg': t.surface,
+    '--ansi-0': t.muted, '--ansi-1': t.danger, '--ansi-2': t.success,
+    '--ansi-3': t.warning, '--ansi-4': t.accent, '--ansi-5': t.accent,
+    '--ansi-6': t.accent, '--ansi-7': t.text,
+  };
+}
+
+function applyThemeTokens(tokens, name) {
+  if (!tokens) return;
+  const css = themeCssProperties(tokens);
+  const root = document.documentElement;
+  Object.keys(css).forEach((key) => {
+    if (css[key]) root.style.setProperty(key, css[key]);
+  });
+  root.style.colorScheme = themeContrast(tokens.bg) === '#111111' ? 'light' : 'dark';
+  document.documentElement.dataset.themeName = name || '';
+  const btn = $('themeBtn');
+  if (btn && name) btn.title = 'theme: ' + name + ' \u2014 open the Theme Manager';
+  try {
+    localStorage.setItem('pedacito_theme_tokens', JSON.stringify(tokens));
+    localStorage.setItem('pedacito_theme_css', JSON.stringify(css));
+    localStorage.setItem('pedacito_theme_name', name || '');
+  } catch (err) {}
+}
+
+function clearThemeTokens() {
+  const root = document.documentElement;
+  Object.keys(themeCssProperties({
+    bg: '#000000', surface: '#000000', surface_alt: '#000000',
+    text: '#000000', muted: '#000000', accent: '#000000',
+    border: '#000000', success: '#000000', warning: '#000000',
+    danger: '#000000',
+  })).forEach((key) => root.style.removeProperty(key));
+  root.style.colorScheme = '';
+  try {
+    localStorage.removeItem('pedacito_theme_tokens');
+    localStorage.removeItem('pedacito_theme_css');
+    localStorage.removeItem('pedacito_theme_name');
+  } catch (err) {}
+}
+
+// Resolve which palette the GUI paints. gui_theme (config) is the source of
+// truth for the nine CSS-native schemes: an explicit browser marker, or the
+// server-injected data-theme attribute when no marker exists, wins over
+// whatever palette sits in themes.json -- the engine must not flatten a
+// crafted scheme into its ten-token derivation. `explicitEngine` marks a
+// Theme Manager pick/save/delete, which always switches to the engine palette.
+function applyThemePayload(payload, explicitEngine) {
+  if (!payload || !payload.themes) return;
+  const active = payload.active_theme;
+  const tokens = payload.themes[active];
+  if (!tokens) return;
+  let marker = '';
+  try { marker = localStorage.getItem('pedacito_theme') || ''; } catch (err) {}
+  const attr = document.documentElement.getAttribute('data-theme') || '';
+  if (!explicitEngine) {
+    if (isCssScheme(marker)) {
+      clearThemeTokens();
+      if (marker === 'slate') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', marker);
+      document.documentElement.dataset.themeName = marker;
+      return;
+    }
+    if (!marker && isCssScheme(attr)) {
+      clearThemeTokens();
+      document.documentElement.dataset.themeName = attr;
+      try { localStorage.setItem('pedacito_theme', attr); } catch (err) {}
+      return;
+    }
+  }
+  // Engine-native: an explicit Theme Manager pick, or no CSS preference
+  // anywhere. The built-in presets ARE the nine crafted gui_theme schemes,
+  // so let their app.css blocks paint the full palette instead of the
+  // flattened token derivation; only custom palettes use inline tokens.
+  if (isCssScheme(active)) {
+    clearThemeTokens();
+    if (active === 'slate') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', active);
+  } else {
+    applyThemeTokens(tokens, active);
+    document.documentElement.removeAttribute('data-theme');
+  }
+  document.documentElement.dataset.themeName = active;
+  try { localStorage.setItem('pedacito_theme', active); } catch (err) {}
+}
+
+function loadActiveTheme() {
+  return PDC.api('/api/themes').then((j) => {
+    if (j && j.ok) applyThemePayload(j);
+    return j;
+  }).catch(() => null);
+}
+
+function expandThemeHex(value) {
+  let text = String(value || '').trim();
+  if (!text.startsWith('#')) text = '#' + text;
+  if (/^#[0-9a-f]{3}$/i.test(text)) {
+    text = '#' + text.slice(1).split('').map((c) => c + c).join('');
+  }
+  return /^#[0-9a-f]{6}$/i.test(text) ? text.toLowerCase() : null;
+}
+
+function openThemeManager() {
+  PDC.api('/api/themes').then((j) => {
+    if (!j || !j.ok) {
+      PDC.toast('Could not load themes: ' + ((j && j.detail) || 'server error'), true);
+      return;
+    }
+    showThemeManager(j);
+  }).catch(() => PDC.toast('Could not load themes (server unreachable).', true));
+}
+
+function showThemeManager(initial) {
+  let marker0 = '';
+  try { marker0 = localStorage.getItem('pedacito_theme') || ''; } catch (err) {}
+  const attr0 = document.documentElement.getAttribute('data-theme') || '';
+  const st = {
+    themes: initial.themes || {},
+    builtin: new Set(initial.builtin_names || []),
+    active: initial.active_theme,
+    project: initial.project_theme || null,
+    draft: { ...(initial.themes[initial.active_theme] || {}) },
+    cssSchemes: initial.css_schemes || [],
+    // Which family the GUI currently paints: a CSS-native gui_theme scheme
+    // (crafted app.css block) or an engine palette (inline ten tokens).
+    mode: isCssScheme(marker0) ? 'css'
+      : (marker0 ? 'engine'
+        : (isCssScheme(attr0) ? 'css'
+          : (isCssScheme(initial.active_theme) ? 'css' : 'engine'))),
+    cssActive: '',
+  };
+  st.cssActive = st.mode === 'css'
+    ? (marker0 || attr0 || initial.active_theme || 'slate') : '';
+  const grid = h('div', { class: 'theme-grid', id: 'themeGrid' });
+  const editor = h('div', { class: 'theme-editor' });
+  const status = h('div', { class: 'theme-status', id: 'themeStatus' });
+  const nameInp = h('input', { type: 'text', class: 'theme-name',
+    id: 'themeName', placeholder: 'custom theme name', spellcheck: 'false',
+    autocomplete: 'off' });
+  const rows = {};
+  let selected = st.active;
+
+  const say = (text, tone) => {
+    status.textContent = text || '';
+    status.className = 'theme-status' + (tone ? ' ' + tone : '');
+  };
+  const preview = () => applyThemeTokens(st.draft, nameInp.value.trim() || selected);
+
+  function syncInputs(tokens) {
+    THEME_FIELDS.forEach(([key]) => {
+      if (!rows[key]) return;
+      rows[key].color.value = tokens[key] || '#000000';
+      rows[key].text.value = tokens[key] || '';
+    });
+  }
+
+  function renderGrid() {
+    clear(grid);
+    // The nine crafted gui_theme schemes first: they paint their full app.css
+    // palette and persist as gui_theme, exactly like the Settings enum.
+    st.cssSchemes.forEach((name) => {
+      const meta = CSS_SCHEME_META[name] || {};
+      const sw = h('span', { class: 'sw',
+        style: 'background:' + (meta.bg || '#808080')
+          + ';border-color:' + (meta.accent || '#808080') });
+      grid.appendChild(h('button', {
+        class: 'theme-pill'
+          + (st.mode === 'css' && name === st.cssActive ? ' on' : ''),
+        title: name,
+        onclick: () => selectCssScheme(name),
+      }, sw, h('span', { text: meta.label || name })));
+    });
+    const custom = Object.keys(st.themes).filter((n) => !st.builtin.has(n)).sort();
+    // The built-in presets are the crafted schemes above -- one pill each,
+    // not a second engine pill for the same name.
+    const names = Array.from(st.builtin)
+      .filter((n) => st.cssSchemes.indexOf(n) < 0).concat(custom);
+    names.forEach((name) => {
+      const t = st.themes[name];
+      if (!t) return;
+      const sw = h('span', { class: 'sw',
+        style: 'background:' + t.accent + ';border-color:' + t.border });
+      grid.appendChild(h('button', {
+        class: 'theme-pill'
+          + (st.mode === 'engine' && name === st.active ? ' on' : ''),
+        title: name,
+        onclick: () => selectTheme(name),
+      }, sw, h('span', { text: name }),
+        st.builtin.has(name) ? null : h('span', {
+          class: 'small-text', text: 'custom' })));
+    });
+  }
+
+  function selectCssScheme(name) {
+    // applyTheme clears the engine tokens, paints the crafted CSS block and
+    // persists gui_theme through /api/settings/theme (browser-local fallback).
+    applyTheme(name, true);
+    st.mode = 'css';
+    st.cssActive = name;
+    renderGrid();
+    say('Active: ' + ((CSS_SCHEME_META[name] || {}).label || name), 'ok');
+  }
+
+  function selectTheme(name) {
+    say('Switching to ' + name + '\u2026');
+    PDC.api('/api/themes/select', { name }).then((j) => {
+      if (!j || !j.ok) { say((j && j.detail) || 'Could not switch theme.', 'err'); return; }
+      st.themes = j.themes || st.themes;
+      st.builtin = new Set(j.builtin_names || []);
+      st.active = j.active_theme;
+      st.project = j.project_theme || null;
+      selected = st.active;
+      st.draft = { ...(st.themes[selected] || {}) };
+      nameInp.value = st.builtin.has(selected) ? '' : selected;
+      syncInputs(st.draft);
+      applyThemePayload(j, true);
+      st.mode = 'engine';
+      renderGrid();
+      delBtn.disabled = st.builtin.has(selected);
+      say('Active: ' + selected + (st.project ? ' (project override)' : ''), 'ok');
+    }).catch(() => say('Could not switch theme.', 'err'));
+  }
+
+  THEME_FIELDS.forEach(([key, label]) => {
+    const color = h('input', { type: 'color', value: st.draft[key] || '#000000',
+      title: label });
+    const text = h('input', { type: 'text', value: st.draft[key] || '',
+      spellcheck: 'false', autocomplete: 'off' });
+    color.addEventListener('input', () => {
+      text.value = color.value;
+      st.draft[key] = color.value;
+      preview();
+    });
+    text.addEventListener('input', () => {
+      const value = expandThemeHex(text.value);
+      if (value) {
+        color.value = value;
+        st.draft[key] = value;
+        preview();
+      }
+    });
+    text.addEventListener('blur', () => {
+      const value = expandThemeHex(text.value);
+      if (value) {
+        text.value = value;
+        color.value = value;
+        st.draft[key] = value;
+        preview();
+      } else {
+        text.value = st.draft[key] || '';
+      }
+    });
+    rows[key] = { color, text };
+    editor.append(h('div', { class: 'theme-row' },
+      h('span', { class: 'theme-key', text: label }), color, text));
+  });
+
+  const saveBtn = h('button', { class: 'primary', text: 'Save Custom Theme',
+    id: 'themeSave', onclick: () => {
+      const name = nameInp.value.trim();
+      if (!name) { say('Enter a custom theme name first.', 'err'); nameInp.focus(); return; }
+      const tokens = {};
+      for (const key of THEME_TOKEN_KEYS) {
+        const value = expandThemeHex(st.draft[key]);
+        if (!value) { say('Invalid color for ' + key + '.', 'err'); return; }
+        tokens[key] = value;
+      }
+      PDC.api('/api/themes/save', { name, tokens }).then((j) => {
+        if (!j || !j.ok) { say((j && j.detail) || 'Could not save theme.', 'err'); return; }
+        st.themes = j.themes || st.themes;
+        st.builtin = new Set(j.builtin_names || []);
+        st.active = j.active_theme;
+        st.project = j.project_theme || null;
+        selected = j.active_theme;
+        st.draft = { ...(st.themes[selected] || tokens) };
+        nameInp.value = selected;
+        syncInputs(st.draft);
+        applyThemePayload(j, true);
+        st.mode = 'engine';
+        renderGrid();
+        delBtn.disabled = false;
+        say('Saved and activated ' + selected + '.', 'ok');
+      }).catch(() => say('Could not save theme.', 'err'));
+    } });
+
+  const delBtn = h('button', { class: 'danger', text: 'Delete Custom Theme',
+    id: 'themeDelete', onclick: () => {
+      const name = nameInp.value.trim() || selected;
+      if (st.builtin.has(name) || !st.themes[name] || st.builtin.has(selected)
+          && name === selected) {
+        say('Built-in presets cannot be deleted.', 'err');
+        return;
+      }
+      PDC.confirm('Delete the custom theme \u201c' + name + '\u201d?', 'Delete', true)
+        .then((ok) => {
+          if (!ok) return;
+          PDC.api('/api/themes/delete', { name }).then((j) => {
+            if (!j || !j.ok) { say((j && j.detail) || 'Could not delete theme.', 'err'); return; }
+            st.themes = j.themes || st.themes;
+            st.builtin = new Set(j.builtin_names || []);
+            st.active = j.active_theme;
+            st.project = j.project_theme || null;
+            selected = j.active_theme;
+            st.draft = { ...(st.themes[selected] || {}) };
+            nameInp.value = st.builtin.has(selected) ? '' : selected;
+            syncInputs(st.draft);
+            applyThemePayload(j, true);
+            st.mode = 'engine';
+            renderGrid();
+            delBtn.disabled = st.builtin.has(selected);
+            say('Deleted ' + name + '. Active: ' + selected + '.', 'ok');
+          }).catch(() => say('Could not delete theme.', 'err'));
+        });
+    } });
+
+  const importBox = h('textarea', { class: 'theme-import', id: 'themeImport',
+    placeholder: '{"name":"my-theme","tokens":{"bg":"#101418", ...}}\n'
+      + 'or just the ten-token object',
+    spellcheck: 'false' });
+  const importBtn = h('button', { text: 'Import / Paste JSON',
+    id: 'themeImportBtn', onclick: () => {
+      try {
+        const parsed = JSON.parse(importBox.value || '{}');
+        const tokens = parsed.tokens || parsed.theme || parsed;
+        const clean = {};
+        for (const key of THEME_TOKEN_KEYS) {
+          const value = expandThemeHex(tokens[key]);
+          if (!value) throw new Error('missing or invalid ' + key);
+          clean[key] = value;
+        }
+        st.draft = clean;
+        if (parsed.name) nameInp.value = String(parsed.name);
+        syncInputs(clean);
+        preview();
+        say('Imported palette \u2014 review it, then Save Custom Theme.', 'ok');
+      } catch (err) {
+        say('Could not import: ' + (err && err.message ? err.message : 'invalid JSON'), 'err');
+      }
+    } });
+
+  const content = h('div', {},
+    h('div', { class: 'theme-hint',
+      text: 'GUI schemes paint their full crafted palette and save as gui_theme. '
+        + 'Presets and custom palettes are shared with the terminal TUI. '
+        + 'Edit any of the ten colors for a live preview.' }),
+    grid,
+    h('div', { class: 'theme-hint', text: 'Active palette \u2014 ten shared tokens' }),
+    editor,
+    h('div', { class: 'theme-actions' }, nameInp, saveBtn, delBtn),
+    status,
+    h('div', { class: 'theme-hint', text: 'Import / Paste JSON' }),
+    importBox,
+    h('div', { class: 'theme-actions' }, importBtn));
+  PDC.modal('Theme Manager & Custom Color Editor', content, [{ label: 'Close' }],
+    { wide: true, onClose: () => loadActiveTheme() });
+  syncInputs(st.draft);
+  renderGrid();
+  if (!st.builtin.has(selected)) nameInp.value = selected;
+  delBtn.disabled = st.builtin.has(selected);
+  if (st.project) say('Active: ' + st.active + ' (project override)', 'ok');
+  else say('Active: ' + st.active, 'ok');
+}
+PDC.openThemes = openThemeManager;
+
 function clearTerm() { PDC.api('/api/term_clear', {}); }
 function restoreDialog() {
   const snaps = S.status.snapshots || [];
@@ -1655,6 +2957,169 @@ function renameSymbolDialog() {
     } }], { wide: true });
   setTimeout(() => { oldInp.focus(); }, 30);
   return m;
+}
+
+// ------------------------------------------------------------------ image generation dialog ---
+function imageGenDialog() {
+  const s = S.status || {};
+  const calMap = s.calibration || {};
+  const models = s.profile_models || {};
+  const imgProfiles = Object.keys(calMap).filter((n) => calMap[n] && calMap[n].is_image_model);
+  const activeProf = s.profile || s.default_profile || '';
+  const initialProf = imgProfiles.indexOf(activeProf) >= 0 ? activeProf : (imgProfiles[0] || '');
+
+  const promptEl = h('textarea', {
+    id: 'imgGenPrompt',
+    rows: '3',
+    placeholder: PDC.t('gui.image.prompt_ph', null, 'Describe the image to generate\u2026'),
+  });
+  const negEl = h('input', {
+    id: 'imgGenNeg',
+    type: 'text',
+    placeholder: PDC.t('gui.image.negative_ph', null, 'Optional negative prompt (what to avoid)'),
+  });
+  const profSel = h('select', { id: 'imgGenProfile' });
+  if (imgProfiles.length) {
+    imgProfiles.forEach((n) => {
+      const m = models[n] ? ' \u00B7 ' + models[n] : '';
+      const optEl = h('option', { value: n, text: n + m });
+      if (n === initialProf) optEl.selected = true;
+      profSel.appendChild(optEl);
+    });
+  } else {
+    profSel.appendChild(h('option', { value: '', text: PDC.t('gui.image.no_profile', null, '(no image profile configured)') }));
+    profSel.disabled = true;
+  }
+
+  const sizes = ['512x512', '768x768', '1024x1024', '1024x768', '768x1024'];
+  const sizeSel = h('select', { id: 'imgGenSize' });
+  sizes.forEach((sz) => {
+    const o = h('option', { value: sz, text: sz });
+    if (sz === '1024x1024') o.selected = true;
+    sizeSel.appendChild(o);
+  });
+  const stepsEl = h('input', { id: 'imgGenSteps', type: 'number', min: '1', max: '150', step: '1', placeholder: 'auto' });
+  const seedEl = h('input', { id: 'imgGenSeed', type: 'number', step: '1', placeholder: 'random' });
+  const outEl = h('input', {
+    id: 'imgGenOut',
+    type: 'text',
+    class: 'mono',
+    spellcheck: false,
+    placeholder: PDC.t('gui.image.out_ph', null, 'Optional save path (e.g. assets/hero.png)'),
+  });
+
+  const statusEl = h('div', { class: 'img-gen-status muted small-text' });
+  const previewWrap = h('div', { class: 'img-gen-preview', hidden: true });
+  const previewImg = h('img', { alt: PDC.t('gui.image.preview_alt', null, 'Generated image preview') });
+  const metaRow = h('div', { class: 'img-gen-meta' });
+  const metaText = h('span', { class: 'mono small-text grow' });
+  let lastRelPath = '';
+  const copyBtn = h('button', {
+    type: 'button',
+    class: 'small',
+    text: PDC.t('gui.image.copy_path', null, 'Copy path'),
+    onclick: () => {
+      if (!lastRelPath) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(lastRelPath).then(
+          () => PDC.toast(PDC.t('gui.image.path_copied', { path: lastRelPath }, 'Copied: ' + lastRelPath)),
+          () => PDC.toast(lastRelPath)
+        );
+      } else {
+        PDC.toast(lastRelPath);
+      }
+    },
+  });
+  metaRow.appendChild(metaText);
+  metaRow.appendChild(copyBtn);
+  previewWrap.appendChild(previewImg);
+  previewWrap.appendChild(metaRow);
+
+  const field = (label, el) => h('label', { class: 'img-gen-field' },
+    h('span', { class: 'muted small-text', text: label }), el);
+
+  const body = h('div', { class: 'img-gen-dialog' },
+    !imgProfiles.length ? h('div', { class: 'note-box', text: PDC.t('gui.image.setup_hint', null, 'No image profile detected yet. Scan a local image server (e.g. Lemonade sd-cpp) or add a profile with modality = "image" in Settings.') }) : null,
+    field(PDC.t('gui.image.prompt_label', null, 'Prompt'), promptEl),
+    field(PDC.t('gui.image.negative_label', null, 'Negative prompt (optional)'), negEl),
+    h('div', { class: 'img-gen-grid' },
+      field(PDC.t('gui.image.profile_label', null, 'Image profile'), profSel),
+      field(PDC.t('gui.image.size_label', null, 'Size'), sizeSel),
+      field(PDC.t('gui.image.steps_label', null, 'Steps (optional)'), stepsEl),
+      field(PDC.t('gui.image.seed_label', null, 'Seed (optional)'), seedEl),
+    ),
+    field(PDC.t('gui.image.out_label', null, 'Save path (optional)'), outEl),
+    statusEl,
+    previewWrap,
+  );
+
+  let busy = false;
+  const doGenerate = () => {
+    if (busy) return false;
+    const prompt = (promptEl.value || '').trim();
+    if (!prompt) {
+      PDC.toast(PDC.t('gui.image.prompt_required', null, 'Enter a prompt first.'), true);
+      promptEl.focus();
+      return false;
+    }
+    const payload = {
+      prompt: prompt,
+      size: sizeSel.value || '1024x1024',
+    };
+    const neg = (negEl.value || '').trim();
+    if (neg) payload.negative_prompt = neg;
+    if (profSel.value) payload.profile = profSel.value;
+    const stepsVal = parseInt(stepsEl.value, 10);
+    if (!isNaN(stepsVal) && stepsVal > 0) payload.steps = stepsVal;
+    const seedVal = parseInt(seedEl.value, 10);
+    if (!isNaN(seedVal)) payload.seed = seedVal;
+    const outVal = (outEl.value || '').trim();
+    if (outVal) payload.output_path = outVal;
+
+    busy = true;
+    statusEl.textContent = PDC.t('gui.image.generating', null, 'Generating image\u2026');
+    statusEl.className = 'img-gen-status muted small-text';
+    const genBtn = modal.box && modal.box.querySelector('.modal-foot button.primary');
+    if (genBtn) genBtn.disabled = true;
+
+    PDC.api('/api/image/generate', payload).then((j) => {
+      busy = false;
+      if (genBtn) genBtn.disabled = false;
+      if (!j.ok) {
+        statusEl.textContent = j.detail || PDC.t('gui.image.failed', null, 'Image generation failed.');
+        statusEl.className = 'img-gen-status err small-text';
+        return;
+      }
+      lastRelPath = j.rel_path || j.path || '';
+      const dims = (j.width && j.height) ? (j.width + '\u00d7' + j.height) : '';
+      const lat = j.elapsed_s != null ? (Number(j.elapsed_s).toFixed(2) + 's') : '';
+      const bits = [lastRelPath, dims, lat, j.model || ''].filter(Boolean);
+      metaText.textContent = bits.join(' \u00B7 ');
+      previewImg.src = j.url + (j.url.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+      previewWrap.hidden = false;
+      statusEl.textContent = PDC.t('gui.image.done', { path: lastRelPath }, 'Saved to ' + lastRelPath);
+      statusEl.className = 'img-gen-status ok small-text';
+      refreshState();
+    }).catch(() => {
+      busy = false;
+      if (genBtn) genBtn.disabled = false;
+      statusEl.textContent = PDC.t('errors.connection_failed', null, 'Could not reach the server.');
+      statusEl.className = 'img-gen-status err small-text';
+    });
+    return false;
+  };
+
+  const modal = PDC.modal(
+    PDC.t('gui.image.dialog_title', null, '\uD83C\uDFA8 Generate Image'),
+    body,
+    [
+      { label: PDC.t('common.close', null, 'Close') },
+      { label: PDC.t('gui.image.generate_btn', null, 'Generate'), primary: true, stay: true, onclick: doGenerate },
+    ],
+    { wide: true },
+  );
+  setTimeout(() => { promptEl.focus(); }, 30);
+  return modal;
 }
 
 // ------------------------------------------------------------------ project dialogs ---
@@ -1755,6 +3220,7 @@ function skillsDialog() {
   const detail = h('div', {});
   const editor = h('div', {});
   const note = h('div', { class: 'muted small-text' });
+  const pinBox = h('div', {});
   let rows = [], matchNames = [];
   const filter = h('input', { type: 'text', class: 'grow', spellcheck: false,
     placeholder: 'filter by name or description\u2026',
@@ -1764,6 +3230,59 @@ function skillsDialog() {
     onkeydown: (e) => { if (e.key === 'Enter') previewMatches(); } });
   const newBtn = h('button', { class: 'primary', text: '+ New Custom Skill',
     onclick: () => openEditor(null) });
+
+  // Manual injection: a pinned skill rides the same request-level `pinned`
+  // list as @file/@symbol picks, so the server's existing pinned-context
+  // block receives its full checklist body.
+  function skillRef(name) { return 'skill:' + name; }
+  function isSkillPinned(name) {
+    return S.pinned.some((p) => p.insert === skillRef(name));
+  }
+  function pinSkill(r) {
+    if (!isSkillPinned(r.name)) {
+      S.pinned.push({ kind: 'skill', label: r.name, insert: skillRef(r.name),
+        skillName: r.name,
+        detail: (r.scope || 'skill') + ' skill: ' + (r.description || '') });
+    }
+    emit();
+    paintPins();
+    paintList();
+    PDC.toast('Skill \u201c' + r.name + '\u201d will be injected into the next task.');
+  }
+  function unpinSkill(name) {
+    S.pinned = S.pinned.filter((p) => p.insert !== skillRef(name));
+    emit();
+    paintPins();
+    paintList();
+    PDC.toast('Removed \u201c' + name + '\u201d from the next task.');
+  }
+  function paintPins() {
+    PDC.clear(pinBox);
+    const pins = S.pinned.filter((p) => String(p.insert || '').indexOf('skill:') === 0);
+    if (!pins.length) return;
+    const box = h('div', { class: 'note-box', style: 'margin:6px 0' },
+      h('div', { class: 'row' },
+        h('b', { text: 'Pinned for the next task' }),
+        h('span', { class: 'grow muted small-text',
+          text: 'full checklist body, injected through the pinned-context block' }),
+        h('button', { class: 'ghost small', text: 'Clear skills', onclick: () => {
+          S.pinned = S.pinned.filter((p) => String(p.insert || '').indexOf('skill:') !== 0);
+          emit(); paintPins(); paintList();
+        } })));
+    pins.forEach((p) => {
+      const name = p.skillName || p.label;
+      const row = rows.find((x) => x.name === name) || {};
+      const chars = (row.body || '').length;
+      box.appendChild(h('div', { class: 'row small-text', style: 'padding:2px 0' },
+        h('span', { class: 'tag', text: row.scope || 'skill' }),
+        h('b', { text: name }),
+        h('span', { class: 'grow muted',
+          text: (row.description || '') + (chars ? ' \u00b7 ' + chars + ' chars' : '') }),
+        h('button', { class: 'ghost small danger', text: 'Remove',
+          onclick: () => unpinSkill(name) })));
+    });
+    pinBox.appendChild(box);
+  }
 
   function previewMatches() {
     const t = (task.value || '').trim();
@@ -1792,12 +3311,19 @@ function skillsDialog() {
     shown.forEach((r) => {
       const matched = matchNames.indexOf(r.name) >= 0;
       const custom = r.scope !== 'bundled';
+      const pinned = isSkillPinned(r.name);
       list.appendChild(h('div', { class: 'row small-text', style: 'padding:3px 0;cursor:pointer',
         onclick: () => showDetail(r) },
         h('span', { class: 'tag' + (matched ? ' act' : ''), text: r.scope }),
         h('b', { text: r.name, style: 'min-width:200px' }),
         matched ? h('span', { class: 'tag act', text: 'matches task' }) : null,
         h('span', { class: 'grow muted', text: r.description }),
+        h('button', { class: pinned ? 'ghost small' : 'primary small',
+          text: pinned ? 'Pinned for next task' : 'Use in next task',
+          onclick: (e) => {
+            e.stopPropagation();
+            if (pinned) unpinSkill(r.name); else pinSkill(r);
+          } }),
         custom ? h('button', { class: 'ghost small', text: 'Edit', onclick: (e) => {
           e.stopPropagation(); openEditor(r);
         } }) : null,
@@ -1817,11 +3343,15 @@ function skillsDialog() {
 
   function showDetail(r) {
     PDC.clear(detail);
+    const pinned = isSkillPinned(r.name);
     detail.appendChild(h('div', { class: 'note-box', style: 'margin-top:10px' },
       h('div', { class: 'row' },
         h('b', { text: r.name }),
         h('span', { class: 'tag', text: r.scope }),
-        h('span', { class: 'muted small-text grow', text: r.source || '' })),
+        h('span', { class: 'muted small-text grow', text: r.source || '' }),
+        h('button', { class: pinned ? 'ghost small' : 'primary small',
+          text: pinned ? 'Pinned for next task' : 'Use in next task',
+          onclick: () => { if (pinned) unpinSkill(r.name); else pinSkill(r); } })),
       h('div', { class: 'small-text', style: 'margin:4px 0',
         text: 'triggers: ' + ((r.triggers || []).join(', ') || '(none)') }),
       h('pre', { class: 'diffwrap', style: 'max-height:26vh;overflow:auto;margin:0;white-space:pre-wrap',
@@ -1893,14 +3423,17 @@ function skillsDialog() {
   body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' },
     task, h('button', { text: 'Preview matches', onclick: previewMatches })));
   body.appendChild(note);
+  body.appendChild(pinBox);
   body.appendChild(list);
   body.appendChild(detail);
   body.appendChild(editor);
+  paintPins();
   PDC.modal('Skills library & creator', body, [{ label: 'Close' }], { wide: true });
   PDC.api('/api/skills').then((j) => {
     if (!j.ok) { note.textContent = j.detail || 'Could not load the skills library.'; return; }
     rows = j.skills || [];
     paintList();
+    paintPins();
   }, () => { note.textContent = 'The GUI server did not answer.'; });
 }
 PDC.skillsDialog = skillsDialog;
@@ -1925,6 +3458,198 @@ PDC.consolidateSession = consolidateSession;
 
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
+// Background servers, model-server lifecycle, and live VRAM/RAM telemetry.
+// The badge polls slowly (15 s); the modal refreshes after every action.
+function _gb(n) { return Number(n || 0).toFixed(1); }
+function _gbShort(n) { return String(Math.round(Number(n || 0))); }
+function _memText(mem) {
+  const v = (mem && mem.vram) || {}, r = (mem && mem.ram) || {};
+  return 'VRAM: ' + _gb(v.used_gb) + ' / ' + _gb(v.total_gb) + ' GB | RAM: '
+    + _gb(r.used_gb) + ' / ' + _gb(r.total_gb) + ' GB';
+}
+function _memCompact(mem) {
+  const v = (mem && mem.vram) || {}, r = (mem && mem.ram) || {};
+  return 'RAM ' + _gbShort(r.used_gb) + '/' + _gbShort(r.total_gb)
+    + 'G \u00B7 VRAM ' + _gbShort(v.used_gb) + '/' + _gbShort(v.total_gb) + 'G';
+}
+
+function HardwareBadge() {
+  const [mem, setMem] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => PDC.api('/api/servers').then((j) => {
+      if (!alive || !j) return;
+      if (j.memory) setMem(j.memory);
+      // The same 15 s cycle refreshes the profile picker's disabled states.
+      if (j.profile_availability) {
+        S.profile_availability = j.profile_availability;
+        emit();
+      }
+    }, () => {});
+    load();
+    const timer = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+  if (!mem) return null;
+  const v = mem.vram || {}, r = mem.ram || {};
+  const src = mem.sources || {};
+  const cards = (v.cards || []).map((c) => c.card + ' ' + _gb(c.used_gb)
+    + '/' + _gb(c.total_gb) + ' GB (' + (c.source || '?') + ')').join('\n');
+  return html`<span class="chip" id="hwChip"
+      title=${_memText(mem)
+        + '\nhardware totals only \u2014 no per-process GPU attribution'
+        + '\nRAM source: ' + (src.ram_total_gb || 'unavailable')
+        + '\nVRAM source: ' + (src.vram_total_gb || 'unavailable')
+        + (cards ? '\n' + cards : '')}
+      onClick=${() => serversDialog()}>
+    <b>${_memCompact(mem)}</b>
+  </span>`;
+}
+
+function serversDialog() {
+  // One registry row per endpoint: every profile pointing at the same URL
+  // shares it. The row is titled after the server itself (kind + host) --
+  // naming it after the first profile (s.name) reads like a model sitting
+  // unloaded on the server. s.name stays the registry key the actions route
+  // by; the profile names ride as a secondary line.
+  const KIND_LABELS = {
+    lemonade: 'Lemonade', lemond: 'Lemonade', 'llama-server': 'llama.cpp',
+    strata: 'Strata', avalon: 'Avalon', 'local-moe': 'Local MoE',
+    local: 'Local server', custom: 'Local server',
+  };
+  function serverTitle(s) {
+    const host = String(s.base_url || '')
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0];
+    const kind = KIND_LABELS[String(s.kind || '').toLowerCase()]
+      || 'Local server';
+    return host ? kind + ' \u00b7 ' + host : (s.name || kind);
+  }
+  const status = h('div', { class: 'muted small-text', style: 'margin-bottom:8px' });
+  const list = h('div', {});
+  const check = h('input', { type: 'checkbox', checked: !!S.status.auto_evict_servers });
+
+  function setAutoEvict(on) {
+    PDC.api('/api/servers/auto-evict', { enabled: on }).then((j) => {
+      if (!j.ok) { PDC.toast(j.detail || 'could not save the setting', true); return; }
+      S.status.auto_evict_servers = !!j.auto_evict_servers;
+      emit();
+      PDC.toast(on ? 'Auto-unload other local servers on switch: on'
+                   : 'Auto-unload other local servers on switch: off');
+    });
+  }
+  check.addEventListener('change', () => setAutoEvict(!!check.checked));
+
+  function act(path, payload) {
+    status.textContent = 'Working\u2026';
+    PDC.api(path, payload).then((j) => {
+      if (j.skipped) {
+        status.textContent = j.detail || 'nothing to do';
+      } else if (!j.ok) {
+        status.textContent = (j.detail || 'the server refused the action');
+      } else {
+        const verb = path.indexOf('pin') >= 0
+          ? (payload.pinned ? 'Pinned ' : 'Unpinned ')
+          : (path.indexOf('unload') >= 0 ? 'Unloaded ' : 'Loaded ');
+        status.textContent = verb
+          + (payload.model || payload.server || 'model')
+          + ' \u00B7 ' + _memText(j.memory || {});
+      }
+      paint(j);
+    }, () => { status.textContent = 'The GUI server did not answer.'; });
+  }
+
+  function paint(j) {
+    PDC.clear(list);
+    if (!j) {
+      status.textContent = 'Could not read the server registry.';
+      return;
+    }
+    if (!j.ok) {
+      status.textContent = j.detail || 'Could not read the server registry.';
+      // A refused load/unload/pin still answers 502 WITH fresh telemetry:
+      // keep the registry visible instead of blanking the dialog.
+      if (!(j.servers || []).length) return;
+    } else if (!j.detail) {
+      status.textContent = _memText(j.memory || {});
+    }
+    const rows = j.servers || [];
+    if (!rows.length) {
+      list.appendChild(h('div', { class: 'tip',
+        text: 'No local servers are configured. Add a local profile in Settings \u2192 Profiles.' }));
+      return;
+    }
+    rows.forEach((s) => {
+      const loaded = s.loaded_models || [];
+      const loading = s.loading_models || [];
+      const available = (s.models || []).filter(
+        (m) => loaded.indexOf(m) < 0 && loading.indexOf(m) < 0);
+      const sel = h('select', { title: 'model to load' });
+      available.forEach((m) => sel.appendChild(h('option', { value: m, text: m })));
+      const pinSel = h('select', { title: 'loaded model to pin' });
+      loaded.forEach((m) => pinSel.appendChild(h('option', { value: m, text: m })));
+      const canPin = ['lemonade', 'lemond'].indexOf(
+        String(s.kind || '').toLowerCase()) >= 0;
+      const loadBtn = h('button', { class: 'small primary', text: 'Load',
+        disabled: !available.length,
+        onclick: () => act('/api/servers/load', { server: s.name, model: sel.value }) });
+      const unloadBtn = h('button', { class: 'small danger', text: loaded.length > 1 ? 'Eject all' : 'Unload / Eject',
+        disabled: !loaded.length,
+        onclick: () => act('/api/servers/unload',
+          { server: s.name, model: loaded.length === 1 ? loaded[0] : '' }) });
+      list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
+        h('div', { class: 'row' },
+          h('b', { text: serverTitle(s) }),
+          h('span', { class: 'tag' + (s.online ? ' act' : ''), text: s.online ? 'online' : 'offline' }),
+          h('span', { class: 'tag', text: s.kind || 'custom' }),
+          h('span', { class: 'grow' }),
+          unloadBtn),
+        h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
+        (s.profiles && s.profiles.length) ? h('div', {
+          class: 'muted small-text', style: 'margin-top:2px',
+          title: s.profiles.join(', '),
+          text: 'profiles: ' + s.profiles.slice(0, 3).join(', ')
+            + (s.profiles.length > 3
+               ? ' + ' + (s.profiles.length - 3) + ' more' : '') }) : null,
+        h('div', { class: 'small-text', style: 'margin-top:4px',
+          text: loaded.length ? 'resident: ' + loaded.join(', ')
+            : (loading.length ? 'loading: ' + loading.join(', ')
+                              : 'no model resident') }),
+        (canPin && loaded.length) ? h('div', { class: 'row', style: 'margin-top:6px' },
+          pinSel,
+          h('button', { class: 'small', text: 'Pin',
+            title: 'prevent Lemonade from evicting this model',
+            onclick: () => act('/api/servers/pin',
+              { server: s.name, kind: s.kind, model: pinSel.value, pinned: true }) }),
+          h('button', { class: 'small', text: 'Unpin',
+            title: 'allow Lemonade to evict this model again',
+            onclick: () => act('/api/servers/pin',
+              { server: s.name, kind: s.kind, model: pinSel.value, pinned: false }) })) : null,
+        (available.length || !s.online) ? h('div', { class: 'row', style: 'margin-top:6px' },
+          sel, loadBtn) : null));
+    });
+  }
+
+  function refresh() {
+    status.textContent = 'Probing local servers\u2026';
+    PDC.api('/api/servers').then(paint,
+      () => { status.textContent = 'The GUI server did not answer.'; });
+  }
+
+  const body = h('div', {},
+    status,
+    list,
+    h('label', { class: 'chk', style: 'display:block;margin-top:10px' },
+      check, ' Auto-unload other local servers on switch'),
+    h('div', { class: 'muted small-text', style: 'margin-top:6px',
+      text: 'Before a run, resident models on other configured local servers are unloaded and VRAM/RAM is polled briefly. A sleeping server is never touched.' }),
+    h('div', { class: 'muted small-text', style: 'margin-top:6px',
+      text: 'Load / unload acts on the server itself (Lemonade: POST /v1/load, /v1/unload) \u2014 it creates no profile and switches nothing. The dropdown is the live catalog the server reports, including models no profile references; running a model still needs a profile pointing at this server with that model id.' }));
+  PDC.modal('Servers & memory', body,
+    [{ label: 'Refresh', onclick: () => { refresh(); return false; } },
+     { label: 'Close' }], { wide: true });
+  refresh();
+}
+
 function procsDialog() {
   // Workspace-backed: background servers live under the scratchpad when no
   // project is open.
@@ -2215,6 +3940,24 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
   const defName = peek ? peek.default : s.default_profile;
   const active = S.ui.pendingProfile !== null ? S.ui.pendingProfile
     : (s.profile && s.profile !== defName ? s.profile : '');
+  // Peek lists another folder's profiles, which the current server map does
+  // not describe, so the annotations only apply to the open config.
+  const availability = peek ? {} : (S.profile_availability || {});
+  const optionFor = (p) => {
+    const model = (s.profile_models || {})[p] || '';
+    const isImg = !!((s.calibration || {})[p] || {}).is_image_model;
+    const label = p + (model ? ' \u00B7 ' + model : '') + (isImg ? ' \u00B7 \uD83C\uDFA8 image' : '');
+    const state = availability[p] || 'unknown';
+    if (state === 'unavailable') return {
+      label: label + ' \u00B7 unavailable', disabled: true,
+      title: 'model ' + (model || '?') + ' was not found on its server \u2014 '
+        + 'it may have been deleted; update the profile in Settings' };
+    if (state === 'offline') return {
+      label: label + ' \u00B7 server offline', disabled: true,
+      title: 'the model server is not reachable \u2014 start it; this profile '
+        + 'becomes selectable again after the next telemetry poll' };
+    return { label: label, disabled: false, title: '' };
+  };
   const ref = useRef(null);
   useEffect(() => {                       // sync only when it truly differs,
     const el = ref.current;                // and never while it is open/focused
@@ -2225,7 +3968,11 @@ function ProfileSelect(props) {           // header dropdown; uncontrolled
             disabled=${!!props.busy && !!s.root}
             onchange=${(e) => props.onChange(e.target.value)}>
       <option value="">(default${defName ? ': ' + defName : ''})</option>
-      ${profiles.map((p) => html`<option key=${p} value=${p}>${p}${(s.profile_models || {})[p] ? ' \u00B7 ' + s.profile_models[p] : ''}</option>`)}
+      ${profiles.map((p) => {
+        const o = optionFor(p);
+        return html`<option key=${p} value=${p} disabled=${o.disabled}
+                            title=${o.title}>${o.label}</option>`;
+      })}
     </select>`;
 }
 
@@ -2242,12 +3989,35 @@ function calChoicesTip(ch) {
                    .map((k) => k + ': ' + ch[k]);
   return bits.length ? '\n' + bits.join('\n') : '';
 }
+function tuneTip() {
+  const s = S.status || {};
+  if (!s.auto_tune) return '';
+  const src = (s.tuning_sources || {}).context_tokens;
+  return '\nauto-tune: ' + PDC.fmtInt(s.context_tokens || 0) + ' context tokens, '
+    + Number(s.timeout || 0).toFixed(0) + 's timeout, max_concurrency '
+    + (s.max_concurrency || 0) + (src && src !== 'default' ? '\ncontext: ' + src : '');
+}
 function CalibrationBadge(props) {
   const s = S.status;
   const name = props.name || '';
   if (!name && !s.root) return null;
   const cal = (s.calibration || {})[name] || {};
   const openProfiles = () => callSettings({ tab: 'discovery' });
+  if (cal.is_image_model) {
+    const verified = !!(cal.calibrated && (cal.image_ok || cal.card_score > 0));
+    const lat = cal.image_latency_s ? ' (' + Number(cal.image_latency_s).toFixed(1) + 's)' : '';
+    const badgeText = verified
+      ? PDC.t('gui.cal.image_verified', { latency: lat }, '\uD83C\uDFA8 Image \u00B7 \u2713 Verified' + lat)
+      : PDC.t('gui.cal.image_badge', null, '\uD83C\uDFA8 Image');
+    const tip = verified
+      ? PDC.t('gui.cal.image_verified_tip', { at: cal.calibrated_at || '' },
+          'Image generation model \u2014 verified ' + (cal.calibrated_at || '') + '.\nClick to open Settings \u2192 Model discovery')
+      : PDC.t('gui.cal.image_tip', null,
+          'Image generation model \u2014 run Probe image to verify endpoint readiness.\nClick to open Settings \u2192 Model discovery');
+    return html`<span class=${'chip cal-chip image' + (verified ? ' ok' : '')} id="calChip" onClick=${openProfiles}
+      title=${tip}>
+      <b>${badgeText}</b></span>`;
+  }
   if (cal.is_hosted) {
     return html`<span class="chip cal-chip hosted" id="calChip"
       title=${'Hosted provider model \u2014 uses provider-table defaults automatically.\nCalibration disabled for hosted models.'}>
@@ -2259,16 +4029,19 @@ function CalibrationBadge(props) {
     return html`<span class="chip cal-chip ok" id="calChip" onClick=${openProfiles}
       title=${'Calibrated ' + (cal.calibrated_at || '') + '\nscore: '
         + Number(cal.card_score || 0).toFixed(2) + calChoicesTip(cal.card_choices)
+        + tuneTip()
         + '\nClick to open Settings \u2192 Model discovery'}>
       <b>\u2713 Calibrated (${ago})</b></span>`;
   }
   if (cal.calibrated && cal.calibrated_stale) {
     return html`<span class="chip cal-chip stale" id="calChip" onClick=${openProfiles}
-      title=${'The model card is older than 30 days (or from an older calibrate version).\nRe-calibrate to refresh the tuned defaults.\nClick to open Settings \u2192 Model discovery'}>
+      title=${'The model card is older than 30 days (or from an older calibrate version).\nRe-calibrate to refresh the tuned defaults.'
+        + tuneTip() + '\nClick to open Settings \u2192 Model discovery'}>
       <b>\u26A0 Calibration stale (${(cal.calibrated_age_days || 0) + 'd ago'})</b></span>`;
   }
   return html`<span class="chip cal-chip none" id="calChip" onClick=${openProfiles}
-    title=${'No model card yet \u2014 calibrate to measure this model and tune its defaults.\nClick to open Settings \u2192 Model discovery'}>
+    title=${'No model card yet \u2014 calibrate to measure this model and tune its defaults.'
+      + tuneTip() + '\nClick to open Settings \u2192 Model discovery'}>
     <b>\u25CB Not calibrated</b></span>`;
 }
 
@@ -2316,40 +4089,40 @@ function TelemetryBar() {
   const drawer = open ? html`
     <div class="tele-drawer" id="teleDrawer">
       <div class="tele-grid">
-        <div><span class="muted">Last turn</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
-        <div><span class="muted">Last turn total</span><b>${PDC.fmtInt(t.last_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.last_reasoning_tokens)} reasoning</b></div>
-        <div><span class="muted">Latency</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
-        <div><span class="muted">Speed (last / avg)</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
-        <div><span class="muted">Context window</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
-        <div><span class="muted">Session</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
-        <div><span class="muted">Session total</span><b>${PDC.fmtInt(t.session_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.session_reasoning_tokens)} reasoning</b></div>
-        <div><span class="muted">KV cache hit</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
-        <div><span class="muted">Context folds</span><b>${s.folds || 0}</b></div>
-        <div><span class="muted">Cost</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
-        <div><span class="muted">Provider</span><b>${t.provider || '\u2014'}</b></div>
-        <div><span class="muted">Active model</span><b>${activeName} (${activeTag})</b></div>
-        <div><span class="muted">Orchestrator</span><b>${s.planner_profile || '\u2014'}</b></div>
-        ${s.scout_profile ? html`<div><span class="muted">Scout</span><b>${s.scout_profile}</b></div>` : null}
+        <div><span class="muted">${PDC.t('gui.tele.last_turn', null, 'Last turn')}</span><b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.last_turn_total', null, 'Last turn total')}</span><b>${PDC.fmtInt(t.last_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.last_reasoning_tokens)} reasoning</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.latency', null, 'Latency')}</span><b>${fmt1(t.last_elapsed_s)} s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.speed', null, 'Speed (last / avg)')}</span><b>${fmt1(t.last_tok_per_s)} / ${fmt1(t.avg_tok_per_s)} tok/s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.context_window', null, 'Context window')}</span><b>${PDC.fmtInt(t.context_tokens)} tokens (${s.context_origin || 'default'})</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.session', null, 'Session')}</span><b>${PDC.fmtInt(u.calls)} calls \u00B7 ${PDC.fmtTokens(u.tokens_in)} in / ${PDC.fmtTokens(u.tokens_out)} out \u00B7 ${Math.round(u.seconds || 0)}s</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.session_total', null, 'Session total')}</span><b>${PDC.fmtInt(t.session_total_tokens)} tokens \u00B7 ${PDC.fmtInt(t.session_reasoning_tokens)} reasoning</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.kv_cache', null, 'KV cache hit')}</span><b>${fmt1(t.cache_hit_pct)}%</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.folds', null, 'Context folds')}</span><b>${s.folds || 0}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.cost', null, 'Cost')}</span><b>${u.cost ? '$' + Number(u.cost).toFixed(4) : '\u2014'}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.provider', null, 'Provider')}</span><b>${t.provider || '\u2014'}</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.active_model', null, 'Active model')}</span><b>${activeName} (${activeTag})</b></div>
+        <div><span class="muted">${PDC.t('gui.tele.orchestrator', null, 'Orchestrator')}</span><b>${s.planner_profile || '\u2014'}</b></div>
+        ${s.scout_profile ? html`<div><span class="muted">${PDC.t('gui.tele.scout', null, 'Scout')}</span><b>${s.scout_profile}</b></div>` : null}
       </div>
     </div>` : null;
   return html`
     <footer id="telemetryBar" class=${open ? 'open' : ''}>
       ${drawer}
       <div class="tele-row" onClick=${() => setOpen(!open)}
-           title=${'Live model telemetry \u2014 click to ' + (open ? 'collapse' : 'expand')}>
-        <span class=${'tele-bar ' + heat} title=${'context utilization ' + pct + '%'}>
+           title=${PDC.t('gui.tele.toggle_title', { action: open ? PDC.t('gui.collapse', null, 'collapse') : PDC.t('gui.expand', null, 'expand') }, 'Live model telemetry \u2014 click to ' + (open ? 'collapse' : 'expand'))}>
+        <span class=${'tele-bar ' + heat} title=${PDC.t('gui.tele.ctx_util', { pct: pct }, 'context utilization ' + pct + '%')}>
           <i style=${'width:' + Math.max(0, Math.min(100, pct)) + '%'}></i>
         </span>
-        <span class="tele-item">Context: <b>${PDC.fmtInt(t.last_prompt_tokens)} / ${PDC.fmtInt(t.context_tokens)}</b> (${pct}%)</span>
-        <span class="tele-item">Turn: <b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></span>
-        <span class="tele-item">Session: <b>${PDC.fmtTokens(t.session_prompt_tokens)} in / ${PDC.fmtTokens(t.session_completion_tokens)} out</b></span>
-        <span class="tele-item">Speed: <b>${fmt1(t.last_tok_per_s)} tok/s</b> (avg ${fmt1(t.avg_tok_per_s)} tok/s) \u00B7 ${fmt1(t.last_elapsed_s)}s</span>
-        <span class="tele-item">KV Cache Hit: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | Folds: <b>${s.folds || 0}</b></span>
-        <span class="tele-item">Active: <b>${activeName}</b> (${activeTag})</span>
-        ${s.planner_profile ? html`<span class="tele-item">Orchestrator: <b>${s.planner_profile}</b></span>` : null}
+        <span class="tele-item">${PDC.t('gui.tele.context', null, 'Context')}: <b>${PDC.fmtInt(t.last_prompt_tokens)} / ${PDC.fmtInt(t.context_tokens)}</b> (${pct}%)</span>
+        <span class="tele-item">${PDC.t('gui.tele.turn', null, 'Turn')}: <b>${PDC.fmtInt(t.last_prompt_tokens)} in / ${PDC.fmtInt(t.last_completion_tokens)} out</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.session', null, 'Session')}: <b>${PDC.fmtTokens(t.session_prompt_tokens)} in / ${PDC.fmtTokens(t.session_completion_tokens)} out</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.speed_short', null, 'Speed')}: <b>${fmt1(t.last_tok_per_s)} tok/s</b> (avg ${fmt1(t.avg_tok_per_s)} tok/s) \u00B7 ${fmt1(t.last_elapsed_s)}s</span>
+        <span class="tele-item">${PDC.t('gui.tele.kv_cache_short', null, 'KV Cache Hit')}: <b>${Math.round(t.cache_hit_pct || 0)}%</b> | ${PDC.t('gui.tele.folds_short', null, 'Folds')}: <b>${s.folds || 0}</b></span>
+        <span class="tele-item">${PDC.t('gui.tele.active', null, 'Active')}: <b>${activeName}</b> (${activeTag})</span>
+        ${s.planner_profile ? html`<span class="tele-item">${PDC.t('gui.tele.orchestrator', null, 'Orchestrator')}: <b>${s.planner_profile}</b></span>` : null}
         <button id="consolidateBtn" class="small ghost"
-                title="Compact this session into a handoff checkpoint; the next turn starts from it alone"
-                onClick=${(e) => { e.stopPropagation(); consolidateSession(); }}>Consolidate Session</button>
+                title=${PDC.t('gui.tele.consolidate_title', null, 'Compact this session into a handoff checkpoint; the next turn starts from it alone')}
+                onClick=${(e) => { e.stopPropagation(); consolidateSession(); }}>${PDC.t('gui.tele.consolidate', null, 'Consolidate Session')}</button>
         <i class="tele-caret">${open ? '\u25BE' : '\u25B4'}</i>
       </div>
     </footer>`;
@@ -2379,110 +4152,125 @@ function TopBar() {
   const activeProf = s.profile || s.default_profile || '';
   const activeCal = (s.calibration || {})[activeProf] || {};
   const activeHosted = !!activeCal.is_hosted;
+  const activeImage = !!activeCal.is_image_model;
   const eng = s.engine || {};
+  const teleVisible = Boolean((s.root && s.telemetry && s.telemetry.context_tokens) || s.job || (s.llm_call && s.llm_call.started));
   const phase = eng.phase || (j ? 'gather' : 'idle');
-  const phaseName = { idle: 'Idle', gather: 'Gathering', edit: 'Editing',
-                      verify: 'Verifying', repair: 'Repairing', done: 'Done' }[phase] || 'Idle';
+  const phaseName = {
+    idle: PDC.t('gui.phase.idle', null, 'Idle'),
+    gather: PDC.t('gui.phase.gather', null, 'Gathering'),
+    edit: PDC.t('gui.phase.edit', null, 'Editing'),
+    verify: PDC.t('gui.phase.verify', null, 'Verifying'),
+    repair: PDC.t('gui.phase.repair', null, 'Repairing'),
+    done: PDC.t('gui.phase.done', null, 'Done'),
+  }[phase] || PDC.t('gui.phase.idle', null, 'Idle');
   return html`
     <header id="topbar">
       <div class="tb-row" id="tbRow1">
         <div class="brand">pe<span>da</span>cito</div>
         <div id="projectBar">
-          <input type="text" id="path" ref=${pathRef} placeholder="/path/to/your/project"
+          <input type="text" id="path" ref=${pathRef} placeholder=${PDC.t('gui.project.path_ph', null, '/path/to/your/project')}
                  spellcheck="false" autocomplete="off"
                  oninput=${(e) => { S.peek = null; peeked = ''; peek(e.target.value.trim()); }}
                  onkeydown=${(e) => { if (e.key === 'Enter') open(); }} />
-          <button id="browseBtn" title="browse folders on this machine"
-                  onClick=${() => PDC.browse({ title: 'Choose a project folder',
+          <button id="browseBtn" title=${PDC.t('gui.browse_title', null, 'browse folders on this machine')}
+                  onClick=${() => PDC.browse({ title: PDC.t('gui.browse_dialog_title', null, 'Choose a project folder'),
                     start: ((pathRef.current && pathRef.current.value) || s.root || '').replace(/[\\/][^\\/]*[\\/]$/, ''),
-                    pickLabel: 'Open this folder',
-                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>Browse\u2026</button>
-          <${Menu} button=${html`<button id="recent" title="projects you opened here before">Recent \u25BE</button>`}>
+                    pickLabel: PDC.t('gui.browse_pick', null, 'Open this folder'),
+                    onPick: (p) => { if (pathRef.current) pathRef.current.value = p; openProject(p, S.ui.pendingProfile || ''); } })}>${PDC.t('gui.browse', null, 'Browse\u2026')}</button>
+          <${Menu} button=${html`<button id="recent" title=${PDC.t('gui.recent_title', null, 'projects you opened here before')}>${PDC.t('gui.recent', null, 'Recent')} \u25BE</button>`}>
             ${(s.recent || []).length ? (s.recent || []).map((r) => html`
               <button key=${r} class="menuitem ellip" title=${r}
                       onClick=${() => { if (pathRef.current) pathRef.current.value = r; openProject(r, ''); }}>${r}</button>`)
-              : html`<button class="menuitem" disabled>no recent projects yet</button>`}
+              : html`<button class="menuitem" disabled>${PDC.t('gui.recent_empty', null, 'no recent projects yet')}</button>`}
           <//>
-          <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>Open</button>
-          <button id="newProjectBtn" title="start a new project from a description"
-                  disabled=${!!j} onClick=${startNewProject}>+ New</button>
-          <${Menu} button=${html`<button id="projMenuBtn" title="calibrate, index, restore and other project actions">Project \u25BE</button>`}>
-            <${MenuItem} label="New project\u2026" disabled=${!!j} action=${startNewProject} />
-            <${MenuItem} label="Calibrate active profile" disabled=${!!j || !activeProf || activeHosted}
-                       title=${activeHosted ? 'Calibration disabled for hosted models' : ''}
+          <button class="primary" id="openBtn" disabled=${!!j} onClick=${open}>${PDC.t('gui.open', null, 'Open')}</button>
+          <button id="newProjectBtn" title=${PDC.t('gui.new_project_title', null, 'start a new project from a description')}
+                  disabled=${!!j} onClick=${startNewProject}>+ ${PDC.t('gui.new', null, 'New')}</button>
+          <${Menu} button=${html`<button id="projMenuBtn" title=${PDC.t('gui.project_menu_title', null, 'calibrate, index, restore and other project actions')}>${PDC.t('gui.project', null, 'Project')} \u25BE</button>`}>
+            <${MenuItem} label=${PDC.t('gui.menu.new_project', null, 'New project\u2026')} disabled=${!!j} action=${startNewProject} />
+            <${MenuItem} label=${PDC.t('gui.menu.generate_image', null, '\uD83C\uDFA8 Generate image\u2026')}
+                       title=${PDC.t('gui.menu.generate_image_title', null, 'Generate an image with a configured image profile')}
+                       action=${imageGenDialog} />
+            <${MenuItem} label=${activeImage ? PDC.t('gui.menu.probe_image_active', null, 'Probe active image profile') : PDC.t('gui.menu.calibrate_active', null, 'Calibrate active profile')} disabled=${!!j || !activeProf || activeHosted}
+                       title=${activeHosted ? PDC.t('gui.menu.calibrate_hosted_disabled', null, 'Calibration disabled for hosted models') : ''}
                        action=${() => calibrateProfile(activeProf)} />
-            <${MenuItem} label="Calibrate All Local Models\u2026" disabled=${!!j}
-                       title="Calibrate every local profile in turn (hosted models are skipped)"
+            <${MenuItem} label=${PDC.t('gui.menu.calibrate_all', null, 'Calibrate All Local Models\u2026')} disabled=${!!j}
+                       title=${PDC.t('gui.menu.calibrate_all_title', null, 'Calibrate every local profile in turn (hosted models are skipped)')}
                        action=${calibrateAllProfiles} />
-            <${MenuItem} label="Check model (loads it)" disabled=${!!j || !s.root} action=${checkModel} />
-            <${MenuItem} label="Index project (with summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
-            <${MenuItem} label="Quick index (no summaries)" disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
-            <${MenuItem} label="Restore from a backup\u2026" disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
-            <${MenuItem} label="Rename symbol\u2026" disabled=${!!j || !s.root} action=${renameSymbolDialog} />
-            <${MenuItem} label="Memory & repo lessons\u2026" action=${memoryDialog}
-                       title="scratchpad memory while no project is open" />
-            <${MenuItem} label="Skills library & creator\u2026" action=${skillsDialog}
-                       title="browse the built-in, user and project skills; write or auto-draft custom ones" />
-            <${MenuItem} label="Background servers\u2026" action=${procsDialog}
-                       title="servers live in the scratchpad while no project is open" />
-            <${MenuItem} label="Run project checks\u2026" disabled=${!s.root} action=${checksDialog} />
-            <${MenuItem} label="Prune old sessions/backups\u2026" action=${pruneDialog}
-                       title="prunes the scratchpad while no project is open" />
-            <${MenuItem} label="Reset project state\u2026" disabled=${!!j} action=${resetDialog}
-                       title="resets the scratchpad state while no project is open" />
-            <${MenuItem} label="Consolidate session\u2026" disabled=${!!j} action=${consolidateSession}
-                       title="compact the transcript into a handoff checkpoint (also in the telemetry bar)" />
-            <${MenuItem} label="Provider settings\u2026" action=${() => callSettings()} />
-            <${MenuItem} label="Clear terminal" action=${clearTerm} />
-            <${MenuItem} label="Clear chat" action=${() => PDC.api('/api/clear', {})} />
+            <${MenuItem} label=${PDC.t('gui.menu.check_model', null, 'Check model (loads it)')} disabled=${!!j || !s.root} action=${checkModel} />
+            <${MenuItem} label=${PDC.t('gui.menu.index_project', null, 'Index project (with summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(true)} />
+            <${MenuItem} label=${PDC.t('gui.menu.quick_index', null, 'Quick index (no summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
+            <${MenuItem} label=${PDC.t('gui.menu.restore_backup', null, 'Restore from a backup\u2026')} disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.checkpoints', null, 'Checkpoints / Undo\u2026')} disabled=${!s.root} action=${openCheckpointsDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.rename_symbol', null, 'Rename symbol\u2026')} disabled=${!!j || !s.root} action=${renameSymbolDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.memory', null, 'Memory & repo lessons\u2026')} action=${memoryDialog}
+                       title=${PDC.t('gui.menu.memory_title', null, 'scratchpad memory while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.skills', null, 'Skills library & creator\u2026')} action=${skillsDialog}
+                       title=${PDC.t('gui.menu.skills_title', null, 'browse the built-in, user and project skills; write or auto-draft custom ones')} />
+            <${MenuItem} label=${PDC.t('gui.menu.procs', null, 'Background servers\u2026')} action=${procsDialog}
+                       title=${PDC.t('gui.menu.procs_title', null, 'servers live in the scratchpad while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.checks', null, 'Run project checks\u2026')} disabled=${!s.root} action=${checksDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.prune', null, 'Prune old sessions/backups\u2026')} action=${pruneDialog}
+                       title=${PDC.t('gui.menu.prune_title', null, 'prunes the scratchpad while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.reset', null, 'Reset project state\u2026')} disabled=${!!j} action=${resetDialog}
+                       title=${PDC.t('gui.menu.reset_title', null, 'resets the scratchpad state while no project is open')} />
+            <${MenuItem} label=${PDC.t('gui.menu.consolidate', null, 'Consolidate session\u2026')} disabled=${!!j} action=${consolidateSession}
+                       title=${PDC.t('gui.menu.consolidate_title', null, 'compact the transcript into a handoff checkpoint (also in the telemetry bar)')} />
+            <${MenuItem} label=${PDC.t('gui.menu.provider_settings', null, 'Provider settings\u2026')} action=${() => callSettings()} />
+            <${MenuItem} label=${PDC.t('gui.menu.clear_term', null, 'Clear terminal')} action=${clearTerm} />
+            <${MenuItem} label=${PDC.t('gui.menu.clear_chat', null, 'Clear chat')} action=${() => PDC.api('/api/clear', {})} />
           <//>
         </div>
         <div id="topRight">
-          <button id="benchBtn" title="run a diagnostic benchmark against a configured profile" onClick=${() => openBenchmarks()}>\u25A6 Benchmarks</button>
-          <button id="settingsBtn" title="profiles and settings" onClick=${() => callSettings()}>\u2699 Settings</button>
-          <select id="theme" title="color scheme (saved as gui_theme in config.toml)"
-                  onchange=${(e) => applyTheme(e.target.value, true)}>
-            <optgroup label="Light">
-              <option value="light">Light \u2014 GitHub</option>
-              <option value="daylight">Daylight \u2014 warm paper</option>
-            </optgroup>
-            <optgroup label="Dark">
-              <option value="slate">Slate \u2014 GitHub Dark</option>
-              <option value="nord">Nord \u2014 Catppuccin</option>
-              <option value="midnight">Midnight \u2014 high contrast</option>
-            </optgroup>
-            <optgroup label="1990s">
-              <option value="jazz_solo">Jazz Cup \u2014 '91 teal/purple</option>
-              <option value="trapper_keeper">Trapper Keeper \u2014 cobalt/coral</option>
-              <option value="memphis_arcade">Memphis Arcade \u2014 neon geometry</option>
-              <option value="windbreaker">Windbreaker \u2014 color-block nylon</option>
-            </optgroup>
-          </select>
-          <button class="danger" id="exitBtn" title="stop the pedacito gui server"
-                  onClick=${() => PDC.confirm('Stop the pedacito gui server? Run "pedacito gui" again to reopen it.', 'Stop server', true).then((ok) => {
+          <button id="checkpointsBtn" title=${PDC.t('gui.checkpoints_title', null, 'time-travel: inspect, diff, restore or branch from any checkpoint')}
+                  disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 ${PDC.t('gui.checkpoints', null, 'Checkpoints / Undo')}</button>
+          <button id="rulesBtn" title=${PDC.t('gui.rules_title', null, 'edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call')}
+                  onClick=${openRulesDialog}>\uD83D\uDCDC ${PDC.t('gui.rules', null, 'Rules')}</button>
+          <button id="serversBtn" title=${PDC.t('gui.servers_title', null, 'live VRAM/RAM and local model-server lifecycle')}
+                  onClick=${() => serversDialog()}>${PDC.t('gui.servers', null, 'Servers')}</button>
+          <button id="benchBtn" title=${PDC.t('gui.benchmarks_title', null, 'run a diagnostic benchmark against a configured profile')} onClick=${() => openBenchmarks()}>\u25A6 ${PDC.t('gui.benchmarks', null, 'Benchmarks')}</button>
+          <button id="arenaBtn" title=${PDC.t('gui.arena_title', null, 'compare two models on one prompt in isolated sandboxes, then apply the winner')}
+                  disabled=${!s.root} onClick=${() => openArena()}>\u2694 ${PDC.t('gui.arena', null, 'Arena')}</button>
+          <button id="settingsBtn" title=${PDC.t('gui.settings_title', null, 'profiles and settings')} onClick=${() => callSettings()}>\u2699 ${PDC.t('gui.settings', null, 'Settings')}</button>
+          <button id="themeBtn" title=${PDC.t('gui.theme_title', null, 'theme manager and custom color editor')}
+                  onClick=${() => openThemeManager()}>\uD83C\uDFA8 ${PDC.t('gui.theme', null, 'Theme')}</button>
+          <div id="langSwitch" class="lang-switch" role="group" aria-label="Language / Idioma">
+            <button type="button" class=${'lang-btn' + (PDC.lang === 'en' ? ' on' : '')}
+                    aria-pressed=${PDC.lang === 'en' ? 'true' : 'false'}
+                    title="English"
+                    onClick=${() => PDC.setLang('en', true)}>EN</button>
+            <button type="button" class=${'lang-btn' + (PDC.lang === 'es' ? ' on' : '')}
+                    aria-pressed=${PDC.lang === 'es' ? 'true' : 'false'}
+                    title="Espa\u00f1ol"
+                    onClick=${() => PDC.setLang('es', true)}>ES</button>
+          </div>
+          <button class="danger" id="exitBtn" title=${PDC.t('gui.exit_title', null, 'stop the pedacito gui server')}
+                  onClick=${() => PDC.confirm(PDC.t('gui.exit_confirm', null, 'Stop the pedacito gui server? Run "pedacito gui" again to reopen it.'), PDC.t('gui.exit_stop', null, 'Stop server'), true).then((ok) => {
                     if (!ok) return;
                     PDC.api('/api/shutdown', {}).catch(() => {}).then(() => {
-                      document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">pedacito gui has stopped. You can close this tab.</div>';
+                      document.body.innerHTML = '<div style="padding:80px 20px;text-align:center;font:16px sans-serif;color:#8b91a0">' + PDC.t('gui.exit_stopped', null, 'pedacito gui has stopped. You can close this tab.') + '</div>';
                     });
-                  })}>Exit</button>
+                  })}>${PDC.t('gui.exit', null, 'Exit')}</button>
         </div>
       </div>
       <div class="tb-row" id="tbRow2">
-        <label class="tb-label" for="profile">Profile</label>
+        <label class="tb-label" for="profile">${PDC.t('gui.profile', null, 'Profile')}</label>
         <${ProfileSelect} busy=${j} peek=${peekOn ? S.peek : null}
                           onChange=${(name) => switchProfile(name)} />
         <span class="chip" id="modelChip"
-              title=${(s.model_status || 'click to check the model server') + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '')}
+              title=${(s.model_status || PDC.t('gui.model_check_title', null, 'click to check the model server')) + (s.base_url ? '\n' + s.base_url : '') + (s.context_tokens ? '\nwindow ' + PDC.fmtInt(s.context_tokens) + ' tokens (' + s.context_origin + ')' : '') + (s.auto_tune ? '\nauto-tune: timeout ' + Number(s.timeout || 0).toFixed(0) + 's, max_concurrency ' + (s.max_concurrency || 0) + '\ncontext: ' + ((s.tuning_sources || {}).context_tokens || s.context_origin || 'default') : '')}
               onClick=${() => { if (s.root && !j) checkModel(); }}>
           <i class=${'dot ' + (j ? 'busy' : s.model_ok === true ? 'ok' : s.model_ok === false ? 'bad' : 'idle')}></i>
-          <b>${s.needs_setup ? 'no model selected' : (s.model || (s.root ? '\u2014' : 'no model selected'))}</b>
+          <b>${s.needs_setup ? PDC.t('gui.no_model', null, 'no model selected') : (s.model || (s.root ? '\u2014' : PDC.t('gui.no_model', null, 'no model selected')))}</b>
           ${s.model && !s.needs_setup ? html`<span class="tag ${s.disable_thinking ? '' : 'act'}"
-            title=${s.disable_thinking ? 'thinking is disabled for this profile (disable_thinking = true)'
-                                       : 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles'}>${s.disable_thinking ? 'no-think' : 'thinking'}</span>` : null}
+            title=${s.disable_thinking ? PDC.t('gui.thinking_off_title', null, 'thinking is disabled for this profile (disable_thinking = true)')
+                                       : PDC.t('gui.thinking_on_title', null, 'thinking is allowed (disable_thinking = false) \u2014 turn it off in Settings \u2192 Profiles')}>${s.disable_thinking ? PDC.t('gui.no_think', null, 'no-think') : PDC.t('gui.thinking', null, 'thinking')}</span>` : null}
         </span>
+        <${HardwareBadge} />
         ${!s.root ? html`<span class="chip" id="workspaceChip"
-              title="Questions run on the selected profile in a scratchpad until you open or create a project">
-          <b>${s.workspace_label || 'Workspace: Scratchpad (no project open)'}</b>
+              title=${PDC.t('gui.scratchpad_title', null, 'Questions run on the selected profile in a scratchpad until you open or create a project')}>
+          <b>${PDC.t('gui.scratchpad_label', null, s.workspace_label || 'Workspace: Scratchpad (no project open)')}</b>
         </span>` : null}
         <${CalibrationBadge} name=${activeProf} />
         ${s.scout_profile ? html`<span class="chip" id="scoutChip"
@@ -2490,17 +4278,8 @@ function TopBar() {
                 + s.scout_profile + '\' (a fast model); planning, answers and edits stay on \''
                 + (s.profile || 'active') + '\'. Click to change scout_profile.'}
               onClick=${() => callSettings({ tab: 'all', search: 'scout_profile' })}>
-          <b>Scout: ${s.scout_profile}</b>
+          <b>${PDC.t('gui.scout', null, 'Scout')}: ${s.scout_profile}</b>
         </span>` : null}
-        <label class="chip" id="autoRouteChip"
-              title=${'Specialist auto-routing (auto_route_specialties): each task runs on the profile'
-                + ' whose specialty tags fit it best (model-card tags, or explicit specialties in'
-                + ' Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean'
-                + ' VRAM handoff when the profiles share one local server.'}>
-          <input type="checkbox" checked=${!!s.auto_route_specialties}
-                 onChange=${(e) => setAutoRoute(e.target.checked)} />
-          <b>\u2726 Auto-route</b>
-        </label>
         ${eng.specialist && eng.specialist.profile ? html`<span class="chip" id="specialistChip"
               title=${'Specialist routed: profile \'' + eng.specialist.profile + '\' ('
                 + (eng.specialist.model || '?') + ') for specialty \''
@@ -2512,18 +4291,18 @@ function TopBar() {
           <button class="chip" id="indexChip" title=${idxTitle} disabled=${!!j || !s.root}
                   onClick=${(e) => { if (s.root && !j) buildIndex(!e.shiftKey); }}>
             <i class=${'dot ' + (indexed ? 'ok' : 'idle')}></i>
-            <b>${indexed ? 'indexed' : 'no index'}</b>
-            ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} files \u00B7 ${PDC.fmtInt(s.index_chunks)} units</span>` : null}
+            <b>${indexed ? PDC.t('gui.indexed', null, 'indexed') : PDC.t('gui.no_index', null, 'no index')}</b>
+            ${indexed ? html`<span class="muted small-text">${PDC.fmtInt(s.index_files)} ${PDC.t('gui.files_unit', null, 'files')} \u00B7 ${PDC.fmtInt(s.index_chunks)} ${PDC.t('gui.units', null, 'units')}</span>` : null}
             <i class="reidx" aria-hidden="true">\u21BB</i>
           </button>
-          ${(s.usage && s.usage.calls) ? html`
+          ${(!teleVisible && s.usage && s.usage.calls) ? html`
             <span class="chip" id="usageChip" title=${'model usage this session (' + Math.round(s.usage.seconds) + 's)'}>
-              <b>${s.usage.calls + ' calls \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
+              <b>${s.usage.calls + ' ' + PDC.t('gui.calls', null, 'calls') + ' \u00B7 ' + PDC.fmtTokens(s.usage.tokens_in) + ' in / ' + PDC.fmtTokens(s.usage.tokens_out) + ' out'
                 + (s.usage.cache_hit ? ' \u00B7 cache ' + Math.round(s.usage.cache_hit * 100) + '%' : '')
                 + (s.usage.cost ? ' \u00B7 $' + Number(s.usage.cost).toFixed(4) : '')}</b>
             </span>` : null}
           <span class=${'phase ' + phase} id="phaseChip"
-                title=${'engine phase' + (j ? ' of the running job' : '')}>${phaseName}</span>
+                title=${PDC.t('gui.engine_phase', null, 'engine phase')}>${phaseName}</span>
         </div>
       </div>
     </header>`;
@@ -2724,7 +4503,12 @@ function UserMsg(props) {
         ${m.text}
         ${(m.attachments && m.attachments.length) ? html`
           <div class="chiprow">
-            ${m.attachments.map((a, i) => html`<span key=${i} class="fchip">\uD83D\uDCCE ${a.name} (${PDC.fmtInt(a.chars)} chars)</span>`)}
+            ${m.attachments.map((a, i) => a && a.kind === 'image' ? html`
+              <span key=${i} class="fchip fchip-img">
+                ${a.thumb ? html`<img class="attach-thumb" src=${a.thumb} alt=${a.name || 'image'} />` : '\uD83D\uDDBC\uFE0F'}
+                <span>${a.name || 'image'}${a.width && a.height ? ' (' + a.width + '\u00D7' + a.height + ')' : ''}</span>
+              </span>` : html`
+              <span key=${i} class="fchip">\uD83D\uDCCE ${a.name} (${PDC.fmtInt(a.chars || 0)} chars)</span>`)}
           </div>` : null}
       </div>
     </div>`;
@@ -2887,6 +4671,101 @@ function toggleCreative() {
   emit();
 }
 
+// ---- @file / @symbol autocomplete -------------------------------------------
+// The menu is deliberately tiny: the server already fuzzy-matches the warm
+// index, so each keystroke is one GET and no model work. Boundary matching
+// keeps an email (`user@example.com`) from opening it.
+let ctxSuggestTimer = 0;
+function contextMention(text, caret) {
+  const before = String(text || '').slice(0, caret == null ? String(text || '').length : caret);
+  const m = before.match(/(^|[\s([{,;:])@([A-Za-z0-9_][A-Za-z0-9_./:\\-]*)$/);
+  if (!m) return null;
+  return { query: m[2], start: m.index + m[1].length, end: caret };
+}
+function clearContextSuggest() {
+  S.ui.suggestSeq = (S.ui.suggestSeq || 0) + 1;
+  if (S.ui.suggest) { S.ui.suggest = null; emit(); }
+}
+function requestContextSuggest(text, caret) {
+  const m = contextMention(text, caret);
+  if (!m) { clearContextSuggest(); return; }
+  const seq = (S.ui.suggestSeq || 0) + 1;
+  S.ui.suggestSeq = seq;
+  clearTimeout(ctxSuggestTimer);
+  ctxSuggestTimer = setTimeout(() => {
+    PDC.api('/api/context/suggest?q=' + encodeURIComponent(m.query)).then((j) => {
+      if (seq !== S.ui.suggestSeq) return;      // a newer keystroke won
+      const items = (j.items || j.suggestions || []).slice(0, 20);
+      S.ui.suggest = items.length
+        ? { items: items, index: 0, start: m.start, end: m.end, query: m.query }
+        : null;
+      emit();
+    }, () => { if (seq === S.ui.suggestSeq) { S.ui.suggest = null; emit(); } });
+  }, 70);
+}
+function insertPinned(item) {
+  const ta = inputEl || $('input');
+  const st = S.ui.suggest;
+  if (!ta || !st) return;
+  const text = ta.value || '';
+  const token = String(item.insert || ('@' + item.label)) + ' ';
+  const before = text.slice(0, st.start), after = text.slice(st.end);
+  ta.value = before + token + after;
+  const pos = (before + token).length;
+  try { ta.setSelectionRange(pos, pos); } catch (e) {}
+  ta.focus();
+  S.drafts[S.mode] = ta.value;
+  writeDraft(ta.value);
+  S.ui.suggest = null;
+  S.ui.suggestSeq = (S.ui.suggestSeq || 0) + 1;
+  if (!S.pinned.some((p) => p.insert === item.insert)) {
+    S.pinned.push({ kind: item.kind, label: item.label,
+                    insert: item.insert, detail: item.detail || '' });
+  }
+  emit();
+}
+function removePinned(i) {
+  S.pinned.splice(i, 1);
+  emit();
+}
+
+// ---- persistent project rules (.pedacito/rules.md) --------------------------
+function openRulesDialog() {
+  if (!S.status.root) { PDC.toast('Open a project first.', true); return; }
+  PDC.api('/api/rules').then((j) => {
+    if (j._status !== 200 || !j.ok) {
+      PDC.toast(j.detail || 'Could not read project rules.', true);
+      return;
+    }
+    const ta = h('textarea', { class: 'rules-editor', rows: '16',
+      spellcheck: false, placeholder:
+        'Project-specific rules every Task, Auto and Refine call must follow.\n' +
+        'Examples:\n- Use pathlib, never os.path\n- Tests live in tests/ and use pytest\n' +
+        '- Never edit generated files under build/',
+      value: j.text || '' });
+    const info = h('p', { class: 'muted small-text', style: 'margin:0 0 8px',
+      text: 'Saved as .pedacito/rules.md and injected into the static prompt prefix, ' +
+            'so it rides the cached KV prefix on local and local-moe servers.' });
+    const note = h('p', { class: 'muted small-text', style: 'margin:8px 0 0',
+      text: 'Empty content clears the file.' });
+    PDC.modal('Project Rules (.pedacito/rules.md)',
+      h('div', {}, info, ta, note), [
+        { label: 'Cancel' },
+        { label: 'Clear', danger: true, stay: true, onclick: () => { ta.value = ''; ta.focus(); } },
+        { label: 'Save rules', primary: true, stay: true, onclick: (close) => {
+            PDC.api('/api/rules', { text: ta.value }).then((r) => {
+              if (r._status !== 200 || !r.ok) {
+                PDC.toast(r.detail || 'Could not save rules.', true);
+                return;
+              }
+              PDC.toast(r.exists ? 'Project rules saved.' : 'Project rules cleared.');
+              close();
+            }, () => PDC.toast('The GUI server did not answer.', true));
+          } },
+      ], { wide: true });
+  });
+}
+
 function Composer() {
   const s = S.status, j = job(), m = MODES[S.mode] || MODES.task;
   const taRef = useRef(null);
@@ -2899,6 +4778,7 @@ function Composer() {
   const needIndex = s.root && !s.has_index && S.mode !== 'new' && S.mode !== 'how';
   const steerable = j && j.kind === 'task' && s.allow_steering;
   const isHow = S.mode === 'how';
+  const hasImageProfile = Object.values(s.calibration || {}).some((c) => c && c.is_image_model);
   const setMode = (k) => {
     if (taRef.current) {
       S.drafts[S.mode] = taRef.current.value;
@@ -2933,47 +4813,47 @@ function Composer() {
            title="Drag to resize composer (double-click to toggle expand/compact)"
            onMousedown=${dragComposer} onDblclick=${toggleComposer}></div>
       ${S.ui.modeConfirm ? html`
-        <div id="modeConfirm" role="alertdialog" aria-label="Run as a single-pass Task instead?">
-          <b>Run as a single-pass Task instead?</b>
-          <span class="muted">Task mode applies all clauses in one fast pass without creating a 7-step PLAN.md.${S.ui.modeConfirm.reason ? ' ' + S.ui.modeConfirm.reason : ''}</span>
+        <div id="modeConfirm" role="alertdialog" aria-label=${PDC.t('gui.mode_confirm.title', null, 'Run as a single-pass Task instead?')}>
+          <b>${PDC.t('gui.mode_confirm.title', null, 'Run as a single-pass Task instead?')}</b>
+          <span class="muted">${PDC.t('gui.mode_confirm.desc', null, 'Task mode applies all clauses in one fast pass without creating a 7-step PLAN.md.')}${S.ui.modeConfirm.reason ? ' ' + S.ui.modeConfirm.reason : ''}</span>
           <span class="modeConfirmBtns">
-            <button class="small primary" onClick=${runAsTaskFromConfirm}>Run as Task (Recommended)</button>
-            <button class="small" onClick=${runAutoAnyway}>Run Auto Anyway</button>
+            <button class="small primary" onClick=${runAsTaskFromConfirm}>${PDC.t('gui.mode_confirm.run_task', null, 'Run as Task (Recommended)')}</button>
+            <button class="small" onClick=${runAutoAnyway}>${PDC.t('gui.mode_confirm.run_auto', null, 'Run Auto Anyway')}</button>
           </span>
         </div>` : (nudge ? html`
         <div id="modeNudge" role="status">
-          <span>\uD83D\uDCA1 Looks like a single-pass edit \u2014</span>
-          <button class="small primary" onClick=${switchToTaskMode}>Switch to Task mode (Recommended)</button>
-          <button class="small ghost" title="Keep Auto mode for this prompt"
-                  onClick=${() => { S.ui.autoAck = autoText; emit(); }}>Continue with Auto</button>
+          <span>\uD83D\uDCA1 ${PDC.t('gui.mode_nudge.text', null, 'Looks like a single-pass edit \u2014')}</span>
+          <button class="small primary" onClick=${switchToTaskMode}>${PDC.t('gui.mode_nudge.switch', null, 'Switch to Task mode (Recommended)')}</button>
+          <button class="small ghost" title=${PDC.t('gui.mode_nudge.keep_title', null, 'Keep Auto mode for this prompt')}
+                  onClick=${() => { S.ui.autoAck = autoText; emit(); }}>${PDC.t('gui.mode_nudge.continue', null, 'Continue with Auto')}</button>
         </div>` : null)}
       <div id="modeTabs">
         ${MODE_ORDER.map((k) => html`
-          <button key=${k} class=${k === S.mode ? 'on' : ''} title=${MODES[k].title}
-                  onClick=${() => setMode(k)}>${MODES[k].label}</button>`)}
+          <button key=${k} class=${k === S.mode ? 'on' : ''} title=${PDC.t('gui.mode.' + k + '.title', null, MODES[k].title)}
+                  onClick=${() => setMode(k)}>${PDC.t('gui.mode.' + k + '.label', null, MODES[k].label)}</button>`)}
       </div>
       <p id="modeHint">
-        ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? 'Open a project first. ' : null}
+        ${!s.root && (S.mode === 'task' || S.mode === 'auto') ? PDC.t('gui.composer.open_project_first', null, 'Open a project first. ') : null}
         ${!s.root && S.mode === 'explain'
-          ? html`Workspace: <b>Scratchpad (no project open)</b> \u2014 answers run on <b>${s.model || 'the selected profile'}</b>. `
+          ? html`${PDC.t('gui.composer.scratchpad_prefix', null, 'Workspace: ')}<b>${PDC.t('gui.composer.scratchpad_name', null, 'Scratchpad (no project open)')}</b> \u2014 ${PDC.t('gui.composer.scratchpad_runs_on', null, 'answers run on ')}<b>${s.model || PDC.t('gui.composer.selected_profile', null, 'the selected profile')}</b>. `
           : null}
-        ${!s.root && S.mode === 'new' ? 'The new project becomes your workspace when it is created. ' : null}
+        ${!s.root && S.mode === 'new' ? PDC.t('gui.composer.new_becomes_ws', null, 'The new project becomes your workspace when it is created. ') : null}
         ${needIndex
-          ? html`No index yet \u2014 build one to start:
-              <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>Build index</button>
-              <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>Quick (no summaries)</button>`
-          : m.hint}
+          ? html`${PDC.t('gui.composer.no_index_yet', null, 'No index yet \u2014 build one to start:')}
+              <button class="small primary" disabled=${!!j} onClick=${() => buildIndex(true)}>${PDC.t('gui.composer.build_index', null, 'Build index')}</button>
+              <button class="small" disabled=${!!j} onClick=${() => buildIndex(false)}>${PDC.t('gui.composer.quick_index', null, 'Quick (no summaries)')}</button>`
+          : PDC.t('gui.mode.' + S.mode + '.hint', null, m.hint)}
       </p>
-      ${planning ? html`<p id="planHint" title=${PLAN_HINT}>${PLAN_HINT}</p>` : null}
+      ${planning ? html`<p id="planHint" title=${PDC.t('gui.plan_hint', null, PLAN_HINT)}>${PDC.t('gui.plan_hint', null, PLAN_HINT)}</p>` : null}
       ${S.mode === 'new' ? html`<div id="newProjectRow">
-        <label for="newProjectPath">Target directory for new project</label>
+        <label for="newProjectPath">${PDC.t('gui.composer.new_dir_label', null, 'Target directory for new project')}</label>
         <input id="newProjectPath" type="text" spellcheck="false" autocomplete="off"
                defaultValue=${opt('new', 'project')}
                placeholder=${s.suggested_new_project || '/path/to/new-project'}
                oninput=${(e) => { S.opts.new.project = e.target.value; saveOpts(); }} />
         <button class="small" onClick=${() => PDC.browse({
-          title: 'Choose the parent folder for the new project',
-          files: false, pickLabel: 'Use this folder',
+          title: PDC.t('gui.composer.new_dir_title', null, 'Choose the parent folder for the new project'),
+          files: false, pickLabel: PDC.t('gui.composer.use_folder', null, 'Use this folder'),
           start: S.status.root || '',
           onPick: (p) => {
             const current = String(opt('new', 'project') || '').trim();
@@ -2983,52 +4863,151 @@ function Composer() {
             const el = $('newProjectPath');
             if (el) el.value = target;
             saveOpts();
-          } })}>Browse\u2026</button>
+          } })}>${PDC.t('gui.browse', null, 'Browse\u2026')}</button>
       </div>` : null}
       <div id="attachRow">
-        ${S.attachments.map((a, i) => html`
-          <span key=${i} class="attach">\uD83D\uDCCE ${a.name} \u00B7 ${PDC.fmtInt(a.text.length)} chars
-            <button title="remove" onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
+        ${S.attachments.map((a, i) => a && a.kind === 'image' ? html`
+          <span key=${i} class="attach attach-img">
+            <img class="attach-thumb" src=${a.data_url || a.thumb || ''} alt=${a.name || 'image'} />
+            <span class="attach-name">${a.name}</span>
+            <button title=${PDC.t('gui.attach.remove', null, 'remove')} onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
+          </span>` : html`
+          <span key=${i} class="attach">\uD83D\uDCCE ${a.name} \u00B7 ${PDC.fmtInt((a.text || '').length)} chars
+            <button title=${PDC.t('gui.attach.remove', null, 'remove')} onClick=${() => { S.attachments.splice(i, 1); emit(); }}>\u2715</button>
           </span>`)}
       </div>
+      ${S.pinned.length ? html`
+        <div id="pinnedRow" title="Explicit context pinned for this session (also sent as request pins)">
+          <span class="pinned-title">\uD83D\uDCCC Pinned</span>
+          ${S.pinned.map((p, i) => html`
+            <span key=${'p' + i} class=${'pin ' + (p.kind === 'symbol' ? 'symbol' : 'file')}
+                  title=${p.detail || p.label}>
+              ${p.kind === 'symbol' ? '\u0192' : '\u25A4'} ${p.label}
+              <button title="unpin" onClick=${() => removePinned(i)}>\u2715</button>
+            </span>`)}
+          <button class="pin-clear" title="unpin everything" onClick=${() => { S.pinned = []; emit(); }}>clear</button>
+        </div>` : null}
       <textarea id="input" rows="3" spellcheck="true" ref=${taRef}
-                placeholder=${isHow ? m.ph : (j ? (steerable ? 'Type a note to steer the model (Enter)\u2026' : 'Working\u2026 press Stop to cancel.') : m.ph)}
+                placeholder=${isHow ? PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph) : (j ? (steerable ? PDC.t('gui.composer.steer_ph', null, 'Type a note to steer the model (Enter)\u2026') : PDC.t('gui.composer.working_ph', null, 'Working\u2026 press Stop to cancel.')) : PDC.t('gui.mode.' + S.mode + '.ph', null, m.ph))}
                 disabled=${!!j && !steerable && !isHow}
+                onpaste=${handlePromptPaste}
                 oninput=${(e) => { S.drafts[S.mode] = e.target.value;
                   writeDraft(e.target.value);       // F5 must not lose it
                   scheduleModeCheck(e.target.value);
+                  requestContextSuggest(e.target.value, e.target.selectionStart);
                   const rb = $('refineBtn');
                   if (rb) rb.disabled = S.ui.refining || !e.target.value.trim(); }}
-                onkeydown=${(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } }} />
+                onclick=${(e) => requestContextSuggest(e.target.value, e.target.selectionStart)}
+                onblur=${() => setTimeout(() => { if (S.ui.suggest) clearContextSuggest(); }, 180)}
+                onkeydown=${(e) => {
+                  const sg = S.ui.suggest;
+                  if (sg && sg.items.length) {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      const n = sg.items.length;
+                      sg.index = (sg.index + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+                      emit();
+                      return;
+                    }
+                    if (e.key === 'Enter' || e.key === 'Tab') {
+                      e.preventDefault();
+                      insertPinned(sg.items[sg.index] || sg.items[0]);
+                      return;
+                    }
+                    if (e.key === 'Escape') {
+                      e.preventDefault(); clearContextSuggest(); return;
+                    }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+                    e.preventDefault(); clearContextSuggest(); send();
+                  }
+                }} />
+      ${(() => {
+        const sg = S.ui.suggest;
+        if (!sg || !sg.items.length) return null;
+        const ta = taRef.current;
+        const style = ta
+          ? ('left:' + ta.offsetLeft + 'px;width:' + ta.offsetWidth +
+             'px;bottom:calc(100% - ' + Math.max(0, ta.offsetTop - 4) + 'px)')
+          : '';
+        return html`
+          <div id="ctxMenu" role="listbox" aria-label="Pin file or symbol context" style=${style}>
+            <div class="ctx-head">Pin context \u00B7 ${sg.query ? '@' + sg.query : 'files & symbols'}</div>
+            ${sg.items.map((x, i) => html`
+              <button key=${'ctx' + i} type="button" role="option"
+                      aria-selected=${i === sg.index ? 'true' : 'false'}
+                      class=${'ctx-item' + (i === sg.index ? ' on' : '')}
+                      onMouseDown=${(ev) => ev.preventDefault()}
+                      onClick=${() => insertPinned(x)}>
+                <span class="ctx-kind">${x.kind === 'symbol' ? '\u0192' : '\u25A4'}</span>
+                <span class="ctx-label">${x.insert || ('@' + x.label)}</span>
+                <span class="ctx-detail">${x.detail || ''}</span>
+              </button>`)}
+            <div class="ctx-foot">\u2191\u2193 move \u00B7 Enter/Tab insert \u00B7 Esc dismiss</div>
+          </div>`;
+      })()}
       <div id="optsBox" key=${S.mode} hidden=${!S.ui.optsOpen}>
         <div class="opts-grid">${OPTS[S.mode].filter((o) => o.type !== 'check' && !(S.mode === 'new' && o.k === 'project')).map((o, idx) => html`<${OptField} key=${'g' + idx} o=${o} />`)}</div>
         ${OPTS[S.mode].some((o) => o.type === 'check') ? html`<div class="opts-checks">${OPTS[S.mode].filter((o) => o.type === 'check').map((o, idx) => html`<${OptField} key=${'c' + idx} o=${o} />`)}</div>` : null}
       </div>
       <div id="composerBtns">
-        <button id="attachBtn" title="attach a text file (or drop one here)"
+        <label id="effortControl" class="effort"
+               title=${PDC.t('gui.composer.effort_title', null, 'Reasoning effort forwarded as reasoning_effort to local-moe (Strata/Avalon) and reasoning-capable hosted models. Default sends no field.')}>
+          <span>${PDC.t('gui.composer.effort', null, 'Effort')}</span>
+          <select value=${s.reasoning_effort || 'default'}
+                  onChange=${(e) => setReasoningEffort(e.target.value)}>
+            <option value="default">${PDC.t('gui.effort.default', null, 'Default')}</option>
+            <option value="low">${PDC.t('gui.effort.low', null, 'Low')}</option>
+            <option value="medium">${PDC.t('gui.effort.medium', null, 'Medium')}</option>
+            <option value="high">${PDC.t('gui.effort.high', null, 'High')}</option>
+          </select>
+        </label>
+        <button id="attachBtn" title=${PDC.t('gui.composer.attach_title', null, 'Attach text files or images (or drag/paste here)')}
                 hidden=${isHow}
-                disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE Attach</button>
+                disabled=${!!j} onClick=${() => $('filePick').click()}>\uD83D\uDCCE ${PDC.t('gui.composer.attach', null, 'Attach')}</button>
+        ${hasImageProfile ? html`
+          <button id="imageGenBtn" class="ghost" hidden=${isHow}
+                  title=${PDC.t('gui.composer.image_title', null, 'Generate an image')}
+                  onClick=${imageGenDialog}>\uD83C\uDFA8</button>` : null}
         <button id="optsBtn" class="ghost" hidden=${!OPTS[S.mode].length}
-                onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>Options \u25BE</button>
+                onClick=${() => { S.ui.optsOpen = !S.ui.optsOpen; emit(); }}>${PDC.t('gui.composer.options', null, 'Options')} \u25BE</button>
         <button id="refineBtn" class="ghost${S.ui.refining ? ' busy' : ''}" hidden=${isHow}
-                title="expand this brief into a full spec with interface contracts (one architect call)"
+                title=${PDC.t('gui.composer.refine_title', null, 'expand this brief into a full spec with interface contracts (one architect call)')}
                 disabled=${!!j || S.ui.refining || !(S.drafts[S.mode] || '').trim()}
-                onClick=${refinePrompt}>${S.ui.refining ? '\u2726 Refining\u2026' : '\u2726 Refine Prompt'}</button>
+                onClick=${refinePrompt}>${S.ui.refining ? '\u2726 ' + PDC.t('gui.composer.refining', null, 'Refining\u2026') : '\u2726 ' + PDC.t('gui.composer.refine', null, 'Refine Prompt')}</button>
         <button id="undoRefineBtn" class="ghost" hidden=${isHow || S.ui.previousPrompt == null}
-                title="restore the prompt as it was before refining"
-                onClick=${undoRefine}>↶ Undo Refine</button>
+                title=${PDC.t('gui.composer.undo_refine_title', null, 'restore the prompt as it was before refining')}
+                onClick=${undoRefine}>\u21B6 ${PDC.t('gui.composer.undo_refine', null, 'Undo Refine')}</button>
         <button id="creativeBtn" class=${'ghost' + (S.creative ? ' on' : '')}
                 hidden=${isHow || S.mode === 'explain'}
                 aria-pressed=${S.creative ? 'true' : 'false'}
-                title="Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected."
-                onClick=${toggleCreative}>${S.creative ? '✨ Creative: on' : '✨ Creative'}</button>
-        <span class="grow muted small-text" id="sendHint">${isHow ? 'answers stay out of this chat thread' : (steerable ? 'delivered at the next lookup step' : '')}</span>
+                title=${PDC.t('gui.composer.creative_title', null, 'Creative / UI-polish mode: warmer sampling, a designer persona and full-page rewrites for UI work. Off = design tasks are still auto-detected.')}
+                onClick=${toggleCreative}>${S.creative ? '\u2728 ' + PDC.t('gui.composer.creative_on', null, 'Creative: on') : '\u2728 ' + PDC.t('gui.composer.creative', null, 'Creative')}</button>
+        <label class="chip composer-toggle" id="autoRouteChip"
+              title=${PDC.t('gui.auto_route_title', null, 'Specialist auto-routing (auto_route_specialties): each task runs on the profile whose specialty tags fit it best (model-card tags, or explicit specialties in Settings \u2192 Profiles). Switches happen at task boundaries only, with a clean VRAM handoff when the profiles share one local server.')}>
+          <input type="checkbox" checked=${!!s.auto_route_specialties}
+                 onChange=${(e) => setAutoRoute(e.target.checked)} />
+          <b>\u2726 ${PDC.t('gui.auto_route', null, 'Auto-route')}</b>
+        </label>
+        <label class="chip composer-toggle" id="postEditVerifyChip"
+              title=${'Post-edit verification (auto_verify): '
+                + (s.auto_verify ? 'ON \u2014 ' + s.auto_verify : 'off')
+                + '. Detected test command: '
+                + (s.detected_test_command || 'none detected')
+                + '. The syntax, static and interface-contract gates and the scoped'
+                + ' impacted tests always run on every edit; the full suite is this'
+                + ' verify command.'}>
+          <input type="checkbox" checked=${!!s.auto_verify}
+                 onChange=${(e) => setPostEditVerify(e.target.checked)} />
+          <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
+        </label>
+        <span class="grow muted small-text" id="sendHint">${isHow ? PDC.t('gui.composer.how_hint', null, 'answers stay out of this chat thread') : (steerable ? PDC.t('gui.composer.steer_hint', null, 'delivered at the next lookup step') : '')}</span>
         <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
                 disabled=${!!(j && j.cancelled && !isHow)}
                 onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
-          ${isHow ? (S.how.loading ? 'Asking\u2026' : 'Ask')
-              : (j ? (j.cancelled ? 'Stopping\u2026' : 'Stop')
-              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? 'Plan only' : 'Apply & run') : m.send))}
+          ${isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
+              : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
+              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)))}
         </button>
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />
@@ -3041,7 +5020,18 @@ function OptField(props) {
   const val = opt(mode, o.k);
   const set = useCallback((v) => { S.opts[mode][o.k] = v; saveOpts(); emit(); }, [o.k, mode]);
   let el;
-  if (o.type === 'select') {
+  if (o.k === 'architect_provider') {
+    // Hybrid Stage-1 planner: the choices are the live profile list (the
+    // static OPTS table cannot know them), each labeled with its model.
+    const s = S.status || {};
+    const names = s.profiles || [];
+    const models = s.profile_models || {};
+    const cur = val || s.architect_provider || '';
+    el = html`<select value=${cur} onchange=${(e) => set(e.target.value)}>
+      <option value="">None (single-model runs)</option>
+      ${names.map((n) => html`<option key=${n} value=${n}>${n + (models[n] ? ' \u00b7 ' + models[n] : '')}</option>`)}
+    </select>`;
+  } else if (o.type === 'select') {
     el = html`<select value=${val} onchange=${(e) => set(e.target.value)}>
       ${o.opts.map((x) => html`<option key=${x[0]} value=${x[0]}>${x[1]}</option>`)}
     </select>`;
@@ -3114,6 +5104,7 @@ function DiffPane() {
   const R = S.review, D = S.diff;
   const unified = S.ui.diffMode === 'unified';
   const oldRef = useRef(null), newRef = useRef(null);
+  const [editDraft, setEditDraft] = useState('');
   useEffect(() => {                       // keep the two panes in step
     const a = oldRef.current, b = newRef.current;
     if (!a || !b) return;
@@ -3123,8 +5114,117 @@ function DiffPane() {
     return () => { a.removeEventListener('scroll', sa); b.removeEventListener('scroll', sb); };
   }, [D, S.diffRel, S.editing]);
   useEffect(() => {                       // fill the editor when entering it
-    if (S.editing && editBox.current) editBox.current.value = (S.diff && S.diff.after) || '';
+    if (S.editing) {
+      const next = (D && D.after) || '';
+      setEditDraft(next);
+      if (editBox.current) editBox.current.value = next;
+    }
   }, [S.editing, D]);
+  useEffect(() => {                       // keep textarea synced across split/unified toggle
+    if (S.editing && editBox.current && editBox.current.value !== editDraft) {
+      editBox.current.value = editDraft;
+    }
+  }, [unified, S.editing]);
+  const switchDiffFile = useCallback((rel, editAfter) => {
+    if (!R) return;
+    if (rel === S.diffRel) {
+      if (editAfter && !S.editing && S.diff) toggleEdit();
+      return;
+    }
+    if (!S.editing) {
+      S.editAfterLoad = !!editAfter;
+      loadDiffFile(rel);
+      return;
+    }
+    const currentText = editBox.current ? editBox.current.value : editDraft;
+    const dirty = D && currentText !== (D.after || '');
+    if (!dirty) {
+      S.editing = false;
+      S.editAfterLoad = !!editAfter;
+      loadDiffFile(rel);
+      return;
+    }
+    const fromRel = S.diffRel;
+    PDC.modal('Unsaved changes',
+      h('p', { style: 'margin:0', text: 'Save your edits to ' + fromRel + ' before switching to ' + rel + '?' }),
+      [
+        { label: 'Cancel' },
+        { label: 'Discard', danger: true, onclick: () => {
+          S.editing = false;
+          S.editAfterLoad = !!editAfter;
+          loadDiffFile(rel);
+        } },
+        { label: 'Save & switch', primary: true, onclick: () => {
+          PDC.api('/api/review/rediff', { id: R.id, rel: fromRel, text: currentText }).then((d) => {
+            S.editing = false;
+            if (d._status === 200) {
+              const item = (S.review && S.review.files || []).find((x) => x.rel === fromRel);
+              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; }
+              S.editAfterLoad = !!editAfter;
+              loadDiffFile(rel);
+            } else {
+              PDC.toast(d.detail || 'could not update', true);
+              emit();
+            }
+          });
+        } },
+      ], { narrow: true });
+  }, [R, D, editDraft]);
+  useEffect(() => {
+    if (!R || !R.files || R.files.length < 2) return;
+    const onKey = (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key !== '[' && e.key !== ']') return;
+      const t = e.target;
+      const tag = (t && t.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+      if (document.querySelector('.overlay') || !S.ui.diffOpen) return;
+      const idx = R.files.findIndex((f) => f.rel === S.diffRel);
+      const len = R.files.length;
+      const next = idx < 0 ? 0 : (idx + (e.key === ']' ? 1 : -1) + len) % len;
+      e.preventDefault();
+      switchDiffFile(R.files[next].rel, false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
+  const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
+  const { oldRows, newRows, uniRows } = useMemo(() => {
+    const oldR = [], newR = [], uniR = [];
+    const rows = (D && D.rows) || [];
+    rows.forEach((r, i) => {
+      const key = 'r' + i;
+      if (r[0] === 'skip') {
+        const foldKey = S.diffRel + '#' + r[2];
+        const opened = S.ui.folds[foldKey] === true;
+        const label = '\u22EF ' + r[1] + ' unchanged line' + (r[1] === 1 ? '' : 's') + ' \u2014 click to show';
+        const mk = () => html`<div key=${key} class="skip" hidden=${opened}
+          onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
+        oldR.push(mk()); newR.push(mk()); uniR.push(mk());
+        return;
+      }
+      const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
+      if (kind === 'equal') {
+        oldR.push(codeLine('equal', r[1], r[2], show, key));
+        newR.push(codeLine('equal', r[3], r[4], show, key));
+        uniR.push(uniLine('equal', r[1], r[2], show, key));
+      } else if (kind === 'replace') {
+        oldR.push(codeLine('replace del', r[1], markedCells(r[2], r[5]), show, key));
+        newR.push(codeLine('replace add', r[3], markedCells(r[4], r[6]), show, key));
+        uniR.push(uniLine('del', r[1], markedCells(r[2], r[5]), show, key + 'a'));
+        uniR.push(uniLine('add', r[3], markedCells(r[4], r[6]), show, key + 'b'));
+      } else if (kind === 'delete') {
+        oldR.push(codeLine('delete', r[1], r[2], show, key));
+        newR.push(codeLine('blank', null, '', show, key));
+        uniR.push(uniLine('del', r[1], r[2], show, key));
+      } else {
+        oldR.push(codeLine('blank', null, '', show, key));
+        newR.push(codeLine('insert', r[3], r[4], show, key));
+        uniR.push(uniLine('add', r[3], r[4], show, key));
+      }
+    });
+    return { oldRows: oldR, newRows: newR, uniRows: uniR };
+  }, [D, S.diffRel, foldSig]);
 
   if (!R) {
     return html`
@@ -3137,64 +5237,31 @@ function DiffPane() {
   const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
-  const rows = (D && D.rows) || [];
-  const oldRows = [], newRows = [], uniRows = [];
-  rows.forEach((r, i) => {
-    const key = 'r' + i;
-    if (r[0] === 'skip') {
-      const foldKey = S.diffRel + '#' + r[2];
-      const opened = S.ui.folds[foldKey] === true;
-      const label = '\u22EF ' + r[1] + ' unchanged line' + (r[1] === 1 ? '' : 's') + ' \u2014 click to show';
-      const mk = () => html`<div key=${key} class="skip" hidden=${opened}
-        onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
-      oldRows.push(mk()); newRows.push(mk()); uniRows.push(mk());
-      return;
-    }
-    const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
-    if (kind === 'equal') {
-      oldRows.push(codeLine('equal', r[1], r[2], show, key));
-      newRows.push(codeLine('equal', r[3], r[4], show, key));
-      uniRows.push(uniLine('equal', r[1], r[2], show, key));
-    } else if (kind === 'replace') {
-      oldRows.push(codeLine('replace del', r[1], markedCells(r[2], r[5]), show, key));
-      newRows.push(codeLine('replace add', r[3], markedCells(r[4], r[6]), show, key));
-      uniRows.push(uniLine('del', r[1], markedCells(r[2], r[5]), show, key + 'a'));
-      uniRows.push(uniLine('add', r[3], markedCells(r[4], r[6]), show, key + 'b'));
-    } else if (kind === 'delete') {
-      oldRows.push(codeLine('delete', r[1], r[2], show, key));
-      newRows.push(codeLine('blank', null, '', show, key));
-      uniRows.push(uniLine('del', r[1], r[2], show, key));
-    } else {
-      oldRows.push(codeLine('blank', null, '', show, key));
-      newRows.push(codeLine('insert', r[3], r[4], show, key));
-      uniRows.push(uniLine('add', r[3], r[4], show, key));
-    }
-  });
   const acceptLabel = !R.partial_ok || nSel === editable.length
-    ? (editable.length > 1 ? 'Accept all' : 'Accept')
-    : 'Accept ' + nSel + ' of ' + editable.length;
+    ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
+    : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
   return html`
     <div class="diffwrap">
       <div id="reviewBar">
-        <b id="reviewTitle" title=${R.task || ''}>${R.task || 'Proposed changes'}</b>
+        <b id="reviewTitle" title=${R.task || ''}>${R.task || PDC.t('gui.diff.proposed_changes', null, 'Proposed changes')}</b>
         ${!pending ? html`<span class=${'badge-out ' + R.outcome}>
-            ${R.outcome === 'applied' ? 'accepted' : R.outcome === 'cancelled' ? 'rejected' : R.outcome}</span>` : null}
+            ${R.outcome === 'applied' ? PDC.t('gui.diff.accepted', null, 'accepted') : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
         ${!pending && (R.unaccepted || []).length ? html`
           <span class="badge-out unaccepted"
                 title=${R.unaccepted.map((c) => c + ': ' + ((R.clause_texts || {})[c] || '')).join('\n')}>
             clause(s) left open: ${R.unaccepted.join(', ')}</span>` : null}
         <div id="reviewActions">
-          <button class="ghost small" title="collapse the diff (Chat stays full-width)"
-                  onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 Collapse</button>
-          <span id="diffViewToggle" title="diff layout: two panes or one unified column">
-            <button class=${'small' + (unified ? '' : ' on')} onClick=${() => setDiffMode('split')}>Side by side</button>
-            <button class=${'small' + (unified ? ' on' : '')} onClick=${() => setDiffMode('unified')}>Unified</button>
+          <button class="ghost small" title=${PDC.t('gui.diff.collapse_title', null, 'collapse the diff (Chat stays full-width)')}
+                  onClick=${() => { S.ui.diffOpen = false; emit(); }}>\u29C9 ${PDC.t('gui.collapse', null, 'Collapse')}</button>
+          <span id="diffViewToggle" title=${PDC.t('gui.diff.layout_title', null, 'diff layout: two panes or one unified column')}>
+            <button class=${'small' + (unified ? '' : ' on')} onClick=${() => setDiffMode('split')}>${PDC.t('gui.diff.side_by_side', null, 'Side by side')}</button>
+            <button class=${'small' + (unified ? ' on' : '')} onClick=${() => setDiffMode('unified')}>${PDC.t('gui.diff.unified', null, 'Unified')}</button>
           </span>
           ${pending ? html`
             <button class="small" id="editBtn" hidden=${!R.partial_ok}
-                    title="edit the proposed code for the selected file by hand before accepting"
-                    onClick=${toggleEdit}>${S.editing ? '\u2716 Show diff' : '\u270E Edit proposed'}</button>
-            <button class="small danger" onClick=${() => decide('reject')}>Reject${R.files.length > 1 ? ' all' : ''}</button>
+                    title=${PDC.t('gui.diff.edit_title', null, 'edit the proposed code for the selected file by hand before accepting')}
+                    onClick=${toggleEdit}>${S.editing ? '\u2716 ' + PDC.t('gui.diff.show_diff', null, 'Show diff') : '\u270E ' + PDC.t('gui.diff.edit_proposed', null, 'Edit proposed')}</button>
+            <button class="small danger" onClick=${() => decide('reject')}>${R.files.length > 1 ? PDC.t('gui.diff.reject_all', null, 'Reject all') : PDC.t('gui.diff.reject', null, 'Reject')}</button>
             <button class="small primary" disabled=${nSel === 0}
                     onClick=${() => decide('apply')}>${acceptLabel}</button>` : null}
         </div>
@@ -3202,7 +5269,7 @@ function DiffPane() {
       <div id="fileStrip">
         ${R.files.map((f) => html`
           <div key=${f.rel} class=${'fileitem' + (f.rel === S.diffRel ? ' on' : '') + (f.source ? ' source' : '')}
-               title=${f.message || ''} onClick=${() => { S.editing = false; loadDiffFile(f.rel); }}>
+               title=${f.message || ''} onClick=${() => switchDiffFile(f.rel, false)}>
             ${pending && R.partial_ok && !f.source ? html`
               <input type="checkbox" checked=${S.sel[f.rel] !== false} title="include in Accept"
                      onclick=${(e) => e.stopPropagation()}
@@ -3216,8 +5283,7 @@ function DiffPane() {
               <button class="fedit" title="edit this file's proposed code"
                       onClick=${(e) => {
                         e.stopPropagation();
-                        if (f.rel === S.diffRel && S.diff) { toggleEdit(); }
-                        else { S.editAfterLoad = true; loadDiffFile(f.rel); }
+                        switchDiffFile(f.rel, true);
                       }}>\u270E</button>` : null}
           </div>`)}
       </div>
@@ -3227,7 +5293,9 @@ function DiffPane() {
             <div class="pane-head"><span>${S.diffRel}</span><span>\u2212${D.removed} / +${D.added} lines</span></div>
             <div class="code" hidden=${S.editing}>${uniRows}</div>
             <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
-                      ref=${(el) => { editBox.current = el; }}></textarea>
+                      value=${editDraft}
+                      onInput=${(e) => setEditDraft(e.target.value)}
+                      ref=${(el) => { editBox.current = el; if (el && S.editing && el.value !== editDraft) el.value = editDraft; }}></textarea>
           </div>
         </div>` : html`
         <div id="panes">
@@ -3239,7 +5307,9 @@ function DiffPane() {
             <div class="pane-head"><span>Updated code</span><span>+${D.added} lines</span></div>
             <div class="code" ref=${newRef} hidden=${S.editing}>${newRows}</div>
             <textarea id="editBox" spellcheck="false" hidden=${!S.editing}
-                      ref=${(el) => { editBox.current = el; }}></textarea>
+                      value=${editDraft}
+                      onInput=${(e) => setEditDraft(e.target.value)}
+                      ref=${(el) => { editBox.current = el; if (el && S.editing && el.value !== editDraft) el.value = editDraft; }}></textarea>
           </div>
         </div>`)}
     </div>`;
@@ -3289,30 +5359,31 @@ function ActivityPane() {
   return html`
     <section class="panel" id="activityPanel">
       <div class="panel-head">
-        <h2>Activity</h2>
+        <h2>${PDC.t('gui.panel.activity', null, 'Activity')}</h2>
         <span class="chip">
           <i class=${'dot ' + (j ? 'busy' : 'idle')}></i><b>${phase}</b></span>
         <span class="muted small-text grow" id="engCount">
-          ${PDC.fmtInt(eng.calls || 0)} calls \u00B7 ${PDC.fmtInt(eng.steps || 0)} steps</span>
-        ${j ? html`<button class="ghost small" onClick=${() => stop()}>Stop</button>` : null}
+          ${PDC.fmtInt(eng.calls || 0)} ${PDC.t('gui.calls', null, 'calls')} \u00B7 ${PDC.fmtInt(eng.steps || 0)} ${PDC.t('gui.steps', null, 'steps')}</span>
+        ${j ? html`<button class="ghost small" disabled=${!!j.cancelled} onClick=${() => stop()}>${j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop')}</button>` : null}
       </div>
       <div id="activityBody">
-        <div class="eng-bar" title="Engine V2 state (during and after runs)">
+        <${LiveStreamDrawer} />
+        <div class="eng-bar" title=${PDC.t('gui.activity.engine_title', null, 'Engine V2 state (during and after runs)')}>
           <span class=${'phase ' + phase}>${phase}</span>
-          <span class="estat" title="model calls this session">calls
+          <span class="estat" title=${PDC.t('gui.activity.calls_title', null, 'model calls this session')}>${PDC.t('gui.calls', null, 'calls')}
             <b>${PDC.fmtInt(eng.calls || 0)}</b></span>
-          <span class="estat" title="gather steps in the last run">step
+          <span class="estat" title=${PDC.t('gui.activity.step_title', null, 'gather steps in the last run')}>${PDC.t('gui.activity.step', null, 'step')}
             <b>${PDC.fmtInt(eng.steps || 0)}</b></span>
-          <span class="estat" title="read spans recorded in the ledger">read spans
+          <span class="estat" title=${PDC.t('gui.activity.spans_title', null, 'read spans recorded in the ledger')}>${PDC.t('gui.activity.read_spans', null, 'read spans')}
             <b>${PDC.fmtInt(eng.read_spans || 0)}</b></span>
           ${eng.specialist && eng.specialist.profile ? html`
             <span class="estat" title=${'specialist routed: ' + eng.specialist.profile
               + ' (' + (eng.specialist.model || '?') + ') for specialty \''
-              + (eng.specialist.specialty || '?') + '\''}>specialist
+              + (eng.specialist.specialty || '?') + '\''}>${PDC.t('gui.activity.specialist', null, 'specialist')}
               <b>${eng.specialist.profile}</b></span>` : null}
         </div>
         ${reqs.length ? html`
-          <div class="eng-sec"><b>Requirement ledger</b><ol class="reqs">
+          <div class="eng-sec"><b>${PDC.t('gui.activity.req_ledger', null, 'Requirement ledger')}</b><ol class="reqs">
             ${reqs.map((rq, i) => html`
               <li key=${i} class="reqrow" title=${rq.text}>
                 <span class=${'rq st-' + String(rq.state || 'UNLOCATED').toLowerCase()}>${rq.state}</span>
@@ -3321,7 +5392,7 @@ function ActivityPane() {
               </li>`)}
           </ol></div>` : null}
         ${acts.length ? html`
-          <div class="eng-sec"><b>Recent actions</b><ul class="acts">
+          <div class="eng-sec"><b>${PDC.t('gui.activity.recent_actions', null, 'Recent actions')}</b><ul class="acts">
             ${acts.map((a, i) => html`
               <li key=${i} class=${'actrow' + (a.ok === false ? ' bad' : '')}>
                 <span class=${'atool k-' + String(a.tool || 'step').toLowerCase().replace(/[^a-z0-9-]+/g, '')}>${a.tool}</span>
@@ -3330,9 +5401,9 @@ function ActivityPane() {
         ${tail.length ? html`<ol class="steps" hidden=${!!acts.length}>
             ${tail.map((l, i) => html`<li key=${'l' + (lines.length - tail.length + i)}>
               <span class="tx">${l}</span></li>`)}
-          </ol>` : (acts.length ? null : html`<div class="tip">No lookups yet \u2014 run something.</div>`)}
+          </ol>` : (acts.length ? null : html`<div class="tip">${PDC.t('gui.activity.empty', null, 'No lookups yet \u2014 run something.')}</div>`)}
         ${lastStream && lastStream.text ? html`
-          <div class="streamtail" title="live model output"><b>${lastStream.site || 'answer'}</b>
+          <div class="streamtail" title=${PDC.t('gui.activity.live_output', null, 'live model output')}><b>${lastStream.site || 'answer'}</b>
           <pre>${lastStream.text.slice(-2000)}</pre></div>` : null}
       </div>
     </section>`;
@@ -3353,25 +5424,23 @@ function PlanPane() {
   return html`
     <section class="panel" id="planPanel">
       <div class="panel-head">
-        <h2>Plan</h2>
-        ${S.ui.planGenerating ? html`<span class="badge">new plan\u2026</span>`
+        <h2>${PDC.t('gui.panel.plan', null, 'Plan')}</h2>
+        ${S.ui.planGenerating ? html`<span class="badge">${PDC.t('gui.plan.new_plan', null, 'new plan\u2026')}</span>`
           : tasks.length ? html`<span class="badge">${done}/${tasks.length}</span>` : null}
         <span class="muted small-text grow mono" id="planPath">${p.exists ? p.path : ''}</span>
         ${p.exists && !S.ui.planGenerating ? html`
           <button class="small" onClick=${() => { S.ui.planEditing = !S.ui.planEditing; emit(); }}>
-            ${S.ui.planEditing ? 'Cancel' : 'Edit'}</button>
-          ${S.ui.planEditing ? html`<button class="small primary" onClick=${() => savePlan()}>Save</button>` : null}
-          <button class="small primary" disabled=${running || !openN} title="run this plan now"
-                  onClick=${() => PDC.runPlan()}>Run</button>` : null}
+            ${S.ui.planEditing ? PDC.t('common.cancel', null, 'Cancel') : PDC.t('gui.edit', null, 'Edit')}</button>
+          ${S.ui.planEditing ? html`<button class="small primary" onClick=${() => savePlan()}>${PDC.t('common.save', null, 'Save')}</button>` : null}
+          <button class="small primary" disabled=${running || !openN} title=${PDC.t('gui.plan.run_title', null, 'run this plan now')}
+                  onClick=${() => PDC.runPlan()}>${PDC.t('gui.run', null, 'Run')}</button>` : null}
       </div>
       <div id="planBody" hidden=${S.ui.planEditing}>
         ${S.ui.planGenerating ? html`
-          <div class="tip"><b>Generating new plan\u2026</b><br>The previous
-          checklist is complete; the planner is replacing it for this goal.</div>`
+          <div class="tip"><b>${PDC.t('gui.plan.generating', null, 'Generating new plan\u2026')}</b><br>${PDC.t('gui.plan.generating_desc', null, 'The previous checklist is complete; the planner is replacing it for this goal.')}</div>`
         : !p.exists ? html`
-          <div class="tip">No plan yet. Use <b>Auto</b> to turn a goal into a
-          checklist; its progress shows here as it runs.</div>` : html`
-          <div class="muted small-text">${done} of ${tasks.length} tasks done</div>
+          <div class="tip">${PDC.t('gui.plan.empty', null, 'No plan yet. Use Auto to turn a goal into a checklist; its progress shows here as it runs.')}</div>` : html`
+          <div class="muted small-text">${PDC.t('gui.plan.progress', { done: done, total: tasks.length }, done + ' of ' + tasks.length + ' tasks done')}</div>
           <div class="progress"><div style=${'width:' + pct + '%'}></div></div>
           ${tasks.map((t, i) => {
             const cur = t.status === 'todo' && firstTodo && running;
@@ -3399,11 +5468,11 @@ function WorkspacePane() {
   useEffect(() => {
     if (termRef.current && !term) term = new Term(termRef.current);
   }, []);
-  const tabs = S.ws.pages.length
-    ? [WS_TABS[0], ['preview', '\uD83C\uDF10 Preview']].concat(WS_TABS.slice(1))
-    : WS_TABS;
+  const tabs = [['files', PDC.t('gui.panel.files', null, 'Files')], ['runner', '\u25B6 ' + PDC.t('gui.run', null, 'Run')]]
+    .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 ' + PDC.t('gui.panel.preview', null, 'Preview')]] : [])
+    .concat([['backups', PDC.t('gui.panel.backups', null, 'Backups')], ['logs', PDC.t('gui.panel.logs', null, 'Logs')]]);
   let tab = S.ws.tab;
-  if (tab === 'preview' && !S.ws.pages.length) tab = 'files';  // saved tab, no pages
+  if (tab === 'preview' && !S.ws.pages.length) tab = 'runner';  // saved tab, no pages
   const idxSet = S.ws.indexedSet || new Set();
   const flt = S.ws.filter.trim().toLowerCase();
   const all = S.ws.files || [];
@@ -3429,14 +5498,16 @@ function WorkspacePane() {
   return html`
     <section class=${'panel' + (S.ui.wsCollapsed ? ' collapsed' : '')} id="wsPanel">
       <div class="panel-head">
-        <div id="wsTabs">
+        <div id="wsTabs" role="tablist">
           ${tabs.map(([k, lbl]) => html`
-            <button key=${k} class=${tab === k ? 'on' : ''}
+            <button key=${k} role="tab" aria-selected=${tab === k ? 'true' : 'false'}
+                    class=${tab === k ? 'on' : ''}
                     onClick=${() => setWsTab(k)}>${lbl}</button>`)}
         </div>
         <span class="muted small-text grow ws-sub">
           ${tab === 'files' ? (s.root ? PDC.fmtInt(S.ws.indexed.length) + ' of ' + PDC.fmtInt(all.length) + ' files indexed' : 'no project open')
           : tab === 'backups' ? 'undo a Task/Edit or Auto write'
+          : tab === 'runner' ? 'preview + one-click commands'
           : tab === 'preview' ? 'read-only \u00B7 reloads when a run finishes'
           : 'live output'}
         </span>
@@ -3476,9 +5547,66 @@ function WorkspacePane() {
                   onClick=${openPreviewTab}>\u2197 New tab</button>
         </div>
         ${S.ws.page
-          ? html`<iframe id="live-preview-frame" title=${'Live preview of ' + S.ws.page}
+          ? html`<iframe id="live-preview-frame" sandbox="allow-scripts"
+                         title=${'Live preview of ' + S.ws.page}
                          src=${previewSrc(S.ws.page, S.ws.previewRev)}></iframe>`
           : html`<div class="tip">No HTML pages in this project yet \u2014 create one and it shows up here.</div>`}
+      </div>
+      <div class="ws-body" id="wsRunner" hidden=${tab !== 'runner'}>
+        ${!s.root ? html`<div class="tip">Open a project to preview and run it.</div>`
+        : (() => {
+          const t = S.ws.targets || { web: [], commands: [] };
+          const web = t.web || [];
+          const cmds = t.commands || [];
+          const out = S.ws.runOut;
+          return html`
+            <div class="runner-preview">
+              <div class="ws-tools">
+                <select class="grow" title="static page to preview" value=${S.ws.runPage}
+                        disabled=${!web.length}
+                        onchange=${(e) => setRunPage(e.target.value)}>
+                  ${web.length ? web.map((p) => html`<option key=${p.path} value=${p.path}>${p.path}</option>`)
+                    : html`<option value="">no HTML entrypoint</option>`}
+                </select>
+                <button class="small" disabled=${!S.ws.runPage}
+                        title="reload the live preview" onClick=${reloadRunnerPreview}>\u27F3 Reload Preview</button>
+                <button class="small" disabled=${!S.ws.runPage}
+                        title="open this page in a browser tab" onClick=${openRunnerPreview}>\u2197 New tab</button>
+              </div>
+              ${S.ws.runPage
+                ? html`<iframe class="runner-frame" sandbox="allow-scripts"
+                               title=${'Live app preview of ' + S.ws.runPage}
+                               src=${runnerSrc(S.ws.runPage, S.ws.runRev)}></iframe>`
+                : html`<div class="tip">No <code>index.html</code>, <code>public/index.html</code> or <code>dist/index.html</code> yet \u2014 create one and it appears here live.</div>`}
+            </div>
+            <div class="runner-cmd">
+              <select title="detected runnable target" value=${S.ws.runCmd}
+                      onchange=${(e) => { S.ws.runCmd = e.target.value; emit(); }}>
+                ${cmds.length ? cmds.map((c) => html`<option key=${c.id} value=${c.id}>${c.label}</option>`)
+                  : html`<option value="">no entrypoint detected</option>`}
+              </select>
+              <input type="text" class="grow" spellcheck="false" value=${S.ws.runCustom}
+                     placeholder="or type a command (argv, no shell)"
+                     oninput=${(e) => { S.ws.runCustom = e.target.value; }} />
+              <button class="small primary" disabled=${S.ws.runRunning}
+                      onClick=${runProjectCommand}>${S.ws.runRunning ? 'Running\u2026' : '\u25B6 Run'}</button>
+            </div>
+            ${out ? html`
+              <div class=${'runner-out' + (out.ok ? '' : ' failed')}>
+                <div class="runner-out-head">
+                  <b class=${out.ok ? 'ok' : 'bad'}>${out.ok ? 'OK' : 'FAILED'} \u00B7 exit ${out.exit_code}</b>
+                  <span class="muted small-text ellip">${out.command} \u00B7 ${PDC.fmtInt(out.duration_ms)} ms</span>
+                  <span class="grow"></span>
+                  ${!out.ok ? html`<button class="small danger" title="put the command, exit code and traceback into the Task composer"
+                        onClick=${fixRunnerCrash}>\u2691 Fix This Crash</button>` : null}
+                </div>
+                ${out.stdout ? html`<pre class="runner-pre">${out.stdout}</pre>` : null}
+                ${out.stderr ? html`<pre class="runner-pre err">${out.stderr}</pre>` : null}
+                ${out.traceback_summary && String(out.stderr || '').indexOf(out.traceback_summary) < 0
+                  ? html`<pre class="runner-pre err">${out.traceback_summary}</pre>` : null}
+              </div>` : null}
+          `;
+        })()}
       </div>
       <div class="ws-body" id="wsBackups" hidden=${tab !== 'backups'}>
         <div class="ws-tools">
@@ -3514,6 +5642,149 @@ function diffMode() {
   return S.ui.diffOpen ? 'expanded' : 'collapsed';
 }
 
+// ---- Non-blocking Security Notice banner -----------------------------------
+// Shown above the workspace whenever /api/state reports unacknowledged
+// secrets or unignored sensitive files. It never blocks the composer: every
+// action is an explicit HTTP call, and Dismiss hides it for this page session.
+function SecurityBanner() {
+  const sec = S.status.security || {};
+  const findings = sec.findings || [];
+  const files = sec.unignored_sensitive_files || [];
+  if ((!findings.length && !files.length) || S.ui.securityDismissed) return null;
+  const ack = (fingerprint) => {
+    PDC.api('/api/security/ack', { fingerprints: [fingerprint] })
+      .then(refreshState, () => PDC.toast('Could not acknowledge that finding.', true));
+  };
+  const ackAll = () => {
+    PDC.api('/api/security/ack', { all: true })
+      .then(refreshState, () => PDC.toast('Could not acknowledge findings.', true));
+  };
+  const gitignore = () => {
+    PDC.api('/api/security/gitignore', {})
+      .then((j) => { PDC.toast('Added ' + ((j.added || []).join(', ') || '.env') + ' to .gitignore.'); refreshState(); },
+        () => PDC.toast('Could not update .gitignore.', true));
+  };
+  return html`
+    <div id="securityNotice" role="status" aria-live="polite">
+      <div class="security-head">
+        <span>\u26A0 ${PDC.t('gui.security.title', null, 'Security Notice')}</span>
+        <span class="grow">${PDC.t('gui.security.desc', null, 'Potential credentials are present in this workspace. Nothing was sent or changed without your choice.')}</span>
+        <button class="ghost small" title=${PDC.t('gui.security.dismiss_title', null, 'dismiss this notice for now')}
+                onClick=${() => { S.ui.securityDismissed = true; emit(); }}>${PDC.t('gui.dismiss', null, 'Dismiss')}</button>
+      </div>
+      ${findings.length ? html`
+        <ul class="security-list">
+          ${findings.map((f) => html`
+            <li key=${f.fingerprint} class="security-row">
+              <code>${f.file}:${f.line}</code>
+              <span class="mask">[${f.kind}] ${f.masked_preview}</span>
+              <button class="small" title=${PDC.t('gui.security.ack_title', null, 'ignore this exact key from now on')}
+                      onClick=${() => ack(f.fingerprint)}>${PDC.t('gui.security.ack', null, 'Acknowledge (Ignore)')}</button>
+            </li>`)}
+        </ul>
+        ${findings.length > 1 ? html`
+          <div class="security-actions">
+            <button class="small" onClick=${ackAll}>${PDC.t('gui.security.ack_all', { count: findings.length }, 'Acknowledge all (' + findings.length + ')')}</button>
+          </div>` : null}` : null}
+      ${files.length ? html`
+        <ul class="security-list">
+          ${files.map((f) => html`
+            <li key=${'file:' + f.file} class="security-row">
+              <code>${f.file}</code>
+              <span class="mask">${f.kind === 'unignored_env' ? PDC.t('gui.security.unignored_env', null, 'environment secrets file is not ignored by .gitignore') : PDC.t('gui.security.unignored_cred', null, 'credential file is not ignored by .gitignore')}</span>
+            </li>`)}
+        </ul>` : null}
+      ${(sec.unignored_env || []).length ? html`
+        <div class="security-actions">
+          <button class="small primary" onClick=${gitignore}>${PDC.t('gui.security.add_gitignore', null, 'Add .env to .gitignore')}</button>
+        </div>` : null}
+    </div>`;
+}
+
+// ---- Non-blocking Update notice (pedacito.update) ---------------------------
+// A slim, dismissible banner when the startup check found a newer release on
+// PyPI. Update streams the detected upgrade command into a small output
+// drawer; exit 0 offers Restart, a failure (or an editable install) shows the
+// output plus the manual command. In-flow like SecurityBanner: it pushes the
+// workspace down, never covers a control, and never opens a modal.
+function UpdateBanner() {
+  const info = S.status.update;
+  const run = S.status.update_run || {};
+  const manual = S.ui.updateManual || '';
+  const dismissed = S.ui.updateDismissed;
+  const showBanner = !!(info && info.update_available
+    && (!dismissed || isNewerVersion(info.latest, dismissed)));
+  const showRun = !S.ui.updateRunHidden
+    && !!(run.running || run.ok === true || run.ok === false || manual);
+  if (!showBanner && !showRun) return null;
+  const startUpgrade = () => {
+    S.ui.updateManual = '';
+    S.ui.updateRunHidden = false;
+    PDC.api('/api/update/run', {}).then((j) => {
+      if (j.ok) { S.ui.updateDrawerOpen = true; refreshState(); }
+      else {
+        // Editable install or opt-out: no command to run, show instructions.
+        S.ui.updateManual = j.detail || 'Upgrade unavailable.';
+        S.ui.updateDrawerOpen = true; emit();
+      }
+    }, () => PDC.toast('Could not start the upgrade.', true));
+  };
+  const restart = () => {
+    PDC.api('/api/update/restart', {}).then((j) => {
+      if (!j.ok) PDC.toast(j.detail || 'Could not restart.', true);
+    });
+  };
+  const stopUpgrade = () => {
+    PDC.api('/api/update/cancel', {}).then((j) => {
+      if (!j.ok) PDC.toast(j.detail || 'Could not stop the upgrade.', true);
+      refreshState();
+    }, () => PDC.toast('Could not stop the upgrade.', true));
+  };
+  const runLabel = run.running ? PDC.t('gui.update.upgrading', null, 'Upgrading\u2026')
+    : run.ok === true ? PDC.t('gui.update.finished', null, 'Upgrade finished')
+    : run.ok === false ? PDC.t('gui.update.failed', null, 'Upgrade failed') : PDC.t('gui.update.upgrade', null, 'Upgrade');
+  const runNote = run.running ? (run.command || []).join(' ')
+    : run.ok === true ? PDC.t('gui.update.restart_note', null, 'Restart Pedacito to run the new version.')
+    : run.ok === false ? (run.detail || PDC.t('gui.update.see_output', null, 'See the output below.'))
+    : manual;
+  return html`
+    <div id="updateNotice" role="status" aria-live="polite">
+      ${showBanner ? html`
+        <div class="update-head">
+          <span>\u2B06 ${PDC.t('gui.update.available', { version: info.latest }, 'Pedacito v' + info.latest + ' is available')}</span>
+          <span class="grow">${PDC.t('gui.update.current', { version: info.current }, '(you have ' + info.current + ')')}</span>
+          <button class="small primary" disabled=${!!run.running}
+                  title=${PDC.t('gui.update.run_title', null, 'run the detected upgrade command')}
+                  onClick=${startUpgrade}>${PDC.t('gui.update.btn', null, 'Update')}</button>
+          <button class="ghost small" title=${PDC.t('gui.update.dismiss_title', null, 'hide this notice until a newer release')}
+                  onClick=${() => { S.ui.updateDismissed = info.latest; writeUpdateDismissed(info.latest); emit(); }}>${PDC.t('gui.dismiss', null, 'Dismiss')}</button>
+        </div>` : null}
+      ${showRun ? html`
+        <div class="update-run">
+          <div class="update-head">
+            <span>${runLabel}</span>
+            <span class="grow">${runNote}</span>
+            ${run.ok === true && !run.running ? html`
+              <button class="small primary" onClick=${restart}>${PDC.t('gui.update.restart', null, 'Restart Pedacito')}</button>` : null}
+            ${run.running ? html`
+              <button class="small danger" disabled=${!!run.cancelling}
+                      title=${PDC.t('gui.update.stop_title', null, 'stop the upgrade process and its children')}
+                      onClick=${stopUpgrade}>${run.cancelling ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop')}</button>` : null}
+            <button class="ghost small"
+                    onClick=${() => { S.ui.updateDrawerOpen = !S.ui.updateDrawerOpen; emit(); }}>
+              ${S.ui.updateDrawerOpen ? PDC.t('gui.update.hide_output', null, 'Hide output') : PDC.t('gui.update.show_output', null, 'Show output')}</button>
+            ${!run.running ? html`
+              <button class="ghost small" title=${PDC.t('gui.update.close_title', null, 'hide this upgrade panel')}
+                      onClick=${() => { S.ui.updateRunHidden = true; S.ui.updateManual = ''; emit(); }}>${PDC.t('common.close', null, 'Close')}</button>` : null}
+          </div>
+          ${run.ok === false && info && info.instructions ? html`
+            <p class="update-manual">${info.instructions}</p>` : null}
+          ${S.ui.updateDrawerOpen ? html`
+            <pre class="update-out">${run.output || manual || PDC.t('gui.update.no_output', null, '(no output yet)')}</pre>` : null}
+        </div>` : null}
+    </div>`;
+}
+
 function App() {
   const [, force] = useState(0);
   const appRef = useRef(null);
@@ -3528,33 +5799,35 @@ function App() {
   return html`
     <div id="shell">
       <${TopBar} />
+      <${SecurityBanner} />
+      <${UpdateBanner} />
       <main id="app" ref=${appRef} data-diff=${dm}>
         <section class="panel" id="chatPanel">
           <div class="panel-head">
-            <h2>${S.mode === 'how' ? 'How / Help' : 'Chat'}</h2>
+            <h2>${S.mode === 'how' ? PDC.t('gui.panel.how', null, 'How / Help') : PDC.t('gui.panel.chat', null, 'Chat')}</h2>
             <span class="muted small-text grow" id="busyLbl">
-              ${s.job ? (s.job.cancelled ? 'stopping\u2026' : s.job.title + '\u2026') : ''}</span>
+              ${s.job ? (s.job.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : s.job.title + '\u2026') : ''}</span>
             <${LlmHeartbeat} />
-            ${S.mode === 'how' ? html`<span class="muted small-text">CLI commands \u00b7 GUI paths \u00b7 settings</span>` : null}
+            ${S.mode === 'how' ? html`<span class="muted small-text">${PDC.t('gui.how.subtitle', null, 'CLI commands \u00b7 GUI paths \u00b7 settings')}</span>` : null}
             ${dm === 'collapsed' ? html`
-              <button class="small primary" id="diffPill" title="show the staged diff beside the chat"
+              <button class="small primary" id="diffPill" title=${PDC.t('gui.diff.pill_title', null, 'show the staged diff beside the chat')}
                       onClick=${() => { S.ui.diffOpen = true; emit(); }}>
-                \u29C6 ${s.review.pending ? 'Review staged' : 'Review'}
-                ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' file(s)' : ''} \u2014 expand</button>` : null}
-            <select id="threadSel" title="this project's saved conversations"
+                \u29C6 ${s.review.pending ? PDC.t('gui.diff.review_staged', null, 'Review staged') : PDC.t('gui.diff.review', null, 'Review')}
+                ${(s.review.files || []).length ? ' \u00B7 ' + s.review.files.filter((f) => !f.source).length + ' ' + PDC.t('gui.files_unit', null, 'file(s)') : ''} \u2014 ${PDC.t('gui.expand', null, 'expand')}</button>` : null}
+            <select id="threadSel" title=${PDC.t('gui.thread.select_title', null, "this project's saved conversations")}
                     value=${s.active_thread_id || ''} disabled=${!!s.job}
                     onchange=${(e) => selectThread(e.target.value)}>
               ${(s.threads || []).map((t) => html`
                 <option key=${t.id} value=${t.id}>${t.title_custom ? '\u270E ' : ''}${t.title} \u00b7 ${t.message_count} msg${t.message_count === 1 ? '' : 's'}</option>`)}
             </select>
-            <button class="ghost small" id="newThread" title="start a new conversation (this one stays saved in the project)"
-                    disabled=${!!s.job} onClick=${newThread}>+ New</button>
-            <button class="ghost small" id="renameThreadBtn" title=${'rename \u201c' + (s.thread_title || 'this conversation') + '\u201d'}
-                    disabled=${!!s.job || !s.active_thread_id} onClick=${renameThread}>Rename</button>
-            <button class="ghost small danger" id="delThread" title="delete this conversation and its saved thread"
-                    disabled=${!!s.job} onClick=${deleteCurrentThread}>Delete</button>
-            <button class="ghost small" id="clearChat" title="clear the conversation"
-                    onClick=${() => PDC.api('/api/clear', {})}>Clear</button>
+            <button class="ghost small" id="newThread" title=${PDC.t('gui.thread.new_title', null, 'start a new conversation (this one stays saved in the project)')}
+                    disabled=${!!s.job} onClick=${newThread}>+ ${PDC.t('gui.new', null, 'New')}</button>
+            <button class="ghost small" id="renameThreadBtn" title=${PDC.t('gui.thread.rename_title', { title: s.thread_title || 'this conversation' }, 'rename \u201c' + (s.thread_title || 'this conversation') + '\u201d')}
+                    disabled=${!!s.job || !s.active_thread_id} onClick=${renameThread}>${PDC.t('gui.rename', null, 'Rename')}</button>
+            <button class="ghost small danger" id="delThread" title=${PDC.t('gui.thread.delete_title', null, 'delete this conversation and its saved thread')}
+                    disabled=${!!s.job} onClick=${deleteCurrentThread}>${PDC.t('gui.delete', null, 'Delete')}</button>
+            <button class="ghost small" id="clearChat" title=${PDC.t('gui.thread.clear_title', null, 'clear the conversation')}
+                    onClick=${() => PDC.api('/api/clear', {})}>${PDC.t('gui.clear', null, 'Clear')}</button>
           </div>
           <${MessageList} />
           <${Composer} />
@@ -3572,11 +5845,14 @@ function App() {
         </aside>
       </main>
       <${TelemetryBar} />
-      <nav id="mobileTabs">
-        <button data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>Chat</button>
-        <button data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}
-                disabled=${dm === 'none'} onClick=${() => { S.ui.diffOpen = true; setView('diff'); }}>Changes</button>
-        <button data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>Activity</button>
+      <nav id="mobileTabs" role="tablist">
+        <button role="tab" aria-selected=${S.ui.view === 'chat' ? 'true' : 'false'}
+                data-view="chat" class=${S.ui.view === 'chat' ? 'on' : ''} onClick=${() => setView('chat')}>${PDC.t('gui.panel.chat', null, 'Chat')}</button>
+        <button role="tab" aria-selected=${S.ui.view === 'diff' ? 'true' : 'false'}
+                data-view="diff" class=${S.ui.view === 'diff' ? 'on' : ''}
+                disabled=${dm === 'none'} onClick=${() => { S.ui.diffOpen = true; setView('diff'); }}>${PDC.t('gui.panel.changes', null, 'Changes')}</button>
+        <button role="tab" aria-selected=${S.ui.view === 'right' ? 'true' : 'false'}
+                data-view="right" class=${S.ui.view === 'right' ? 'on' : ''} onClick=${() => setView('right')}>${PDC.t('gui.panel.activity', null, 'Activity')}</button>
       </nav>
     </div>`;
 }
@@ -3592,19 +5868,13 @@ function callSettings(opts) {
 }
 
 // ------------------------------------------------------------------- boot ----
-function initThemeSelect() {
-  const sel = $('theme');
-  if (sel) {
-    let t = localStorage.getItem('pedacito_theme') || 'slate';
-    // the legacy theme names (mocha/sage/parchment/clay/nightshade) no
-    // longer exist: an unknown saved value falls back to the slate default
-    if (!Array.prototype.some.call(sel.options, (o) => o.value === t)) t = 'slate';
-    sel.value = t;
-  }
+function initViewState() {
   if (S.ui.view) document.body.dataset.view = S.ui.view;
 }
 
 render(html`<${App}/>`, $('root'));
-initThemeSelect();
-refreshState().then(() => loadSnapshot());
+initViewState();
+loadI18n();
+loadActiveTheme();
+loadSnapshot();
 setInterval(() => { if (!document.hidden) refreshState(); }, 2500);

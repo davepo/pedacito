@@ -68,29 +68,59 @@ def _skip_dir(name: str) -> bool:
 
 def _iter_code_files(root: Path, exts: set[str], cap: int = 400) -> list[str]:
     """Sorted project-relative paths with one of `exts`, bounded and never
-    crossing into vendored/hidden directories. Empty when root is absent."""
+    crossing into vendored/hidden/ignored directories. Empty when root is
+    absent."""
+    from .select import Matcher, is_venv_dir
+
     root = Path(root)
     if not root.is_dir():
         return []
+    matcher = Matcher.from_files(root)
     out: list[str] = []
     stack = [root]
     while stack and len(out) < cap:
         d = stack.pop()
+        rel_d = "" if d == root else d.relative_to(root).as_posix()
+        if rel_d and matcher.nested_names:
+            for name in matcher.nested_names:
+                ign = d / name
+                if ign.is_file():
+                    try:
+                        matcher.add_scoped(rel_d, fileio.read_lines(ign))
+                    except OSError:
+                        pass
         try:
             entries = sorted(d.iterdir(), key=lambda p: p.name.lower())
         except OSError:
             continue
-        dirs = [e for e in entries if e.is_dir() and not _skip_dir(e.name)]
+        dirs: list[Path] = []
+        for e in entries:
+            if not e.is_dir():
+                continue
+            if _skip_dir(e.name) or is_venv_dir(e):
+                continue
+            sub_rel = f"{rel_d}/{e.name}" if rel_d else e.name
+            if matcher.prunable_dir(sub_rel):
+                continue
+            dirs.append(e)
         for e in dirs:
             stack.append(e)
         for e in entries:
-            if e in dirs or not e.is_file():
+            if not e.is_file():
                 continue
-            if e.suffix.lower() in exts and e.stat().st_size <= MAX_FILE_BYTES:
-                rel = e.relative_to(root).as_posix()
-                out.append(rel)
-                if len(out) >= cap:
-                    break
+            if e.suffix.lower() not in exts:
+                continue
+            rel = f"{rel_d}/{e.name}" if rel_d else e.name
+            if matcher.excluded(rel):
+                continue
+            try:
+                if e.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            out.append(rel)
+            if len(out) >= cap:
+                break
     out.sort()
     return out
 
@@ -514,20 +544,117 @@ def _collect_exports(info: _Mod, tree: ast.AST) -> None:
         visit(stmt)
 
 
-def _local_py_modules(root: Path) -> dict[str, _Mod]:
+class _VerifyCache:
+    """Per-verification-call cache for file discovery, reads, Python ASTs,
+    tree-sitter parse roots, and JS/TS module summaries.
+
+    Always enter via `with _VerifyCache(root) as cache:`: it holds
+    `_ts_guard()` (`ts_nodes()`) for the entire lifetime of any cached
+    tree-sitter `Node` objects and releases them before re-enabling the GC."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self._files: dict[tuple[frozenset[str], int], list[str]] = {}
+        self._texts: dict[str, str] = {}
+        self._py_asts: dict[str, ast.AST | None] = {}
+        self._ts_roots: dict[str, object] = {}
+        self._js_info: dict[str, dict | None] = {}
+        self._externals: bool | None = None
+        self._guard = None
+
+    def __enter__(self) -> "_VerifyCache":
+        self._guard = _ts_guard()
+        self._guard.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Release all tree-sitter Node references while GC is still paused.
+        self._ts_roots.clear()
+        self._js_info.clear()
+        self._py_asts.clear()
+        self._texts.clear()
+        self._files.clear()
+        guard = self._guard
+        self._guard = None
+        if guard is not None:
+            guard.__exit__(exc_type, exc, tb)
+
+    def files(self, exts: set[str], cap: int = 400) -> list[str]:
+        fexts = frozenset(exts)
+        key = (fexts, cap)
+        hit = self._files.get(key)
+        if hit is not None:
+            return hit
+        for (e, c), vals in self._files.items():
+            if e == fexts and c >= cap and len(vals) < c:
+                hit = vals[:cap]
+                self._files[key] = hit
+                return hit
+        hit = _iter_code_files(self.root, exts, cap=cap)
+        self._files[key] = hit
+        return hit
+
+    def read(self, rel: str) -> str:
+        text = self._texts.get(rel)
+        if text is None:
+            text = _read(rel, self.root)
+            self._texts[rel] = text
+        return text
+
+    def py_ast(self, rel: str) -> ast.AST | None:
+        if rel not in self._py_asts:
+            src = self.read(rel)
+            if not src.strip():
+                self._py_asts[rel] = None
+            else:
+                try:
+                    self._py_asts[rel] = ast.parse(src)
+                except (SyntaxError, ValueError):
+                    self._py_asts[rel] = None
+        return self._py_asts[rel]
+
+    def ts_root(self, rel: str):
+        if rel not in self._ts_roots:
+            text = self.read(rel)
+            if not text.strip():
+                self._ts_roots[rel] = None
+            else:
+                suffix = "." + rel.rsplit(".", 1)[-1].lower()
+                try:
+                    self._ts_roots[rel] = _ts_parse(text, suffix)
+                except Exception:
+                    self._ts_roots[rel] = None
+        return self._ts_roots[rel]
+
+    def js_info(self, rel: str) -> dict | None:
+        if rel not in self._js_info:
+            node = self.ts_root(rel)
+            self._js_info[rel] = (
+                _js_module_info_from_root(node) if node is not None else None
+            )
+        return self._js_info[rel]
+
+
+def _local_py_modules(root: Path,
+                      cache: _VerifyCache | None = None) -> dict[str, _Mod]:
     """{dotted module name: _Mod} for the project's .py files, plus package
     roots (a dir with __init__.py maps to the package name)."""
     root = Path(root)
     mods: dict[str, _Mod] = {}
-    for rel in _iter_code_files(root, _PY, cap=300):
+    rels = (cache.files(_PY, cap=300) if cache is not None
+            else _iter_code_files(root, _PY, cap=300))
+    for rel in rels:
         modname = rel[:-3].replace("/", ".")
         if modname.endswith(".__init__"):
             modname = modname[: -len(".__init__")]
-        src = _read(rel, root)
-        try:
-            tree = ast.parse(src) if src.strip() else None
-        except (SyntaxError, ValueError):
-            tree = None
+        if cache is not None:
+            tree = cache.py_ast(rel)
+        else:
+            src = _read(rel, root)
+            try:
+                tree = ast.parse(src) if src.strip() else None
+            except (SyntaxError, ValueError):
+                tree = None
         info = _Mod(rel)
         if tree is not None:
             _collect_exports(info, tree)
@@ -659,6 +786,9 @@ def _ts_guarded(fn):
 
 
 def _ts_parse(text: str, suffix: str):
+    """Parse `text` with tree-sitter and return its root Node (or None on
+    syntax error / missing grammar). Callers MUST hold `_ts_guard()`
+    (`chunker_ts.ts_nodes()`) for the entire lifetime of the returned Node."""
     parser = _ts_parser_for(suffix)
     if parser is None:
         return None
@@ -884,13 +1014,8 @@ def _js_add_export_info(info: dict, node, text: str) -> None:
         info["opaque"] = True             # CommonJS / UMD-shaped surface
 
 
-@_ts_guarded
-def _js_module_info(text: str, suffix: str) -> dict | None:
-    """Exports/locals/opaque/module facts for one JS/TS source, or None when
-    the parser cannot read it (the syntax gate owns that failure)."""
-    root = _ts_parse(text, suffix)
-    if root is None:
-        return None
+def _js_module_info_from_root(root) -> dict:
+    """Exports/locals/opaque/module facts from an already-parsed JS/TS root."""
     info = {"exports": {}, "locals": {}, "opaque": False, "module": False}
     for child in root.named_children:
         if child.type == "import_statement":
@@ -914,6 +1039,16 @@ def _js_module_info(text: str, suffix: str) -> dict | None:
                     info["module"] = True
                     info["opaque"] = True
     return info
+
+
+@_ts_guarded
+def _js_module_info(text: str, suffix: str) -> dict | None:
+    """Exports/locals/opaque/module facts for one JS/TS source, or None when
+    the parser cannot read it (the syntax gate owns that failure)."""
+    root = _ts_parse(text, suffix)
+    if root is None:
+        return None
+    return _js_module_info_from_root(root)
 
 
 def _js_imports_and_reexports(root) -> tuple[list[dict], list[dict]]:
@@ -1066,7 +1201,8 @@ def _js_export_label(exports) -> list[str]:
 
 
 @_ts_guarded
-def _js_cross_file_errors(root: Path, cap: int = 60
+def _js_cross_file_errors(root: Path, cap: int = 60,
+                          cache: _VerifyCache | None = None
                           ) -> list[tuple[str, str, str]]:
     """(importer_rel, target_rel, ContractError) for JS/TS module contracts.
 
@@ -1075,16 +1211,12 @@ def _js_cross_file_errors(root: Path, cap: int = 60
     imports, `export *`, CommonJS, unparsable files, shadowed locals,
     rest/arguments arity)."""
     root = Path(root)
-    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if cache is None:
+        with _VerifyCache(root) as local_cache:
+            return _js_cross_file_errors(root, cap=cap, cache=local_cache)
+    rels = cache.files(TS_EXTS, cap=300)
     if not rels:
         return []
-    info_cache: dict[str, dict | None] = {}
-
-    def info_for(rel: str) -> dict | None:
-        if rel not in info_cache:
-            info_cache[rel] = _js_module_info(_read(rel, root),
-                                              "." + rel.rsplit(".", 1)[-1].lower())
-        return info_cache[rel]
 
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
@@ -1096,11 +1228,7 @@ def _js_cross_file_errors(root: Path, cap: int = 60
         out.append((importer, target, text))
 
     for rel in rels:
-        text = _read(rel, root)
-        if not text.strip():
-            continue
-        suffix = "." + rel.rsplit(".", 1)[-1].lower()
-        root_node = _ts_parse(text, suffix)
+        root_node = cache.ts_root(rel)
         if root_node is None:
             continue                       # syntax gate owns broken files
         imports, reexports = _js_imports_and_reexports(root_node)
@@ -1122,7 +1250,7 @@ def _js_cross_file_errors(root: Path, cap: int = 60
                          f"imports '{item['spec']}', but no such file exists "
                          f"in the project -- create it or fix the path")
                 continue
-            target_info = info_for(target)
+            target_info = cache.js_info(target)
             if target_info is None or not target_info["module"] \
                     or target_info["opaque"]:
                 continue                   # not provable: only existence above
@@ -1159,7 +1287,7 @@ def _js_cross_file_errors(root: Path, cap: int = 60
                 continue
             if item["star"]:
                 continue
-            target_info = info_for(target)
+            target_info = cache.js_info(target)
             if target_info is None or not target_info["module"] \
                     or target_info["opaque"]:
                 continue
@@ -1417,22 +1545,33 @@ def _js_is_host_name(name: str) -> bool:
     return any(name.startswith(p) for p in _JS_GLOBAL_PREFIXES)
 
 
-def _js_page_externals(root: Path) -> bool:
+def _js_page_externals(root: Path, cache: _VerifyCache | None = None) -> bool:
     """True when some HTML page loads a script from outside the project.
 
     A CDN bundle (three.js, gsap, phaser) puts names in the global scope that
     no file in the tree defines, so the "nothing defines this name" check has
     no business guessing about it; it is skipped in that project."""
-    for rel in _iter_code_files(root, _FE_HTML_EXTS):
-        text = _read(rel, root)
+    if cache is not None and cache._externals is not None:
+        return cache._externals
+    rels = (cache.files(_FE_HTML_EXTS) if cache is not None
+            else _iter_code_files(root, _FE_HTML_EXTS))
+    found = False
+    for rel in rels:
+        text = cache.read(rel) if cache is not None else _read(rel, root)
         for m in _FE_SCRIPT_SRC_RE.finditer(text):
             if _fe_external(m.group(1)):
-                return True
-    return False
+                found = True
+                break
+        if found:
+            break
+    if cache is not None:
+        cache._externals = found
+    return found
 
 
 @_ts_guarded
-def _js_module_link_errors(root: Path, cap: int = 40
+def _js_module_link_errors(root: Path, cap: int = 40,
+                           cache: _VerifyCache | None = None
                            ) -> list[tuple[str, str, str]]:
     """(rel, peer, ContractError) for ES module wiring a parse cannot see.
 
@@ -1452,32 +1591,12 @@ def _js_module_link_errors(root: Path, cap: int = 40
     `_js_cross_file_errors`, which owns the import-vs-export contract, and
     anything the project might be loading from a CDN stays unreported."""
     root = Path(root)
-    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if cache is None:
+        with _VerifyCache(root) as local_cache:
+            return _js_module_link_errors(root, cap=cap, cache=local_cache)
+    rels = cache.files(TS_EXTS, cap=300)
     if not rels:
         return []
-    parsed: dict[str, object] = {}
-    info_cache: dict[str, dict | None] = {}
-
-    def text_for(rel: str) -> str:
-        return _read(rel, root)
-
-    def tree_for(rel: str):
-        if rel not in parsed:
-            suffix = "." + rel.rsplit(".", 1)[-1].lower()
-            try:
-                parsed[rel] = _ts_parse(text_for(rel), suffix)
-            except Exception:
-                parsed[rel] = None
-        return parsed[rel]
-
-    def info_for(rel: str) -> dict | None:
-        if rel not in info_cache:
-            suffix = "." + rel.rsplit(".", 1)[-1].lower()
-            try:
-                info_cache[rel] = _js_module_info(text_for(rel), suffix)
-            except Exception:
-                info_cache[rel] = None
-        return info_cache[rel]
 
     # --- the project-wide pools the free-identifier check reasons over -----
     exported_by: dict[str, list[str]] = {}     # name -> module files exporting it
@@ -1486,12 +1605,12 @@ def _js_module_link_errors(root: Path, cap: int = 40
     defined_anywhere: set[str] = set()         # any project file, any depth
     html_defined: set[str] = set()
     for rel in rels:
-        text = text_for(rel)
+        text = cache.read(rel)
         if not text.strip():
             continue
         for m in _JS_ANY_DEF_RE.finditer(text):
             defined_anywhere.add(next(g for g in m.groups() if g))
-        info = info_for(rel)
+        info = cache.js_info(rel)
         if info is None:
             continue
         if not info["module"]:
@@ -1504,12 +1623,12 @@ def _js_module_link_errors(root: Path, cap: int = 40
         for name in info["locals"]:
             if name not in info["exports"]:
                 declared_in.setdefault(name, []).append(rel)
-    for rel in _iter_code_files(root, _FE_HTML_EXTS):
-        text = text_for(rel)
+    for rel in cache.files(_FE_HTML_EXTS):
+        text = cache.read(rel)
         for m in _JS_ANY_DEF_RE.finditer(text):
             html_defined.add(next(g for g in m.groups() if g))
     defined_anywhere |= html_defined
-    externals = _js_page_externals(root)
+    externals = _js_page_externals(root, cache=cache)
 
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
@@ -1521,10 +1640,10 @@ def _js_module_link_errors(root: Path, cap: int = 40
         out.append((rel, peer, text))
 
     for rel in rels:
-        node = tree_for(rel)
+        node = cache.ts_root(rel)
         if node is None:
             continue                       # the syntax gate owns broken files
-        info = info_for(rel)
+        info = cache.js_info(rel)
         # 1. a module-level name bound twice: one SyntaxError, whole file dead.
         # An ES module only lets `var` repeat; a classic script also allows
         # repeated functions and var/function mixes (last one wins).
@@ -1731,7 +1850,8 @@ def _js_assignment_targets(root_node):
 
 
 @_ts_guarded
-def _js_const_reassign_errors(root: Path, cap: int = 40
+def _js_const_reassign_errors(root: Path, cap: int = 40,
+                              cache: _VerifyCache | None = None
                               ) -> list[tuple[str, str, str]]:
     """(rel, '', ContractError) for writes to a const or imported binding.
 
@@ -1740,17 +1860,16 @@ def _js_const_reassign_errors(root: Path, cap: int = 40
     the line runs (BUG-210). The NEAREST binding decides, so a shadowing
     let/param in an inner scope is never blamed on an outer const."""
     root = Path(root)
-    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if cache is None:
+        with _VerifyCache(root) as local_cache:
+            return _js_const_reassign_errors(root, cap=cap, cache=local_cache)
+    rels = cache.files(TS_EXTS, cap=300)
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for rel in rels:
         if len(out) >= cap:
             break
-        text = _read(rel, root)
-        if not text.strip():
-            continue
-        suffix = "." + rel.rsplit(".", 1)[-1].lower()
-        node = _ts_parse(text, suffix)
+        node = cache.ts_root(rel)
         if node is None:
             continue                     # the syntax gate owns broken files
         scopes: dict[int, dict] = {}
@@ -1868,7 +1987,8 @@ def _js_class_surface(class_node) -> tuple[set[str], bool]:
 
 
 @_ts_guarded
-def _js_instance_method_errors(root: Path, cap: int = 40
+def _js_instance_method_errors(root: Path, cap: int = 40,
+                               cache: _VerifyCache | None = None
                                ) -> list[tuple[str, str, str]]:
     """(rel, def_rel, ContractError) for `x.method()` where x is a project
     class instance and the class defines no such method (BUG-211).
@@ -1880,19 +2000,12 @@ def _js_instance_method_errors(root: Path, cap: int = 40
     ambiguous -- an unknown parent, a computed member, a second binding of
     the name -- stays quiet."""
     root = Path(root)
-    rels = _iter_code_files(root, TS_EXTS, cap=300)
+    if cache is None:
+        with _VerifyCache(root) as local_cache:
+            return _js_instance_method_errors(root, cap=cap, cache=local_cache)
+    rels = cache.files(TS_EXTS, cap=300)
     if not rels:
         return []
-    parsed: dict[str, object] = {}
-
-    def tree_for(rel: str):
-        if rel not in parsed:
-            suffix = "." + rel.rsplit(".", 1)[-1].lower()
-            try:
-                parsed[rel] = _ts_parse(_read(rel, root), suffix)
-            except Exception:
-                parsed[rel] = None
-        return parsed[rel]
 
     # --- 1. every project class: name -> [(rel, methods, opaque, parent)] --
     classes: dict[str, list] = {}
@@ -1906,7 +2019,7 @@ def _js_instance_method_errors(root: Path, cap: int = 40
             default_class[rel] = entry
 
     for rel in rels:
-        node = tree_for(rel)
+        node = cache.ts_root(rel)
         if node is None:
             continue
         for c in _walk_ts(node):
@@ -1965,7 +2078,7 @@ def _js_instance_method_errors(root: Path, cap: int = 40
     for rel in rels:
         if len(out) >= cap:
             break
-        node = tree_for(rel)
+        node = cache.ts_root(rel)
         if node is None:
             continue
         imports, _reexports = _js_imports_and_reexports(node)
@@ -2168,7 +2281,6 @@ def verify_cross_file_contracts(root: Path,
     root = Path(root)
     if not root.is_dir():
         return []
-    mods = _local_py_modules(root)
     touched: set[str] = set()
     for m in modified_files or ():
         name = fileio.normalise_rel(str(m))
@@ -2182,7 +2294,7 @@ def verify_cross_file_contracts(root: Path,
             pass
         touched.add(name)
 
-    out: list[str] = []
+    out: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     def emit(text: str, rel: str) -> None:
@@ -2191,119 +2303,118 @@ def verify_cross_file_contracts(root: Path,
         seen.add(text)
         out.append((0 if rel in touched else 1, len(out), text))
 
-    for _modname, info in sorted(mods.items()):
-        rel = info.rel
-        src = _read(rel, root)
-        if not src.strip():
-            continue
-        try:
-            tree = ast.parse(src)
-        except (SyntaxError, ValueError):
-            continue
-        local_imports: dict[str, tuple[str, ast.AST | None]] = {}
-        pkg = _file_package(rel, mods)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
-                continue                  # plain `import pkg.mod`: not guessed
-            names = [a for a in node.names if a.name != "*"]
-            if not names:
+    with _VerifyCache(root) as cache:
+        mods = _local_py_modules(root, cache=cache)
+
+        for _modname, info in sorted(mods.items()):
+            rel = info.rel
+            tree = cache.py_ast(rel)
+            if tree is None:
                 continue
-            base = node.module or ""
-            prefix = pkg
-            if node.level:
-                if not pkg:
-                    continue      # relative import outside a known package
-                depth = len(pkg.split(".")) - (node.level - 1)
-                if depth < 1:
-                    continue      # escapes the project's package tree
-                prefix = ".".join(pkg.split(".")[:depth])
-                target = f"{prefix}.{base}" if base else prefix
-                # `from . import x` lands here too: target is the package,
-                # and each name is checked as one of its submodules/defs.
-            else:
-                target = base
-            if target not in mods:
-                if not node.level:
-                    continue      # stdlib or third-party: never guessed
-                emit(f"ContractError in {rel}:{node.lineno}: imports "
-                     f"'{'.' * node.level}{base}' from package '{prefix}', "
-                     f"but that module does not exist in the project", rel)
-                continue
-            minfo = mods[target]
-            children = _package_children(mods, target)
-            for a in names:
-                alias = a.asname or a.name
-                if a.name in minfo.exports or a.name in children:
-                    local_imports[alias] = (minfo.rel,
-                                            minfo.defs.get(a.name))
+            local_imports: dict[str, tuple[str, ast.AST | None]] = {}
+            pkg = _file_package(rel, mods)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue                  # plain `import pkg.mod`: not guessed
+                names = [a for a in node.names if a.name != "*"]
+                if not names:
                     continue
-                defines = _local_defs_names(minfo)
-                emit(f"ContractError in {rel}:{node.lineno}: imports "
-                     f"'{a.name}' from {minfo.rel}, but {minfo.rel} only "
-                     f"defines {defines or '[]'}"
-                     + (f" (submodules: {sorted(children)[:4]})"
-                        if children and not defines else ""), rel)
-
-        if not local_imports:
-            continue
-        # Shadowed names are trusted: a same-file def or assignment wins over
-        # the import, and telling them apart from a real drift is guesswork.
-        shadowed: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                 ast.ClassDef)):
-                shadowed.add(node.name)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) \
-                    else [node.target]
-                for t in targets:
-                    if isinstance(t, ast.Name):
-                        shadowed.add(t.id)
-        from .apicheck import _arity_error
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)):
-                continue
-            name = node.func.id
-            if name in shadowed or name not in local_imports:
-                continue
-            src_rel, defnode = local_imports[name]
-            if defnode is None:
-                continue
-            got = _arity_sig(defnode)
-            if got is None:
-                continue
-            sig, _names = got
-            msg = _arity_error(sig, node)
-            if msg:
-                if isinstance(defnode, ast.ClassDef):
-                    kind = "class"
-                    shown = _signature(next(
-                        (n for n in defnode.body if isinstance(n, DEF_NODES)
-                         and n.name == "__init__"), defnode))
+                base = node.module or ""
+                prefix = pkg
+                if node.level:
+                    if not pkg:
+                        continue      # relative import outside a known package
+                    depth = len(pkg.split(".")) - (node.level - 1)
+                    if depth < 1:
+                        continue      # escapes the project's package tree
+                    prefix = ".".join(pkg.split(".")[:depth])
+                    target = f"{prefix}.{base}" if base else prefix
+                    # `from . import x` lands here too: target is the package,
+                    # and each name is checked as one of its submodules/defs.
                 else:
-                    kind = "function"
-                    shown = _signature(defnode)
-                emit(f"ContractError in {rel}:{node.lineno}: calls {name}(...)"
-                     f" ({msg}) imported from {src_rel}, where the {kind} is "
-                     f"defined as {shown or name}", rel)
+                    target = base
+                if target not in mods:
+                    if not node.level:
+                        continue      # stdlib or third-party: never guessed
+                    emit(f"ContractError in {rel}:{node.lineno}: imports "
+                         f"'{'.' * node.level}{base}' from package '{prefix}', "
+                         f"but that module does not exist in the project", rel)
+                    continue
+                minfo = mods[target]
+                children = _package_children(mods, target)
+                for a in names:
+                    alias = a.asname or a.name
+                    if a.name in minfo.exports or a.name in children:
+                        local_imports[alias] = (minfo.rel,
+                                                minfo.defs.get(a.name))
+                        continue
+                    defines = _local_defs_names(minfo)
+                    emit(f"ContractError in {rel}:{node.lineno}: imports "
+                         f"'{a.name}' from {minfo.rel}, but {minfo.rel} only "
+                         f"defines {defines or '[]'}"
+                         + (f" (submodules: {sorted(children)[:4]})"
+                            if children and not defines else ""), rel)
 
-    # JS/TS ES module contracts: relative import existence, exported names,
-    # and imported-function arity. Same diagnostic shape, same touched-first
-    # ordering, same conservative skips.
-    for importer, _target, text in _js_cross_file_errors(root):
-        emit(text, importer)
+            if not local_imports:
+                continue
+            # Shadowed names are trusted: a same-file def or assignment wins over
+            # the import, and telling them apart from a real drift is guesswork.
+            shadowed: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                    shadowed.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) \
+                        else [node.target]
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            shadowed.add(t.id)
+            from .apicheck import _arity_error
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)):
+                    continue
+                name = node.func.id
+                if name in shadowed or name not in local_imports:
+                    continue
+                src_rel, defnode = local_imports[name]
+                if defnode is None:
+                    continue
+                got = _arity_sig(defnode)
+                if got is None:
+                    continue
+                sig, _names = got
+                msg = _arity_error(sig, node)
+                if msg:
+                    if isinstance(defnode, ast.ClassDef):
+                        kind = "class"
+                        shown = _signature(next(
+                            (n for n in defnode.body if isinstance(n, DEF_NODES)
+                             and n.name == "__init__"), defnode))
+                    else:
+                        kind = "function"
+                        shown = _signature(defnode)
+                    emit(f"ContractError in {rel}:{node.lineno}: calls {name}(...)"
+                         f" ({msg}) imported from {src_rel}, where the {kind} is "
+                         f"defined as {shown or name}", rel)
 
-    # ... and the wiring a parse cannot see: a name bound twice at module
-    # level, a call whose exporter was never imported.
-    for importer, _target, text in _js_module_link_errors(root):
-        emit(text, importer)
+        # JS/TS ES module contracts: relative import existence, exported names,
+        # and imported-function arity. Same diagnostic shape, same touched-first
+        # ordering, same conservative skips.
+        for importer, _target, text in _js_cross_file_errors(root, cache=cache):
+            emit(text, importer)
 
-    # Test files calling into (changed) source through dotted
-    # imports or bound instances -- the two spellings the from-import pass
-    # above never sees. Surfaced here, BEFORE the loop spawns pytest.
-    for rel, text in _incoming_test_caller_errors(root, mods):
-        emit(text, rel)
+        # ... and the wiring a parse cannot see: a name bound twice at module
+        # level, a call whose exporter was never imported.
+        for importer, _target, text in _js_module_link_errors(root, cache=cache):
+            emit(text, importer)
+
+        # Test files calling into (changed) source through dotted
+        # imports or bound instances -- the two spellings the from-import pass
+        # above never sees. Surfaced here, BEFORE the loop spawns pytest.
+        for rel, text in _incoming_test_caller_errors(root, mods, cache=cache):
+            emit(text, rel)
 
     out.sort(key=lambda t: (t[0], t[1]))
     return [t for _o, _i, t in out][:20]
@@ -2346,7 +2457,9 @@ def _test_arity_error(call: ast.Call, node: ast.AST, drop_self: bool):
 
 
 def _incoming_test_caller_errors(root: Path,
-                                 mods: dict[str, _Mod]) -> list[tuple[str, str]]:
+                                 mods: dict[str, _Mod],
+                                 cache: _VerifyCache | None = None
+                                 ) -> list[tuple[str, str]]:
     """Arity violations at TEST-file call sites of project source: dotted
     `import mod` + `mod.fn(...)`, `from pkg import submodule` + `sub.fn(...)`,
     and instance-method calls on variables bound by constructor (`store =
@@ -2405,13 +2518,18 @@ def _incoming_test_caller_errors(root: Path,
         rel = info.rel
         if not _is_test_file(rel):
             continue
-        src = _read(rel, root)
-        if not src.strip():
-            continue
-        try:
-            tree = ast.parse(src)
-        except (SyntaxError, ValueError):
-            continue
+        if cache is not None:
+            tree = cache.py_ast(rel)
+            if tree is None:
+                continue
+        else:
+            src = _read(rel, root)
+            if not src.strip():
+                continue
+            try:
+                tree = ast.parse(src)
+            except (SyntaxError, ValueError):
+                continue
         pkg = _file_package(rel, mods)
         class_imports: dict[str, tuple[str, ast.AST]] = {}   # alias -> (rel, class)
         module_alias: dict[tuple[str, ...], str] = {}        # chain -> module rel
@@ -2902,6 +3020,15 @@ def refine_prompt(prompt: str, root, cfg, llm_client,
         system = REFINE_SYSTEM
         if is_simple_web_brief(prompt, snapshot):
             system += "\n\n" + WEB_POLISH_NOTE
+        # Persistent project rules are hard requirements for every Task, Auto
+        # and Refine call. They ride at the end of the system prompt (the
+        # stable prefix), after the built-in architect brief.
+        try:
+            from . import prompts as prompts_mod
+            system = prompts_mod.with_project_rules(
+                system, cfg, root=project_root)
+        except Exception:
+            pass
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         try:
@@ -3244,35 +3371,254 @@ def auto_heal_file(root: Path, rel: str, cfg=None,
     return receipts
 
 
+_JS_MISSING_IMPORT_RE = re.compile(
+    r"^(?:[A-Za-z]*ContractError) in (?P<file>.+?):\d+: calls "
+    r"(?P<name>[A-Za-z_$][\w$]*)\(\) but this module never imports it -- "
+    r"(?P<where>[^,]+?) exports (?P=name), .*?"
+    r"\(add `import \{ (?P=name) \} from '(?P<spec>[^']+)'`\)"
+)
+
+
+@_ts_guarded
+def _insert_js_imports(rel: str, src: str,
+                       additions: dict[str, list[str]]) -> str | None:
+    """Insert or merge unambiguous ES module named imports into `src`,
+    validating the resulting source with tree-sitter before returning it.
+    Returns None when nothing can be safely healed."""
+    suffix = Path(rel).suffix.lower()
+    if suffix not in TS_EXTS:
+        return None
+    root_node = _ts_parse(src, suffix)
+    if root_node is None:
+        return None
+    bound = {name for name, _line, _kind in _js_top_level_bindings(root_node)}
+    filtered: dict[str, list[str]] = {}
+    for spec_str, syms in sorted(additions.items()):
+        keep = sorted({s for s in syms if s and s not in bound})
+        if keep:
+            filtered[spec_str] = keep
+    if not filtered:
+        return None
+
+    healed = src
+    new_lines: list[str] = []
+    for spec_str, syms in filtered.items():
+        merge_rx = re.compile(
+            r"^(?P<head>[ \t]*import\s*\{)(?P<body>[^}\n]*)"
+            r"(?P<tail>\}\s*from\s*(?P<q>['\"])" + re.escape(spec_str)
+            + r"(?P=q)\s*;?[ \t]*)$",
+            re.M,
+        )
+        m = merge_rx.search(healed)
+        if m:
+            existing = [p.strip() for p in m.group("body").split(",")
+                        if p.strip()]
+            to_add = [s for s in syms if s not in existing]
+            if to_add:
+                merged = ", ".join(existing + to_add)
+                rep = f"{m.group('head')} {merged} {m.group('tail')}"
+                healed = healed[:m.start()] + rep + healed[m.end():]
+        else:
+            new_lines.append(
+                f"import {{ {', '.join(syms)} }} from '{spec_str}';")
+
+    if new_lines:
+        # Locate insertion point using tree-sitter's top-level import nodes.
+        cur_root = _ts_parse(healed, suffix)
+        if cur_root is None:
+            return None
+        insert_idx = 0
+        last_import_end = -1
+        for ch in cur_root.named_children:
+            if ch.type == "import_statement":
+                last_import_end = max(last_import_end, ch.end_point[0] + 1)
+        lines = healed.split("\n")
+        if last_import_end >= 0:
+            insert_idx = min(last_import_end, len(lines))
+        else:
+            # Skip shebang, leading comments, and "use strict" directive.
+            idx = 0
+            while idx < len(lines):
+                stripped = lines[idx].strip()
+                if not stripped or stripped.startswith("//") \
+                        or stripped.startswith("#!") \
+                        or stripped in ('"use strict";', "'use strict';",
+                                        '"use strict"', "'use strict'"):
+                    idx += 1
+                    continue
+                break
+            insert_idx = idx
+        lines[insert_idx:insert_idx] = new_lines
+        healed = "\n".join(lines)
+
+    # Validate healed source with tree-sitter before accepting.
+    check_root = _ts_parse(healed, suffix)
+    if check_root is None:
+        return None
+    # Belt-and-braces: ensure we introduced no duplicate top-level binding.
+    counts: dict[str, int] = {}
+    for name, _line, _kind in _js_top_level_bindings(check_root):
+        counts[name] = counts.get(name, 0) + 1
+    for syms in filtered.values():
+        for s in syms:
+            if counts.get(s, 0) != 1:
+                return None
+    return healed
+
+
+def _rel_set(root: Path, files) -> list[str] | None:
+    if files is None:
+        return None
+    root_res = Path(root).resolve()
+    out: list[str] = []
+    for f in files:
+        p = Path(f)
+        if p.is_absolute():
+            try:
+                rel = p.resolve().relative_to(root_res).as_posix()
+            except ValueError:
+                continue
+        else:
+            rel = fileio.normalise_rel(str(f))
+        if rel:
+            out.append(rel)
+    return out
+
+
+@_ts_guarded
+def heal_js_module_imports(root: Path, files=None, errors=None, cfg=None
+                           ) -> tuple[list[str], list[str]]:
+    """Auto-heal unambiguous missing sibling ES imports identified by
+    `_js_module_link_errors`, validating each edited file with tree-sitter
+    before writing to disk.
+
+    Returns `(errors_after, receipts)`. When `auto_heal_imports` is disabled or
+    nothing can be healed unambiguously, returns `(list(errors or []), [])`.
+    """
+    if not _auto_heal_enabled(cfg):
+        return list(errors or []), []
+    root = Path(root)
+    rel_scope = _rel_set(root, files)
+    scope_set = set(rel_scope) if rel_scope is not None else None
+    from_caller = errors is not None
+    raw_errors = (list(errors) if from_caller
+                  else [t for imp, _tgt, t in _js_module_link_errors(root)
+                        if scope_set is None or imp in scope_set])
+    if not raw_errors:
+        return [], []
+
+    # Group unambiguous `(name, spec)` additions by importer file.
+    by_file: dict[str, dict[str, list[str]]] = {}
+    for err in raw_errors:
+        m = _JS_MISSING_IMPORT_RE.match(str(err or "").strip())
+        if not m:
+            continue
+        rel = fileio.normalise_rel(m.group("file"))
+        if scope_set is not None and rel not in scope_set:
+            continue
+        name = m.group("name").strip()
+        spec_str = m.group("spec").strip()
+        if not name or not spec_str:
+            continue
+        by_file.setdefault(rel, {}).setdefault(spec_str, []).append(name)
+
+    if not by_file:
+        return raw_errors, []
+
+    receipts: list[str] = []
+    healed_files: list[str] = []
+    for rel, additions in sorted(by_file.items()):
+        path = root / rel
+        if not path.is_file():
+            continue
+        try:
+            src, style = fileio.read(path)
+        except OSError:
+            continue
+        healed = _insert_js_imports(rel, src, additions)
+        if healed is None or healed == src:
+            continue
+        try:
+            fileio.write(path, healed, style)
+        except OSError:
+            continue
+        healed_files.append(rel)
+        for spec_str, syms in sorted(additions.items()):
+            uniq = ", ".join(sorted(set(syms)))
+            receipts.append(
+                f"[auto-heal] {rel}: added `import {{ {uniq} }} from "
+                f"'{spec_str}';`")
+
+    if not receipts:
+        return raw_errors, []
+
+    if from_caller:
+        try:
+            after = verify_frontend_contracts(root, rel_scope)
+        except Exception:
+            after = raw_errors
+    else:
+        after = [t for imp, _tgt, t in _js_module_link_errors(root)
+                 if scope_set is None or imp in scope_set]
+    return after, receipts
+
+
 def heal_static_gate_errors(root: Path, files, errors, cfg=None
                             ) -> tuple[list[str], list[str]]:
-    """Heal NEW F821 gate errors on disk, then re-run the gate on `files`.
+    """Heal NEW F821 Python gate errors and unambiguous missing sibling ES
+    module imports on disk, then re-run the gates on `files`.
 
     Returns `(errors_after, receipts)`. When nothing can be healed the
     original error list is returned unchanged, so the normal repair path sees
     exactly what it would have seen without this feature."""
     if not _auto_heal_enabled(cfg) or not errors:
         return list(errors or []), []
-    by_file: dict[str, set[str]] = {}
+    py_by_file: dict[str, set[str]] = {}
+    js_errors: list[str] = []
     for err in errors:
         text = str(err or "")
-        if ": F821 " not in text:
-            continue
-        m = re.match(r"^(?P<file>.+?):\d+:\d+: ", text)
-        name_m = _F821_NAME_RE.search(text)
-        if m and name_m:
-            by_file.setdefault(m.group("file"), set()).add(
-                name_m.group(1).strip())
+        if ": F821 " in text:
+            m = re.match(r"^(?P<file>.+?):\d+:\d+: ", text)
+            name_m = _F821_NAME_RE.search(text)
+            if m and name_m:
+                py_by_file.setdefault(m.group("file"), set()).add(
+                    name_m.group(1).strip())
+        elif _JS_MISSING_IMPORT_RE.match(text.strip()):
+            js_errors.append(text)
+
     receipts: list[str] = []
-    for rel, names in sorted(by_file.items()):
-        receipts.extend(auto_heal_file(root, rel, cfg, names=names))
+    py_healed = False
+    for rel, names in sorted(py_by_file.items()):
+        got = auto_heal_file(root, rel, cfg, names=names)
+        if got:
+            py_healed = True
+            receipts.extend(got)
+
+    js_after: list[str] = []
+    js_healed = False
+    if js_errors:
+        js_after, js_receipts = heal_js_module_imports(
+            root, files=files, errors=js_errors, cfg=cfg)
+        if js_receipts:
+            js_healed = True
+            receipts.extend(js_receipts)
+
     if not receipts:
         return list(errors or []), []
-    timeout = float(_get(cfg, "static_gate_timeout", _RUFF_TIMEOUT))
-    try:
-        after = run_fast_static_gate(root, files, timeout=timeout)
-    except Exception:
-        after = list(errors or [])
+
+    after: list[str] = []
+    if py_healed:
+        timeout = float(_get(cfg, "static_gate_timeout", _RUFF_TIMEOUT))
+        try:
+            after.extend(run_fast_static_gate(root, files, timeout=timeout))
+        except Exception:
+            after.extend([e for e in errors if not _JS_MISSING_IMPORT_RE.match(str(e or "").strip())])
+    else:
+        after.extend([e for e in errors if not _JS_MISSING_IMPORT_RE.match(str(e or "").strip())])
+    if js_healed:
+        after.extend(js_after)
+    elif js_errors:
+        after.extend(js_errors)
     return after, receipts
 
 
@@ -4002,7 +4348,7 @@ def _fe_external(ref: str) -> bool:
             or _FE_TEMPLATE_REF_RE.search(ref) is not None)
 
 
-def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
+def _fe_js_syntax_problem(rel: str, text: str, ts_ok: bool = False) -> str | None:
     """Return `line: message` when `rel` does not parse, else None.
     `node --check` is the ground truth when node is installed; otherwise the
     tree-sitter grammar the indexer already uses reports the first ERROR
@@ -4047,6 +4393,8 @@ def _fe_js_syntax_problem(rel: str, text: str) -> str | None:
             return f"{line}: {msg[:200] or 'node --check failed'}"
         except (OSError, subprocess.TimeoutExpired):
             pass  # node unusable right now: fall through to tree-sitter
+    if ts_ok:
+        return None
     try:
         from . import chunker_ts
         parser = chunker_ts._get_parser("javascript")
@@ -4097,139 +4445,141 @@ def verify_frontend_contracts(root: Path, modified_files=None) -> list[str]:
     the whole frontend (scaffold and one-shot audits). Returns plain strings,
     sorted, capped -- deterministic, no LLM."""
     root = Path(root)
-    html_rels = _iter_code_files(root, _FE_HTML_EXTS)
-    js_rels = _iter_code_files(root, _FE_JS_EXTS)
-    module_rels = _iter_code_files(root, TS_EXTS)
-    if not html_rels and not js_rels and not module_rels:
-        return []
-    scope = None
-    if modified_files:
-        scope = set()
-        for f in modified_files:
-            try:
-                scope.add(Path(str(f)).relative_to(root).as_posix())
-            except (ValueError, OSError, TypeError):
-                scope.add(str(f).replace("\\", "/"))
-    html_text = {rel: _read(rel, root) for rel in html_rels}
-    js_text = {rel: _read(rel, root) for rel in js_rels}
-    errors: list[str] = []
+    with _VerifyCache(root) as cache:
+        html_rels = cache.files(_FE_HTML_EXTS)
+        js_rels = cache.files(_FE_JS_EXTS)
+        module_rels = cache.files(TS_EXTS)
+        if not html_rels and not js_rels and not module_rels:
+            return []
+        scope = None
+        if modified_files:
+            scope = set()
+            for f in modified_files:
+                try:
+                    scope.add(Path(str(f)).relative_to(root).as_posix())
+                except (ValueError, OSError, TypeError):
+                    scope.add(str(f).replace("\\", "/"))
+        html_changed = scope is not None and any(
+            rel in scope for rel in html_rels)
+        if scope is not None and not html_changed \
+                and not any(rel in scope for rel in js_rels + module_rels):
+            return []   # an edit to a non-frontend file cannot break the page
 
-    html_changed = scope is not None and any(
-        rel in scope for rel in html_rels)
-    if scope is not None and not html_changed \
-            and not any(rel in scope for rel in js_rels + module_rels):
-        return []   # an edit to a non-frontend file cannot break the page
+        html_text = {rel: cache.read(rel) for rel in html_rels}
+        js_text = {rel: cache.read(rel) for rel in js_rels}
+        errors: list[str] = []
 
-    def note(rel: str, line: int, msg: str, peer: bool = False) -> None:
-        if scope is None or rel in scope:
-            errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
-        elif peer and html_changed:
-            # the id registry moved: a query in UNTOUCHED JS can have been
-            # broken by the HTML edit, and that is this task's breakage
-            errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
+        def note(rel: str, line: int, msg: str, peer: bool = False) -> None:
+            if scope is None or rel in scope:
+                errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
+            elif peer and html_changed:
+                # the id registry moved: a query in UNTOUCHED JS can have been
+                # broken by the HTML edit, and that is this task's breakage
+                errors.append(f"FrontendContractError in {rel}:{line}: {msg}")
 
-    # 1. asset link integrity: html references a script/css path, file absent
-    for rel, text in html_text.items():
-        refs = []
-        for m in _FE_SCRIPT_SRC_RE.finditer(text):
-            refs.append((m.group(1), m.start(), "script"))
-        for m in _FE_LINK_RE.finditer(text):
-            tag = m.group(0)
-            if "stylesheet" not in (_FE_REL_RE.search(tag).group(1).lower()
-                                    if _FE_REL_RE.search(tag) else ""):
-                continue
-            hm = _FE_HREF_RE.search(tag)
-            if hm:
-                refs.append((hm.group(1), m.start(), "stylesheet"))
-        for ref, pos, kind in refs:
-            if _fe_external(ref):
-                continue
-            clean = ref.split("?")[0].split("#")[0]
-            if not clean or not clean.lower().endswith(_FE_ASSET_EXTS):
-                continue  # an extensionless ref is a route, not an asset file
-            base = (root / rel).parent
-            cand = [(base / clean), (root / clean.lstrip("/"))]
-            if not any(c.exists() for c in cand):
-                note(rel, _fe_line(text, pos),
-                     f"references missing {kind} asset '{ref}' -- create the "
-                     f"file or fix the path; the browser would 404 it")
+        # 1. asset link integrity: html references a script/css path, file absent
+        for rel, text in html_text.items():
+            refs = []
+            for m in _FE_SCRIPT_SRC_RE.finditer(text):
+                refs.append((m.group(1), m.start(), "script"))
+            for m in _FE_LINK_RE.finditer(text):
+                tag = m.group(0)
+                if "stylesheet" not in (_FE_REL_RE.search(tag).group(1).lower()
+                                        if _FE_REL_RE.search(tag) else ""):
+                    continue
+                hm = _FE_HREF_RE.search(tag)
+                if hm:
+                    refs.append((hm.group(1), m.start(), "stylesheet"))
+            for ref, pos, kind in refs:
+                if _fe_external(ref):
+                    continue
+                clean = ref.split("?")[0].split("#")[0]
+                if not clean or not clean.lower().endswith(_FE_ASSET_EXTS):
+                    continue  # an extensionless ref is a route, not an asset file
+                base = (root / rel).parent
+                cand = [(base / clean), (root / clean.lstrip("/"))]
+                if not any(c.exists() for c in cand):
+                    note(rel, _fe_line(text, pos),
+                         f"references missing {kind} asset '{ref}' -- create the "
+                         f"file or fix the path; the browser would 404 it")
 
-    # 2. DOM id cross-reference: JS queries vs ids the HTML/JS defines
-    defined_ids: set[str] = set()
-    html_names: list[str] = []
-    for rel, text in html_text.items():
-        found = set(_FE_ID_ATTR_RE.findall(text))
-        if found:
-            defined_ids |= found
-            html_names.append(rel)
-    dynamic_js = {rel for rel, text in js_text.items()
-                  if _FE_TEMPLATE_INTERP_ID_RE.search(text)}
-    if (html_text or defined_ids) and js_text:
+        # 2. DOM id cross-reference: JS queries vs ids the HTML/JS defines
+        defined_ids: set[str] = set()
+        html_names: list[str] = []
+        for rel, text in html_text.items():
+            found = set(_FE_ID_ATTR_RE.findall(text))
+            if found:
+                defined_ids |= found
+                html_names.append(rel)
+        dynamic_js = {rel for rel, text in js_text.items()
+                      if _FE_TEMPLATE_INTERP_ID_RE.search(text)}
+        if (html_text or defined_ids) and js_text:
+            for rel, text in js_text.items():
+                for m in _FE_SETID_RE.finditer(text):
+                    defined_ids.add(m.group(2))
+                for m in _FE_SETATTR_ID_RE.finditer(text):
+                    defined_ids.add(m.group(3))
         for rel, text in js_text.items():
-            for m in _FE_SETID_RE.finditer(text):
-                defined_ids.add(m.group(2))
-            for m in _FE_SETATTR_ID_RE.finditer(text):
-                defined_ids.add(m.group(3))
-    for rel, text in js_text.items():
-        if rel in dynamic_js:
-            continue  # this file builds ids at runtime; nothing to verify
-        if scope is not None and rel not in scope and not html_changed:
-            continue  # neither this file nor the id registry was touched
-        queries = [(m.group(2), m.start()) for m in _FE_GETID_RE.finditer(text)]
-        queries += [(m.group(2), m.start())
-                    for m in _FE_QS_ID_RE.finditer(text)]
-        for ident, pos in sorted(set(queries), key=lambda t: t[1]):
-            if ident in defined_ids or "%" in ident:
+            if rel in dynamic_js:
+                continue  # this file builds ids at runtime; nothing to verify
+            if scope is not None and rel not in scope and not html_changed:
+                continue  # neither this file nor the id registry was touched
+            queries = [(m.group(2), m.start()) for m in _FE_GETID_RE.finditer(text)]
+            queries += [(m.group(2), m.start())
+                        for m in _FE_QS_ID_RE.finditer(text)]
+            for ident, pos in sorted(set(queries), key=lambda t: t[1]):
+                if ident in defined_ids or "%" in ident:
+                    continue
+                if not html_text:
+                    break  # no templates at all: queries belong to a lib/test
+                known = sorted(defined_ids)[:5]
+                where = ", ".join(html_names[:3]) if html_names else "any script"
+                note(rel, _fe_line(text, pos),
+                     f"queries DOM element '#{ident}', but {where} only defines "
+                     f"ids {known or '[]'} -- render it, or fix the selector",
+                     peer=True)
+
+        # 3. JS syntax: the file must parse or the browser aborts it entirely
+        for rel, text in js_text.items():
+            if not text.strip():
                 continue
-            if not html_text:
-                break  # no templates at all: queries belong to a lib/test
-            known = sorted(defined_ids)[:5]
-            where = ", ".join(html_names[:3]) if html_names else "any script"
-            note(rel, _fe_line(text, pos),
-                 f"queries DOM element '#{ident}', but {where} only defines "
-                 f"ids {known or '[]'} -- render it, or fix the selector",
-                 peer=True)
+            ts_ok = cache.ts_root(rel) is not None
+            problem = _fe_js_syntax_problem(rel, text, ts_ok=ts_ok)
+            if problem:
+                line, _, msg = problem.partition(": ")
+                note(rel, int(line) if line.isdigit() else 1,
+                     f"does not parse -- {msg[:220]}")
 
-    # 3. JS syntax: the file must parse or the browser aborts it entirely
-    for rel, text in js_text.items():
-        if not text.strip():
-            continue
-        problem = _fe_js_syntax_problem(rel, text)
-        if problem:
-            line, _, msg = problem.partition(": ")
-            note(rel, int(line) if line.isdigit() else 1,
-                 f"does not parse -- {msg[:220]}")
+        # 4. ES module contracts: a relative import that points at no
+        # file or names an export the target does not have, and an imported call
+        # whose argument count cannot satisfy the real signature. Bare packages
+        # and dynamic imports are deliberately absent from the helper's output.
+        for importer, target, text in _js_cross_file_errors(root, cache=cache):
+            if scope is None or importer in scope or (target and target in scope):
+                errors.append(text)
 
-    # 4. ES module contracts: a relative import that points at no
-    # file or names an export the target does not have, and an imported call
-    # whose argument count cannot satisfy the real signature. Bare packages
-    # and dynamic imports are deliberately absent from the helper's output.
-    for importer, target, text in _js_cross_file_errors(root):
-        if scope is None or importer in scope or (target and target in scope):
-            errors.append(text)
+        # 5. ES module WIRING: the two failures a parse accepts and the browser
+        # aborts on -- a module-level name bound twice (`import { WAYPOINTS }`
+        # appended by an incremental edit next to the import that already binds
+        # it) and a call to a name this module neither declares nor imports.
+        # Neither is visible to `has_syntax_error` or to the DOM checks above, and
+        # both kill the whole module graph before a single line runs.
+        for importer, target, text in _js_module_link_errors(root, cache=cache):
+            if scope is None or importer in scope or (target and target in scope):
+                errors.append(text)
 
-    # 5. ES module WIRING: the two failures a parse accepts and the browser
-    # aborts on -- a module-level name bound twice (`import { WAYPOINTS }`
-    # appended by an incremental edit next to the import that already binds
-    # it) and a call to a name this module neither declares nor imports.
-    # Neither is visible to `has_syntax_error` or to the DOM checks above, and
-    # both kill the whole module graph before a single line runs.
-    for importer, target, text in _js_module_link_errors(root):
-        if scope is None or importer in scope or (target and target in scope):
-            errors.append(text)
+        # 6. runtime-fatal assignments: a write to a const/import binding parses
+        # clean and throws TypeError the first time the line runs (BUG-210).
+        for rel, _peer, text in _js_const_reassign_errors(root, cache=cache):
+            if scope is None or rel in scope:
+                errors.append(text)
 
-    # 6. runtime-fatal assignments: a write to a const/import binding parses
-    # clean and throws TypeError the first time the line runs (BUG-210).
-    for rel, _peer, text in _js_const_reassign_errors(root):
-        if scope is None or rel in scope:
-            errors.append(text)
-
-    # 7. instance-method contracts: `engine.setBpm(...)` on a project class
-    # that defines no setBpm is a TypeError on the first slider move, and no
-    # import/DOM check sees it (BUG-211).
-    for rel, peer, text in _js_instance_method_errors(root):
-        if scope is None or rel in scope or (peer and peer in scope):
-            errors.append(text)
+        # 7. instance-method contracts: `engine.setBpm(...)` on a project class
+        # that defines no setBpm is a TypeError on the first slider move, and no
+        # import/DOM check sees it (BUG-211).
+        for rel, peer, text in _js_instance_method_errors(root, cache=cache):
+            if scope is None or rel in scope or (peer and peer in scope):
+                errors.append(text)
     return sorted(set(errors))[:_FE_ERRORS_CAP]
 
 

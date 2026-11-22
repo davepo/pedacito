@@ -239,3 +239,119 @@ def test_proc_spawn_terminate_kills_the_whole_tree(tmp_path):
     child.wait(timeout=5)
     assert _dead(parent), f"child {parent} survived terminate()"
     assert _dead(grandchild), f"grandchild {grandchild} survived terminate()"
+
+
+def test_proc_terminate_kills_group_when_getpgid_raises_lookup_error(monkeypatch):
+    """If the group leader already exited (ProcessLookupError from getpgid),
+    terminate() must still killpg(proc.pid, SIGKILL) so orphaned grandchildren
+    in that process group die."""
+    import os
+    import signal
+
+    if os.name == "nt":
+        pytest.skip("POSIX process-group test")
+    events: list[tuple] = []
+
+    class FakeProc:
+        pid = 98765
+
+        def kill(self):
+            events.append(("kill", self.pid))
+
+    def fake_getpgid(pid):
+        events.append(("getpgid", pid))
+        raise ProcessLookupError
+
+    def fake_killpg(pgid, sig):
+        events.append(("killpg", pgid, sig))
+
+    monkeypatch.setattr(proc.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(proc.os, "killpg", fake_killpg)
+    proc.terminate(FakeProc())
+    assert events == [
+        ("getpgid", 98765),
+        ("killpg", 98765, signal.SIGKILL),
+        ("kill", 98765),
+    ]
+
+
+def test_rpc_worker_finally_only_clears_matching_active_req_id():
+    """A finishing worker must clear _active strictly in finally: and never
+    clobber a newer task's _active req_id."""
+    import threading
+    from pedacito import rpc
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_run(task, apply=False, refine=False, plan=None):
+        entered.set()
+        release.wait(5)
+        return type("R", (), {"reply": "ok", "applied": False, "results": [],
+                              "ok": True, "stats": {}})()
+
+    buf = io.StringIO()
+    srv = rpc.RpcServer(
+        run=slow_run, explain=lambda s: s, status=lambda: {},
+        switch=lambda r, k: r, output=rpc.RpcOut(buf))
+    srv._set_active("req-1")
+    t = threading.Thread(
+        target=srv._task_worker,
+        args=("req-1", "ask", "work", False, False, None), daemon=True)
+    t.start()
+    assert entered.wait(5)
+    # Simulate another request having become active before req-1 finishes.
+    srv._set_active("req-2")
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert srv._tag_for(None) == "req-2"
+    assert srv._busy.is_set()
+    # Matching req-2 clears cleanly.
+    srv._set_active(None, expected="req-2")
+    assert srv._tag_for(None) is None
+    assert not srv._busy.is_set()
+
+
+def test_rpc_serve_restores_previous_permission_hook():
+    """serve() must restore whatever permission hook was installed before it
+    started, without clobbering a different hook if someone else replaced it."""
+    def prev_hook(info):
+        return True, ""
+
+    security.install_permission_hook(prev_hook)
+    h = Harness()
+    assert security.permission_handler() == h.server._permission_request
+    h.stop()
+    assert security.permission_handler() is prev_hook
+
+
+def test_rpc_eof_join_grace_cancels_active_client(monkeypatch):
+    """When stdin hits EOF and the worker outlives EOF_JOIN_GRACE, serve()
+    must cancel self._client so a mid-stream LLM call unwinds promptly."""
+    import threading
+    from pedacito import rpc
+
+    monkeypatch.setattr(rpc, "EOF_JOIN_GRACE", 0.15)
+    monkeypatch.setattr(rpc, "EOF_CANCEL_GRACE", 1.0)
+    cancelled = threading.Event()
+    started = threading.Event()
+
+    class CancelClient:
+        def cancel(self):
+            cancelled.set()
+
+    def stuck_run(h, task, apply, refine, plan, r):
+        started.set()
+        cancelled.wait(5)
+        r.reply = "unwound"
+        return r
+
+    h = Harness(run=stuck_run)
+    h.server.set_client(CancelClient())
+    h.inp.feed({"id": 1, "method": "ask", "params": {"task": "stream"}})
+    assert started.wait(5)
+    h.inp.close()
+    h.thread.join(timeout=5)
+    assert not h.thread.is_alive()
+    assert cancelled.is_set()

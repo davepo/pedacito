@@ -51,18 +51,22 @@ from . import fileio
 from . import fold as fold_mod
 from . import gitinfo
 from . import hooks as hooks_mod
+from . import imagegen as imagegen_mod
 from . import instructions as instructions_mod
 from . import mcp as mcp_mod
 from . import memory as memory_mod
 from . import prompts as prompts_mod
 from . import safety
+from . import select as select_mod
 from . import sessions as sessions_mod
 from . import skills as skills_mod
 from . import steering as steering_mod
 from . import todo as todo_mod
 from .config import is_hosted
 from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
-from .llm import LLMError, _is_local_server, estimate_messages, estimate_tokens
+from .llm import (IMAGE_TOKENS_ESTIMATE, CancelledError, LLMError,
+                  _append_message_text, _is_local_server,
+                  estimate_messages, estimate_tokens)
 from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
@@ -331,6 +335,94 @@ def _step_signature(step: dict) -> tuple:
         if k != "reasoning"))
 
 
+_OSCILLATION_WINDOW = 8
+_MAX_HYPOTHESIS_LEDGER = 5
+_TAIL_PRIORITY_ACTIONS = frozenset({"run", "diagnose", "serve", "git_diff"})
+_GREP_HIT_RE = re.compile(r"^([^:\n]+?):(\d+)([:-])")
+
+
+def _oscillation_key(step: dict) -> tuple[str, str]:
+    """Normalized `(action, target)` signature for ping-pong oscillation
+    detection across a rolling window of gather steps."""
+    s = step or {}
+    action = str(s.get("action") or "").strip().lower()
+    raw_file = str(s.get("file") or "").strip()
+    norm_file = fileio.path_key(raw_file) if raw_file else ""
+    if action == "read":
+        if norm_file:
+            target = f"{norm_file}:{s.get('start', 0)}-{s.get('end', 0)}"
+        else:
+            target = str(s.get("symbol") or "").strip().lower()
+    elif action == "grep":
+        pat = str(s.get("pattern") or "").strip().lower()
+        target = f"{norm_file}:{pat}" if norm_file else pat
+    elif action == "mcp_call":
+        srv = str(s.get("server") or "").strip().lower()
+        tl = str(s.get("tool") or "").strip().lower()
+        target = f"{srv}.{tl}" if srv or tl else ""
+    else:
+        target = ""
+        for k in ("file", "symbol", "pattern", "command", "target", "url", "query"):
+            v = str(s.get(k) or "").strip()
+            if v:
+                target = fileio.path_key(v) if k == "file" else v.lower()
+                break
+    return action, target[:120]
+
+
+def _detect_oscillation(window: list[tuple[str, str]]) -> int:
+    """Return oscillation period (2 or 3) when the tail of `window` forms a
+    period-2 (`[A, B, A, B]`, A != B) or period-3 (`[A, B, C, A, B, C]`,
+    >= 2 distinct steps) ping-pong cycle, else 0."""
+    if len(window) >= 4 and window[-4:-2] == window[-2:] \
+            and window[-1] != window[-2]:
+        return 2
+    if len(window) >= 6 and window[-6:-3] == window[-3:] \
+            and len(set(window[-3:])) >= 2:
+        return 3
+    return 0
+
+
+def _group_cap_grep(obs: str, max_per_file: int = 5) -> str:
+    """Group-cap `grep` hits at `max_per_file` hits per file so one noisy file
+    never drowns out matches in other files before global truncation."""
+    lines = obs.split("\n")
+    counts: dict[str, int] = {}
+    dropped: dict[str, int] = {}
+    out: list[str] = []
+    # Preserve order; record a compact overflow note right where each file's
+    # block ends (or at the tail if interleaved).
+    last_file: str | None = None
+
+    def _flush_file(rel: str | None) -> None:
+        if rel is not None and dropped.get(rel, 0) > 0:
+            n = dropped.pop(rel)
+            out.append(f"  ... (+{n} more hit(s) in {rel})")
+
+    for ln in lines:
+        m = _GREP_HIT_RE.match(ln)
+        if not m:
+            _flush_file(last_file)
+            last_file = None
+            out.append(ln)
+            continue
+        rel = m.group(1)
+        if last_file is not None and rel != last_file:
+            _flush_file(last_file)
+        last_file = rel
+        c = counts.get(rel, 0)
+        if c < max_per_file:
+            counts[rel] = c + 1
+            out.append(ln)
+        else:
+            dropped[rel] = dropped.get(rel, 0) + 1
+    _flush_file(last_file)
+    for rel, n in list(dropped.items()):
+        if n > 0:
+            out.append(f"  ... (+{n} more hit(s) in {rel})")
+    return "\n".join(out)
+
+
 def _norm_key(path: str) -> str:
     """Normalise a read-ledger path. Models alternate between `pkg/a.py` and
     `./pkg/a.py`; the ledger, eviction pass and coverage must share one key."""
@@ -514,22 +606,33 @@ def _evict_duplicate_reads(messages: list[dict], gathered: list[str],
     """
     if not spans or not any(len(seq) > 1 for seq in spans.values()):
         return gathered
-    deltas = _first_seen_spans(spans)
 
+    seen_g: dict[str, list[tuple[int, int]]] = {}
     new_items: list[str] = []
     for g in gathered:
-        head = g.split("\n", 1)[0]
-        if head.startswith("--- read ") and "\n" in g:
-            rest = head[len("--- read "):].strip()
-            key = _norm_key(rest.rsplit(" L", 1)[0])
-            body = g.split("\n", 1)[1]
-            keep = deltas.get(key)
-            if keep is None:
-                new_items.append(g)
-            else:
-                new_items.append(head + "\n" + _slice_numbered(body, keep))
-        else:
-            new_items.append(g)
+        head, sep, body = g.partition("\n")
+        if head.startswith("--- read ") and sep:
+            m = _READ_HEAD_RX.match(body)
+            if m:
+                key = _norm_key(m.group(1))
+                s_, e_ = int(m.group(2)), int(m.group(3))
+                prior = seen_g.get(key, [])
+                uncovered = _subtract_spans([(s_, e_)], prior)
+                if uncovered == [(s_, e_)]:
+                    new_items.append(g)
+                elif uncovered:
+                    new_items.append(head + "\n" + _slice_numbered(body, uncovered))
+                else:
+                    new_items.append(
+                        head + "\n"
+                        + f"{m.group(1).strip()} lines {s_}-{e_}: "
+                          "[all of these lines were duplicates of an earlier read]"
+                    )
+                shown_end = _delivered_end(body, s_)
+                if shown_end >= s_:
+                    seen_g[key] = _fold_spans(prior + [(s_, shown_end)])
+                continue
+        new_items.append(g)
 
     # Oldest -> newest, so each turn keeps only lines no earlier turn showed.
     for i, msg in enumerate(messages):
@@ -1124,6 +1227,9 @@ def _trim_gathered(src: str, too_big, requirements=None, diagnostics=None,
         if hasattr(requirements, "pinned_spans") else []
     pins += _diagnostic_pins(diagnostics)
     pinned = {i for i, m in enumerate(metas) if _item_has_pin(m, pins)}
+    # Explicitly pinned context blocks are never eligible for eviction, no
+    # matter how tight the request budget is.
+    pinned |= {i for i, m in enumerate(metas) if m.kind == "pinned"}
     terms = requirements.packing_terms() \
         if hasattr(requirements, "packing_terms") else []
     anchor_files = {rel for rel, _a, _b in pins if rel}
@@ -1252,7 +1358,7 @@ def _evict_overflow_turns(messages: list[dict], client, cfg) -> bool:
     est = getattr(client, "estimate_tokens", None) or estimate_tokens
 
     def over_by() -> int:
-        return sum(est(m["content"]) for m in messages) - room
+        return estimate_messages(messages, est) - room
 
     changed_any = False
     while over_by() > -headroom:
@@ -1317,6 +1423,14 @@ class Agent:
         self.index = index
         self.client = client
         self.cfg = cfg
+        # Keep the prompt layer's project-root pointer valid before gather():
+        # persistent rules and prompt overrides resolve from it, and callers
+        # (tests, scaffold, explain) may ask for an answer without a lookup.
+        try:
+            if getattr(index, "root", None) is not None:
+                self.cfg._root = str(index.root)
+        except Exception:
+            pass
         # The tool dispatcher resolves a `task` subagent's parent through this
         # back-reference (kept out of dispatch()'s call signature so existing
         # monkeypatched dispatchers remain compatible).
@@ -1327,6 +1441,11 @@ class Agent:
         # Set by gather(); _repair_source() falls back to it for files no
         # longer on disk.
         self.gathered_source = ""
+        # Explicitly pinned context resolved from the task's @mentions and
+        # the request's `pinned` list. `pinned_context` is already-rendered
+        # source placed ahead of every automatically retrieved item.
+        self.pinned_items: list = []
+        self.pinned_context = ""
         # When set, gather() mines "files the task will change" from this text
         # (the clean plan title) instead of the full prompt, so goal prose and
         # prior reports do not become forced must-reads.
@@ -1380,6 +1499,32 @@ class Agent:
         # SEARCH blocks that matched nowhere in the file, over every apply()
         # round of this agent (the eval row reports it next to repair calls).
         self.search_mismatches = 0
+        # Harness-owned TRIED & FAILED hypothesis ledger: up to 5 compact
+        # `(target, concise_error)` entries carried into repair prompts and
+        # STATE folds so small models stop repeating broken patches.
+        self._failed_hypotheses: list[tuple[str, str]] = []
+
+    def _record_failed_hypothesis(self, target: str, error: str) -> None:
+        """Record a compact `(target -> concise error)` failure in the
+        harness hypothesis ledger (deduplicated, capped at 5 entries)."""
+        tgt = " ".join(str(target or "").split())[:80] or "(general)"
+        err_lines = [ln.strip() for ln in str(error or "").splitlines()
+                     if ln.strip()]
+        err = " ".join((err_lines[0] if err_lines else "").split())[:140]
+        if not err:
+            return
+        pair = (tgt, err)
+        if pair in self._failed_hypotheses:
+            self._failed_hypotheses.remove(pair)
+        self._failed_hypotheses.append(pair)
+        if len(self._failed_hypotheses) > _MAX_HYPOTHESIS_LEDGER:
+            self._failed_hypotheses = (
+                self._failed_hypotheses[-_MAX_HYPOTHESIS_LEDGER:])
+
+    def _format_hypothesis_ledger(self) -> str:
+        """Render the `TRIED & FAILED` hypothesis ledger, or '' when empty."""
+        return fold_mod.format_hypotheses(
+            self._failed_hypotheses, max_items=_MAX_HYPOTHESIS_LEDGER)
 
     # ------------------------------------------------------------ helpers
     def _creative_for(self, task: str) -> bool:
@@ -1573,6 +1718,23 @@ class Agent:
         if self.events is not None:
             self.events.emit(kind, **fields)
 
+    def _run_cancelled(self) -> bool:
+        """True when the active run's cancel token was set (GUI Stop/TUI
+        Ctrl-C). Checked between gather steps so no new model call starts."""
+        for source in (getattr(self.cfg, "_cancel_event", None),
+                       getattr(self.client, "cancel_event", None)):
+            if source is None:
+                continue
+            checker = getattr(source, "is_set", None)
+            try:
+                if callable(checker) and checker():
+                    return True
+                if callable(source) and source():
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _note_lease_strike(self, task: str) -> None:
         """A no-progress lease spent on this task. TWO leases on one task
         (across its attempts) are an escalation signal: the profile is not
@@ -1603,8 +1765,14 @@ class Agent:
     def _cap_observation(self, action: str, obs: str) -> str:
         """Per-action ceiling for everything but source reads: one broad grep,
         a chatty command or a big MCP reply must not eat the gather budget or
-        the tail of the window. Cut on a line boundary, say how much was left
-        and how to narrow it."""
+        the tail of the window.
+
+        - `run`, `diagnose`, `serve`, `git_diff`: preserve 25% head +
+          `... [omitted N chars] ...` + 75% tail so tracebacks and exit
+          summaries at the bottom survive.
+        - `grep`: group-cap at max 5 hits per file first, then fall back to
+          the global cap if still over budget.
+        - Everything else: cut on a line boundary with a narrowing hint."""
         if action in ("read", "context", "done", "todo") \
                 or obs.startswith("ERROR"):
             return obs
@@ -1615,6 +1783,23 @@ class Agent:
         cap = int(tokens * 3.6)
         if len(obs) <= cap:
             return obs
+        if action in _TAIL_PRIORITY_ACTIONS:
+            head_cap = max(1, cap // 4)
+            tail_cap = max(1, cap - head_cap)
+            head = obs[:head_cap]
+            h_nl = head.rfind("\n")
+            if h_nl > head_cap // 2:
+                head = head[:h_nl]
+            tail = obs[-tail_cap:]
+            t_nl = tail.find("\n")
+            if 0 <= t_nl < tail_cap // 2:
+                tail = tail[t_nl + 1:]
+            omitted = max(1, len(obs) - len(head) - len(tail))
+            return f"{head}\n... [omitted {omitted} chars] ...\n{tail}"
+        if action == "grep":
+            obs = _group_cap_grep(obs, max_per_file=5)
+            if len(obs) <= cap:
+                return obs
         cut = obs[:cap]
         nl = cut.rfind("\n")
         if nl > cap // 2:
@@ -2100,10 +2285,12 @@ class Agent:
             max_chars = max(500, min(2500, int(room * 3.6 * 0.10)))
             while True:
                 before = estimate_messages(messages, est)
-                if fold_mod.fold_middle(messages, keep, max_chars):
+                if fold_mod.fold_middle(messages, keep, max_chars,
+                                        hypotheses=self._failed_hypotheses):
                     self._after_fold(messages, est, before, client)
                     changed = True
-                if estimate_messages(messages, est) <= room or keep <= 1:
+                    break
+                if keep <= 1:
                     break
                 keep -= 1
         if estimate_messages(messages, est) > room:
@@ -2161,7 +2348,8 @@ class Agent:
                on_step=None, base: str | None = None,
                backup_dir=None,
                prefix_messages: list[dict] | None = None,
-               is_repair: bool = False) -> str:
+               is_repair: bool = False,
+               images: list[dict] | None = None) -> str:
         """Run the tool-calling loop until the model says `done`, the
         gathered-source budget is exhausted, or cfg.max_steps (0 = no limit)
         is reached.
@@ -2189,6 +2377,8 @@ class Agent:
         """
         # A fresh run: drop any backup directory left by a previous task.
         self.cfg._backup_dir = backup_dir
+        if not is_repair:
+            self._failed_hypotheses = []
         root = self.index.root
         self.cfg._root = str(root)
         self.cfg._is_git = gitinfo.is_repo(root)
@@ -2227,6 +2417,56 @@ class Agent:
         self._set_site("gather", gclient)
         self._prime_fewshot(gclient)
         repo_map, tier = self._map(task)
+        # Explicit context pins are resolved BEFORE automatic retrieval: the
+        # task's `@file`/`@symbol` mentions plus any request-level `pinned`
+        # list. Their source text is placed ahead of the map in user0 and is
+        # never subject to automatic scoring/eviction.
+        self.pinned_items = []
+        self.pinned_context = ""
+        try:
+            pins = select_mod.parse_pinned_references(task, self.index)
+            refs = [str(ref).strip() for ref in
+                    (getattr(self.cfg, "_pinned_refs", ()) or ())
+                    if str(ref).strip()]
+            # `skill:NAME` refs are the manual `/skill NAME` (TUI) and
+            # "Use in next task" (GUI) injection. They ride the same
+            # pinned-context block as @file/@symbol, resolved here where the
+            # Config is available so the shipped project/user/bundled
+            # precedence applies.
+            skill_refs = [ref for ref in refs
+                          if ref.lower().startswith("skill:")]
+            file_refs = [ref for ref in refs
+                         if not ref.lower().startswith("skill:")]
+            pins.extend(select_mod.resolve_pinned_references(
+                file_refs, self.index))
+            for ref in skill_refs:
+                name = ref.split(":", 1)[1].strip()
+                if not name:
+                    continue
+                text, info = skills_mod.load(self.index.root, self.cfg, name)
+                if info is None:
+                    continue
+                # `load` returns "SKILL name (source):\n<body>"; keep the
+                # full body and let render_pinned_context supply the header.
+                body = text.split("\n", 1)[1] if "\n" in text else text
+                pins.append(select_mod.PinnedContext(
+                    raw_token=ref, kind="skill",
+                    path=str(info.get("source") or ""),
+                    symbol_name=name.strip().lower(), content=body))
+            self.pinned_items = select_mod._dedupe_pins(pins)
+        except Exception:
+            self.pinned_items = []
+        if self.pinned_items:
+            self.pinned_context = select_mod.render_pinned_context(
+                self.pinned_items)
+            summary = select_mod.pinned_summary(self.pinned_items)
+            print(f"Pinned context: {summary}", file=sys.stderr)
+            self._emit(
+                "pinned_context", summary=summary,
+                items=[{"kind": p.kind, "path": p.path,
+                        "symbol": p.symbol_name,
+                        "start": p.start_line, "end": p.end_line}
+                       for p in self.pinned_items])
         hint = {"flat": FLAT_HINT, "cards": CARDS_HINT,
                 "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
         system = prompts_mod.gather_system(
@@ -2293,16 +2533,25 @@ class Agent:
             examples = fewshot_block(
                 self._fewshot_shots(FEWSHOT_USER0_READ_LINES),
                 schema_for(self.cfg))
+        pinned_section = ""
+        if self.pinned_context:
+            pinned_section = ("### Explicitly Pinned Context\n\n"
+                              + self.pinned_context + "\n\n")
         user0 = (lead + "\n\n" if lead else "") \
+            + pinned_section \
             + f"PROJECT MAP\n\n{repo_map}\n\n" \
             + (examples + "\n\n" if examples else "") + f"TASK\n{task}"
         if safety.has_secret(task) and is_hosted(self.cfg) \
                 and getattr(self.cfg, "redact_secrets", True):
             print("  [warning: the task text looks like it contains a secret "
                   "and goes to a hosted API]", file=sys.stderr)
+        active_images = (list(images) if images is not None
+                         else list(getattr(self.cfg, "_task_images", None) or ()))
+        self._task_images = active_images
+        user0_content = imagegen_mod.make_multimodal_content(user0, active_images)
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user0},
+            {"role": "user", "content": user0_content},
         ]
         if prefix_messages:
             # Single-slot local server (TECHNIQUES.md #28): fork the parent's
@@ -2365,7 +2614,12 @@ class Agent:
         self.cfg._task_reads = spans
         self.cfg._task_allowlist = self._task_file_targets(self._targets_text)
         # Charged per NEW byte, so re-reading lines already in context is free.
-        budget = self.cfg.max_gathered_chars
+        # Explicit pins are allocated first: automatic retrieval only gets
+        # what remains after their (already-injected) source.
+        pinned_chars = (len(self.pinned_context)
+                        + (len("### Explicitly Pinned Context\n\n")
+                           if self.pinned_context else 0))
+        budget = max(0, int(self.cfg.max_gathered_chars) - pinned_chars)
 
         def nudge(step: int) -> str:
             """Suffix telling the model how many lookups remain."""
@@ -2379,7 +2633,7 @@ class Agent:
 
         # Nudges ride with the preceding user message: some chat templates
         # reject two user messages in a row.
-        messages[-1]["content"] += "\n\n" + nudge(1)
+        _append_message_text(messages[-1], "\n\n" + nudge(1))
 
         # Step-0 prefetch (opt-in): read the task-named files/symbols before
         # the first model step. Runs through the normal tool path so the read
@@ -2402,7 +2656,8 @@ class Agent:
         # One targeted recovery prompt per distress signal before gather gives
         # up (cfg.stuck_recovery): a small model often escapes a loop when
         # told, specifically, what it is doing.
-        recoveries = {"repeat": 0, "errors": 0, "dup": 0}
+        recoveries = {"repeat": 0, "oscillation": 0, "errors": 0, "dup": 0}
+        recent_steps: list[tuple[str, str]] = []
         questions = 0            # clarifying questions asked so far
         ran: dict = {}           # step signature -> (step, index gen, folds, mutations)
         # BUG-320: identical FAILING read-only steps used to be exempt from
@@ -2430,7 +2685,7 @@ class Agent:
             user messages in a row break some chat templates, so it rides
             with the last one (as the nudges do)."""
             if messages and messages[-1]["role"] == "user":
-                messages[-1]["content"] += "\n\n" + text
+                _append_message_text(messages[-1], "\n\n" + text)
             else:
                 messages.append({"role": "user", "content": text})
 
@@ -2515,11 +2770,11 @@ class Agent:
                     prior = list(spans.get(key, []))
                     delta = _delta_len(obs, prior)
                     if delta > budget:
-                        obs = (obs[:budget] +
+                        obs = ((obs[:budget] if budget > 0 else "") +
                                "\n[truncated: context budget reached]")
                         budget = 0
                     else:
-                        budget -= delta
+                        budget = max(0, budget - delta)
                     # BUG-309: credit only the lines that survived the cut.
                     # The old order appended the full requested span BEFORE
                     # the budget cut, so lines never shown counted as read
@@ -2541,11 +2796,11 @@ class Agent:
                             f"\n{obs}")
                         changed = True
                 else:
-                    budget -= len(obs)
+                    budget = max(0, budget - len(obs))
                     self.requirements.observe_search(
                         act, payload, obs, self.index)
             else:
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self.requirements.observe_search(act, payload, obs, self.index)
                 gathered.append(f"--- {act} {detail}\n{obs}")
                 changed = True
@@ -2554,9 +2809,11 @@ class Agent:
             self.steps_log.append(
                 f"{step}. auto-{act} {detail}  (requirement assist)")
             if tail and messages and messages[-1]["role"] == "user":
-                messages[-1]["content"] += (
+                _append_message_text(
+                    messages[-1],
                     f"\n\n[HARNESS {act.upper()} for an unmet requirement]\n"
-                    f"RESULT:\n{obs}")
+                    f"RESULT:\n{obs}",
+                )
             else:
                 messages.append({"role": "assistant",
                                  "content": _compact(payload)})
@@ -2600,6 +2857,11 @@ class Agent:
             return acted
 
         while unlimited or step < step_cap:
+            if self._run_cancelled():
+                self._emit("run_cancelled", stage="gather", step=step)
+                raise CancelledError(
+                    "Stopped by user while gathering; no further work was "
+                    "done.")
             if call_cap > 0 and model_calls >= call_cap:
                 harness_note(f"[Harness: gather stopped -- this task reached "
                              f"its ceiling of {call_cap} model calls. Answer "
@@ -2619,9 +2881,11 @@ class Agent:
             # Steering: lines the user typed mid-run join the turn that has
             # not been sent yet, so the cached prefix is untouched.
             for note in steering_mod.drain(getattr(self.cfg, "_steer", None)):
-                messages[-1]["content"] += (
+                _append_message_text(
+                    messages[-1],
                     f"\n\n[The USER says, mid-task: {note}  -- follow this "
-                    "over your earlier plan.]")
+                    "over your earlier plan.]",
+                )
                 self._emit("steer", step=step, chars=len(note))
                 if verbose:
                     print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
@@ -2630,6 +2894,8 @@ class Agent:
                 stepjson = gclient.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
+            except CancelledError:
+                raise
             except LLMError as e:
                 # A step that cannot produce JSON ends gather, not the run:
                 # the answer phase works from whatever was gathered. Re-ask
@@ -2638,12 +2904,12 @@ class Agent:
                 if "token limit" in msg or "valid json" in msg:
                     step_recoveries += 1
                     if step_recoveries <= _MAX_GATHER_RECOVERIES:
-                        messages.append({"role": "user", "content":
+                        harness_note(
                             "[Your last reply hit the output token limit and "
                             "contained no valid action. Choose your next "
                             "action now: put ONE short phrase in 'reasoning' "
                             "(under 10 words) and fill 'action' plus its "
-                            "fields. Reply with the JSON object only.]"})
+                            "fields. Reply with the JSON object only.]")
                         step -= 1        # the failed turn costs no step
                         continue
                     print(f"  [gather step failed: {str(e)[:120]}...]\n"
@@ -2712,7 +2978,7 @@ class Agent:
                                  "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 if verbose:
                     print(f"  [step {step} discarded: `{cut}` payload cut "
@@ -2760,7 +3026,7 @@ class Agent:
                                  "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 malformed_streak += 1
                 if verbose:
@@ -2906,6 +3172,50 @@ class Agent:
                 if note_progress(False):
                     break
                 continue
+
+            recent_steps.append(_oscillation_key(stepjson))
+            if len(recent_steps) > _OSCILLATION_WINDOW:
+                del recent_steps[:-_OSCILLATION_WINDOW]
+            osc_period = _detect_oscillation(recent_steps)
+            if osc_period and recover_on:
+                cycle = " -> ".join(
+                    f"{a}({t})" if t else a
+                    for a, t in recent_steps[-osc_period:])
+                if recover_on and recoveries["oscillation"] < 1:
+                    recoveries["oscillation"] += 1
+                    note = (f"[STUCK: you are oscillating in a period-"
+                            f"{osc_period} loop ({cycle}); alternating "
+                            "between the same steps cannot add new "
+                            "information. Do something DIFFERENT now: a "
+                            "different file or symbol, `find`/`grep` for "
+                            "what you are missing, or `done` if you already "
+                            "have what you need.]")
+                    messages.append({"role": "assistant",
+                                     "content": _compact(stepjson)})
+                    messages.append({"role": "user",
+                                     "content": f"{note}\n\n{nudge(step + 1)}"})
+                    if self.requirements and _requirement_assist(tail=True):
+                        if verbose:
+                            print("  [recovery: harness fetched the cheapest "
+                                  "lookup for the oldest unmet requirement]",
+                                  file=sys.stderr)
+                    recent_steps.clear()
+                    repeated, last_sig = 0, None
+                    self._emit("recovery", signal="oscillation",
+                               period=osc_period, step=step)
+                    if verbose:
+                        print(f"  [recovery: period-{osc_period} oscillation "
+                              f"({cycle}); asking for a different move]",
+                              file=sys.stderr)
+                    self._fit(messages, gclient)
+                    if note_progress(False):
+                        break
+                    continue
+                if verbose:
+                    print(f"  [gather stopped: period-{osc_period} "
+                          f"oscillation ({cycle}); moving to answer]",
+                          file=sys.stderr)
+                break
 
             if repeated >= _MAX_REPEATED_STEPS:
                 if recover_on and recoveries["repeat"] < 1:
@@ -3116,6 +3426,8 @@ class Agent:
                 arg = (stepjson.get("file") or stepjson.get("pattern")
                        or stepjson.get("symbol") or stepjson.get("command") or "")
                 arg = arg if isinstance(arg, str) else str(arg)
+                self._record_failed_hypothesis(
+                    f"{action} {arg}".strip(), obs)
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
                 self._emit("step", n=step, action=action, detail=arg[:120],
@@ -3125,17 +3437,19 @@ class Agent:
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
                 # Charge errors too, so a model repeating one failing step
                 # cannot loop forever at max_steps = 0.
-                budget -= len(obs)
+                budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 if error_streak >= _MAX_CONSECUTIVE_ERRORS:
                     if recover_on and recoveries["errors"] < 1 and budget > 0:
                         recoveries["errors"] += 1
-                        messages[-1]["content"] += (
+                        _append_message_text(
+                            messages[-1],
                             f"\n\n[STUCK: your last {error_streak} actions "
                             "all failed. Re-read the PROJECT MAP for exact "
                             "paths and line ranges; use `find` or `outline` "
                             "to get a valid file name before `read`; never "
-                            "invent a range.]")
+                            "invent a range.]",
+                        )
                         error_streak = 0
                         self._emit("recovery", signal="errors", step=step)
                         if verbose:
@@ -3169,7 +3483,8 @@ class Agent:
             # end dedups the conversation).
             if read_delta is not None:
                 if read_delta > budget:
-                    obs = obs[:budget] + "\n[truncated: context budget reached]"
+                    obs = ((obs[:budget] if budget > 0 else "") +
+                           "\n[truncated: context budget reached]")
                     budget = 0
                     # BUG-309: the span ledger already credited the header's
                     # range; the cut just removed lines the model never saw.
@@ -3183,11 +3498,14 @@ class Agent:
                         else:
                             seq.pop()
                 else:
-                    budget -= read_delta
+                    budget = max(0, budget - read_delta)
             else:
                 if len(obs) > budget:
-                    obs = obs[:budget] + "\n[truncated: context budget reached]"
-                budget -= len(obs)
+                    obs = ((obs[:budget] if budget > 0 else "") +
+                           "\n[truncated: context budget reached]")
+                    budget = 0
+                else:
+                    budget = max(0, budget - len(obs))
 
             if duplicate_read:
                 duplicate_reads += 1
@@ -3281,10 +3599,15 @@ class Agent:
         # show, so the answer phase sees every line once. The live
         # conversation is NOT rewritten: it is only needed for answer
         # continuation, which wants the cached prefix untouched.
-        new_items = _evict_duplicate_reads(list(messages), gathered, spans)
+        new_items = _evict_duplicate_reads([], gathered, spans)
         digest = self._read_digest(spans)
         if digest:
             new_items = new_items + [digest]
+        # Pinned source is part of the SELECTED context, not a lookup result:
+        # keep it first so every downstream packer sees it before automatic
+        # evidence and can never drop it.
+        if self.pinned_context:
+            new_items = [self.pinned_context] + new_items
         self.gathered_source = "\n\n".join(new_items)
         self._emit("gather_done", steps=step, files_read=len(spans),
                    folds=self.fold_count, lossy=self._lossy,
@@ -3527,7 +3850,7 @@ class Agent:
             else:
                 delta = len(obs)
             self._record_evidence(obs, 0)  # prefetch displays = step 0
-            budget -= delta
+            budget = max(0, budget - delta)
             gathered.append(f"--- read {rel}\n{obs}")
             self.steps_log.append(f"0. read {rel} L{start}-{end}  (prefetch)")
             messages.append({"role": "assistant", "content": _compact(stepjson)})
@@ -3541,7 +3864,8 @@ class Agent:
     # ------------------------------------------------------------------ phase 2
     def answer(self, task: str, gathered: str, stream: bool = True,
                system: str | None = None, max_tokens: int | None = None,
-               include_edit_format: bool = True) -> str:
+               include_edit_format: bool = True,
+               images: list[dict] | None = None) -> str:
         """Ask the model to answer the task, or produce search/replace edits,
         given the project map and whatever source `gather()` collected.
 
@@ -3561,17 +3885,22 @@ class Agent:
         self._creative_task = self._creative_for(task)
         with self._phase_temp("temperature_answer"):
             return self._answer(task, gathered, stream, system, max_tokens,
-                                include_edit_format)
+                                include_edit_format, images=images)
 
     def _answer(self, task: str, gathered: str, stream: bool,
                 system: str | None, max_tokens: int | None,
-                include_edit_format: bool) -> str:
+                include_edit_format: bool,
+                images: list[dict] | None = None) -> str:
         self._set_site("answer")
         if self._task_budget_exceeded("answer"):
             # A clear no-edit verdict, not another 24k-token draft: the
             # outer loop reads the marker as a refusal to edit.
             return ("[No changes: the task budget ran out before the answer "
                     "could be generated; nothing was written.]")
+        active_images = (list(images) if images is not None
+                         else list(getattr(self, "_task_images", None)
+                                   or getattr(self.cfg, "_task_images", None)
+                                   or ()))
         brief = self._answer_brief(system, include_edit_format, task)
         mode = self._answer_mode()
         if mode in ("continue", "auto") and self._can_continue(task, brief,
@@ -3587,7 +3916,8 @@ class Agent:
                 print("  [the continued answer was unusable; rebuilding the "
                       "answer prompt]", file=sys.stderr)
         self.answer_mode_used = "rebuild"
-        reply = self._answer_rebuild(task, gathered, stream, brief, max_tokens)
+        reply = self._answer_rebuild(task, gathered, stream, brief, max_tokens,
+                                     images=active_images)
         self._emit("answer", mode="rebuild", reply_chars=len(reply or ""))
         return reply
 
@@ -3662,6 +3992,8 @@ class Agent:
                 max_tokens=min(int(getattr(self.cfg, "max_tokens_answer",
                                             3000) or 3000), 1200),
                 stream=False)
+        except CancelledError:
+            raise
         except LLMError as e:
             if verbose:
                 print(f"  [edit-intent plan failed ({type(e).__name__}); "
@@ -4112,6 +4444,8 @@ class Agent:
                     reply = self._chat_at(
                         "temperature_answer", msgs,
                         max_tokens=hunk_tokens, stream=False)
+                except CancelledError:
+                    raise
                 except LLMError as e:
                     last_results = [Result(
                         False, rel, f"edit generation failed: {type(e).__name__}")]
@@ -4371,7 +4705,7 @@ class Agent:
                                          for rel, ln, txt in hits[:2])
                              if hits else "")
                     for lit in getattr(req, "missing_literals", []):
-                        verb = ("still present" if req.literal_remove
+                        verb = ("still present" if req.literal_must_go(lit)
                                 else "missing")
                         findings.append(verify_mod.Finding(
                             "coverage", "error", hits[0][0] if hits else "",
@@ -4470,6 +4804,11 @@ class Agent:
             rules = prompts_mod.test_rules(self.cfg)
             if rules not in system:
                 system += "\n\n" + rules
+        for err in errors:
+            self._record_failed_hypothesis(
+                getattr(err, "file", "") or getattr(err, "kind", "check"),
+                getattr(err, "message", str(err)))
+        ledger = self._format_hypothesis_ledger()
         # Implicit rehydration: flagged regions the model WAS
         # shown get their fresh exact bytes appended at the TAIL of this
         # repair prompt, and the read ledger is credited -- the corrected
@@ -4484,6 +4823,7 @@ class Agent:
                     + f"YOUR PROPOSED EDIT BLOCKS:\n{blocks}\n\n"
                     + "An automatic check of these edits found problems:\n"
                     + verify_mod.render(errors) + "\n\n"
+                    + (f"{ledger}\n\n" if ledger else "")
                     + "Output the COMPLETE corrected set of search/replace blocks "
                     "for the whole task (not only the changed ones). Fix each "
                     "problem, or -- if a problem means you are editing code you "
@@ -4502,6 +4842,8 @@ class Agent:
                                         max_tokens=self.cfg.max_tokens_answer,
                                         stream=False),
                 msgs)
+        except CancelledError:
+            raise
         except LLMError as e:
             print("  [repair: re-ask failed (%s); failing checks remain]"
                   % type(e).__name__, file=sys.stderr)
@@ -4595,6 +4937,8 @@ class Agent:
                  {"role": "user", "content":
                   f"TASK\n{task}\n\nSOURCE\n{src}\n\nPROPOSED EDITS\n{blocks}"
                   + (_NEED_HINT if self._rehydration_rounds_left() else "")}])
+        except CancelledError:
+            raise
         except LLMError:
             return []
         return verify_mod.parse_verdict(text, self.index.resolve_file,
@@ -4632,6 +4976,8 @@ class Agent:
                         cand = self.answer(task, gathered, stream=False)
                 else:
                     cand = self.answer(task, gathered, stream=False)
+            except CancelledError:
+                raise
             except LLMError:
                 break
             if cand and parse_edits(cand):
@@ -4712,7 +5058,9 @@ class Agent:
         if include_edit_format:
             brief += "\n\n" + prompts_mod.edit_format(self.cfg, EDIT_FORMAT,
                                                       creative=creative)
-        return brief
+        # A caller-supplied brief (scaffold, explain) still obeys the project's
+        # persistent rules; answer_system already carries them for the default.
+        return prompts_mod.with_project_rules(brief, self.cfg)
 
     def _answer_mode(self) -> str:
         """rebuild | continue | auto: the setting, else the model card, else
@@ -4776,13 +5124,16 @@ class Agent:
                     m, max_tokens=self._answer_max_tokens(max_tokens),
                     stream=stream),
                 msgs)
+        except CancelledError:
+            raise
         except LLMError as e:
             print(f"  [continued answer failed ({str(e)[:100]}); rebuilding]",
                   file=sys.stderr)
             return None
 
     def _answer_rebuild(self, task: str, gathered: str, stream: bool,
-                        brief: str, max_tokens: int | None) -> str:
+                        brief: str, max_tokens: int | None,
+                        images: list[dict] | None = None) -> str:
         """A fresh two-message answer conversation. Over budget it DEGRADES
         (drop project notes, shrink the map, drop the oldest whole source
         items with re-read pointers) before it ever refuses."""
@@ -4820,9 +5171,17 @@ class Agent:
             notes_prefix += mcp_notes + "\n\n"
         src = gathered or "(nothing was looked up)"
         need_hint = _NEED_HINT if self._rehydration_rounds_left() else ""
+        # Pinned source is rendered as its own section before the map/source,
+        # so automatic packing can trim only the automatic evidence below it.
+        pinned = getattr(self, "pinned_context", "") or ""
+        if pinned and pinned in src:
+            src = src.replace(pinned, "", 1).strip() \
+                or "(nothing was looked up)"
+        pin_section = ("### Explicitly Pinned Context\n\n" + pinned + "\n\n"
+                       if pinned else "")
 
         def assemble(notes: str, rmap: str, source: str) -> str:
-            return (notes + f"PROJECT MAP\n\n{rmap}\n\n"
+            return (notes + pin_section + f"PROJECT MAP\n\n{rmap}\n\n"
                     f"SOURCE YOU REQUESTED\n\n{source}\n\n"
                     f"TASK\n{task}" + need_hint)
 
@@ -4893,13 +5252,15 @@ class Agent:
             print("[answer prompt over budget; degraded: "
                   + "; ".join(notices) + "]", file=sys.stderr)
             self._emit("degrade", notices=notices)
-        print(f"[answer context ~{est(user)} tokens]", file=sys.stderr)
+        img_tokens = len(images or ()) * IMAGE_TOKENS_ESTIMATE
+        print(f"[answer context ~{est(user) + img_tokens} tokens]", file=sys.stderr)
+        user_content = imagegen_mod.make_multimodal_content(user, images)
         return self._chat_needs(
             lambda m: self.client.chat(
                 m, max_tokens=self._answer_max_tokens(max_tokens),
                 stream=stream),
             [{"role": "system", "content": brief},
-             {"role": "user", "content": user}])
+             {"role": "user", "content": user_content}])
 
     # ------------------------------------------------------------------- edits
     def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,
@@ -5113,7 +5474,12 @@ class Agent:
                     "in those bytes (a mangled character, a tab, a CR) is "
                     "not what it shows. Never re-emit a SEARCH that already "
                     "failed unchanged.")
+            for r in failures:
+                self._record_failed_hypothesis(r.file or "(edit)", r.message)
+            ledger = self._format_hypothesis_ledger()
             extra = ("\n\n" + "\n\n".join(extras)) if extras else ""
+            if ledger:
+                extra += "\n\n" + ledger
             reply = self._chat_at(
                 "temperature_repair",
                 [
@@ -5247,6 +5613,10 @@ class Agent:
                 self.active_diagnostics = found or {}
                 if not found:
                     break
+                for rel_f, msgs_f in sorted(found.items()):
+                    for msg_f in msgs_f:
+                        self._record_failed_hypothesis(rel_f, msg_f)
+                ledger = self._format_hypothesis_ledger()
                 n = sum(len(v) for v in found.values())
                 print(f"\n[post-edit check: {n} new finding(s) in the changed "
                       "files; asking for a fix]", file=sys.stderr)
@@ -5260,7 +5630,8 @@ class Agent:
                             "changed files reports NEW problems they "
                             "introduced:\n"
                             f"{diagnostics_mod.render_findings(found)}\n\n"
-                            "SOURCE (current contents around each finding)\n\n"
+                            + (f"{ledger}\n\n" if ledger else "")
+                            + "SOURCE (current contents around each finding)\n\n"
                             f"{self._diagnostics_source(found)}\n\n"
                             "Fix ONLY these problems with minimal search/"
                             "replace blocks -- copy the SEARCH text exactly "
@@ -5586,20 +5957,42 @@ class Agent:
         return allowed
 
     def _resolve_symbol_anchors(self, edits: list) -> tuple[list, list]:
-        """Turn `SYMBOL name` anchors into LINES ranges via the index,
-        falling back to `chunker.locate_symbol_span` (AST / tree-sitter on the
-        current file bytes) when the index misses. Returns (failure Results,
-        edits left to apply). A file with a missing or ambiguous symbol fails
-        whole -- mirroring apply_edits' per-file failure -- and the message
-        feeds the repair loop."""
+        """Resolve `SYMBOL` / `AFTER_SYMBOL` anchors, preferring the live AST
+        span (`chunker.locate_symbol_span` on current file bytes) over a
+        potentially stale index, and respecting `insert_after` (never
+        overwriting `e.lines` on `insert_after` edits so `apply_edits`
+        splices after the symbol instead of replacing it).
+
+        When an earlier edit in the same batch already modifies `e.file`,
+        later symbol anchors on that file stay unresolved here so
+        `apply_edits` locates them against the evolving in-memory buffer.
+        Returns `(failure Results, edits left to apply)`."""
+        from .chunker import locate_symbol_span
         results: list = []
         bad: set[str] = set()
+        seen_files: set[str] = set()
         for e in edits:
-            if not e.symbol or e.lines:
+            fkey = _norm_key(e.file)
+            prior_edit = fkey in seen_files
+            seen_files.add(fkey)
+            sym = e.symbol or e.insert_after
+            if not sym or e.lines:
                 continue
-            want = _norm_key(e.symbol)
-            same = [c for c in self.index.find_symbol(e.symbol)
-                    if _norm_key(c.file) == _norm_key(e.file)]
+            if prior_edit:
+                # An earlier block in this reply already mutates this file;
+                # leave the anchor for `apply_edits` to locate against the
+                # evolving in-memory text so sequential splices compose.
+                continue
+            # Prefer live AST / tree-sitter span on current disk bytes over a
+            # potentially stale index.
+            disk = locate_symbol_span(self.index.root / e.file, sym)
+            if disk is not None:
+                if e.symbol and not e.insert_after:
+                    e.lines = (disk[0], disk[1])
+                continue
+            want = _norm_key(sym)
+            same = [c for c in self.index.find_symbol(sym)
+                    if _norm_key(c.file) == fkey]
             # find_symbol also matches via class members; only a name that
             # really ends with the symbol may be replaced.
             exact = [c for c in same
@@ -5607,19 +6000,11 @@ class Agent:
                      or _norm_key(c.qualname).endswith("." + want)]
             if len(exact) == 1:
                 c = exact[0]
-                # A classheader chunk stands for the whole class.
-                e.lines = (c.start, c.scope_end or c.end)
+                if e.symbol and not e.insert_after:
+                    # A classheader chunk stands for the whole class.
+                    e.lines = (c.start, c.scope_end or c.end)
                 continue
-            # Symbol-splice fallback: the index missed it (a method inside a
-            # whole-class chunk, a file not indexed yet, a stale line map).
-            # Ask the AST (Python) or tree-sitter directly where the symbol
-            # sits in the CURRENT bytes before failing the whole file.
-            from .chunker import locate_symbol_span
-            disk = locate_symbol_span(self.index.root / e.file, e.symbol)
-            if disk is not None:
-                e.lines = (disk[0], disk[1])
-                continue
-            bad.add(_norm_key(e.file))
+            bad.add(fkey)
             if not same:
                 why = ("no definition by that name in this file; check the "
                        "spelling against an `outline`")
@@ -5632,9 +6017,10 @@ class Agent:
                                     for c in exact[:5])
                 why = (f"{len(exact)} definitions match ({listing}); name "
                        "one exactly or anchor with LINES <start>-<end>")
+            label = "AFTER_SYMBOL" if e.insert_after else "SYMBOL"
             results.append(Result(
                 False, e.file,
-                f"SYMBOL anchor '{e.symbol}': {why}"))
+                f"{label} anchor '{sym}': {why}"))
         if bad:
             edits = [e for e in edits if _norm_key(e.file) not in bad]
         return results, edits
@@ -5644,4 +6030,4 @@ def _compact(step: dict) -> str:
     """Render a parsed step with empty fields dropped, to echo the model's
     action into the conversation history."""
     keep = {k: v for k, v in step.items() if v not in ("", 0, None)}
-    return str(keep)
+    return json.dumps(keep, ensure_ascii=False)

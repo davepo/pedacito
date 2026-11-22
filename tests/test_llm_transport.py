@@ -111,6 +111,61 @@ def test_error_kinds_form_a_taxonomy():
     assert BudgetExceeded.kind == "budget" and CancelledError.kind == "cancelled"
 
 
+# BUG-007: the /models probe collapsed every failure into "Cannot reach the
+# server", so a reached-but-errored server (5xx, auth) looked like a dead port.
+class _ProbeResp(Resp):
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(
+                f"{self.status_code} error", response=self)
+
+
+def _patch_get(monkeypatch, fn):
+    monkeypatch.setattr("pedacito.llm.requests.get", fn)
+
+
+def test_check_names_a_server_500_instead_of_unreachable(monkeypatch):
+    _patch_get(monkeypatch,
+               lambda *a, **k: _ProbeResp(500, text="internal error"))
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    msg = str(e.value)
+    assert "Server returned 500" in msg and "internal error" in msg
+    assert "Cannot reach" not in msg
+
+
+def test_check_names_an_auth_failure_and_points_at_the_key(monkeypatch):
+    _patch_get(monkeypatch,
+               lambda *a, **k: _ProbeResp(401, text="invalid api key"))
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    msg = str(e.value)
+    assert "Server returned 401" in msg
+    assert "api_key" in msg
+    assert "Cannot reach" not in msg
+
+
+def test_check_names_a_probe_timeout(monkeypatch):
+    def slow(*a, **k):
+        raise requests.exceptions.ReadTimeout("slow")
+
+    _patch_get(monkeypatch, slow)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    assert "did not answer within" in str(e.value)
+    assert "Cannot reach" not in str(e.value)
+
+
+def test_check_still_reports_a_dead_port_as_unreachable(monkeypatch):
+    def dead(*a, **k):
+        raise requests.exceptions.ConnectionError("refused")
+
+    _patch_get(monkeypatch, dead)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).check()
+    assert "Cannot reach the server" in str(e.value)
+
+
 def test_stale_keepalive_connection_is_retried_once(monkeypatch):
     client = LLMClient(_cfg())
     calls = []
@@ -765,3 +820,337 @@ def test_calibrate_picks_native_only_when_it_measures_better():
     assert modelcard.choose({**base, "tool_choice_native": 0.9,
                              "json_ok_native": 0.8}, False)["tool_mode"] == "grammar"
     assert modelcard.choose(dict(base), False)["tool_mode"] == "grammar"
+
+
+# ----------------------------------------------------------- WP-08 regressions
+def test_repair_truncated_json_preserves_existing_escapes():
+    from pedacito.llm import repair_truncated_json
+
+    raw = (r'{"action": "write", "content": "line1\nline2\t\"quoted\"'
+           r'\\path\u0041')
+    fixed = repair_truncated_json(raw)
+    assert fixed is not None
+    obj = json.loads(fixed)
+    assert obj == {
+        "action": "write",
+        "content": 'line1\nline2\t"quoted"\\pathA',
+    }
+
+    # Unescaped control chars, trailing lone backslash, and cut \uXXXX still parse
+    raw2 = '{"action": "write", "content": "a\nb\tc\\'
+    obj2 = json.loads(repair_truncated_json(raw2))
+    assert obj2["content"] == "a\nb\tc\\"
+
+    raw3 = '{"action": "write", "content": "hi\\u12'
+    obj3 = json.loads(repair_truncated_json(raw3))
+    assert obj3["content"] == "hi\\u12"
+
+
+def test_selective_prompt_lookup_denial_keeps_cache_prompt_active(monkeypatch):
+    llm_mod._ACCEL_CAPS.clear()
+    try:
+        posts = []
+
+        def fake(url, **kw):
+            p = dict(kw["json"])
+            posts.append(p)
+            if "prompt_lookup_num_tokens" in p:
+                return Resp(400, text='{"error": "unknown field: '
+                                      'prompt_lookup_num_tokens"}')
+            return _ok("ok")
+
+        _patch_post(monkeypatch, fake)
+        cfg = _cfg(enable_prompt_lookup=True, prompt_lookup_num_tokens=10,
+                   model="selective-accel")
+        out = LLMClient(cfg).chat([{"role": "user", "content": "go"}], 20)
+        assert out == "ok"
+        assert len(posts) == 2
+        assert "prompt_lookup_num_tokens" in posts[0]
+        assert "cache_prompt" in posts[0]
+        assert "prompt_lookup_num_tokens" not in posts[1]
+        assert posts[1]["cache_prompt"] is True
+        caps = llm_mod._accel_caps(cfg.base_url, cfg.model)
+        assert caps == {"cache": True, "lookup": False}
+    finally:
+        llm_mod._ACCEL_CAPS.clear()
+
+
+def test_json_schema_to_object_downgrade_injects_json_hint(monkeypatch):
+    llm_mod._JSON_CAPS.clear()
+    try:
+        posts = []
+
+        def fake(url, **kw):
+            p = dict(kw["json"])
+            posts.append(p)
+            rf = (p.get("response_format") or {}).get("type")
+            if rf == "json_schema":
+                return Resp(400, text='{"error": "json_schema is not supported"}')
+            if rf == "json_object":
+                text = p["messages"][-1]["content"]
+                if "json" not in text.lower():
+                    return Resp(400, text='{"error": "messages must contain json"}')
+                return _ok('{"action": "done", "reasoning": "ok"}')
+            raise AssertionError("Should not fall through to plain mode")
+
+        _patch_post(monkeypatch, fake)
+        client = LLMClient(_cfg(model="downgrade-hint"))
+        schema = {
+            "type": "object",
+            "properties": {"action": {"type": "string"},
+                           "reasoning": {"type": "string"}},
+            "required": ["action", "reasoning"],
+        }
+        out = client.chat_json([{"role": "user", "content": "go"}], schema, 50)
+        assert out["action"] == "done"
+        assert len(posts) == 2
+        assert posts[1]["response_format"] == {"type": "json_object"}
+        assert "Reply with one JSON object only" in \
+            posts[1]["messages"][-1]["content"]
+        # Recursive capability-downgrade retry must not double-count calls.
+        assert client.stats["calls"] == 1
+    finally:
+        llm_mod._JSON_CAPS.clear()
+
+
+@pytest.mark.parametrize("oom_text", [
+    "cudaMalloc failed: out of memory",
+    "RuntimeError: out of memory",
+    "hipErrorOutOfMemory on device 0",
+    "GGML_ASSERT(buffer != nullptr) failed",
+    "vk::OutOfDeviceMemoryError: allocation failed",
+])
+def test_oom_error_hint_on_500_and_stream_drop(monkeypatch, oom_text):
+    _patch_post(monkeypatch, lambda *a, **k: Resp(500, text=oom_text))
+    with pytest.raises(LLMError) as exc:
+        LLMClient(_cfg()).chat([{"role": "user", "content": "x"}], 10)
+    msg = str(exc.value)
+    assert "context_tokens" in msg and 'k_cache_quant = "q8_0"' in msg
+
+    err = requests.exceptions.ChunkedEncodingError(oom_text)
+    _patch_post(monkeypatch, lambda *a, **k: Resp(200, lines=[], raise_after=err))
+    with pytest.raises(LLMError) as exc2:
+        LLMClient(_cfg()).chat([{"role": "user", "content": "x"}], 10, stream=True)
+    msg2 = str(exc2.value)
+    assert "context_tokens" in msg2 and 'k_cache_quant = "q8_0"' in msg2
+
+
+def test_no_system_role_context_overflow_trims_middle_turns(monkeypatch):
+    posts = []
+
+    def fake(url, **kw):
+        p = dict(kw["json"])
+        posts.append(p)
+        if len(posts) == 1:
+            return Resp(400, text='{"error": "context_length_exceeded"}')
+        return _ok("trimmed ok")
+
+    _patch_post(monkeypatch, fake)
+    client = LLMClient(_cfg(model="gemma-3-27b"))
+    client._no_system_role = True
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "middle-1"},
+        {"role": "user", "content": "follow-up"},
+    ]
+    out = client.chat(msgs, 256)
+    assert out == "trimmed ok"
+    assert len(posts) == 2
+    assert len(posts[1]["messages"]) == 1
+    assert posts[1]["messages"][0]["role"] == "user"
+    assert "middle-1" not in posts[1]["messages"][0]["content"]
+
+
+def test_append_text_handles_list_and_none_content(monkeypatch):
+    posts = []
+    _patch_post(monkeypatch, lambda *a, **k: posts.append(k["json"]) or _ok())
+    client = LLMClient(_cfg(model="Qwen3-8B", disable_thinking=True))
+    client.chat([{"role": "user", "content": None}], 20)
+    assert "/no_think" in posts[0]["messages"][-1]["content"]
+
+    client.chat([{"role": "user", "content": [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]}], 20)
+    parts = posts[1]["messages"][-1]["content"]
+    assert isinstance(parts, list)
+    assert "/no_think" in parts[0]["text"]
+
+
+def test_non_chat_responses_are_closed(monkeypatch, tmp_path):
+    closed = []
+
+    class TrackedResp(Resp):
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            super().close()
+            closed.append(self)
+
+    monkeypatch.setattr(
+        "pedacito.llm.requests.post",
+        lambda url, **kw: (
+            TrackedResp(200, {"data": [{"index": 0, "embedding": [1.0]}]})
+            if url.endswith("/embeddings")
+            else TrackedResp(200, {"count": 100})
+            if url.endswith("/tokenize")
+            else TrackedResp(200, {"choices": [{"message": {
+                "content": '{"action": "done", "file": "", "reasoning": "ok"}'}}]})
+        ),
+    )
+    monkeypatch.setattr(
+        "pedacito.llm.requests.get",
+        lambda url, **kw: TrackedResp(200, {"data": [{"id": "m", "state": "loaded"}]}),
+    )
+    c = LLMClient(_cfg())
+    assert c.embed(["hi"]) == [[1.0]]
+    img = tmp_path / "a.png"
+    img.write_bytes(b"png")
+    assert c.vision("desc", img)
+    assert c.loaded_models() == {"m": "loaded"}
+    assert c.check(warn=False) == "m"
+    c.calibrate_tokenizer()
+    assert len(closed) == 5 and all(r.closed for r in closed)
+
+
+def test_retry_sleep_aborts_promptly_on_cancel_event(monkeypatch):
+    import threading
+    import time
+
+    cancel = threading.Event()
+    _patch_post(monkeypatch,
+                lambda *a, **k: Resp(429, text="slow", headers={"Retry-After": "5"}))
+    client = LLMClient(_cfg())
+    timer = threading.Timer(0.05, cancel.set)
+    timer.start()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(llm_mod.RunCancelledError):
+            client.chat([{"role": "user", "content": "x"}], 10, cancel_event=cancel)
+    finally:
+        timer.cancel()
+    assert time.monotonic() - t0 < 1.0
+
+
+# ----------------------------------------------------------- WP-12 regressions
+# Malformed/truncated tool calls, SSE disconnects on the buffered path, native
+# tool-call argument accumulation across SSE deltas, and the full three-rung
+# structured-output downgrade ladder.
+
+def test_native_tool_call_with_truncated_json_arguments_is_repaired(monkeypatch):
+    """A native tool call cut off mid-arguments still yields a usable step:
+    the complete fields survive and the salvage flags the cut field."""
+    from pedacito.tools import schema_for
+
+    def fake(url, **kw):
+        return Resp(200, {"choices": [{"message": {
+            "content": "", "tool_calls": [{"id": "1", "type": "function",
+                "function": {"name": "step", "arguments":
+                    '{"action": "grep", "pattern": "x", "reasoning": "se'}}]},
+            "finish_reason": "length"}], "usage": {}})
+
+    _patch_post(monkeypatch, fake)
+    c = LLMClient(_cfg(tool_mode="native"))
+    out = c.chat_json([{"role": "user", "content": "go"}],
+                      schema_for(c.cfg), 200)
+    assert out == {"action": "grep", "pattern": "x", "reasoning": "se"}
+    assert c.step_truncated is True
+    assert c.truncated_field == "reasoning"
+
+
+def test_native_tool_call_with_garbage_arguments_fails_cleanly(monkeypatch):
+    """Arguments that are not JSON at all cannot be salvaged: chat_json gives
+    up with its structured-output error rather than a parse crash."""
+    from pedacito.tools import schema_for
+
+    def fake(url, **kw):
+        return Resp(200, {"choices": [{"message": {
+            "content": "", "tool_calls": [{"id": "1", "type": "function",
+                "function": {"name": "step",
+                             "arguments": "{not valid json"}}]},
+            "finish_reason": "tool_calls"}], "usage": {}})
+
+    _patch_post(monkeypatch, fake)
+    c = LLMClient(_cfg(tool_mode="native"))
+    with pytest.raises(LLMError) as e:
+        c.chat_json([{"role": "user", "content": "go"}], schema_for(c.cfg), 200)
+    assert "would not produce valid JSON" in str(e.value)
+
+
+def test_buffered_request_answered_with_sse_that_drops_mid_stream(monkeypatch):
+    """A server that answers a non-streaming request with `text/event-stream`
+    anyway, then drops, is an error: unlike the primary streaming path this
+    reader cannot keep a partial reply, so it reports the dropped connection."""
+    err = requests.exceptions.ChunkedEncodingError("connection broken")
+    resp = Resp(200, lines=[_chunk("partial answer")], raise_after=err,
+                headers={"Content-Type": "text/event-stream"})
+    _patch_post(monkeypatch, lambda *a, **k: resp)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).chat([{"role": "user", "content": "x"}], 10)
+    assert "dropped mid-reply" in str(e.value)
+
+
+def test_native_sse_tool_call_deltas_accumulate_into_one_json(monkeypatch):
+    """Streamed tool-call argument fragments accumulate across SSE deltas and
+    parse as the step the native channel asked for (buffered request, but the
+    server chose SSE, so `native` still routes through the tool-call reader)."""
+    from pedacito.tools import schema_for
+
+    def tool_delta(args):
+        return "data: " + json.dumps({"choices": [{"delta": {
+            "tool_calls": [{"index": 0, "function": {"arguments": args}}]}}]})
+
+    lines = [
+        tool_delta('{"action": "grep", "pat'),
+        tool_delta('tern": "x", "reasoning": "r"}'),
+        "data: " + json.dumps({"choices": [{"delta": {},
+                                            "finish_reason": "tool_calls"}]}),
+        "data: [DONE]",
+    ]
+    resp = Resp(200, lines=lines,
+                headers={"Content-Type": "text/event-stream"})
+    _patch_post(monkeypatch, lambda *a, **k: resp)
+    c = LLMClient(_cfg(tool_mode="native"))
+    out = c.chat_json([{"role": "user", "content": "go"}],
+                      schema_for(c.cfg), 200)
+    assert out == {"action": "grep", "pattern": "x", "reasoning": "r"}
+    assert c._native_ok is True
+
+
+def test_full_json_schema_object_plain_downgrade_ladder(monkeypatch):
+    """A server that refuses both json_schema and json_object falls all the way
+    to plain JSON prompting in one logical call (one recorded call, three
+    requests, each rung re-sent one tier down)."""
+    llm_mod._JSON_CAPS.clear()
+    try:
+        posts = []
+
+        def fake(url, **kw):
+            p = dict(kw["json"])
+            posts.append(p)
+            rf = (p.get("response_format") or {}).get("type")
+            if rf == "json_schema":
+                return Resp(400, text='{"error": "json_schema is not supported"}')
+            if rf == "json_object":
+                return Resp(400, text='{"error": "json_object is not supported"}')
+            assert "response_format" not in p
+            return _ok('{"action": "done", "reasoning": "ok"}')
+
+        _patch_post(monkeypatch, fake)
+        client = LLMClient(_cfg(model="full-ladder"))
+        schema = {"type": "object",
+                  "properties": {"action": {"type": "string"},
+                                 "reasoning": {"type": "string"}},
+                  "required": ["action", "reasoning"]}
+        out = client.chat_json([{"role": "user", "content": "go"}], schema, 50)
+        assert out == {"action": "done", "reasoning": "ok"}
+        assert [(p.get("response_format") or {}).get("type") for p in posts] \
+            == ["json_schema", "json_object", None]
+        # The plain rung keeps discipline in the prompt.
+        assert "Reply with one JSON object only" in \
+            posts[2]["messages"][-1]["content"]
+        assert client.stats["calls"] == 1
+    finally:
+        llm_mod._JSON_CAPS.clear()

@@ -132,7 +132,17 @@ class RpcOut:
         self._buf_lock = threading.Lock()
         self._buf = ""
         self._closed = False
-        self.results = 0  # `kind:"result"` events let through - see _task_worker
+        self._results = 0  # `kind:"result"` events let through - see _task_worker
+
+    @property
+    def results(self) -> int:
+        with self._lock:
+            return self._results
+
+    @results.setter
+    def results(self, value: int) -> None:
+        with self._lock:
+            self._results = value
 
     # -- EventLog.tee duck-type ------------------------------------------ #
     def write(self, s: str) -> Optional[int]:
@@ -183,7 +193,8 @@ class RpcOut:
         if req is not None:
             event["req_id"] = req
         if event.get("kind") == "result":
-            self.results += 1
+            with self._lock:
+                self._results += 1
         self.emit(event)
 
     def emit(self, obj: dict) -> None:
@@ -269,13 +280,16 @@ class RpcServer:
         with self._mu:
             return self._active
 
-    def _set_active(self, req_id: Optional[str]) -> None:
+    def _set_active(self, req_id: Optional[str], *,
+                    expected: Optional[str] = None) -> None:
         with self._mu:
+            if expected is not None and self._active != expected:
+                return
             self._active = req_id
-        if req_id is None:
-            self._busy.clear()
-        else:
-            self._busy.set()
+            if req_id is None:
+                self._busy.clear()
+            else:
+                self._busy.set()
 
     def _frame(self, req_id: Any, method: str, *, result: Any = None,
                error: Any = None) -> dict:
@@ -452,18 +466,18 @@ class RpcServer:
 
     def _task_worker(self, req_id: Any, method: str, task: str,
                      apply_: bool, refine: Any, plan: Any) -> None:
+        terminal_frames: list[dict] = []
         try:
             if method == "explain":
                 reply = self._explain(task)
-                self._set_active(None)  # untether the tee before terminal frames
-                self.out.emit({"kind": "reply", "req_id": str(req_id),
-                               "reply": reply})
-                self.out.emit(self._frame(req_id, method, result={"reply": reply}))
+                terminal_frames.append({"kind": "reply", "req_id": str(req_id),
+                                        "reply": reply})
+                terminal_frames.append(
+                    self._frame(req_id, method, result={"reply": reply}))
                 return
             before = self.out.results
             res = self._run(task, apply=apply_, refine=refine, plan=plan)
             cancelled = self._cancel.is_set()
-            self._set_active(None)
             payload = self._summary(res)
             if not cancelled and payload["applied"] and self._save_checkpoint:
                 self._save_checkpoint(task)
@@ -475,29 +489,29 @@ class RpcServer:
                          **payload}
                 if cancelled:
                     frame["cancelled"] = True
-                self.out.emit(frame)
+                terminal_frames.append(frame)
             if cancelled:
-                self.out.emit(self._frame(req_id, method, error="cancelled",
-                                          result=payload))
+                terminal_frames.append(
+                    self._frame(req_id, method, error="cancelled",
+                                result=payload))
                 return
-            self.out.emit(self._frame(req_id, method, result=payload))
+            terminal_frames.append(self._frame(req_id, method, result=payload))
         except (llm.LLMError, llm.CancelledError, llm.BudgetExceeded) as exc:
-            self._set_active(None)
-            self.out.emit(self._frame(req_id, method, error=str(exc)))
+            terminal_frames.append(self._frame(req_id, method, error=str(exc)))
         except OSError as exc:
-            self._set_active(None)
-            self.out.emit(self._frame(req_id, method, error=str(exc)))
+            terminal_frames.append(self._frame(req_id, method, error=str(exc)))
         except Exception as exc:  # a crashed worker must not kill the session
-            self._set_active(None)
-            self.out.emit(self._frame(req_id, method,
-                                      error=f"internal error: {exc!r}"))
+            terminal_frames.append(
+                self._frame(req_id, method, error=f"internal error: {exc!r}"))
         finally:
-            self._set_active(None)
+            self._set_active(None, expected=str(req_id))
             with self._mu:
                 for slot in self._perm.values():
                     if not slot["decision"]:
                         slot["decision"] = "deny"
                         slot["event"].set()
+            for frame in terminal_frames:
+                self.out.emit(frame)
 
     @staticmethod
     def _summary(res: Any) -> dict:
@@ -594,11 +608,11 @@ class RpcServer:
             "setting_key": setting_key,
             "timeout_seconds": self._perm_timeout,
         })
-        deadline = time.time() + self._perm_timeout
+        deadline = time.monotonic() + self._perm_timeout
         # 0.5s beats keep the wait interruptible by cancel, same rhythm as
         # the GUI's broker.
         while not ev.wait(0.5):
-            if time.time() > deadline or self._cancel.is_set():
+            if time.monotonic() > deadline or self._cancel.is_set():
                 break
         with self._mu:
             slot = self._perm.pop(rid, None)
@@ -638,7 +652,9 @@ class RpcServer:
     # ------------------------------------------------------------------ #
     def serve(self) -> int:
         """Read stdin until EOF / a broken pipe. Returns the process exit code."""
-        security.install_permission_hook(self._permission_request)
+        prev_hook = security.permission_handler()
+        my_hook = self._permission_request
+        security.install_permission_hook(my_hook)
         self._set_active(None)
         try:
             while True:
@@ -694,6 +710,13 @@ class RpcServer:
                     if forced:
                         break                 # wedged worker: let the process go
                     self._cancel.set()        # grace spent: wind the task down
+                    with self._mu:
+                        client = self._client
+                    if client is not None:
+                        try:
+                            client.cancel()
+                        except Exception:
+                            pass
                     forced = True
                     deadline = time.monotonic() + EOF_CANCEL_GRACE
                 worker.join(timeout=0.5)
@@ -703,6 +726,8 @@ class RpcServer:
                     if not slot["decision"]:
                         slot["decision"] = "deny"
                         slot["event"].set()
+            if security.permission_handler() == my_hook:
+                security.install_permission_hook(prev_hook)
             self.out.close()
         return 0
 

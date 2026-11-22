@@ -620,6 +620,9 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
                 timeout: int) -> tuple[bool, dict | str]:
     if out is None:
         return False, "the Chrome fallback needs an output screenshot path"
+    u = str(url or "").strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False, f"the Chrome fallback needs an http(s) URL, got {url!r}"
     budget = max(1000, int(float(wait or 0) * 1000) + 3000)
     detail = ""
     # Chrome 109+ prefers --headless=new; older builds only know --headless.
@@ -627,14 +630,16 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
         cmd = [
             exe, mode, "--disable-gpu", "--hide-scrollbars",
             "--window-size=1280,800", f"--virtual-time-budget={budget}",
-            f"--screenshot={out}", url,
+            f"--screenshot={out}", "--", url,
         ]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               timeout=max(5, int(timeout) + 15))
+            rc, out_text, stopped, _el = proc.run(
+                cmd, cwd=".", timeout=max(5, int(timeout) + 15),
+                idle_timeout=0, max_output=8000)
         except Exception as e:
             return False, f"could not run {Path(exe).name}: {e}"
+        if stopped == "error":
+            return False, f"could not run {Path(exe).name}: {out_text}"
         if out.is_file():
             return True, {
                 "method": f"{Path(exe).name} {mode} (navigation only)",
@@ -647,7 +652,7 @@ def _run_chrome(exe: str, url: str, *, wait: float, out,
                 "actions": [],
                 "action_errors": [],
             }
-        detail = ((p.stdout or "") + (p.stderr or "")).strip()
+        detail = (out_text or "").strip()
     return False, ("Chrome did not produce a screenshot: "
                    + (detail[:400] or "no output"))
 

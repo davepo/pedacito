@@ -61,7 +61,8 @@ def test_partial_edit_reported_at_task_and_run_level(tmp_path, monkeypatch,
             "done", True, ["a.py"], idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (True, ""))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: (True, ""))
     code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                          verify="pytest -q")
     assert code == 0                       # unchanged: still not a failure
@@ -88,7 +89,8 @@ def test_partial_edit_final_summary_mentions_partial_tasks(tmp_path,
             "done", True, ["a.py"], idx_)
 
     monkeypatch.setattr(loop, "run_task", fake_run_task)
-    monkeypatch.setattr(loop, "run_verify", lambda root, cmd: (True, ""))
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, **kw: (True, ""))
     loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                   verify="pytest -q")
     err = capsys.readouterr().err
@@ -120,7 +122,7 @@ def _two_task_ratchet(tmp_path, monkeypatch):
 
     calls: list[str] = []
 
-    def fake_verify(root, cmd):
+    def fake_verify(root, cmd, **kw):
         calls.append(cmd)
         ok = ((root / "a.py").is_file() and (root / "b.py").is_file())
         return ok, "" if ok else "half the fix is missing"
@@ -182,7 +184,7 @@ def test_verify_final_rolls_back_only_the_last_step_when_it_fails(tmp_path,
 
     calls: list[str] = []
 
-    def fake_verify(root, cmd):
+    def fake_verify(root, cmd, **kw):
         calls.append(cmd)
         ok = not (root / "b.py").exists()
         return ok, "" if ok else "b.py is broken"

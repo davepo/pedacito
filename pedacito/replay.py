@@ -37,7 +37,18 @@ def _digest(messages) -> str:
 
 def _preview(messages) -> str:
     last = messages[-1]["content"] if messages else ""
-    if not isinstance(last, str):
+    if isinstance(last, list):
+        from . import imagegen
+        parts = []
+        for part in imagegen.sanitize_multimodal_content(last):
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        last = "\n".join(parts)
+    elif not isinstance(last, str):
         last = str(last)
     return safety.redact(last[-300:])
 
@@ -87,6 +98,9 @@ class Recorder:
 
     def chat_json(self, messages, *args, **kw):
         return self._call("chat_json", messages, self._c.chat_json, *args, **kw)
+
+    def complete_once(self, messages, *args, **kw):
+        return self._call("chat", messages, self._c.complete_once, *args, **kw)
 
     def __getattr__(self, name):
         return getattr(self._c, name)
@@ -164,6 +178,9 @@ class Replayer:
 
     def chat_json(self, messages, *args, **kw):
         return self._next("chat_json", messages)
+
+    def complete_once(self, messages, *args, **kw):
+        return self._next("chat", messages)
 
     def check(self, warn: bool = True) -> str:
         return "(replay)"
