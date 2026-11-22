@@ -998,7 +998,7 @@ def test_probe_flags_models_the_config_already_imports(gui):
 
 def test_import_names_every_profile_after_its_model(gui):
     preset = settings_api._preset_by_id("deepseek")
-    base = "http://127.0.0.1:9/v1"
+    base = "https://api.deepseek.com/v1"
     status, j = gui.post("/api/providers/import", {
         "preset_id": "deepseek", "base_url": base, "api_key": "sk-d",
         "models": [

@@ -207,6 +207,12 @@ def _strata_entries(root: str, timeout: float, headers=None,
         pass
     if "loaded" in data:
         entry["loaded"] = bool(data["loaded"])
+    # Strata/Avalon's public /health also states whether an API key is needed
+    # and which runtime serves it. Both ride the entry so describe_models can
+    # surface them -- a key-protected /v1/models that answered 401 still
+    # reports its provider and auth requirement.
+    entry["requires_api_key"] = bool(data.get("api_key"))
+    entry["provider"] = str(data.get("service") or "strata").lower()
     return [entry]
 
 
@@ -471,6 +477,11 @@ def describe_models(base_url: str, timeout: float = 5.0, headers=None,
         except Exception:
             info = {}
         rec: dict = {"id": mid, "base_url": base_url}
+        # Strata/Avalon's /health reports whether the server's authenticated
+        # endpoints need a key; carry it so the scan can offer an api_key/
+        # api_key_env on import without a second probe.
+        if entry.get("requires_api_key") is not None:
+            rec["requires_api_key"] = bool(entry["requires_api_key"])
         status = entry.get("status")
         status = (str(status.get("value") or "").lower()
                   if isinstance(status, dict) else "")

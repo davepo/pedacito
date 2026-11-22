@@ -1331,6 +1331,7 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
                    "quant": str(rec.get("quant") or ""),
                    "modality": "image" if is_img else "text",
                    "is_image_model": bool(is_img),
+                   "requires_api_key": bool(rec.get("requires_api_key")),
                    "suggested_profile_name": name,
                    "already_imported": bool(already)}
             rows.append(row)
@@ -1345,6 +1346,20 @@ def _read_config_text(path: Path) -> str:
     template (so a first import produces a valid config)."""
     text = _read_text(path)
     return text if text.strip() else config_mod.TEMPLATE
+
+
+# The scan labels whose runtime a profile should name explicitly. A Strata
+# import must become provider="strata" (and thus tier="local-moe"), not a
+# bare "custom" profile the lifecycle router cannot reach.
+_LOCAL_PROVIDER_LABELS = ("strata", "avalon", "lemonade")
+
+
+def _normalize_provider_label(label: str) -> str:
+    """The profile `provider` value for a scan's label: the three local-MoE /
+    Lemonade runtimes map to their canonical spelling; any other label yields
+    "" so the name/model heuristic classifies the profile instead."""
+    low = str(label or "").strip().lower()
+    return low if low in _LOCAL_PROVIDER_LABELS else ""
 
 
 def import_models(models) -> dict:
@@ -1395,6 +1410,20 @@ def import_models(models) -> dict:
             values["modality"] = "image"
         else:
             imported_text = True
+        # The scan's provider label (Strata/Avalon/Lemonade) becomes the
+        # profile's provider, normalized BEFORE the tier guess so a Strata
+        # import lands on provider="strata" and tier="local-moe".
+        provider = _normalize_provider_label(sel.get("provider") or "")
+        if provider:
+            values["provider"] = provider
+        # A per-model key (or its env var) rides the import so a key-protected
+        # Strata/Avalon is usable the moment it is selected.
+        api_key = str(sel.get("api_key") or "").strip()
+        api_key_env = str(sel.get("api_key_env") or "").strip()
+        if api_key:
+            values["api_key"] = api_key
+        elif api_key_env:
+            values["api_key_env"] = api_key_env
         tier = str(sel.get("tier") or "").strip()
         if not tier:
             tier = config_mod._guess_tier(name, values) or ""
@@ -1787,6 +1816,28 @@ def import_hosted_models(body: dict) -> dict:
     imported: list[str] = []
     skipped: list[str] = []
     default = ""
+    # The "hosted provider" dialog can also be aimed at a local server. Strata/
+    # Avalon answer a public /health naming their service and context window;
+    # use it so a local-MoE server is not forced into tier="hosted".
+    from .. import servers as servers_mod
+    is_local = servers_mod.is_local_url(base_url)
+    local_provider = ""
+    local_ctx = 0
+    if is_local:
+        root = servers_mod._root(base_url)
+        try:
+            r = requests.get(root + "/health", timeout=1.5)
+            data = r.json() if getattr(r, "status_code", 0) == 200 else None
+        except Exception:
+            data = None
+        if isinstance(data, dict) and \
+                str(data.get("service") or "").lower() in ("strata", "avalon"):
+            local_provider = str(data["service"]).lower()
+            try:
+                local_ctx = int(data.get("max_context")
+                                or data.get("context_length") or 0)
+            except (TypeError, ValueError):
+                local_ctx = 0
     for sel in sels:
         if not isinstance(sel, dict):
             continue
@@ -1811,15 +1862,30 @@ def import_hosted_models(body: dict) -> dict:
             if sel.get("set_default"):
                 default = default or name
             continue
-        values: dict = {"base_url": base_url, "model": mid, "tier": "hosted",
-                        "json_mode": "object",
-                        "max_read_tokens": _CLOUD_READ_TOKENS}
-        if ctx > 0:
-            values["context_tokens"] = ctx
-        # The provider table wins where a surface deviates from the generic
-        # hosted default (Anthropic rejects json_object and cannot cache).
-        from .. import providers
-        values.update(providers.profile_overrides(base_url, mid))
+        if local_provider:
+            # A local Strata/Avalon reached through this dialog: a local-MoE
+            # runtime, not a cloud API. Its context window comes from /health.
+            values = {"base_url": base_url, "model": mid,
+                      "provider": local_provider, "tier": "local-moe"}
+            if local_ctx > 0:
+                values["context_tokens"] = local_ctx
+        elif is_local:
+            # Any other local server (Lemonade/LM Studio/llama.cpp): classify
+            # it like the scan would, not as a hosted tier.
+            values = {"base_url": base_url, "model": mid}
+            tier = config_mod._guess_tier(name, values) or ""
+            if tier:
+                values["tier"] = tier
+        else:
+            values: dict = {"base_url": base_url, "model": mid, "tier": "hosted",
+                            "json_mode": "object",
+                            "max_read_tokens": _CLOUD_READ_TOKENS}
+            if ctx > 0:
+                values["context_tokens"] = ctx
+            # The provider table wins where a surface deviates from the generic
+            # hosted default (Anthropic rejects json_object and cannot cache).
+            from .. import providers
+            values.update(providers.profile_overrides(base_url, mid))
         if api_key:
             values["api_key"] = api_key
         elif api_key_env:

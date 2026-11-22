@@ -680,6 +680,150 @@ def test_evict_other_local_servers_skips_pinned_residents(monkeypatch):
     assert "lemonade2 (pinned: stay)" in reasons
 
 
+def test_configured_local_servers_upgrades_a_shared_url_to_a_concrete_kind():
+    """Two profiles point at one URL; the first is generic, the second names
+    Strata. The shared record must be upgraded so load/unload route to the
+    native /v1/unload rather than a bare OpenAI shim."""
+    cfg = _cfg_with({
+        "generic": {"base_url": "http://127.0.0.1:8001/v1",
+                    "model": "qwen3.8-flash"},
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="")
+    shared = next(s for s in servers.configured_local_servers(cfg)
+                  if s["base_url"] == "http://127.0.0.1:8001/v1")
+    assert shared["kind"] == "strata"
+    assert shared["provider"] == "strata"
+
+
+def test_configured_local_servers_keeps_custom_when_no_concrete_kind_follows():
+    """A later generic profile must not upgrade a shared URL; only a concrete
+    runtime label ("strata"/"avalon"/"lemonade"/"llama-server") does."""
+    cfg = _cfg_with({
+        "a": {"base_url": "http://127.0.0.1:8001/v1", "model": "m1"},
+        "b": {"base_url": "http://127.0.0.1:8001/v1", "model": "m2"},
+    }, active="")
+    shared = next(s for s in servers.configured_local_servers(cfg)
+                  if s["base_url"] == "http://127.0.0.1:8001/v1")
+    assert shared["kind"] == "custom"
+    assert shared["provider"] in ("", "a")
+
+
+def test_probe_surfaces_auth_required_and_reuses_the_health_fallback(monkeypatch):
+    """A key-protected Strata answers 401 on /v1/models; the /health fallback
+    must both upgrade the kind and mark auth_required, requesting /health only
+    once (no second probe for the custom/local upgrade)."""
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=401, json=lambda: {})
+        if url.endswith("/health"):
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "service": "strata", "model": "qwen3.8-flash",
+                "loaded": True})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "proxy": {"base_url": "http://127.0.0.1:8001/v1",
+                  "model": "qwen3.8-flash"},
+    }, active="proxy")
+    state = servers.list_server_states(cfg)[0]
+    assert state["auth_required"] is True
+    assert state["kind"] == "strata"
+    assert state["models"] == ["qwen3.8-flash"]
+    assert calls.count("http://127.0.0.1:8001/health") == 1
+
+
+def test_load_server_model_evicts_others_before_loading(monkeypatch):
+    monkeypatch.setattr(servers, "_server_action", lambda *a, **k: {
+        "ok": True, "base_url": "http://127.0.0.1:8001/v1",
+        "model": "qwen3.8-flash"})
+    evicted = []
+    monkeypatch.setattr(servers, "evict_other_local_servers",
+                        lambda target, c, **kw: evicted.append(target)
+                        or {"ok": True, "evicted": []})
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    cfg.auto_evict_servers = True
+    result = servers.load_server_model(
+        "strata", "qwen3.8-flash", cfg, evict_others=True)
+    assert result["ok"] is True
+    assert evicted == ["http://127.0.0.1:8001"]
+
+    # With auto_evict off the handshake is not run at all.
+    evicted.clear()
+    cfg.auto_evict_servers = False
+    servers.load_server_model("strata", "qwen3.8-flash", cfg, evict_others=True)
+    assert evicted == []
+
+
+def test_load_server_model_applies_a_kind_override_without_mutating(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(servers, "_server_action",
+                        lambda server, *a, **k: (
+                            seen.update(server), {"ok": True})[1])
+    row = {"name": "proxy", "kind": "custom", "provider": "custom",
+           "base_url": "http://127.0.0.1:8000/v1",
+           "models": ["qwen3-8b"], "loaded_models": ["qwen3-8b"]}
+    servers.load_server_model(row, "qwen3-8b", None, kind="lemonade")
+    assert seen["kind"] == "lemonade"
+    assert row["kind"] == "custom"          # the caller's row is untouched
+
+
+def test_unload_server_model_applies_a_kind_override_without_mutating(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(servers, "_server_action",
+                        lambda server, *a, **k: (
+                            seen.update(server), {"ok": True})[1])
+    row = {"name": "proxy", "kind": "custom", "provider": "custom",
+           "base_url": "http://127.0.0.1:8000/v1",
+           "models": ["qwen3-8b"], "loaded_models": ["qwen3-8b"]}
+    servers.unload_server_model(row, "qwen3-8b", None, kind="lemonade")
+    assert seen["kind"] == "lemonade"
+    assert row["kind"] == "custom"
+
+
+def test_evict_confirms_idle_when_memory_does_not_drop(monkeypatch):
+    """Strata/Avalon keep a DDR5 working set resident, so the combined
+    VRAM+RAM counter may not drop after an unload. A clean unload is also
+    confirmed by the evicted server reporting loaded_models == [], which must
+    end the poll instead of stalling for the full wait_seconds."""
+    target = {"name": "strata", "kind": "strata", "provider": "strata",
+              "base_url": "http://127.0.0.1:8001/v1", "online": True,
+              "models": ["qwen3.8-flash"], "loaded_models": ["qwen3.8-flash"],
+              "active": True}
+    other = {"name": "lemonade", "kind": "lemonade", "provider": "lemonade",
+             "base_url": "http://127.0.0.1:8000/v1", "online": True,
+             "models": ["gemma-3-27b"], "loaded_models": ["gemma-3-27b"],
+             "active": False}
+    monkeypatch.setattr(servers, "list_server_states",
+                        lambda cfg, timeout=servers.PROBE_TIMEOUT:
+                        [target, other])
+    monkeypatch.setattr(servers, "get_hardware_memory", lambda *a, **k: {
+        "ram": {"used_gb": 1.0, "total_gb": 2.0},
+        "vram": {"used_gb": 1.0, "total_gb": 2.0}})
+    monkeypatch.setattr(servers, "unload_server_model",
+                        lambda state, model="", config=None, kind="":
+                        {"ok": True, "server": state.get("name"),
+                         "action": "unload", "detail": "done"})
+    # The evicted server confirms the unload on the next probe.
+    monkeypatch.setattr(servers, "_probe_server",
+                        lambda state, timeout=servers.PROBE_TIMEOUT:
+                        {**state, "loaded_models": []})
+    monkeypatch.setattr(servers.time, "sleep", lambda s: None)
+    cfg = _cfg_with({}, active="")
+    cfg.auto_evict_servers = True
+    result = servers.evict_other_local_servers("strata", cfg, wait_seconds=5.0)
+    assert result["ok"] is True
+    assert result["confirmed_idle"] is True
+    assert result["waited_s"] < 5.0
+
+
 def test_active_profile_provider_sets_the_server_record_kind(monkeypatch):
     """The active profile is expanded into cfg, but a hand-built config (and
     the GUI's profile switch) may carry only cfg.base_url/model. Its own
@@ -1009,7 +1153,7 @@ def test_gui_unload_endpoint_updates_telemetry(gui, monkeypatch):
                                           "loaded_models": []}])
     calls = []
 
-    def fake_unload(target, model="", config=None):
+    def fake_unload(target, model="", config=None, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "unload", "server": target,
                 "model": model, "detail": "done"}
@@ -1060,7 +1204,7 @@ def test_gui_load_endpoint_returns_telemetry(gui, monkeypatch):
                         lambda *a, **k: [_gui_state()])
     calls = []
 
-    def fake_load(target, model="", config=None):
+    def fake_load(target, model="", config=None, evict_others=False, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "load", "server": target,
                 "model": model, "detail": "loaded"}

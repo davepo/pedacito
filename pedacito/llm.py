@@ -245,11 +245,23 @@ def _server_root(base_url: str) -> str:
 def _api_key(cfg) -> str:
     """The API key for a request: `api_key_env` (the name of an environment
     variable) beats the plain `api_key` string, so a secret never has to be
-    written to the config file."""
+    written to the config file. Strata/Avalon/local-MoE profiles fall back to
+    the conventional `STRATA_API_KEY`/`AVALON_API_KEY` variables when no
+    explicit key is set (the built-in default is LM Studio's dummy "lm-studio"),
+    matching `servers._headers_for` and `settings_api._endpoint_auth`."""
     env = getattr(cfg, "api_key_env", "") or ""
     if env:
         return os.environ.get(env, "")
-    return getattr(cfg, "api_key", "") or ""
+    key = getattr(cfg, "api_key", "") or ""
+    provider = str(getattr(cfg, "provider", "") or "").lower()
+    if not (_is_local_moe(cfg) or provider in (
+            "strata", "avalon", "local-moe", "local_moe", "localmoe")):
+        return key
+    if key and key != "lm-studio":
+        return key
+    for name in ("STRATA_API_KEY", "AVALON_API_KEY"):
+        key = os.environ.get(name, "") or key
+    return key
 
 
 # --------------------------------------------------------------- thinking off
@@ -665,15 +677,14 @@ def unload_model(client) -> str:
     acknowledged the unload, else "" -- the caller proceeds to warmup()
     either way, which loads the new model and surfaces any real failure.
 
-    Ollama: POST /api/generate {"model": ..., "keep_alive": 0} is the
-    documented unload. LM Studio: POST /api/v0/models/unload, best-effort.
-    Lemonade: POST /api/v1/unload {"model": ...}, which answers 200 with
-    "status": "success". The native Lemonade endpoint is tried FIRST: its
-    Ollama-compatible /api/generate performs the unload but can take longer
-    than the 2 s probe, so going there first would unload the model and still
-    report "" (a lost telemetry signal). Other runtimes have no unload
-    endpoint: "" and the load itself does the eviction. Hosted APIs are never
-    touched."""
+    Specialist handoffs delegate to `servers.unload_server_model`, which
+    speaks each runtime's native lifecycle endpoint (Lemonade
+    ``{"model_name": ...}`` on ``/v1/unload``, Strata/Avalon ``/v1/unload``,
+    llama-server ``/models/unload``) with the profile's own key/env threaded
+    through. When that control plane has no answer, the legacy best-effort
+    spellings are tried: Ollama ``POST /api/generate {"keep_alive": 0}`` and
+    LM Studio ``POST /api/v0/models/unload``. Hosted APIs are never touched.
+    """
     cfg = getattr(client, "cfg", None)
     if cfg is None or not _is_local_server(cfg):
         return ""
@@ -682,6 +693,17 @@ def unload_model(client) -> str:
         return ""
     root = _server_root(cfg.base_url)
     headers = getattr(client, "headers", None) or {}
+    from . import servers as servers_mod
+    server = {"base_url": str(getattr(cfg, "base_url", "") or ""),
+              "provider": str(getattr(cfg, "provider", "") or ""),
+              "api_key": str(getattr(cfg, "api_key", "") or ""),
+              "api_key_env": str(getattr(cfg, "api_key_env", "") or "")}
+    try:
+        result = servers_mod.unload_server_model(server, model, config=cfg)
+    except Exception:
+        result = {}
+    if result.get("ok"):
+        return model
     for url, payload in (
             (root + "/api/v1/unload", {"model": model}),
             (root + "/api/v0/models/unload", {"model": model}),
@@ -4673,6 +4695,30 @@ class LLMClient:
                     merge(got)
             except Exception:
                 pass
+
+        # Strata/Avalon name their service and context window on the public
+        # /health endpoint; absorb it when the model listing never carried a
+        # context length (their key-protected /v1/models answers 401, so the
+        # listing probes above learned nothing).
+        if not out.get("context_length") and not out.get("max_context_length"):
+            try:
+                r = requests.get(root + "/health", headers=self.headers,
+                                 timeout=5)
+                try:
+                    data = r.json() if r.status_code == 200 else None
+                finally:
+                    _close(r)
+            except Exception:
+                data = None
+            if isinstance(data, dict) and \
+                    str(data.get("service") or "").lower() in ("strata",
+                                                               "avalon"):
+                ctx = _positive_int(data.get("max_context")
+                                    or data.get("context_length"))
+                if ctx:
+                    out["context_length"] = ctx
+                    out["context_source"] = "strata health"
+                    out.setdefault("source", "strata")
 
         if not (out.get("size_bytes") or out.get("context_length")
                 or out.get("max_context_length")):

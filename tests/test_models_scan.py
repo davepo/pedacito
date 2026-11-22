@@ -159,3 +159,41 @@ def test_models_scan_is_idempotent(tmp_path, fake, monkeypatch):
     # a re-scan appends nothing (and the backup keeps the prior file)
     assert cfgfile.read_text(encoding="utf-8") == first
     assert first.count("[profiles.model-a]") == 1
+
+
+def test_models_scan_passes_per_origin_auth_and_writes_provider(
+        tmp_path, monkeypatch):
+    """`pedacito models scan` carries each profile's key to its own origin
+    (plus STRATA_API_KEY/AVALON_API_KEY) and writes provider for the local-MoE
+    / Lemonade runtimes so the profile classifies as its real daemon."""
+    monkeypatch.setattr(discovery, "DEFAULT_PORTS", ())
+    monkeypatch.setattr(cli, "USER_CONFIG", tmp_path / "user.toml")
+    (tmp_path / "user.toml").write_text(
+        '[profiles.strata]\n'
+        'base_url = "http://127.0.0.1:8090/v1"\n'
+        'model = "some-model-7b"\n'
+        'provider = "strata"\n'
+        'api_key = "sk-strata"\n',
+        encoding="utf-8")
+    seen = {}
+
+    def fake_discover(*a, **k):
+        seen["discover_auth"] = k.get("auth")
+        return [("Strata", "http://127.0.0.1:8090/v1", ["some-model-7b"])]
+
+    def fake_describe(base_url, *a, **k):
+        seen["describe_auth"] = k.get("auth")
+        return [{"id": "some-model-7b", "base_url": base_url, "loaded": True}]
+
+    monkeypatch.setattr(discovery, "discover_servers", fake_discover)
+    monkeypatch.setattr(discovery, "describe_models", fake_describe)
+    cfgfile = tmp_path / "config.toml"
+    rc = cli.main(["models", "scan", "--yes", "--calibrate", "none",
+                   "--config", str(cfgfile)])
+    assert rc == 0
+    key = discovery.normalize_url("http://127.0.0.1:8090/v1")
+    assert seen["discover_auth"][key] == {"Authorization": "Bearer sk-strata"}
+    assert seen["describe_auth"][key] == {"Authorization": "Bearer sk-strata"}
+    text = cfgfile.read_text(encoding="utf-8")
+    assert 'provider = "strata"' in text
+    assert 'tier = "local-moe"' in text
