@@ -1209,7 +1209,7 @@ CLI_COMMANDS = [
     },
     {
         "name": "diagnose",
-        "usage": "pedacito diagnose [--root DIR] [--file FILE]",
+        "usage": "pedacito diagnose [DIR] [--root DIR] [--file FILE]",
         "summary": "Run the project's detected linter/typechecker.",
         "keywords": ["lint", "typecheck", "static analysis"],
         "examples": ["pedacito diagnose .", "pedacito diagnose . --file app.py"],

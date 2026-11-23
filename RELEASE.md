@@ -8,9 +8,9 @@ publish sequence.
 
 | Item | State |
 |---|---|
-| Release branch | `v032/job9-release-gate`, a worktree off `v0.3.2-dev`, which holds all eight merged v0.3.2 implementation jobs |
+| Release branch | `v0.3.2-dev` (all v0.3.2 jobs + post-QA fixes merged and verified) |
 | Version in the tree | `0.3.2` in `pyproject.toml` and `pedacito/__init__.py` |
-| CHANGELOG | `## v0.3.2 — 2026-11-22` lists every v0.3.2 feature and fix |
+| CHANGELOG | `## v0.3.2 — 2026-11-23` lists every v0.3.2 feature and fix |
 | Merged to `main`, tagged, built for upload, or published | No. Each of these happens only after the release is approved (steps 1, 5, 6 and 9 below) |
 
 Check PyPI and `git tag --list` before quoting what is published. This file
