@@ -1313,3 +1313,38 @@ def test_gui_refused_action_still_paints_the_server_registry(gui, monkeypatch):
     assert "if (!j.ok) {" in paint
     assert "if (!(j.servers || []).length) return;" in paint
     assert "if (!j || !j.ok)" not in paint
+
+
+def test_strata_unload_sends_empty_body_with_wait_and_cli_evicts(monkeypatch):
+    """Strata's POST /v1/unload accepts `{}` (and `?wait=15`) and returns 404
+    if a mismatched `model` string is sent. And CLI `_evict_other_local_servers`
+    must evict Strata before switching to Lemonade (and vice versa)."""
+    posted = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posted.append((url, json))
+        return SimpleNamespace(status_code=200, text='{"status":"unloaded"}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8090/v1",
+                   "model": "qwen3.8-flash-next-iq3_s",
+                   "provider": "strata", "api_key": "sk-s"},
+        "lemon": {"base_url": "http://127.0.0.1:11434/v1",
+                  "model": "DaisyRose-27B-GGUF-Q4_K_XL",
+                  "provider": "lemonade"},
+    }, active="lemon")
+    res = servers.unload_server_model("strata", "wrong-spelling", cfg)
+    assert res["ok"] is True
+    assert posted[0] == ("http://127.0.0.1:8090/v1/unload?wait=15", {})
+
+    # CLI eviction helper triggers evict_other_local_servers for multi-server cfg
+    from pedacito import cli
+    evicted_targets = []
+    monkeypatch.setattr(
+        servers, "evict_other_local_servers",
+        lambda target, c, **kw: evicted_targets.append(target)
+        or {"ok": True, "evicted": [{"ok": True, "server": "strata"}]})
+    cli._evict_other_local_servers(cfg)
+    assert evicted_targets == ["http://127.0.0.1:11434/v1"]
+

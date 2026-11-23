@@ -1253,3 +1253,85 @@ def test_interleaved_result_defaults():
     r = InterleavedResult()
     assert not r.ok and r.changed_files == [] and r.turns == 0
     assert r.workspace is None and r.error == ""
+
+
+def test_parse_qwen_strata_xml_tool_calls_preserves_indentation():
+    """Strata / Qwen3.5 / Qwen3.8 emit XML `<tool_call><function=NAME>`
+    blocks in content. parse_text_tool_calls must parse them cleanly while
+    preserving exact leading code indentation inside search/replace."""
+    valid = frozenset(("read", "edit_file", "finish"))
+    read_xml = (
+        "<tool_call>\n"
+        "<function=read>\n"
+        "<parameter=file>\n"
+        "game_logic.py\n"
+        "</parameter>\n"
+        "<parameter=start_line>\n"
+        "1\n"
+        "</parameter>\n"
+        "<parameter=end_line>\n"
+        "140\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    calls = interleaved.parse_text_tool_calls(read_xml, valid)
+    assert len(calls) == 1
+    assert calls[0].name == "read"
+    assert calls[0].arguments == {
+        "file": "game_logic.py", "start_line": 1, "end_line": 140}
+
+    edit_xml = (
+        "<tool_call>\n"
+        "<function=edit_file>\n"
+        "<parameter=file>\npricing.py\n</parameter>\n"
+        "<parameter=search>\n"
+        "    if quantity > 10:\n"
+        "        return 0.1\n"
+        "</parameter>\n"
+        "<parameter=replace>\n"
+        "    if quantity >= 10:\n"
+        "        return 0.15\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    ecalls = interleaved.parse_text_tool_calls(edit_xml, valid)
+    assert len(ecalls) == 1
+    assert ecalls[0].name == "edit_file"
+    assert ecalls[0].arguments["search"] == "    if quantity > 10:\n        return 0.1"
+    assert ecalls[0].arguments["replace"] == "    if quantity >= 10:\n        return 0.15"
+
+
+def test_interleaved_runs_end_to_end_with_strata_xml_tool_calls(tmp_path):
+    """End-to-end proof: a model returning Qwen/Strata XML tool calls in
+    plain content (no OpenAI tool_calls array) completes read -> edit_file ->
+    finish and lands the edit on disk."""
+    replies = iter([
+        "<tool_call>\n<function=read>\n<parameter=file>\npricing.py\n"
+        "</parameter>\n<parameter=start_line>\n1\n</parameter>\n"
+        "<parameter=end_line>\n40\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=edit_file>\n<parameter=file>\npricing.py\n"
+        "</parameter>\n<parameter=search>\n    if quantity > 10:\n"
+        "</parameter>\n<parameter=replace>\n    if quantity >= 10:\n"
+        "</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=finish>\n<parameter=summary>\n"
+        "Fixed >= 10 threshold.\n</parameter>\n</function>\n</tool_call>",
+    ])
+
+    class _XMLClient:
+        stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                 "total_tokens": 0, "reasoning_tokens": 0,
+                 "cached_tokens": 0, "cache_write_tokens": 0,
+                 "seconds": 0.0, "cost": 0.0, "by_site": {}}
+
+        def chat_tools(self, messages, tools, max_tokens, cancel_event=None):
+            return {"content": next(replies), "tool_calls": []}
+
+    root, agent = make_agent(tmp_path, _XMLClient())
+    res = run_interleaved(agent, "Fix bulk_discount in pricing.py", apply=True)
+    assert res.ok, res.error
+    assert "pricing.py" in res.changed_files
+    assert "if quantity >= 10:" in (root / "pricing.py").read_text(
+        encoding="utf-8")
+

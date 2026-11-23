@@ -392,6 +392,41 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     return idx
 
 
+def _evict_other_local_servers(cfg) -> None:
+    """Auto-evict resident models on OTHER configured local servers before a
+    CLI run loads this profile (matching GUI jobs.py and TUI tui.py)."""
+    if not bool(getattr(cfg, "auto_evict_servers", True)):
+        return
+    base = str(getattr(cfg, "base_url", "") or "")
+    if not base:
+        return
+    try:
+        from . import servers as servers_mod
+        if not servers_mod.is_local_url(base):
+            return
+        configured = servers_mod.configured_local_servers(cfg)
+        target_key = servers_mod.normalize_url(base)
+        others = [s for s in configured
+                  if servers_mod.normalize_url(s.get("base_url", "")) != target_key]
+        if not others:
+            return
+        res = servers_mod.evict_other_local_servers(base, cfg)
+        evicted = [r for r in (res.get("evicted") or []) if r.get("ok")]
+        failed = [r for r in (res.get("evicted") or []) if not r.get("ok")]
+        if evicted:
+            names = ", ".join(str(r.get("server") or r.get("model") or "server")
+                              for r in evicted)
+            print(f"[auto-evict: unloaded {names} before switching to "
+                  f"{cfg.active_profile or cfg.model}]", file=sys.stderr)
+        if failed:
+            for r in failed:
+                print(f"[auto-evict warning: could not unload "
+                      f"{r.get('server') or 'server'}: {r.get('detail', '')}]",
+                      file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
     """Load and refresh the project's index, or build it if none exists or
     `rebuild` is set."""
@@ -693,6 +728,7 @@ def _switch_profile(args, ref, arg: str, kind: str = "profile") -> str:
     new_client = LLMClient(new_cfg)
     try:
         new_client.check(warn=False)
+        _evict_other_local_servers(new_cfg)
         new_client.warmup()
     except LLMError:
         args.profile, args.model = prev_profile, prev_model
@@ -1501,7 +1537,8 @@ def _cmd_worktree(args) -> int:
 def _cmd_diagnose(args) -> int:
     """`pedacito diagnose`."""
     from . import diagnostics
-    root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
+    target = getattr(args, "root", None) or getattr(args, "path", None)
+    root = Path(target).expanduser().resolve() if target else Path(".").resolve()
     files = [args.file] if getattr(args, "file", "") else None
     ok, report = diagnostics.run(root, Config(), files=files)
     print(report)
@@ -1747,6 +1784,7 @@ def _cmd_calibrate(args, cfg) -> int:
         return 0
     client = LLMClient(cfg)
     client.check()
+    _evict_other_local_servers(cfg)
     client.warmup()
     card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
                                repeats=getattr(args, "repeats", None))
@@ -3511,6 +3549,8 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
 
     p_diag = sub.add_parser(
         "diagnose", help="run the project's detected linter/typechecker")
+    p_diag.add_argument("path", nargs="?", default=None,
+                        help="the project (default: current directory)")
     p_diag.add_argument("--root", default=None,
                         help="the project (default: current directory)")
     p_diag.add_argument("--file", default="",
@@ -4518,6 +4558,7 @@ def _main(argv=None) -> int:
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
+            _evict_other_local_servers(cfg)
             # One run-scoped collector covers refine + plan + skeleton +
             # implementation, so the closing line aggregates the whole build.
             events_mod.begin_run()
@@ -4581,6 +4622,9 @@ def _main(argv=None) -> int:
             return 0
 
         idx = _get_index(args, cfg, client, rebuild=getattr(args, "reindex", False))
+        # Evict resident models on other local servers (e.g. Strata <-> Lemonade)
+        # before loading this profile so they never fight for VRAM/RAM.
+        _evict_other_local_servers(cfg)
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()

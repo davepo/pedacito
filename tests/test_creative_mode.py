@@ -470,3 +470,18 @@ def test_preview_missing_file_and_no_project(gui, tmp_path):
     status, body = gui.get("/api/preview")
     assert status == 200 and body["files"] == []
     assert gui.req("GET", "/preview/index.html")[0] == 404
+
+
+def test_creative_reclaims_reply_floor_on_moderate_local_context(tmp_path):
+    """On a 13k-token local model (e.g. Gemma 4 at 13,219 ctx), a ~5.5k
+    pinned/task creative prompt must shrink the 8192 creative reply boost
+    cleanly instead of crashing over-budget before making a model call."""
+    agent, client, _cfg = _agent(
+        tmp_path, context_tokens=13219, reserve_tokens=2048,
+        max_tokens_answer=3000, creative_mode=True)
+    big_pin = "def f():\n    return 1\n" * 800       # ~5k untrimmable tokens
+    agent.pinned_context = big_pin
+    agent.answer("polish the neon UI across index.html, style.css, game.js",
+                 big_pin, stream=False)
+    assert len(client.budgets) == 1
+    assert 2048 <= client.budgets[0] < 8192

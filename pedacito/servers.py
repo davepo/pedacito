@@ -883,6 +883,12 @@ def _generic_action(server: dict, action: str,
                     model: str) -> tuple[bool, str, str]:
     """Strata/Avalon/custom: try the OpenAI-ish lifecycle endpoints first.
 
+    Strata/Avalon are single-model servers whose ``POST /v1/unload`` accepts
+    ``{}`` (and ``?wait=15`` to block until weights finish releasing) and
+    returns 404 if a ``model`` string does not match the server's exact
+    internal id. Try empty-body ``/v1/unload`` for those runtimes so cross-
+    server auto-evict never misfires on a profile/model spelling difference.
+
     The alternate spelling is tried only when the server gave no answer at all
     (404, connection failure or timeout), exactly like the Lemonade and
     llama.cpp paths. A real answer -- notably Strata's 401 when the profile
@@ -892,10 +898,22 @@ def _generic_action(server: dict, action: str,
     """
     root = _root(str(server.get("base_url") or ""))
     headers = _headers_for(server)
+    kind = str(server.get("kind") or server.get("provider")
+               or server.get("type") or "").lower()
+    is_strata = kind in ("strata", "avalon", "local-moe", "local_moe",
+                         "localmoe")
     candidates = []
     if action == "unload":
-        candidates = [("/v1/unload", {"model": model} if model else {}),
-                      ("/models/unload", {"model": model} if model else {})]
+        if is_strata:
+            candidates = [("/v1/unload?wait=15", {}),
+                          ("/v1/unload", {}),
+                          ("/models/unload", {"model": model} if model else {})]
+        else:
+            candidates = [("/v1/unload", {"model": model} if model else {})]
+            if model:
+                candidates.append(("/v1/unload", {}))
+            candidates.append(
+                ("/models/unload", {"model": model} if model else {}))
     else:
         candidates = [("/v1/load", {"model": model} if model else {}),
                       ("/models/load", {"model": model} if model else {})]

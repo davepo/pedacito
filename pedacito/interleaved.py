@@ -434,13 +434,88 @@ def _call_from_obj(obj, valid, n: int) -> ToolCall | None:
     return ToolCall(str(obj.get("id") or f"call_json_{n}"), name, args, err)
 
 
+_XML_FUNC_RE = re.compile(
+    r"<function=([A-Za-z0-9_.\-]+)\s*>(.*?)</function>",
+    re.DOTALL | re.IGNORECASE)
+_XML_PARAM_RE = re.compile(
+    r"<parameter=([A-Za-z0-9_.\-]+)\s*>(.*?)</parameter>",
+    re.DOTALL | re.IGNORECASE)
+# Fields that carry raw code/text: never JSON-coerce or strip inner indentation.
+_XML_RAW_STRING_FIELDS = frozenset((
+    "file", "path", "search", "replace", "content", "pattern", "query",
+    "command", "symbol", "summary", "subcommand", "prompt", "args",
+))
+
+
+def _coerce_xml_param(key: str, raw: str):
+    """Strip ONLY one leading and one trailing newline added by XML tag
+    formatting (`<parameter=file>\\ngame_logic.py\\n</parameter>`), preserving
+    code indentation inside `search`/`replace`/`content`. Coerce simple scalars
+    (`start_line`, `end_line`, booleans) when not a raw text field."""
+    val = raw
+    if val.startswith("\r\n"):
+        val = val[2:]
+    elif val.startswith("\n"):
+        val = val[1:]
+    if val.endswith("\r\n"):
+        val = val[:-2]
+    elif val.endswith("\n"):
+        val = val[:-1]
+    if key in _XML_RAW_STRING_FIELDS:
+        return val.strip() if key in ("file", "path", "symbol", "subcommand") \
+            else val
+    stripped = val.strip()
+    if not stripped:
+        return ""
+    if stripped.lower() == "true":
+        return True
+    if stripped.lower() == "false":
+        return False
+    if re.fullmatch(r"-?\d+", stripped):
+        try:
+            return int(stripped)
+        except ValueError:
+            pass
+    if stripped[0] in "{[":
+        try:
+            return json.loads(stripped)
+        except ValueError:
+            pass
+    return stripped
+
+
+def _parse_xml_tool_calls(text: str, valid) -> list[ToolCall]:
+    """Parse Qwen3.5/3.8 / Strata XML tool-call blocks emitted in content:
+    ``<tool_call><function=read><parameter=file>a.py</parameter></function></tool_call>``."""
+    if "<function=" not in text and "<FUNCTION=" not in text:
+        return []
+    calls: list[ToolCall] = []
+    for m in _XML_FUNC_RE.finditer(text):
+        raw_name = m.group(1).strip()
+        name = canonical_name(raw_name, valid)
+        if name not in valid:
+            continue
+        inner = m.group(2)
+        args: dict = {}
+        for pm in _XML_PARAM_RE.finditer(inner):
+            pkey = pm.group(1).strip()
+            if pkey:
+                args[pkey] = _coerce_xml_param(pkey, pm.group(2))
+        calls.append(ToolCall(f"text_{len(calls) + 1}", name, args))
+    return calls
+
+
 def parse_text_tool_calls(text: str, valid) -> list[ToolCall]:
-    """Tool calls a model wrote as JSON in plain text: a single call object,
-    a `{"tool_calls": [...]}` envelope, or a list, optionally inside a code
-    fence or after some prose. Unknown tool names are ignored."""
+    """Tool calls a model wrote in plain text: Qwen3.5/3.8 XML
+    `<tool_call><function=...>...</function></tool_call>`, a single JSON call
+    object, a `{"tool_calls": [...]}` envelope, or a JSON list, optionally
+    inside a code fence or after some prose. Unknown tool names are ignored."""
     body = str(text or "")
     if not body.strip():
         return []
+    xml_calls = _parse_xml_tool_calls(body, valid)
+    if xml_calls:
+        return xml_calls
     decoder = json.JSONDecoder()
     pos = 0
     while True:
