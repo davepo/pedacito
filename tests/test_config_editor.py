@@ -826,3 +826,24 @@ def test_remove_default_profile_promotes_next_non_image_profile():
     flat3, profiles3 = E.validate_text(out3)
     assert profiles3 == {}
     assert flat3["default_profile"] == ""
+
+
+def test_upsert_profiles_deduplicates_localhost_and_v1_url_spellings():
+    """`models scan` must not write a duplicate Strata profile when the user's
+    existing profile spells `127.0.0.1:8090/v1` and discovery reports
+    `localhost:8090/v1` (or without `/v1`)."""
+    text = (
+        '[profiles.qwen3_8-flash-next-iq3-s]\n'
+        'base_url = "http://127.0.0.1:8090/v1"\n'
+        'model = "qwen3.8-flash-next-iq3_s"\n'
+        'provider = "strata"\n'
+        'api_key = "sk-strata-secret"\n'
+    )
+    out = E.upsert_profiles(text, [{
+        "base_url": "http://localhost:8090/v1",
+        "model": "qwen3.8-flash-next-iq3_s",
+        "server_label": "Strata",
+        "provider": "strata",
+    }])
+    assert out == text
+

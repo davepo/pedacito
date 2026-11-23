@@ -606,6 +606,62 @@ def test_remote_lan_checkpoint_resolves_via_cached_hf_metadata(
     assert len(calls) == 1
 
 
+def test_cli_config_shows_calibrated_model_card_temperatures(
+        tmp_path, monkeypatch, capsys):
+    """`pedacito config --profile X` must apply the calibrated model card
+    before displaying Resolved settings so temperature matches runtime."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[universal]\ntemperature = 0.2\n\n'
+        '[profiles.q27]\n'
+        'base_url = "http://127.0.0.1:11434/v1"\n'
+        'model = "Qwen3.8-27B-GGUF"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    modelcard.save_card({
+        "version": modelcard.CARD_VERSION,
+        "key": "http://127.0.0.1:11434/v1|Qwen3.8-27B-GGUF",
+        "ts": time.time(),
+        "model": "Qwen3.8-27B-GGUF",
+        "url": "http://127.0.0.1:11434/v1",
+        "measured": {"overall": 0.95},
+        "choices": {
+            "arch_family": "qwen3.5",
+            "temperature": 0.6,
+            "temperature_answer": 0.6,
+        },
+        "notes": [], "repeats": 1, "seconds": 1.0,
+    })
+    rc = cli.main(["config", "--config", str(cfg_path), "--profile", "q27"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "0.6" in out and "model card (qwen3.5)" in out
+
+
+def test_plan_tasks_guides_no_live_tools_and_small_model_cap():
+    """Without shell/browser/screenshot tools, generate_tasks warns the planner
+    not to emit live-observation tasks; tiny/small tiers also get a compact cap."""
+    from pedacito import loop as loop_mod
+    seen_sys = []
+
+    class _FakePlanner:
+        def chat_json(self, messages, schema, max_tokens=2000, **kw):
+            seen_sys.append(messages[0]["content"])
+            return {"tasks": [{"title": "Add helper"}]}
+
+    cfg = Config(allow_shell=False, allow_browser=False,
+                 allow_screenshots=False, tier="tiny")
+    loop_mod.generate_tasks("Build an arcade game", _FakePlanner(), cfg)
+    assert "TOOL AVAILABILITY NOTE" in seen_sys[-1]
+    assert "SMALL-MODEL PLAN CAP" in seen_sys[-1]
+
+    cfg_full = Config(allow_shell=True, tier="large")
+    loop_mod.generate_tasks("Build an arcade game", _FakePlanner(), cfg_full)
+    assert "TOOL AVAILABILITY NOTE" not in seen_sys[-1]
+    assert "SMALL-MODEL PLAN CAP" not in seen_sys[-1]
+
+
+
 def test_needle_step_down_ladder():
     assert arch_defaults.needle_step_down(131072) == 65536
     assert arch_defaults.needle_step_down(65536) == 32768

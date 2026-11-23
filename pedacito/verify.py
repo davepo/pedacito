@@ -966,17 +966,35 @@ _STUB_OK_RE = re.compile(
     r"unimplemented|abstract|interface|protocol)\b")
 
 
+_NOOP_FUNC_NAMES = frozenset(("noop", "_noop", "log_message"))
+
+
+def _is_bare_pass_or_ellipsis(body: list) -> bool:
+    if body and isinstance(body[0], ast.Expr) \
+            and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]                 # drop the docstring
+    if len(body) != 1:
+        return False
+    stmt = body[0]
+    if isinstance(stmt, ast.Pass):
+        return True
+    return (isinstance(stmt, ast.Expr)
+            and isinstance(getattr(stmt, "value", None), ast.Constant)
+            and stmt.value.value is Ellipsis)
+
+
 def _pass_stub_count(text: str) -> int:
-    """Bare `pass` bodies that are the WHOLE body of a definition.
+    """Bare `pass` / `...` bodies that are the WHOLE body of a definition.
 
     A `pass` is not automatically a stub: `BaseHTTPRequestHandler.log_message`
-    is deliberately a no-op, and `except OSError: pass` is a common best-effort
-    cleanup. Counting every `pass` line refused an otherwise complete dev
-    server for its four-line `log_message` override. When the added text
-    parses, only a definition whose body is exactly `pass` counts; when it is
-    a fragment, the old ratio applies. Either way one no-op among implemented
-    definitions is not a stub -- at least half of the definitions must be
-    pass-only for the text to read as scaffolding.
+    is deliberately a no-op, empty `class MyError(Exception): pass` subclasses
+    are valid, and `except OSError: pass` is best-effort cleanup. However, a
+    top-level (module-scope) function whose entire body is `pass` or `...`
+    (like a scaffolded `def get_wave_difficulty(wave): pass` left behind in a
+    10-function module) is always an unfinished stub. Methods inside classes
+    still use the >= 50% ratio so intentional no-op overrides like
+    `Handler.log_message` beside real handlers are never flagged.
     """
     text = text or ""
     try:
@@ -985,6 +1003,19 @@ def _pass_stub_count(text: str) -> int:
         passes = len(_PASS_RE.findall(text))
         defs = len(_DEF_RE.findall(text))
         return passes if passes and passes * 2 >= max(1, defs) else 0
+    top_stubs = 0
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _NOOP_FUNC_NAMES:
+                continue
+            decs = [getattr(d, "id", "") or getattr(d, "attr", "")
+                    for d in (node.decorator_list or ())]
+            if "abstractmethod" in decs:
+                continue
+            if _is_bare_pass_or_ellipsis(list(node.body)):
+                top_stubs += 1
+    if top_stubs:
+        return top_stubs
     defs = 0
     stubs = 0
     for node in ast.walk(tree):
@@ -992,12 +1023,7 @@ def _pass_stub_count(text: str) -> int:
                                  ast.ClassDef)):
             continue
         defs += 1
-        body = list(node.body)
-        if body and isinstance(body[0], ast.Expr) \
-                and isinstance(getattr(body[0], "value", None), ast.Constant) \
-                and isinstance(body[0].value.value, str):
-            body = body[1:]                 # drop the docstring
-        if len(body) == 1 and isinstance(body[0], ast.Pass):
+        if _is_bare_pass_or_ellipsis(list(node.body)):
             stubs += 1
     if stubs and stubs * 2 >= max(1, defs):
         return stubs

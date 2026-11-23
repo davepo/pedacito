@@ -1622,7 +1622,8 @@ def _short_parts(model_id: str) -> tuple[str, str]:
 
 
 def _norm_url(url: str) -> str:
-    return (url or "").rstrip("/")
+    from . import discovery
+    return discovery.normalize_url(url)
 
 
 def _provenance(entry: dict, when: str) -> str:

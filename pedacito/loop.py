@@ -1254,6 +1254,25 @@ def generate_tasks(spec_text: str, client, cfg,
         plan_system += "\n\n" + WEB_PLAN_NOTE
     if root is not None and not _mode_check_files(root):
         plan_system += "\n\n" + GREENFIELD_PLAN_NOTE
+    if not (getattr(cfg, "allow_shell", False)
+            or getattr(cfg, "allow_browser", False)
+            or getattr(cfg, "allow_screenshots", False)):
+        plan_system += (
+            "\n\nTOOL AVAILABILITY NOTE: No interactive shell (`run`), "
+            "headless browser (`browser`), or screenshot tool is enabled in "
+            "this run. Do NOT emit live-observation tasks that ask the agent "
+            "to launch or visually inspect the running app/game; verify every "
+            "change with unit tests (`run_test`) and code/static checks "
+            "instead.")
+    try:
+        from .config import effective_tier
+        if effective_tier(cfg) in ("tiny", "small"):
+            plan_system += (
+                "\n\nSMALL-MODEL PLAN CAP: Keep the plan compact (at most "
+                "6-8 concrete, single-file tasks). Do not explode one feature "
+                "into dozens of tiny micro-steps.")
+    except Exception:
+        pass
     notes = instructions_mod.render(root, cfg) if root is not None else ""
     if notes:
         plan_system += "\n\n" + notes
@@ -2083,6 +2102,9 @@ class TaskResult:
     unaccepted: list = field(default_factory=list)
     # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
     stats: dict = field(default_factory=dict)
+    # True when the task stopped early because it hit max_task_seconds or
+    # max_task_completion_tokens (partial/aborted work).
+    budget_hit: bool = False
     # The post-edit impacted-tests verdict: None when the tests did not run
     # (verification off / no test command), else True/False from the last
     # verification round. `ask --strict` exits nonzero on False.
@@ -4385,7 +4407,10 @@ def _run_interleaved_task(root: Path, cfg, client, agent, idx, task: str, *,
                       steps_log, backup_dir=backup_dir,
                       live_ok=bool(live_kinds) if live_kinds else None,
                       live_kinds=tuple(live_kinds) if live_kinds else None,
-                      stats=stats, tests_ok=res.tests_green)
+                      stats=stats, tests_ok=res.tests_green,
+                      budget_hit=bool(getattr(res, "stop_reason", "") in (
+                          "max_task_seconds", "max_task_completion_tokens",
+                          "max_total_model_calls")))
 
 
 def run_task(root: Path, cfg, client, agent, idx, task: str, *,
@@ -5163,6 +5188,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       live_kinds=_live_kinds_of(agent),
                       findings=findings, stats=stats, tests_ok=tests_ok,
                       tests_preexisting_only=tests_preexisting_only,
+                      budget_hit=bool(getattr(agent, "_task_budget_hit", False)),
                       clauses=clauses, clause_texts=clause_texts,
                       unaccepted=unaccepted)
 
