@@ -13,7 +13,6 @@ import json
 import re
 import sys
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -924,33 +923,33 @@ def test_list_server_states_probes_concurrently_and_preserves_order(
         "fast-b": {"base_url": "http://127.0.0.1:8003/v1",
                    "model": "m", "provider": "strata"},
     }, active="slow")
-    delays = {"slow": 0.25, "fast-a": 0.02, "fast-b": 0.02}
-    spans = {}
+    # A 3-party barrier only clears when all three probes are in flight at the
+    # same time (sequential probing would time out with BrokenBarrierError).
+    in_flight = threading.Barrier(3, timeout=5.0)
+    fast_done = threading.Event()
+    finished: list[str] = []
+    threads: set[str] = set()
     lock = threading.Lock()
 
     def fake_probe(server, timeout=servers.PROBE_TIMEOUT):
         name = server["name"]
-        start = time.monotonic()
-        time.sleep(delays[name])
-        end = time.monotonic()
+        in_flight.wait()
+        if name == "slow":
+            fast_done.wait(timeout=5.0)
         with lock:
-            spans[name] = (start, end, threading.current_thread().name)
+            threads.add(threading.current_thread().name)
+            finished.append(name)
+            if "fast-a" in finished and "fast-b" in finished:
+                fast_done.set()
         return {**server, "online": True, "status": "online",
                 "models": [], "loaded_models": []}
 
     monkeypatch.setattr(servers, "_probe_server", fake_probe)
-    started = time.monotonic()
     states = servers.list_server_states(cfg)
-    elapsed = time.monotonic() - started
-    # Configured order survives the shuffled completion order.
+    # Configured order survives the shuffled completion order (slow finished last).
     assert [s["name"] for s in states] == ["slow", "fast-a", "fast-b"]
-    # Both fast probes started (and finished) while the slow one was still
-    # in flight, on pool workers rather than the calling thread.
-    assert spans["fast-a"][1] < spans["slow"][1]
-    assert spans["fast-b"][1] < spans["slow"][1]
-    assert len({span[2] for span in spans.values()}) > 1
-    # One slow probe's wall time, not the sum of all three.
-    assert elapsed < sum(delays.values())
+    assert finished[-1] == "slow"
+    assert len(threads) == 3
 
 
 def test_list_server_states_single_server_still_probes(monkeypatch):

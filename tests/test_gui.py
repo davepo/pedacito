@@ -1363,6 +1363,8 @@ def test_hardware_endpoint_bypasses_the_snapshot_ttl(gui, monkeypatch):
 
     monkeypatch.setattr(servers, "get_hardware_memory", fake_reader)
     monkeypatch.setattr(profiler_mod, "_read_nvidia_smi", lambda **k: [])
+    monkeypatch.setattr(profiler_mod, "_read_macos_memory", lambda **k: None)
+    monkeypatch.setattr(profiler_mod, "_read_windows_memory", lambda **k: None)
     profiler_mod.clear_snapshot_cache()
     s1, j1 = gui.get("/api/hardware")
     s2, j2 = gui.get("/api/hardware")
@@ -1430,6 +1432,8 @@ def test_unload_response_reflects_post_action_memory(gui, monkeypatch):
 
     monkeypatch.setattr(servers, "get_hardware_memory", fake_reader)
     monkeypatch.setattr(profiler_mod, "_read_nvidia_smi", lambda **k: [])
+    monkeypatch.setattr(profiler_mod, "_read_macos_memory", lambda **k: None)
+    monkeypatch.setattr(profiler_mod, "_read_windows_memory", lambda **k: None)
     monkeypatch.setattr(servers, "list_server_states", lambda *a, **k: [])
     monkeypatch.setattr(
         servers, "unload_server_model",
