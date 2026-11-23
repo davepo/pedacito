@@ -968,17 +968,38 @@
       render();
     });
   }
+  function _isLoopbackUrl(u) {
+    var m = String(u || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^/:?#]+)/i);
+    if (!m) return false;
+    var host = m[1].toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1' || host === '[::1]';
+  }
+  function _localGpuVramGb() {
+    var mem = PDC.getMemory && PDC.getMemory();
+    var v = mem && mem.vram;
+    if (!v) return 0;
+    var cards = v.cards || [];
+    var gb = 0;
+    cards.forEach(function (c) { var t = Number(c.total_gb || 0); if (t > gb) gb = t; });
+    if (!gb) gb = Number(v.total_gb || 0);
+    return gb >= 1 ? Math.round(gb) : 0;
+  }
   function doImport() {
     var sel = pickedRows();
     if (!sel.length) return;
-    var vram = parseFloat(SCAN.vram) || 0;
+    var typedVram = parseFloat(SCAN.vram) || 0;
+    var localVram = typedVram ? 0 : _localGpuVramGb();
     var list = sel.map(function (r) {
       var k = rowKey(r);
       var pname = sanitizeName(SCAN.name[k] || r.suggested_profile_name);
       SCAN.name[k] = pname;
+      // Only attach this machine's detected GPU VRAM to loopback servers;
+      // a LAN server (e.g. a 24 GB homelab box from an 8 GB laptop) keeps
+      // vram_gb unset unless the user explicitly entered the server's VRAM.
+      var rowVram = typedVram || (_isLoopbackUrl(r.server_url) ? localVram : 0);
       var item = { profile_name: pname, provider: r.provider || '',
         base_url: r.server_url, model: r.model_id,
-        context_length: r.context_length || 0, vram_gb: vram,
+        context_length: r.context_length || 0, vram_gb: rowVram,
         is_image_model: !!r.is_image_model,
         set_default: SCAN.def === k };
       var key = (SCAN.apiKey[normUrl(r.server_url)] || '').trim();

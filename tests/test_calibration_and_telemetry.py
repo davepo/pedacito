@@ -661,6 +661,40 @@ def test_plan_tasks_guides_no_live_tools_and_small_model_cap():
     assert "SMALL-MODEL PLAN CAP" not in seen_sys[-1]
 
 
+def test_auto_fit_ignores_client_universal_vram_for_lan_server(monkeypatch):
+    """When a low-VRAM laptop (universal vram_gb=8) talks to a 24 GB LAN
+    server (192.168.x.x) whose profile did not set its own vram_gb, auto_fit
+    must trust the LAN server's reported context window instead of clamping
+    it with the laptop's 8 GB VRAM."""
+    cfg = Config(
+        base_url="http://192.168.8.220:11434/v1",
+        model="DaisyRose-27B-GGUF-Q4_K_XL",
+        vram_gb=8,
+        context_tokens=49430,
+        json_mode="schema",
+        active_tier="large",
+        model_size_bytes=18 * 1024 ** 3,
+    )
+    cfg.sources["vram_gb"] = "user config"
+    cfg.sources["context_tokens"] = "profile 'daisyrose' (explicit)"
+    monkeypatch.setattr(config_mod, "is_hosted", lambda c: False)
+    notes = config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.context_tokens == 49430
+    assert not any("leaves no room" in n for n in notes)
+
+
+def test_baseline_text_uses_detected_local_gpu_vram(monkeypatch):
+    from pedacito import profiler
+    from pedacito.gui import settings_api
+    monkeypatch.setattr(profiler, "snapshot", lambda: {
+        "vram": {"total_gb": 24.0, "cards": [{"card": "card1", "total_gb": 24.0}]}
+    })
+    assert "vram_gb = 24" in settings_api.baseline_text()
+    monkeypatch.setattr(profiler, "snapshot", lambda: {"vram": {"total_gb": 0.0, "cards": []}})
+    assert "vram_gb = 8" in settings_api.baseline_text()
+
+
+
 
 def test_needle_step_down_ladder():
     assert arch_defaults.needle_step_down(131072) == 65536

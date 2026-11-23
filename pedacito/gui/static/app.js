@@ -484,6 +484,7 @@ PDC.setBusy = setBusy;
 // One reactive memory store for every consumer (topbar chip, Servers dialog,
 // SSE pushes): a fresh snapshot replaces the old one and repaints the page.
 PDC.setMemory = (mem) => { if (mem) { S.memory = mem; emit(); } };
+PDC.getMemory = () => S.memory;
 
 // ----------------------------------------------------------- ANSI terminal ----
 function Term(el) {

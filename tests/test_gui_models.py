@@ -94,8 +94,10 @@ def test_reset_backs_up_wipes_profiles_and_restores_defaults(gui):
     for line in ('step_reasoning_first = true', 'edit_plan_brief = true',
                  'incremental_edit_loop = true', 'max_read_tokens = 1200',
                  'max_total_model_calls = 30', 'max_no_progress_steps = 4',
-                 'temperature_answer = 0.3', 'vram_gb = 8'):
+                 'temperature_answer = 0.3'):
         assert line in new, line
+    from pedacito.gui import settings_api as _sa
+    assert f"vram_gb = {_sa._detected_local_vram_gb(8)}" in new
     assert "max_total_model_calls = 99" not in new
 
     # ...and the live state agrees: no profiles left anywhere

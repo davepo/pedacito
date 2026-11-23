@@ -2200,11 +2200,24 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # Only the configured/loaded length is safe to fit to, not the
         # model's advertised maximum (max_context_length).
         detected = info.get("context_length")
+        host = _hostname(cfg.base_url)
+        is_loopback = host in _LOCAL_HOSTS
+        is_lan = (not is_loopback) and _endpoint_is_local(cfg.base_url)
+        vram_src = cfg.sources.get("vram_gb", "default")
+        vram_on_profile = (
+            ("profile " in vram_src and "explicit" in vram_src)
+            or vram_src.startswith(("--", "env ")))
+        # When talking to a LAN server (e.g. an 8 GB laptop targeting a 24 GB
+        # homelab box), `[universal] vram_gb` describes the CLIENT, not the
+        # server. Unless the profile itself pinned `vram_gb`, trust the LAN
+        # server's own reported context window instead of clamping with the
+        # client's VRAM.
+        use_vram_estimate = not (is_lan and not vram_on_profile)
         hw_ctx = (hardware_context_tokens(
                       cfg.vram_gb, model_bytes,
                       cfg.k_cache_quant, cfg.v_cache_quant,
                       int(cfg.kv_cache_bytes_per_token or 0))
-                  if model_bytes > 0 else 0)
+                  if (model_bytes > 0 and use_vram_estimate) else 0)
         user_ctx = _is_explicit_limit(origin)
         server_ctx = None
         if detected and cfg.auto_detect_context and not user_ctx:
@@ -2220,7 +2233,7 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # the user supplied a length: it is a heuristic that can be off 2-4x
         # (GQA, cache quantization), so a configured length below it only
         # produces a speed warning.
-        if model_bytes > 0:
+        if model_bytes > 0 and use_vram_estimate:
             size_gb = model_bytes / _GIB
             mem = f"{cfg.vram_gb} GB VRAM"
             kv_hint = ""
@@ -2232,6 +2245,26 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
                 kv_hint = (f"; KV cache K={cfg.k_cache_quant or 'f16'}, "
                            f"V={cfg.v_cache_quant or 'f16'}")
             if hw_ctx <= 0:
+                if is_loopback and not vram_on_profile:
+                    try:
+                        from . import servers as servers_mod
+                        hw_mem = servers_mod.get_hardware_memory()
+                        cards = (hw_mem.get("vram") or {}).get("cards") or []
+                        gpu_gb = max(
+                            (float(c.get("total_gb") or 0) for c in cards),
+                            default=float((hw_mem.get("vram") or {}).get(
+                                "total_gb") or 0))
+                        gpu_whole = int(round(gpu_gb))
+                        if gpu_whole > int(cfg.vram_gb or 0):
+                            print(
+                                f"[config warning] vram_gb is {cfg.vram_gb}, "
+                                f"but this machine's GPU reports {gpu_whole} "
+                                f"GB VRAM -- set vram_gb = {gpu_whole} in "
+                                "config.toml so auto-fit does not under-size "
+                                "context and reply budgets.",
+                                file=sys.stderr)
+                    except Exception:
+                        pass
                 # No VRAM headroom: the fallback window is a guess, not a
                 # measurement. When the server reports a real window, clamp
                 # to it (BUG-209) -- deriving 200k-char source budgets from a

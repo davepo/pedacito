@@ -392,24 +392,25 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     return idx
 
 
-def _evict_other_local_servers(cfg) -> None:
+def _evict_other_local_servers(cfg) -> bool:
     """Auto-evict resident models on OTHER configured local servers before a
-    CLI run loads this profile (matching GUI jobs.py and TUI tui.py)."""
+    CLI run loads this profile (matching GUI jobs.py and TUI tui.py). Returns
+    True when at least one other local server was unloaded (VRAM freed)."""
     if not bool(getattr(cfg, "auto_evict_servers", True)):
-        return
+        return False
     base = str(getattr(cfg, "base_url", "") or "")
     if not base:
-        return
+        return False
     try:
         from . import servers as servers_mod
         if not servers_mod.is_local_url(base):
-            return
+            return False
         configured = servers_mod.configured_local_servers(cfg)
         target_key = servers_mod.normalize_url(base)
         others = [s for s in configured
                   if servers_mod.normalize_url(s.get("base_url", "")) != target_key]
         if not others:
-            return
+            return False
         res = servers_mod.evict_other_local_servers(base, cfg)
         evicted = [r for r in (res.get("evicted") or []) if r.get("ok")]
         failed = [r for r in (res.get("evicted") or []) if not r.get("ok")]
@@ -423,8 +424,22 @@ def _evict_other_local_servers(cfg) -> None:
                 print(f"[auto-evict warning: could not unload "
                       f"{r.get('server') or 'server'}: {r.get('detail', '')}]",
                       file=sys.stderr)
+        return bool(evicted)
     except Exception:
-        pass
+        return False
+
+
+def _refit_after_evict(args, cfg) -> object:
+    """When auto-evict freed VRAM from another local server (e.g. Strata ->
+    Lemonade), reload `cfg` so `auto_fit` queries the target server's real
+    post-eviction context window instead of the pre-eviction clamp."""
+    try:
+        fresh = _config(args)
+        if getattr(fresh, "use_model_card", True):
+            modelcard.apply(fresh)
+        return fresh
+    except Exception:
+        return cfg
 
 
 def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
@@ -4624,7 +4639,9 @@ def _main(argv=None) -> int:
         idx = _get_index(args, cfg, client, rebuild=getattr(args, "reindex", False))
         # Evict resident models on other local servers (e.g. Strata <-> Lemonade)
         # before loading this profile so they never fight for VRAM/RAM.
-        _evict_other_local_servers(cfg)
+        if _evict_other_local_servers(cfg):
+            cfg = _refit_after_evict(args, cfg)
+            client = LLMClient(cfg)
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()

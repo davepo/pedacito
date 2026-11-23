@@ -579,6 +579,22 @@ _BASELINE_SECTIONS = (
 )
 
 
+def _detected_local_vram_gb(default: int = 8) -> int:
+    """Whole GB of VRAM on this machine's largest local GPU, or `default` when
+    no GPU is detected (e.g. headless CI / CPU-only box)."""
+    try:
+        from .. import profiler
+        snap = profiler.snapshot()
+        vram = snap.get("vram") or {}
+        cards = vram.get("cards") or []
+        gb = max((float(c.get("total_gb") or 0) for c in cards),
+                 default=float(vram.get("total_gb") or 0))
+        whole = int(round(gb))
+        return whole if whole >= 1 else default
+    except Exception:
+        return default
+
+
 def baseline_text() -> str:
     """The clean baseline config.toml text: recommended Config() defaults,
     no model profiles and no per-role assignments."""
@@ -600,7 +616,8 @@ def baseline_text() -> str:
         lines.append(f"[{section}]")
         lines.append(f"# {blurb}")
         if section == "universal":
-            lines.append("vram_gb = 8   # whole GB of VRAM on the model machine;"
+            vram = _detected_local_vram_gb(8)
+            lines.append(f"vram_gb = {vram}   # whole GB of VRAM on the model machine;"
                          " auto_fit sizes the window from it (hosted APIs ignore it)")
         for key, note in keys:
             value = getattr(cfg, key)

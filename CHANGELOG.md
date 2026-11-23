@@ -2,19 +2,21 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
-## v0.3.2 — 2026-11-22
+## v0.3.2 — 2026-11-23
 
 ### Interleaved Execution, Native Providers, and Strata Onboarding
 
 - **Execution engine (`execution_mode`)** — `two_phase` (the existing
   gather-then-answer loop, still the default), `interleaved` (one native
   tool-calling conversation: read, edit, run a scoped test, read the traceback,
-  edit, verify) and `auto` (interleaved for hosted APIs, local-MoE servers and
-  calibrated large local models with native tool calls; two-phase for tiny,
-  small and medium local models and for uncalibrated ones). Set it in config,
-  per run with `--execution-mode {two_phase,interleaved,auto}` on `ask`, `new`,
-  `auto` and `eval`, or live in the TUI with `/mode` (alias `/exec-mode`). The
-  GUI shows it under Profiles → Reasoning & Execution Overrides.
+  edit, verify; supports OpenAI `tool_calls`, Anthropic `tool_use`, JSON
+  fallback, and Qwen3.5/3.8 / Strata XML `<tool_call><function=...>` blocks)
+  and `auto` (interleaved for hosted APIs, local-MoE servers and calibrated
+  large local models with native tool calls; two-phase for tiny, small and
+  medium local models and for uncalibrated ones). Set it in config, per run
+  with `--execution-mode {two_phase,interleaved,auto}` on `ask`, `new`, `auto`
+  and `eval`, or live in the TUI with `/mode` (alias `/exec-mode`). The GUI
+  shows it under Profiles → Reasoning & Execution Overrides.
 - **Shadow workspace for interleaved runs** — `pedacito/workspace_overlay.py`
   (`VirtualWorkspace`) stages every edit in memory for dry runs and `--review`.
   Tests and linters run against a temporary mirror with the overlay applied, so
@@ -43,8 +45,16 @@ All notable changes to Pedacito (`pdc`) are documented here.
   reads `STRATA_API_KEY` (or `AVALON_API_KEY`) when it is left empty. A server
   that requires a key shows an **API key required** badge. Model listing works
   through the public `/health` endpoint when `/v1/models` answers 401. Lemonade
-  and Strata can share one machine: `auto_evict_servers` (default `true`)
-  unloads the other server's model before a run starts.
+  and Strata can share one machine across GUI, TUI, and CLI: `auto_evict_servers`
+  (default `true`) synchronously unloads the other server's unpinned model
+  (`POST /v1/unload?wait=15` `{}` for Strata) and re-runs `auto_fit` on the freed
+  VRAM before loading the target profile.
+- **VRAM auto-detection & LAN-safe `auto_fit`** — Reset to Baseline and loopback
+  Model Scanner imports auto-detect this machine's local GPU VRAM instead of
+  hardcoding `8 GB`; `auto_fit` warns if loopback `vram_gb` is below the real
+  local GPU, while LAN server profiles (`192.168.x.x` / `*.local`) ignore the
+  client's `[universal] vram_gb` and trust the remote server's reported context
+  unless the profile explicitly sets its own `vram_gb`.
 - **Live GUI RAM/VRAM telemetry** — a new `/api/hardware` endpoint, a 3-second
   poll and an SSE `hardware` push keep the top-bar memory badge current. Server
   probes run in parallel, so one slow server cannot stall the badge. The badge
@@ -54,15 +64,31 @@ All notable changes to Pedacito (`pdc`) are documented here.
   configured. Saving writes `default_profile` and `scout_profile` in one
   comment-preserving edit, and a starter Scout profile can be created from it.
 
-### Calibrated Temperatures and Creative Mode
+### Calibrated Temperatures, GGUF Architecture Detection, and Creative Mode
 
+- **GGUF & runtime base-family detection** — calibration infers the underlying
+  model family of custom fine-tunes (such as `DaisyRose-27B` → `qwen3.5`) from
+  Ollama/LM Studio/llama-server metadata, local GGUF v2/v3 headers
+  (`general.architecture` / `general.base_model.0.name`), or a 30-day cached
+  anonymous HuggingFace Hub metadata fallback for LAN servers. LiquidAI
+  (`lfm2.5-24b-a2b`, `lfm3`, `lfm`) and `starcoder` families are included,
+  always-thinking warmup gets 512 tokens, `Calibrate All` skips individual
+  failing profiles cleanly, and the GUI adds a Quick/Full calibration mode
+  picker while preserving Strata's full `max_context`.
 - **Architecture temperature override** — a calibrated local model card's
-  architecture-library temperature replaces only default-level values. A
-  temperature set on a profile, a `PEDACITO_*` variable or a CLI flag still wins.
-- **`creative_temperature_delta`** — the Creative/design sway is relative to each
-  answer baseline. Unset, it adds +0.20 for tiny and small tiers and +0.30
-  otherwise. An explicit value (0.0 to 0.8) overrides that. The result is capped
-  at 0.95 (1.0 for an explicit delta) and never falls below the baseline.
+  architecture-library temperature replaces only default-level values, is shown
+  directly in `pedacito config --check` and GUI Settings (Profiles & All
+  settings), and still yields to an explicit per-profile, env, or CLI override.
+- **`creative_temperature_delta` & moderate-window fit** — the Creative/design
+  sway is relative to each answer baseline (+0.20 for tiny/small, +0.30
+  otherwise, capped at 0.95 / 1.0 explicit). On moderate-context local models
+  (e.g. 13k), `--creative` reclaims headroom from its 8,192-token reply boost
+  before failing over-budget.
+- **CLI & verification hardening** — `pedacito diagnose` accepts a positional
+  project path, `models scan` normalizes localhost/127.0.0.1 URLs to prevent
+  duplicate profiles, `ask --apply` exits non-zero when budget exhausts with
+  failed edit blocks, and the placeholder gate catches single unfinished
+  top-level `pass` / `...` stubs.
 
 ### Hunk-Level Review and Scoped Shell Allow-Rules
 
