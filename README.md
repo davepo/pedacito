@@ -2,7 +2,7 @@
 
 # Pedacito
 
-[![PyPI](https://img.shields.io/badge/PyPI-v0.3.1-blue)](https://pypi.org/project/pedacito/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.3.2-blue)](https://pypi.org/project/pedacito/)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB)
 [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 ![Local-First](https://img.shields.io/badge/Local--First-yes-brightgreen)
