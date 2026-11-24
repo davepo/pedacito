@@ -830,6 +830,42 @@ def test_tiny_window_raises_a_model_fit_error(monkeypatch):
         assert p.get("think") is not False
 
 
+def test_warmup_gives_always_thinking_models_reasoning_headroom(monkeypatch):
+    """LFM2.5-24B-A2B always reasons before answering 'ok': warmup must not
+    cap it at 5 tokens and trigger a false 20-token model-fit failure."""
+    seen = []
+
+    def fake_chat(self, messages, max_tokens, **kw):
+        seen.append(max_tokens)
+        return "ok"
+
+    orig_chat = LLMClient.chat
+    monkeypatch.setattr(LLMClient, "loaded_models", lambda self: None)
+    monkeypatch.setattr(LLMClient, "calibrate_tokenizer", lambda self: None)
+    monkeypatch.setattr(LLMClient, "chat", fake_chat)
+    c_lfm = LLMClient(_lfm_cfg())
+    c_lfm._schema_supported = True
+    c_lfm.warmup()
+    assert seen[-1] >= 512
+
+    # Tiny initial budget on an always-thinking retry jumps to >= 512 instead
+    # of doubling 5 -> 10 -> 20 and crashing on empty_streak > 2.
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    payloads = []
+    answers = iter([_empty_thinking_lines(),
+                    [_sse({"choices": [{"delta": {"content": "ok"},
+                                        "finish_reason": "stop"}]})]])
+    monkeypatch.setattr("pedacito.llm.requests.post",
+                        lambda url, **kw: payloads.append(kw["json"])
+                        or _Resp(next(answers)))
+    monkeypatch.setattr(LLMClient, "chat", orig_chat)
+    out = LLMClient(_lfm_cfg(context_tokens=32768, reserve_tokens=8192,
+                             max_tokens_answer=4000)).chat(
+        [{"role": "user", "content": "ok"}], 20, stream=True)
+    assert out == "ok"
+    assert payloads[1]["max_tokens"] >= 512
+
+
 # ------------------------------------- BUG-317: raw tool-call sentinels --
 
 def test_strip_reasoning_removes_tool_call_sentinels():

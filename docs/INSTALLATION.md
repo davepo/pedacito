@@ -20,7 +20,7 @@ Pedacito needs **Python 3.11 or newer**. It does not need Node.js for the harnes
 
 Requires Python 3.11+.
 
-Quick install from PyPI (0.3.1):
+Quick install from PyPI (0.3.2):
 
 ```bash
 pip install pedacito                     # Windows: py -m pip install pedacito
@@ -51,6 +51,8 @@ Optional features: `pip install -e ".[full]"` adds screenshots (Pillow) and the
 headless browser (playwright). Or pick one: `pip install -e ".[vision]"` or
 `pip install -e ".[browser]"`. After installing the browser extra, run
 `python -m playwright install chromium`.
+
+`pip install -e ".[keyring]"` adds OS keychain support: `api_key = "keyring:<service>/<account>"` and `api_key_keyring` read the key from your keychain instead of a file.
 
 <details>
 <summary>Install from source (development)</summary>
@@ -148,7 +150,7 @@ Pedacito its base URL and a model name.
 | **LM Studio** | Load a model, then start the server (Developer tab). For another machine, enable "Serve on Local Network". | `http://localhost:1234/v1` |
 | **Ollama** | `ollama serve` and `ollama pull <model>`. For another machine, set `OLLAMA_HOST=0.0.0.0` first. | `http://localhost:11434/v1` |
 | **Lemonade** | Start the server and load a model. | The URL it prints (ends in `/v1` or `/api/v1`) |
-| **Strata / Avalon** | Start the tiered MoE server and load a model, following its own documentation. | Its OpenAI-compatible URL, e.g. `http://127.0.0.1:8000/v1` |
+| **Strata / Avalon** | Start the tiered MoE server and load a model, following its own documentation. | Its OpenAI-compatible URL, e.g. `http://127.0.0.1:8080/v1` (the preset in Model discovery) |
 | **Hosted API** | Get an API key. | e.g. `https://api.deepseek.com/v1` |
 
 The default ports above are hints, not rules: any port works, and the scan
@@ -156,12 +158,27 @@ identifies a server by its replies, so two servers can coexist on one host
 (for example Lemonade on 11434 next to LM Studio on 1234).
 
 Strata and Avalon are tiered mixture-of-experts servers: they keep most of the
-GPU's VRAM resident and reason before answering. Give the profile
+GPU's VRAM resident and reason before answering. They normally require the
+server's own API key on `/v1/*` (their public `/health` stays open). Store it
+in the profile as `api_key`, name an environment variable in `api_key_env`
+(`STRATA_API_KEY` / `AVALON_API_KEY` are also read directly), or add the
+server once with **Add Hosted Provider** so the key is saved. Scans reuse that
+profile key, and identify the server from `/health`, so its model is listed
+even when the unauthenticated `/v1/models` probe answers 401. Give the profile
 `provider = "strata"` (or `"avalon"`), or a name containing `strata`/`avalon`,
 and Pedacito applies the `local-moe` execution tier: larger reply budgets, a
 timeout of at least 600 seconds for weight loading, and exactly one concurrent
 stream so a second prefill cannot evict the resident weights. Pedacito also drives their
-model load/unload lifecycle between runs. See
+model load/unload lifecycle between runs.
+
+Onboarding is one step: **Model discovery** offers a Strata / Avalon preset at
+`http://127.0.0.1:8080/v1` and an API key field next to the scan. When a server
+answers that a key is required, its row shows an **API key required** badge until
+a key is set, either in the field, in the profile, or through `STRATA_API_KEY`
+(or `AVALON_API_KEY`) in the environment. With Lemonade on the same machine,
+`auto_evict_servers` (on by default) unloads the other server's model before a run
+starts, so the target server has the memory it needs; set it to `false` to keep
+every model loaded. See
 [Execution profiles and the local-moe tier](ARCHITECTURE.md#execution-profiles-and-the-local-moe-tier)
 for the budgets and a profile example.
 

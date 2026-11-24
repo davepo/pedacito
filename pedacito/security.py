@@ -52,6 +52,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import shlex
 import socket
 import threading
 import time
@@ -88,6 +89,8 @@ __all__ = [
     "is_sensitive_path",
     "is_sensitive_rel",
     "load_acknowledged_fingerprints",
+    "matches_shell_allowlist",
+    "normalize_project_root",
     "outbound_mode",
     "permission_broker_active",
     "permission_handler",
@@ -103,6 +106,7 @@ __all__ = [
     "security_status",
     "set_permission_handler",
     "ssrf_error",
+    "suggest_shell_pattern",
     "unacknowledged_findings",
 ]
 
@@ -455,25 +459,37 @@ def permission_broker_active() -> bool:
 
 def request_permission(category: str, action_summary: str, detail: str = "",
                        risk_level: str = "medium", reason: str = "",
-                       key: str = "", setting_key: str = "") -> tuple[bool, str]:
+                       key: str = "", setting_key: str = "",
+                       suggested_pattern: str = "",
+                       project_root: str = "") -> tuple[bool, str]:
     """Ask the human. Returns `(allowed, message_for_model)`.
 
     `setting_key` optionally names the Config field an "Always Allow" should
     flip (e.g. `enable_web`), so one modal answer also makes the tool
     standalone-configurable from then on.
 
+    `suggested_pattern`/`project_root` offer the scoped "Allow '<pattern>'
+    in this project" answer (persisted to `shell_allowlist_by_project`);
+    shell/test requests without an explicit suggestion get one derived from
+    `detail` when it is safe to persist.
+
     With no broker installed this answers `(False, DENIED_MESSAGE)` -- callers
     check `permission_broker_active()` first and keep their own historical
     error text for the CLI, so this fallback only fires on an uninstall race,
     which must deny in the safe direction."""
     hook = _hook
+    pattern = str(suggested_pattern or "")
+    if not pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
+        pattern = suggest_shell_pattern(detail)
     info = {"category": str(category or CAT_SHELL),
             "action_summary": str(action_summary or ""),
             "detail": str(detail or "")[:4000],
             "risk_level": str(risk_level or "medium"),
             "reason": str(reason or ""),
             "key": str(key or detail or "")[:500],
-            "setting_key": str(setting_key or "")}
+            "setting_key": str(setting_key or ""),
+            "suggested_pattern": pattern,
+            "project_root": normalize_project_root(project_root)}
     if hook is None:
         return False, DENIED_MESSAGE
     try:
@@ -553,6 +569,138 @@ def is_install_command(argv) -> bool:
         return first in ("install", "ensurepip", "inject")
     # pip / pip3
     return first in _INSTALL_SUBCOMMANDS or first == "install"
+
+
+# --- scoped shell allow-rules (shell_allowlist_by_project) -------------------
+
+# Chaining/injection metacharacters: a command carrying any of these is never
+# auto-allowed by a project rule, whatever the pattern says. `run` executes
+# argv without a shell, so these are inert there -- but a rule must not look
+# like it blesses `pytest ; rm -rf /` either.
+_SHELL_META_CHARS = set(";|&`$<>\n\r")
+
+# Executables a scoped rule can never cover: shells and interpreters (they
+# run anything), destructive/system commands, and network fetchers.
+_SHELL_NEVER_ALLOW = frozenset({
+    "rm", "sudo", "su", "bash", "sh", "zsh", "fish", "cmd", "powershell",
+    "pwsh", "curl", "wget", "ssh", "scp", "dd", "chmod", "chown", "eval",
+    "exec", "xargs", "nohup", "setsid", "env", "kill", "pkill", "mkfs",
+    "shutdown", "reboot", "halt", "poweroff",
+})
+
+
+def normalize_project_root(root) -> str:
+    """The canonical `shell_allowlist_by_project` key for a project root:
+    expanded, resolved, POSIX separators. Empty for an empty/None root."""
+    text = str(root or "").strip()
+    if not text:
+        return ""
+    try:
+        return Path(text).expanduser().resolve().as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return Path(text).expanduser().as_posix()
+
+
+def _has_shell_meta(cmd_or_argv) -> bool:
+    if isinstance(cmd_or_argv, str):
+        return any(c in _SHELL_META_CHARS for c in cmd_or_argv)
+    return any(any(c in _SHELL_META_CHARS for c in str(t))
+               for t in (cmd_or_argv or []))
+
+
+def _shell_argv(cmd_or_argv):
+    """argv from a command string or an argv sequence; None when empty or
+    unsplittable (an unterminated quote is not a command we can judge)."""
+    if isinstance(cmd_or_argv, str):
+        try:
+            argv = shlex.split(cmd_or_argv)
+        except ValueError:
+            return None
+    else:
+        argv = [str(a) for a in (cmd_or_argv or [])]
+    return argv or None
+
+
+def suggest_shell_pattern(cmd_or_argv) -> str:
+    """A narrow, persistable allow-rule for one command, or "" when no rule
+    should ever be offered: `pytest tests/test_foo.py -q` -> `pytest *`,
+    `cargo test --lib` -> `cargo test *`, `npm run lint` -> `npm run lint *`.
+    Installs, shells, destructive commands and anything carrying chaining
+    metacharacters get no suggestion."""
+    if _has_shell_meta(cmd_or_argv):
+        return ""
+    argv = _shell_argv(cmd_or_argv)
+    if not argv or is_install_command(argv):
+        return ""
+    exe = _exe_name(argv[0])
+    if exe in _SHELL_NEVER_ALLOW:
+        return ""
+    rest = argv[1:]
+    words = [w for w in rest if not w.startswith("-")]
+    if exe in ("npm", "pnpm", "yarn", "bun") and len(words) >= 2 \
+            and words[0] == "run":
+        return f"{exe} run {words[1]} *"
+    if exe == "cargo" and words and words[0] in (
+            "test", "build", "check", "clippy", "run", "fmt", "doc"):
+        return f"cargo {words[0]} *"
+    if exe == "go" and words and words[0] in ("test", "build", "vet", "fmt"):
+        return f"go {words[0]} *"
+    if exe == "python" and len(rest) >= 2 and rest[0] == "-m":
+        mod = _exe_name(rest[1])
+        if mod in _INSTALL_EXES or mod == "venv":
+            return ""
+        return f"python -m {rest[1]} *"
+    if exe == "git" and words and words[0] in (
+            "status", "diff", "log", "show", "branch", "blame"):
+        return f"git {words[0]} *"
+    if exe == "make" and words:
+        return f"make {words[0]} *"
+    return f"{exe} *"
+
+
+def matches_shell_allowlist(cmd_or_argv, patterns) -> bool:
+    """True when a command matches one of a project's scoped allow-rules.
+
+    Matching is argv-aware and case-insensitive: each pattern token is an
+    fnmatch glob over the corresponding argv token (the executable name
+    normalised: `python3.12` -> `python`), a trailing `*` covers the rest of
+    the arguments (including none), and a single-token glob like `py*`
+    covers the executable plus any arguments. A pattern without a trailing
+    `*` must match the whole argv exactly.
+
+    Never matches: commands carrying chaining/injection metacharacters
+    (`;`, `&&`, `||`, `|`, backticks, `$()`, redirections, newlines),
+    package installs, or never-allow executables (shells, `rm`, `sudo`, ...)
+    -- a project rule cannot widen trust that far."""
+    if not patterns or _has_shell_meta(cmd_or_argv):
+        return False
+    argv = _shell_argv(cmd_or_argv)
+    if not argv or is_install_command(argv):
+        return False
+    exe = _exe_name(argv[0])
+    if exe in _SHELL_NEVER_ALLOW:
+        return False
+    tokens = [exe] + [str(t).lower() for t in argv[1:]]
+    for pattern in patterns:
+        pat = str(pattern or "").strip().lower()
+        if not pat or any(c in _SHELL_META_CHARS for c in pat):
+            continue
+        ptoks = pat.split()
+        if not ptoks:
+            continue
+        if len(ptoks) == 1 and any(c in ptoks[0] for c in "*?["):
+            if fnmatch.fnmatchcase(tokens[0], ptoks[0]):
+                return True
+            continue
+        trailing = ptoks[-1] == "*"
+        core = ptoks[:-1] if trailing else ptoks
+        if len(tokens) < len(core):
+            continue
+        if not trailing and len(tokens) != len(core):
+            continue
+        if all(fnmatch.fnmatchcase(t, p) for t, p in zip(tokens, core)):
+            return True
+    return False
 
 
 # =====================================================================

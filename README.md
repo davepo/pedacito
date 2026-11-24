@@ -39,6 +39,18 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 > Prefer Spanish? Use the `EN | ES` switcher in the GUI top bar, press `F3` in the TUI, or run
 > `pdc --lang es gui`. See [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language).
 
+## What's new in v0.3.2
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Interleaved execution** | `execution_mode` picks `two_phase`, `interleaved` or `auto`. Interleaved runs keep one native tool-calling conversation (OpenAI `tool_calls`, Anthropic `tool_use`, JSON fallback, and Qwen3.5/3.8 / Strata XML `<tool_call>`), with dry runs staged in a shadow workspace. Set it per run with `--execution-mode`, or live with the TUI `/mode`. | [Configuration](docs/CONFIG.md) |
+| **Native Gemini & OpenAI Responses** | `gemini_native` (on by default) uses Google's `generateContent`; `openai_responses` uses `/v1/responses` for o3, o4 and GPT-5 reasoning models. | [Configuration](docs/CONFIG.md) |
+| **Three-tier model catalog & keychain** | Provider metadata, a 24 h `models.dev` cache and a built-in table supply context windows and prices. `pedacito models refresh` forces an update. `api_key_keyring` reads your OS keychain once `pedacito[keyring]` is installed. | [Configuration](docs/CONFIG.md) |
+| **Strata / Avalon onboarding & coexistence** | A one-step preset at port 8080, an API key field in the scan, `STRATA_API_KEY` fallback, an **API key required** badge, and synchronous Lemonade ↔ Strata auto-evict across GUI, TUI and CLI. | [Model server setup](docs/INSTALLATION.md#model-server-setup) |
+| **Live RAM/VRAM badge & pairing panel** | The GUI hardware badge refreshes every 3 seconds and is pushed live. Local GPU VRAM is auto-detected on baseline reset/loopback scans while LAN profiles stay client-independent. The Dual-GPU / Scout + Architect Pairing panel starts collapsed. | [GUI workspace](docs/USAGE.md) |
+| **Hunk review & project shell rules** | Accept individual hunks in the Changes pane. **Allow in this project** saves a narrow shell rule (`shell_allowlist_by_project`) for the current project only. | [Review page](docs/USAGE.md#review-page) |
+| **GGUF calibration, temperatures & creative sway** | Calibration infers base families for custom fine-tunes from runtime/GGUF headers (or cached HF metadata over LAN), adds a Quick/Full GUI mode picker, surfaces calibrated temperatures in Settings/`config --check`, and adds relative `creative_temperature_delta` sway. | [Configuration](docs/CONFIG.md) |
+
 ## What's new in v0.3.1
 
 | Feature | What you get | Read more |
@@ -46,7 +58,6 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 | **Bilingual EN / ES UI, TUI & docs** | Switch the GUI with the EN/ES top-bar toggle, the TUI with `F3` or `/lang`, the CLI with `--lang es` or `PEDACITO_LANG`. `llm_reply_language` controls the language of the model's explanations. Every guide has a Spanish edition. | [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language) |
 | **Advanced system profiling & auto-tune** | `pedacito profile` shows a vendor-neutral RAM/VRAM snapshot with a source per number (Linux sysfs, NVIDIA `nvidia-smi`, macOS `vm_stat`, Windows `winapi`), a cached prefill/generation probe and the active profile's tuning. `auto_tune = true` (opt-in) fits context, retrieval budgets and timeout to free memory; missing telemetry makes it abstain, and existing configs do not change. | [System profiling and auto-tune](docs/CONFIG.md#advanced-system-profiling-and-auto-tune) |
 | **Context-aware auto-update** | A quiet, opt-out release check: one anonymous PyPI GET at startup (2 s timeout, cached 24 h), a dismissible GUI banner with a streamed upgrade and Restart, `pdc update --run`, and the TUI `/update`. The command matches your install method (pipx, venv, pip --user, or git for editable checkouts). `check_for_updates = false` keeps Pedacito fully offline. | [Upgrading](docs/INSTALLATION.md#upgrading) |
-
 | **Local image generation** | `pedacito image` and the GUI/TUI `/image` generate images on a local Lemonade Server, with calibration for image models. | [Local image generation](docs/USAGE.md#local-image-generation) |
 | **Multimodal image input** | Send PNG/JPEG/WebP/GIF to a vision model: `--image PATH`, GUI paste/drag-drop/`📎 Attach`, TUI `/attach` (4 images, 10 MB each). | [Multimodal chat input](docs/USAGE.md#multimodal-chat-input) |
 | **Native Anthropic prompt caching** | `anthropic_native = true` (default) uses `/v1/messages` with explicit `cache_control` breakpoints, `5m`/`1h` TTLs, native thinking, tools and images. | [Hosted prompt caching](docs/CONFIG.md#hosted-prompt-caching) |

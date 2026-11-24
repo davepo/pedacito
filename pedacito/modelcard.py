@@ -274,6 +274,21 @@ def apply(cfg) -> dict | None:
     def unset(name: str) -> bool:
         return sources.get(name, "default") == "default"
 
+    def explicit_override(name: str) -> bool:
+        """True when `name` was set by a per-profile key, an env var, or a CLI
+        flag -- the sources a model card must never override."""
+        src = sources.get(name, "default")
+        if "profile " in src and "explicit" in src:
+            return True
+        if src.startswith("env "):
+            return True
+        # A CLI flag (--temperature and friends) wins; a `--config FILE` is
+        # just another universal-level config file the card may still replace.
+        return src.startswith("--") and not src.startswith("--config ")
+
+    family = ch.get("arch_family")
+    card_provenance = f"model card ({family})" if family else "model card"
+
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
                  "tool_mode", "disable_thinking", "step_reasoning_first",
                  "fewshot_steps", "fuzzy_match", "edit_style",
@@ -288,13 +303,16 @@ def apply(cfg) -> dict | None:
         sources["specialties"] = "model card"
     # Architecture-library sampler and window (local cards only): fill the
     # settings the user left at their defaults. The temperature gates are
-    # strict; the context window also yields to an earlier auto-detected /
-    # auto-fit value, since those are machine-derived fallbacks rather than
-    # user choices. Budgets re-fit to the new window on the next run.
+    # relaxed for the calibrated pair: a `[universal] temperature = 0.2` is a
+    # default-level value the card may still replace, whereas an explicit
+    # per-profile value, PEDACITO_* env var or CLI flag always wins. The
+    # context window also yields to an earlier auto-detected / auto-fit value,
+    # since those are machine-derived fallbacks rather than user choices.
+    # Budgets re-fit to the new window on the next run.
     for name in ("temperature", "temperature_answer"):
-        if name in ch and unset(name):
+        if name in ch and not explicit_override(name):
             setattr(cfg, name, ch[name])
-            sources[name] = "model card"
+            sources[name] = card_provenance
     if "sampler" in ch and unset("sampler"):
         cfg.sampler = dict(ch["sampler"])
         sources["sampler"] = "model card"
@@ -1233,7 +1251,7 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     Each skill probe runs `repeats` times (default 3, or 1 for `quick`) so the
     card records a mean and spread instead of one noisy sample; `choose()`
     reads the means."""
-    from .config import is_hosted
+    from .config import _endpoint_is_local, is_hosted, is_local_moe
 
     # An image-generator profile has no chat/edit surface: run the image probe
     # instead of the text-LLM suite (the `client` is never used).
@@ -1264,15 +1282,20 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
         info = client.model_info() or {}
     except Exception:
         info = {}
-    hosted = is_hosted(cfg)
+    hosted = is_hosted(cfg) and not _endpoint_is_local(
+        str(getattr(cfg, "base_url", "") or ""))
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
-    arch = None if hosted else arch_defaults.match_arch(cfg.model)
+    allow_hf = bool(getattr(cfg, "auto_refresh_model_catalog", True))
+    arch = None if hosted else arch_defaults.match_arch(
+        cfg.model, info=info, allow_hf_lookup=allow_hf)
+    local_moe = not hosted and is_local_moe(cfg)
     arch_ctx = 0
     if arch is not None:
         arch_ctx = arch_defaults.arch_context_tokens(
             arch, info, int(getattr(cfg, "vram_gb", 0) or 0),
-            int(info.get("size_bytes") or 0))
+            int(info.get("size_bytes") or 0),
+            is_local_moe=local_moe)
         say(f"  architecture     {arch['family']} "
             f"(recommended window {arch_ctx:,})")
 
@@ -1404,13 +1427,38 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
         measured["tok_per_s"] = round(comp_tokens / gen_secs, 1)
     choices = choose(measured, hosted)
     if arch is not None:
-        # The architecture library's recommended sampler and window join the
-        # measured choices; `apply()` only fills settings left at defaults.
+        # The architecture library's recommended temperatures and sampler join
+        # the measured choices; `apply()` only fills settings left at defaults.
+        # Temperatures follow the model's thinking mode (the card's own
+        # `disable_thinking` verdict decides which pair), and a tiny/small tier
+        # caps the gather temperature for strict JSON/tool reliability.
         choices["arch_family"] = arch["family"]
-        choices["temperature"] = arch["temperature"]
-        choices["temperature_answer"] = arch["temperature_answer"]
-        choices["sampler"] = dict(arch["sampler"])
+        choices["temperature"], choices["temperature_answer"], \
+            choices["sampler"] = arch_defaults.recommended_temperatures(
+                arch,
+                thinking_enabled=not bool(choices.get("disable_thinking",
+                                                       False)),
+                tier=str(getattr(cfg, "active_tier", "")
+                         or getattr(cfg, "tier", "") or ""))
         choices["context_tokens"] = final_ctx
+    elif not hosted:
+        # Unlisted local fine-tunes (e.g. custom GGUF merges not in
+        # ARCH_LIBRARY) still deserve calibrated temperatures rather than
+        # falling back to a stale `[universal]` 0.2 / 0.0 greedy default.
+        thinking_on = (
+            not bool(choices.get("disable_thinking", False))
+            and (local_moe or measured.get("thinking_on_ok", 0.0) >= 0.5
+                 and measured.get("thinking_off_ok", 1.0) < 0.5)
+        )
+        if local_moe and not bool(choices.get("disable_thinking", False)):
+            choices["temperature"] = 0.6
+            choices["temperature_answer"] = 0.6
+        elif thinking_on:
+            choices["temperature"] = 0.6
+            choices["temperature_answer"] = 0.6
+        else:
+            choices["temperature"] = 0.3
+            choices["temperature_answer"] = 0.3
     card = {"version": CARD_VERSION, "key": card_key(cfg), "ts": time.time(),
             "model": cfg.model, "url": cfg.base_url, "measured": measured,
             "choices": choices, "notes": notes[:12], "repeats": repeats,

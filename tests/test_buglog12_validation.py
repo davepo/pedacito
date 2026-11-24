@@ -77,3 +77,33 @@ def c():
 def test_todo_and_notimplemented_still_trigger():
     assert len(_findings("def f():\n    # TODO: write this\n    return 1\n")) == 1
     assert len(_findings("def f():\n    raise NotImplementedError\n")) == 1
+
+
+def test_single_top_level_pass_stub_among_real_functions_is_refused():
+    """One unfinished top-level function (`def get_wave_difficulty(): pass`)
+    in an otherwise implemented module must still fail the placeholder gate."""
+    text = '''\
+class GameError(Exception):
+    pass
+
+
+def a():
+    return 1
+
+
+def b():
+    return 2
+
+
+def c():
+    return 3
+
+
+def get_wave_difficulty(wave):
+    pass
+'''
+    findings = _findings(text)
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert "placeholder" in findings[0].message
+

@@ -1119,6 +1119,83 @@ def test_native_sse_tool_call_deltas_accumulate_into_one_json(monkeypatch):
     assert c._native_ok is True
 
 
+# -------------------------------------------------- Strata/Avalon auth + unload
+
+def test_api_key_falls_back_to_strata_env_for_local_moe(monkeypatch):
+    monkeypatch.setenv("STRATA_API_KEY", "sk-strata")
+    monkeypatch.delenv("AVALON_API_KEY", raising=False)
+    assert llm_mod._api_key(_cfg(provider="strata")) == "sk-strata"
+    assert llm_mod._api_key(_cfg(provider="local-moe")) == "sk-strata"
+
+    monkeypatch.delenv("STRATA_API_KEY", raising=False)
+    monkeypatch.setenv("AVALON_API_KEY", "sk-avalon")
+    assert llm_mod._api_key(_cfg(provider="avalon")) == "sk-avalon"
+
+
+def test_api_key_explicit_wins_over_strata_env(monkeypatch):
+    monkeypatch.setenv("STRATA_API_KEY", "sk-env")
+    assert llm_mod._api_key(_cfg(provider="strata", api_key="sk-explicit")) \
+        == "sk-explicit"
+    monkeypatch.setenv("MY_KEY", "sk-mykey")
+    assert llm_mod._api_key(_cfg(provider="strata", api_key_env="MY_KEY")) \
+        == "sk-mykey"
+
+
+def test_api_key_does_not_fall_back_for_a_dense_provider(monkeypatch):
+    monkeypatch.setenv("STRATA_API_KEY", "sk-strata")
+    assert llm_mod._api_key(_cfg(provider="lemonade")) == "lm-studio"
+
+
+def test_model_info_absorbs_strata_health_context(monkeypatch):
+    class Resp:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._b = body
+
+        def json(self):
+            return self._b
+
+    monkeypatch.setattr(llm_mod.requests, "get",
+                        lambda url, headers=None, timeout=None:
+                        Resp(200, {"service": "avalon", "max_context": 131072})
+                        if url.endswith("/health") else Resp(404, None))
+    monkeypatch.setattr(llm_mod.requests, "post",
+                        lambda *a, **k: Resp(404, None))
+    client = llm_mod.LLMClient(_cfg())
+    info = client.model_info("m")
+    assert info["context_length"] == 131072
+    assert info["context_source"] == "strata health"
+
+
+def test_unload_model_delegates_to_the_server_control_plane(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        "pedacito.servers.unload_server_model",
+        lambda server, model, config=None, kind="": (
+            seen.update({"server": server, "model": model, "kind": kind}),
+            {"ok": True})[1])
+    client = llm_mod.LLMClient(_cfg(provider="strata"))
+    assert llm_mod.unload_model(client) == "m"
+    assert seen["model"] == "m"
+    assert seen["server"]["base_url"] == "http://127.0.0.1:1/v1"
+    assert seen["server"]["provider"] == "strata"
+
+
+def test_unload_model_falls_back_to_ollama_generate(monkeypatch):
+    monkeypatch.setattr("pedacito.servers.unload_server_model",
+                        lambda *a, **k: {"ok": False})
+
+    class _R:
+        def __init__(self, status):
+            self.status_code = status
+
+    monkeypatch.setattr(llm_mod.requests, "post",
+                        lambda url, headers=None, json=None, timeout=None:
+                        _R(200 if url.endswith("/api/generate") else 404))
+    cfg = _cfg(base_url="http://127.0.0.1:11434/v1", provider="ollama")
+    assert llm_mod.unload_model(llm_mod.LLMClient(cfg)) == "m"
+
+
 def test_full_json_schema_object_plain_downgrade_ladder(monkeypatch):
     """A server that refuses both json_schema and json_object falls all the way
     to plain JSON prompting in one logical call (one recorded call, three

@@ -220,6 +220,38 @@ def test_calibrate_all_unloads_between_models(tmp_path, monkeypatch):
     assert unloaded == ["qwen2.5-coder-14b", "gemma-3-12b-it"]
 
 
+def test_calibrate_all_continues_when_one_profile_fails(tmp_path, monkeypatch,
+                                                      capsys):
+    """One failing profile (e.g. an always-thinking or OCR/audio model) must
+    unload cleanly, log the error, and let the rest of the batch finish."""
+    cfgfile = tmp_path / "config.toml"
+    _write_cfg(cfgfile, MIXED_CFG)
+    calls: list[str] = []
+    unloaded: list[str] = []
+
+    class FlakyClient(_FakeClient):
+        def warmup(self):
+            if self.cfg.model == "qwen2.5-coder-14b":
+                raise llm_mod.LLMError("model always reasons")
+
+    monkeypatch.setattr(cli, "LLMClient", FlakyClient)
+    monkeypatch.setattr(llm_mod, "unload_model",
+                        lambda client: unloaded.append(client.cfg.model) or "")
+
+    def fake_cal(client, cfg, verbose=True, quick=False, repeats=None):
+        calls.append(cfg.model)
+        return _card(cfg.model)
+
+    monkeypatch.setattr(modelcard, "calibrate", fake_cal)
+    rc = cli.main(["calibrate", "--all", "-y", "--config", str(cfgfile)])
+    assert rc == 0
+    assert calls == ["gemma-3-12b-it"]
+    assert unloaded == ["qwen2.5-coder-14b", "gemma-3-12b-it"]
+    out = capsys.readouterr()
+    assert "failed" in out.err.lower()
+    assert "1 of 2" in out.out
+
+
 def test_gui_calibrate_refuses_hosted(gui):
     _write_cfg(gui.cfg_path, MIXED_CFG)
     for path in ("/api/models/calibrate", "/api/calibrate"):
@@ -284,19 +316,29 @@ def test_models_scan_never_calibrates_hosted(tmp_path, monkeypatch, capsys):
     ("qwen2_5_coder_14b", "qwen2.5-coder"),
     ("Qwen3-Coder-30B", "qwen2.5-coder"),
     ("Qwen3-8B", "qwen3"),
-    ("qwen3.5-32b", "qwen3"),
+    ("qwen3.5-32b", "qwen3.5"),
+    ("Qwen3.8-27B-GSQ-RCO-GGUF", "qwen3.5"),
+    ("Qwen4-32B", "qwen3.5"),
     ("deepseek-coder-v2-lite", "deepseek-coder"),
-    ("DeepSeek-R1-Distill-Qwen-14B", "deepseek-r1"),
-    ("QwQ-32B", "deepseek-r1"),
+    ("DeepSeek-R1-Distill-Qwen-14B", "deepseek"),
+    ("DeepSeek-V3-0324", "deepseek"),
+    ("deepseek-v4.1-flash", "deepseek"),
+    ("QwQ-32B", "deepseek"),
     ("nemotron-4-340b", "nemotron"),
     ("gemma-3-27b-it", "gemma"),
     ("gemma-4-12b", "gemma"),
+    ("glm-4-9b", "glm"),
+    ("glm-5-14b", "glm"),
+    ("gpt-oss-120b", "gpt-oss"),
     ("codestral-22b", "mistral"),
     ("devstral-small", "mistral"),
+    ("ministral-8b", "mistral"),
     ("Mistral-7B-Instruct-v0.3", "mistral"),
     ("granite-3.3-8b-instruct", "granite"),
     ("phi-4-mini", "phi-4"),
-    ("Llama-3.1-8B-Instruct", "llama-3"),
+    ("Llama-3.1-8B-Instruct", "llama"),
+    ("Llama-4-Scout-17B", "llama"),
+    ("lfm-2-3b", "lfm"),
     ("mystery-model-7b", None),
 ])
 def test_match_arch_families(model, family):
@@ -311,13 +353,20 @@ def test_arch_library_values():
     lib = {e["family"]: e for e in arch_defaults.ARCH_LIBRARY}
     q = lib["qwen2.5-coder"]
     assert (q["temperature"], q["temperature_answer"]) == (0.3, 0.3)
+    assert (q["thinking_temperature"], q["thinking_temperature_answer"]) == \
+        (0.5, 0.5)
     assert q["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert q["context_tokens"] == 32768
     assert set(q["specialties"]) == {"coding", "testing_qa"}
-    r1 = lib["deepseek-r1"]
-    assert (r1["temperature"], r1["temperature_answer"]) == (0.6, 0.4)
-    assert r1["specialties"] == ("math_algorithms",)
+    d = lib["deepseek"]
+    assert (d["temperature"], d["temperature_answer"]) == (0.3, 0.3)
+    assert (d["thinking_temperature"], d["thinking_temperature_answer"]) == \
+        (0.6, 0.6)
+    assert d["specialties"] == ("math_algorithms",)
     g = lib["gemma"]
+    assert (g["temperature"], g["temperature_answer"]) == (0.6, 0.6)
+    assert (g["thinking_temperature"], g["thinking_temperature_answer"]) == \
+        (0.7, 0.7)
     assert g["sampler"] == {"top_p": 0.95, "top_k": 64}
     assert set(g["specialties"]) == {"general", "frontend_ui",
                                      "3d_graphics_svg", "translation_i18n"}
@@ -325,7 +374,40 @@ def test_arch_library_values():
     assert lib["phi-4"]["context_tokens"] == 16384
     assert lib["mistral"]["temperature"] == 0.3
     assert lib["nemotron"]["specialties"] == ("general",)
-    assert lib["llama-3"]["context_tokens"] == 32768
+    assert lib["llama"]["context_tokens"] == 32768
+    # modern 2025-2026 families
+    assert lib["qwen3.5"]["sampler"] == {"top_p": 0.95, "top_k": 20}
+    assert lib["gpt-oss"]["temperature"] == 0.4
+    assert lib["glm"]["sampler"] == {"top_p": 0.95}
+    assert "lfm" in lib["lfm"]["patterns"]
+    assert arch_defaults.match_arch(
+        "LFM2.5-24B-A2B-Turbo-Brilliance-50X-NEO-MAX-Imatrix-GGUF")[
+            "family"] == "lfm2.5-24b-a2b"
+    assert arch_defaults.match_arch(
+        "lfm3-1_7b-gguf-modelscope-q8-0")["family"] == "lfm3"
+    assert arch_defaults.match_arch("lfm2-7b")["family"] == "lfm"
+    assert arch_defaults.match_arch(
+        "dolphincoder-starcoder2-7b")["family"] == "starcoder"
+
+
+def test_recommended_temperatures_selects_thinking_and_caps_small_tier():
+    q = arch_defaults.match_arch("qwen2.5-coder-32b")
+    # thinking on: the family's thinking pair
+    assert arch_defaults.recommended_temperatures(q, thinking_enabled=True) == \
+        (0.5, 0.5, {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05})
+    # thinking off: the non-thinking pair
+    assert arch_defaults.recommended_temperatures(q) == \
+        (0.3, 0.3, {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05})
+    # a tiny/small tier caps the gather temperature at <= 0.3 for strict JSON
+    # reliability, while the answer keeps its family warmth
+    g = arch_defaults.match_arch("gemma-3-12b")
+    temp, answer, _sampler = arch_defaults.recommended_temperatures(g,
+                                                                    tier="small")
+    assert temp == 0.3 and answer == 0.6
+    # thinking on keeps the small tier's warmth untouched
+    temp, answer, _sampler = arch_defaults.recommended_temperatures(
+        g, thinking_enabled=True, tier="small")
+    assert temp == 0.7 and answer == 0.7
 
 
 def test_arch_context_capped_by_server_and_vram():
@@ -349,7 +431,274 @@ def test_arch_context_capped_by_server_and_vram():
         == 32768
 
 
+def test_arch_context_local_moe_keeps_server_window():
+    """Strata/Avalon report their configured max_context (e.g. 131072) across
+    VRAM+DDR5; calibration must not shrink it to a dense-GPU 32k preset."""
+    entry = arch_defaults.match_arch("qwen3.8-flash")
+    assert arch_defaults.arch_context_tokens(
+        entry, {"context_length": 131072}, vram_gb=24,
+        size_bytes=20 * 1024 ** 3, is_local_moe=True) == 131072
+    # without a server-reported window, fall back to the family recommendation
+    assert arch_defaults.arch_context_tokens(
+        entry, {}, is_local_moe=True) == 32768
+
+
+def test_calibrate_local_deepseek_and_unlisted_finetune_get_temperatures(
+        tmp_path, monkeypatch):
+    """A local DeepSeek GGUF on 127.0.0.1 must not be treated as hosted
+    during calibration, and an unlisted custom fine-tune (like DaisyRose-27B)
+    still gets calibrated baseline temperatures instead of falling back to
+    [universal] 0.2 / 0.0."""
+    cfg_ds = Config(
+        base_url="http://127.0.0.1:11434/v1",
+        model="DeepSeek-Coder-V2-Lite-Instruct-GGUF-Q8_0",
+        json_mode="object", _hosted_server=True)
+    card_ds = modelcard.calibrate(_ArchProbeClient(), cfg_ds, verbose=False,
+                                  quick=True)
+    assert card_ds["choices"]["arch_family"] == "deepseek-coder"
+    assert card_ds["choices"]["temperature"] in (0.3, 0.5)
+    assert card_ds["choices"]["temperature_answer"] in (0.3, 0.5)
+
+    cfg_ft = Config(
+        base_url="http://127.0.0.1:11434/v1",
+        model="DaisyRose-27B-GGUF-Q4_K_XL")
+    card_ft = modelcard.calibrate(_ArchProbeClient(), cfg_ft, verbose=False,
+                                  quick=True)
+    assert "arch_family" not in card_ft["choices"]
+    assert card_ft["choices"]["temperature"] == 0.3
+    assert card_ft["choices"]["temperature_answer"] == 0.3
+
+
+def _write_fake_gguf(path: Path, kv: dict[str, object]) -> None:
+    """Build a minimal valid GGUF v3 header containing string, int, and array
+    KV entries so `read_gguf_metadata` can be tested with zero external deps."""
+    import struct
+
+    def pack_str(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+
+    buf = bytearray(b"GGUF")
+    buf += struct.pack("<IQQ", 3, 0, len(kv))
+    for k, v in kv.items():
+        buf += pack_str(k)
+        if isinstance(v, str):
+            buf += struct.pack("<I", 8) + pack_str(v)
+        elif isinstance(v, int):
+            buf += struct.pack("<II", 4, v)
+        elif isinstance(v, list):
+            # array of uint32 (type 4)
+            buf += struct.pack("<IIQ", 9, 4, len(v))
+            for item in v:
+                buf += struct.pack("<I", int(item))
+    path.write_bytes(bytes(buf))
+
+
+def test_gguf_header_and_runtime_metadata_match_finetune_family(
+        tmp_path, monkeypatch):
+    """A custom fine-tune like DaisyRose-27B whose model id omits 'qwen'
+    resolves to qwen3.5 via Ollama/LM Studio metadata OR its local GGUF
+    header (via HF_HUB_CACHE / Lemonade checkpoint)."""
+    # 1. Runtime API metadata (Ollama / LM Studio / llama-server)
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"architecture": "qwen35"})["family"] == "qwen3.5"
+    assert arch_defaults.match_arch(
+        "CustomModel-12B",
+        info={"family": "gemma4"})["family"] == "gemma"
+    # Generic runtime wrapper ("llamacpp") must never false-match "llama"
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"architecture": "llamacpp", "family": "llamacpp"}) is None
+
+    # 2. Local GGUF header via HF_HUB_CACHE + Lemonade checkpoint
+    snap = (tmp_path / "models--RadixArk--DaisyRose-27B-GGUF"
+            / "snapshots" / "abc123")
+    snap.mkdir(parents=True)
+    # mmproj must be skipped in favor of the main model GGUF
+    _write_fake_gguf(snap / "mmproj-DaisyRose-27B-BF16.gguf",
+                     {"general.architecture": "clip"})
+    _write_fake_gguf(snap / "DaisyRose-27B-Q4_K_XL.gguf", {
+        "dummy.count": 42,
+        "dummy.array": [1, 2, 3],
+        "general.architecture": "qwen35",
+        "general.base_model.0.name": "Qwen/Qwen3.5-27B",
+    })
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    found = arch_defaults.locate_gguf_for_checkpoint(
+        "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL")
+    assert found is not None and found.name == "DaisyRose-27B-Q4_K_XL.gguf"
+    assert arch_defaults.read_gguf_metadata(found) == {
+        "general.architecture": "qwen35",
+        "general.base_model.0.name": "Qwen/Qwen3.5-27B",
+    }
+    entry = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"})
+    assert entry is not None and entry["family"] == "qwen3.5"
+
+    # Corrupt / non-GGUF files fail silently with {}
+    bad = tmp_path / "corrupt.gguf"
+    bad.write_bytes(b"NOT_GGUF_DATA")
+    assert arch_defaults.read_gguf_metadata(bad) == {}
+
+    # 3. End-to-end calibration uses model_info() -> match_arch() -> qwen3.5
+    class _GGUFClient(_ArchProbeClient):
+        def model_info(self, model=None):
+            return {
+                "context_length": 262144,
+                "checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL",
+            }
+
+    cfg = Config(base_url="http://127.0.0.1:11434/v1",
+                 model="DaisyRose-27B-GGUF-Q4_K_XL")
+    card = modelcard.calibrate(_GGUFClient(), cfg, verbose=False, quick=True)
+    assert card["choices"]["arch_family"] == "qwen3.5"
+    assert card["choices"]["sampler"] == {"top_p": 0.95, "top_k": 20}
+
+
+def test_remote_lan_checkpoint_resolves_via_cached_hf_metadata(
+        tmp_path, monkeypatch):
+    """When pedacito runs on another machine (e.g. Windows laptop talking to a
+    LAN Lemonade server), no local .gguf exists: match_arch falls back to a
+    cached anonymous HuggingFace Hub metadata lookup when allow_hf_lookup=True."""
+    monkeypatch.setattr(arch_defaults, "locate_gguf_for_checkpoint",
+                        lambda ckpt, **kw: None)
+    cache_file = tmp_path / "hf_arch_cache.json"
+    monkeypatch.setattr(arch_defaults, "_hf_cache_path", lambda: cache_file)
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "gguf": {"architecture": "qwen35", "context_length": 262144},
+                "cardData": {"base_model": "RadixArk/DaisyRose-27B"},
+            },
+        )
+
+    import requests as req_mod
+    monkeypatch.setattr(req_mod, "get", fake_get)
+
+    # Air-gapped / opt-out (allow_hf_lookup=False): zero HTTP calls
+    assert arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=False) is None
+    assert calls == []
+
+    # Opt-in (default during calibration): resolves to qwen3.5 and caches
+    entry = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=True)
+    assert entry is not None and entry["family"] == "qwen3.5"
+    assert len(calls) == 1
+    assert calls[0].endswith("/api/models/RadixArk/DaisyRose-27B-GGUF")
+
+    # Second lookup hits the local disk cache — zero extra HTTP calls
+    entry2 = arch_defaults.match_arch(
+        "DaisyRose-27B-GGUF-Q4_K_XL",
+        info={"checkpoint": "RadixArk/DaisyRose-27B-GGUF:Q4_K_XL"},
+        allow_hf_lookup=True)
+    assert entry2 is not None and entry2["family"] == "qwen3.5"
+    assert len(calls) == 1
+
+
+def test_cli_config_shows_calibrated_model_card_temperatures(
+        tmp_path, monkeypatch, capsys):
+    """`pedacito config --profile X` must apply the calibrated model card
+    before displaying Resolved settings so temperature matches runtime."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[universal]\ntemperature = 0.2\n\n'
+        '[profiles.q27]\n'
+        'base_url = "http://127.0.0.1:11434/v1"\n'
+        'model = "Qwen3.8-27B-GGUF"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(config_mod, "USER_CONFIG", cfg_path)
+    modelcard.save_card({
+        "version": modelcard.CARD_VERSION,
+        "key": "http://127.0.0.1:11434/v1|Qwen3.8-27B-GGUF",
+        "ts": time.time(),
+        "model": "Qwen3.8-27B-GGUF",
+        "url": "http://127.0.0.1:11434/v1",
+        "measured": {"overall": 0.95},
+        "choices": {
+            "arch_family": "qwen3.5",
+            "temperature": 0.6,
+            "temperature_answer": 0.6,
+        },
+        "notes": [], "repeats": 1, "seconds": 1.0,
+    })
+    rc = cli.main(["config", "--config", str(cfg_path), "--profile", "q27"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "0.6" in out and "model card (qwen3.5)" in out
+
+
+def test_plan_tasks_guides_no_live_tools_and_small_model_cap():
+    """Without shell/browser/screenshot tools, generate_tasks warns the planner
+    not to emit live-observation tasks; tiny/small tiers also get a compact cap."""
+    from pedacito import loop as loop_mod
+    seen_sys = []
+
+    class _FakePlanner:
+        def chat_json(self, messages, schema, max_tokens=2000, **kw):
+            seen_sys.append(messages[0]["content"])
+            return {"tasks": [{"title": "Add helper"}]}
+
+    cfg = Config(allow_shell=False, allow_browser=False,
+                 allow_screenshots=False, tier="tiny")
+    loop_mod.generate_tasks("Build an arcade game", _FakePlanner(), cfg)
+    assert "TOOL AVAILABILITY NOTE" in seen_sys[-1]
+    assert "SMALL-MODEL PLAN CAP" in seen_sys[-1]
+
+    cfg_full = Config(allow_shell=True, tier="large")
+    loop_mod.generate_tasks("Build an arcade game", _FakePlanner(), cfg_full)
+    assert "TOOL AVAILABILITY NOTE" not in seen_sys[-1]
+    assert "SMALL-MODEL PLAN CAP" not in seen_sys[-1]
+
+
+def test_auto_fit_ignores_client_universal_vram_for_lan_server(monkeypatch):
+    """When a low-VRAM laptop (universal vram_gb=8) talks to a 24 GB LAN
+    server (192.168.x.x) whose profile did not set its own vram_gb, auto_fit
+    must trust the LAN server's reported context window instead of clamping
+    it with the laptop's 8 GB VRAM."""
+    cfg = Config(
+        base_url="http://192.168.8.220:11434/v1",
+        model="DaisyRose-27B-GGUF-Q4_K_XL",
+        vram_gb=8,
+        context_tokens=49430,
+        json_mode="schema",
+        active_tier="large",
+        model_size_bytes=18 * 1024 ** 3,
+    )
+    cfg.sources["vram_gb"] = "user config"
+    cfg.sources["context_tokens"] = "profile 'daisyrose' (explicit)"
+    monkeypatch.setattr(config_mod, "is_hosted", lambda c: False)
+    notes = config_mod.auto_fit(cfg, verbose=False)
+    assert cfg.context_tokens == 49430
+    assert not any("leaves no room" in n for n in notes)
+
+
+def test_baseline_text_uses_detected_local_gpu_vram(monkeypatch):
+    from pedacito import profiler
+    from pedacito.gui import settings_api
+    monkeypatch.setattr(profiler, "snapshot", lambda: {
+        "vram": {"total_gb": 24.0, "cards": [{"card": "card1", "total_gb": 24.0}]}
+    })
+    assert "vram_gb = 24" in settings_api.baseline_text()
+    monkeypatch.setattr(profiler, "snapshot", lambda: {"vram": {"total_gb": 0.0, "cards": []}})
+    assert "vram_gb = 8" in settings_api.baseline_text()
+
+
+
+
 def test_needle_step_down_ladder():
+    assert arch_defaults.needle_step_down(131072) == 65536
+    assert arch_defaults.needle_step_down(65536) == 32768
     assert arch_defaults.needle_step_down(32768) == 16384
     assert arch_defaults.needle_step_down(16384) == 8192
     assert arch_defaults.needle_step_down(8192) is None
@@ -402,8 +751,10 @@ def test_calibrate_records_arch_choices_local_only(home):
     card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
     ch = card["choices"]
     assert ch["arch_family"] == "qwen2.5-coder"
-    assert ch["temperature"] == 0.3
-    assert ch["temperature_answer"] == 0.3
+    # the scripted client keeps thinking on (both A/B arms usable), so the
+    # card records the family's THINKING temperatures.
+    assert ch["temperature"] == 0.5
+    assert ch["temperature_answer"] == 0.5
     assert ch["sampler"] == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert ch["context_tokens"] == 32768
     assert "translation_i18n" in ch["specialties"]
@@ -419,6 +770,39 @@ def test_calibrate_records_arch_choices_local_only(home):
     assert "temperature" not in hcard["choices"]
 
 
+def test_calibrate_records_non_thinking_pair_when_thinking_off(home):
+    cfg = _cfg(model="Qwen2.5-Coder-14B")
+    client = _ArchProbeClient()
+
+    # Force the card's thinking A/B verdict to disable thinking: then the
+    # card records the NON-thinking pair (0.3/0.3).
+    orig = modelcard._t_thinking
+    modelcard._t_thinking = lambda c, cfg: (False, True, [])
+    try:
+        card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
+    finally:
+        modelcard._t_thinking = orig
+    ch = card["choices"]
+    assert ch["disable_thinking"] is True
+    assert ch["temperature"] == 0.3
+    assert ch["temperature_answer"] == 0.3
+
+
+def test_calibrate_records_thinking_baseline_for_unnamed_local_moe(home):
+    from pedacito.config import is_local_moe
+    cfg = _cfg(model="mystery-moe-server")
+    cfg.provider = "strata"          # a local tiered-MoE runtime
+    assert is_local_moe(cfg)
+    client = _ArchProbeClient()
+    card = modelcard.calibrate(client, cfg, verbose=False, quick=True)
+    ch = card["choices"]
+    # no named architecture family, but a local MoE with thinking on gets the
+    # safe thinking baseline so Creative Mode sways from 0.6, not 0.2.
+    assert "arch_family" not in ch
+    assert ch["temperature"] == 0.6
+    assert ch["temperature_answer"] == 0.6
+
+
 def test_apply_fills_arch_settings_only_when_unset(home):
     cfg = _cfg(model="Qwen2.5-Coder-14B")
     card = modelcard.calibrate(_ArchProbeClient(), cfg, verbose=False,
@@ -427,19 +811,31 @@ def test_apply_fills_arch_settings_only_when_unset(home):
 
     fresh = _cfg(model="Qwen2.5-Coder-14B")
     modelcard.apply(fresh)
-    assert fresh.temperature == 0.3
-    assert fresh.temperature_answer == 0.3
+    assert fresh.temperature == 0.5
+    assert fresh.temperature_answer == 0.5
     assert fresh.sampler == {"top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05}
     assert fresh.context_tokens == 32768
-    assert fresh.sources["temperature"] == "model card"
+    assert fresh.sources["temperature"] == "model card (qwen2.5-coder)"
     assert fresh.sources["context_tokens"] == "model card"
 
-    # explicit user values always win
+    # a universal-level default ([universal] temperature = 0.2, no profile
+    # key) is still a default: the calibrated card replaces it.
+    universal = _cfg(model="Qwen2.5-Coder-14B")
+    universal.temperature = 0.2
+    universal.sources["temperature"] = "user config (/path)"
+    universal.temperature_answer = 0.3
+    universal.sources["temperature_answer"] = "user config (/path)"
+    modelcard.apply(universal)
+    assert universal.temperature == 0.5
+    assert universal.temperature_answer == 0.5
+
+    # an explicit per-profile value always wins
     tuned = _cfg(model="Qwen2.5-Coder-14B")
     tuned.temperature = 0.7
-    tuned.sources["temperature"] = "user config"
+    tuned.sources["temperature"] = "profile 'coder' (via --profile; explicit)"
     tuned.temperature_answer = 0.4
-    tuned.sources["temperature_answer"] = "user config"
+    tuned.sources["temperature_answer"] = \
+        "profile 'coder' (via --profile; explicit)"
     tuned.sampler = {"top_p": 0.5}
     tuned.sources["sampler"] = "user config"
     tuned.context_tokens = 4096
@@ -449,6 +845,13 @@ def test_apply_fills_arch_settings_only_when_unset(home):
     assert tuned.temperature_answer == 0.4
     assert tuned.sampler == {"top_p": 0.5}
     assert tuned.context_tokens == 4096
+
+    # an env var always wins too
+    env = _cfg(model="Qwen2.5-Coder-14B")
+    env.temperature = 0.55
+    env.sources["temperature"] = "env PEDACITO_TEMPERATURE"
+    modelcard.apply(env)
+    assert env.temperature == 0.55
 
     # an auto-fit window is a machine fallback, not a user choice: it yields
     autofit = _cfg(model="Qwen2.5-Coder-14B")

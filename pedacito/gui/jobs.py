@@ -113,6 +113,9 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
         finally:
             job.telemetry = _uninterruptible(events_mod.end_run)
             _uninterruptible(STATE.end_job, job, err)
+            # The run may have loaded/evicted models: let the topbar chip see
+            # the post-run memory now, not at its next poll.
+            _uninterruptible(_push_hardware)
             # the turn is over: the thread on disk must match what the user
             # just saw, including anything the throttled saves held back
             _uninterruptible(STATE.save_active_thread, force=True)
@@ -228,6 +231,28 @@ class _Feed:
         if kind == "step":
             self.activity(f"{f.get('n', '?')}. {f.get('action', '')} "
                           f"{f.get('detail', '')}".rstrip())
+        elif kind == "interleaved_turn":
+            self.activity(f"turn {f.get('turn', '?')}: "
+                          f"{len(f.get('calls') or [])} tool call(s)")
+        elif kind == "tool_call":
+            self.activity(f"-> {f.get('name', '?')}")
+        elif kind == "tool_result":
+            self.activity(f"<- {f.get('name', '?')} "
+                          f"({'ok' if f.get('ok') else 'FAILED'}, "
+                          f"{f.get('chars', 0)} chars)")
+        elif kind == "edit_staged":
+            verb = "applied" if f.get("applied") else "staged"
+            self.activity(f"edit {verb}: {f.get('file', '?')} "
+                          f"(+{f.get('added', 0)}/-{f.get('removed', 0)})")
+        elif kind == "gate_error":
+            self.activity(f"gate error ({f.get('gate', '?')}): "
+                          f"{f.get('file', '?')} -- {f.get('message', '')}")
+        elif kind == "finish":
+            self.activity(f"interleaved finish: "
+                          f"{'ok' if f.get('ok') else 'not ok'} "
+                          f"({f.get('stop_reason', '')}, "
+                          f"{f.get('turns', 0)} turns, "
+                          f"{f.get('tool_calls', 0)} tool calls)")
         elif kind == "recovery":
             self.activity(f"recovery: {f.get('signal', '')}")
         elif kind == "steer":
@@ -375,6 +400,21 @@ def _global_project(profile: str = "") -> SimpleNamespace:
                            client=LLMClient(cfg), idx=None, agent=None)
 
 
+def _push_hardware() -> None:
+    """Push a fresh RAM/VRAM snapshot to the topbar chip over SSE.
+
+    Evictions and finished jobs change memory outside the badge's polling
+    cycle; the lightweight "hardware" event lets the chip follow live during
+    model switches without a page refresh. Best-effort: a failed read must
+    never disturb the job itself."""
+    try:
+        from .. import profiler
+        STATE.bus.publish("hardware",
+                          memory=profiler.snapshot(use_cache=False))
+    except Exception:
+        pass
+
+
 def _evict_other_servers(cfg) -> None:
     """Unload models resident on OTHER local servers before a run.
 
@@ -385,6 +425,8 @@ def _evict_other_servers(cfg) -> None:
         from .. import servers
         result = servers.evict_other_local_servers(
             getattr(cfg, "active_profile", "") or cfg.base_url, cfg)
+        # The freed VRAM/RAM must reach the topbar chip right away.
+        _push_hardware()
     except Exception:
         return
     evicted = [r for r in result.get("evicted", []) if r]
@@ -738,27 +780,37 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
         f"{', '.join(n for n, _ in todo)}. Each model loads in turn; "
         "progress streams to the TERMINAL tab.", kind="calibrating")
     done = 0
+    failed: list[str] = []
     try:
-        for n, cfg in todo:
+        for idx, (n, cfg) in enumerate(todo):
             if job.cancelled:
                 break
             if imagegen.profile_is_image_model(cfg):
                 with STATE.lock:
                     job.title = (f"probing image {n} "
-                                 f"({done + 1}/{len(todo)})")
-                card = modelcard.calibrate_image_model(cfg, verbose=True)
-                path = modelcard.save_card(card)
-                done += 1
-                m = card.get("measured") or {}
-                status = (f"verified ({m.get('latency_s', '?')}s)"
-                          if m.get("image_ok") else "probe failed")
-                STATE.add_message(
-                    "system", f"Image probe of '{n}' finished \u2014 "
-                    f"{status}. Card saved to {path}.", kind="calibrated")
+                                 f"({idx + 1}/{len(todo)})")
+                try:
+                    card = modelcard.calibrate_image_model(cfg, verbose=True)
+                    path = modelcard.save_card(card)
+                    done += 1
+                    m = card.get("measured") or {}
+                    status = (f"verified ({m.get('latency_s', '?')}s)"
+                              if m.get("image_ok") else "probe failed")
+                    STATE.add_message(
+                        "system", f"Image probe of '{n}' finished \u2014 "
+                        f"{status}. Card saved to {path}.", kind="calibrated")
+                except (CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception as exc:
+                    failed.append(n)
+                    STATE.add_message(
+                        "system", f"Image probe of '{n}' failed: "
+                        f"{str(exc).splitlines()[0][:240]} \u2014 skipping.",
+                        kind="error")
                 continue
             with STATE.lock:
                 job.title = (f"calibrating {n} "
-                             f"({done + 1}/{len(todo)})")
+                             f"({idx + 1}/{len(todo)})")
             cfg._cancel_event = job.cancel_event
             client = LLMClient(cfg)
             client.cancel_event = job.cancel_event
@@ -776,13 +828,23 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
                     "system", f"Calibration of '{n}' finished \u2014 "
                     f"overall score {m.get('overall', '?')}. "
                     f"Card saved to {path}.", kind="calibrated")
+            except (CancelledError, KeyboardInterrupt):
+                raise
+            except Exception as exc:
+                failed.append(n)
+                STATE.add_message(
+                    "system", f"Calibration of '{n}' failed: "
+                    f"{str(exc).splitlines()[0][:240]} \u2014 skipping and "
+                    "continuing.", kind="error")
             finally:
                 llm_mod.unload_model(client)
-    except KeyboardInterrupt:
+    except (CancelledError, KeyboardInterrupt):
         pass                    # spawn's handler reports the stop
+    fail_note = (f" ({len(failed)} failed: {', '.join(failed)})"
+                 if failed else "")
     STATE.add_message(
         "system", f"Calibrate-all finished: {done} of {len(todo)} local "
-        "profile(s) calibrated.", kind="calibrated")
+        f"profile(s) calibrated{fail_note}.", kind="calibrated")
 
 
 def run_benchmark(job: Job, opts: dict) -> None:

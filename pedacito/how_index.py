@@ -309,6 +309,9 @@ CLI_COMMANDS = [
             {"flag": "--no-plan", "help": "never auto-plan this task"},
             {"flag": "--review-plan",
              "help": "show the plan and ask before running it"},
+            {"flag": "--execution-mode MODE",
+             "help": "task engine for this run: two_phase, interleaved or "
+                     "auto (overrides execution_mode in the config)"},
         ],
         "common": True,
     },
@@ -782,6 +785,27 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "models refresh",
+        "usage": "pedacito models refresh [--json] [--config FILE]",
+        "summary": "Force-refresh the cached models.dev catalog now (context "
+                   "windows and list prices for hosted providers, 24 h TTL). "
+                   "Every failure is quiet: a failed fetch keeps the previous "
+                   "cache, and nothing else changes.",
+        "keywords": ["models refresh", "refresh catalog", "models.dev",
+                     "pricing", "context window", "provider catalog",
+                     "24 hours", "cache", "offline"],
+        "examples": [
+            "pedacito models refresh",
+            "pedacito models refresh --json",
+        ],
+        "flags": [
+            {"flag": "refresh", "help": "the action: refresh model_catalog.json "
+                                      "from models.dev"},
+            {"flag": "--json", "help": "print the refresh result as JSON"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+        ],
+    },
+    {
         "name": "profile",
         "usage": "pedacito profile [--show | --run | --reset] [--json]",
         "summary": "Show the vendor-neutral hardware snapshot (RAM/VRAM with a "
@@ -1185,7 +1209,7 @@ CLI_COMMANDS = [
     },
     {
         "name": "diagnose",
-        "usage": "pedacito diagnose [--root DIR] [--file FILE]",
+        "usage": "pedacito diagnose [DIR] [--root DIR] [--file FILE]",
         "summary": "Run the project's detected linter/typechecker.",
         "keywords": ["lint", "typecheck", "static analysis"],
         "examples": ["pedacito diagnose .", "pedacito diagnose . --file app.py"],
@@ -1791,13 +1815,18 @@ GUI_TOPICS = [
             "the middle Changes pane opens)",
             "Untick files to accept only some; use ✎ Edit proposed or "
             "Side by side / Unified",
+            "Hunk-level sign-off: each change block inside a file is a Hunk "
+            "N row with an accept-this-hunk-only checkbox; accepting a subset "
+            "writes only the accepted hunks, and the file's SHA-256 is still "
+            "re-checked before anything is written",
             "Each file shows clause badges (R1, R2, ...) for the parts of the "
             "task it serves; accepting only some files flags any clause left "
             "unaccepted",
             "Click Accept (or Accept N of M) / Reject",
         ],
         "keywords": ["review", "diff", "accept", "reject", "staged changes",
-                     "before writing"],
+                     "before writing", "hunk", "hunks", "partial accept",
+                     "sign off", "sign-off"],
         "settings": ["review", "backup", "atomic_edits"],
         "cli": ["ask"],
     },
@@ -1899,6 +1928,9 @@ GUI_TOPICS = [
             "remaining defaults, including the architecture library's "
             "recommended temperature, sampler and context window for local "
             "models",
+            "A calibrated temperature replaces only default-level values: a "
+            "temperature you set on a profile, a PEDACITO_* environment "
+            "variable or a CLI flag always wins over the card",
         ],
         "keywords": ["calibrate", "model card", "measure model", "tune model",
                      "benchmark", "calibrate all", "calibration badge",
@@ -1930,10 +1962,15 @@ GUI_TOPICS = [
             "In chat, /status and /cost show the same context bar and speeds; "
             "the rpc status reply carries context_utilization_pct, "
             "last_tok_per_s and avg_tok_per_s",
+            "GUI hardware badge: RAM and VRAM totals refresh every 3 s from "
+            "/api/hardware and are also pushed live over SSE; server probes "
+            "run in parallel, so one slow server does not stall the badge. "
+            "It shows totals only, with no per-process GPU attribution",
         ],
         "keywords": ["telemetry", "context bar", "context usage", "tokens per "
                      "second", "tok/s", "speed", "cache hit", "footer",
-                     "ribbon", "folds", "show_telemetry"],
+                     "ribbon", "folds", "show_telemetry", "hardware", "ram",
+                     "vram", "memory badge", "gpu usage", "api/hardware"],
         "settings": ["show_telemetry", "context_tokens"],
         "cli": ["ask", "chat", "rpc"],
     },
@@ -2004,14 +2041,26 @@ GUI_TOPICS = [
             "cache_read_input_tokens / cache_creation_input_tokens usage, "
             "native extended thinking, tools and images; set "
             "anthropic_native = false for the OpenAI-compatible layer",
+            "Google Gemini (generativelanguage.googleapis.com) uses the native "
+            "generateContent transport by default (gemini_native = true; false "
+            "uses the OpenAI-compatible shim). OpenAI o3/o4/GPT-5 reasoning "
+            "models can opt into the Responses API with openai_responses = "
+            "true, or provider = \"openai-responses\"",
+            "Keep the key out of the file: api_key = \"keyring:<service>/"
+            "<account>\" or api_key_keyring = \"<service>/<account>\" reads the "
+            "OS keychain once the optional extra is installed: pip install "
+            "\"pedacito[keyring]\"",
         ],
         "keywords": ["api key", "hosted", "openai", "deepseek", "anthropic",
                      "server url", "base_url", "api_key_env", "authentication",
                      "anthropic_native", "claude", "cache_control",
-                     "messages api", "cache_read_input_tokens"],
-        "settings": ["base_url", "api_key", "api_key_env", "model",
-                     "json_mode", "tier", "anthropic_native",
-                     "prompt_cache", "prompt_cache_ttl"],
+                     "messages api", "cache_read_input_tokens", "gemini",
+                     "google", "generatecontent", "responses api", "o3",
+                     "gpt-5", "keyring", "keychain"],
+        "settings": ["base_url", "api_key", "api_key_env", "api_key_keyring",
+                     "model", "json_mode", "tier", "anthropic_native",
+                     "gemini_native", "openai_responses", "prompt_cache",
+                     "prompt_cache_ttl"],
         "cli": ["config", "models scan", "calibrate"],
     },
     {
@@ -2344,6 +2393,10 @@ GUI_TOPICS = [
             "Always Allow: never asks again for that request. It is saved to your "
             "config when one exists. Web access flips enable_web, shell commands "
             "flip allow_shell",
+            "Allow '<pattern>' in this project (GUI) or p in the TUI: a shell "
+            "command matching a narrow rule skips the prompt in that project "
+            "only. The rule is saved to shell_allowlist_by_project; package "
+            "installs, shells and chained commands are never covered",
             "Deny & Redirect: refuses the request. The model is told to continue "
             "with local project files only. Stop, or letting the dialog time out, "
             "also denies",
@@ -2352,8 +2405,10 @@ GUI_TOPICS = [
         ],
         "keywords": ["permission", "permissions", "allow", "deny", "approve",
                      "approval", "always allow", "allow once", "popup", "dialog",
-                     "blocked", "waiting", "redirect"],
-        "settings": ["enable_web", "allow_shell", "allow_fetch"],
+                     "blocked", "waiting", "redirect", "allow in this project",
+                     "project allow rule", "shell allowlist", "allow rule"],
+        "settings": ["enable_web", "allow_shell", "allow_fetch",
+                     "shell_allowlist_by_project"],
         "cli": ["config"],
     },
     {
@@ -2516,6 +2571,9 @@ GUI_TOPICS = [
             "➕ Create a starter Scout profile… (second server URL, model id, "
             "VRAM, tier) → Save pairing; it writes default_profile + "
             "scout_profile in one comment-preserving edit",
+            "The Dual-GPU / Scout + Architect Pairing panel is collapsed by "
+            "default; its header shows Paired or Not configured, and the "
+            "Configure button opens the form",
             "⚙ Settings → Auto-Tune → answer the dual-GPU question; when a "
             "second card fits, the preview offers Create starter Scout & pair…",
             "Manual path: ⚙ Settings → Profiles: create or select a second "
@@ -2623,6 +2681,31 @@ GUI_TOPICS = [
         "cli": ["config"],
     },
     {
+        "id": "execution-mode",
+        "title": "Choose the task engine: two_phase, interleaved or auto "
+                 "(execution_mode)",
+        "summary": "two_phase gathers context then answers with edit blocks; "
+                   "interleaved runs one agentic conversation where the model "
+                   "reads, edits, runs tests and fixes until the task is done. "
+                   "auto picks interleaved for hosted APIs, local-MoE servers "
+                   "and calibrated large local models whose card chose native "
+                   "tool calls; tiny/small/medium local models stay two_phase.",
+        "steps": [
+            "⚙ Settings → Profiles → [Select Profile] → Reasoning & Execution "
+            "Overrides → execution_mode",
+            "Or per run: pedacito ask . -t \"...\" --execution-mode interleaved",
+            "In the TUI: /mode interleaved (alias /exec-mode); /status shows "
+            "the active and the resolved mode",
+            "The GUI Activity pane shows live tool-call cards while an "
+            "interleaved run works; review and dry-run use the same sign-off "
+            "page as two_phase",
+        ],
+        "keywords": ["execution mode", "interleaved", "two phase", "agentic",
+                     "agent loop", "engine", "tool loop", "auto mode"],
+        "settings": ["execution_mode", "tool_mode"],
+        "cli": ["ask", "auto"],
+    },
+    {
         "id": "local-acceleration",
         "title": "Speed up local servers: KV prompt cache and n-gram "
                  "speculation (cache_prompt, prompt_lookup_num_tokens)",
@@ -2726,6 +2809,10 @@ GUI_TOPICS = [
             "everywhere); /status shows the current state",
             "On the CLI: --creative forces it for the run (ask, auto, new, "
             "chat, tui)",
+            "Creative sway: creative_temperature_delta adds a relative extra "
+            "temperature on top of the answer baseline (unset = +0.20 for "
+            "tiny/small, +0.30 otherwise; explicit values 0.0-0.8). It never "
+            "drops below the baseline, so a calibrated 0.6 model reaches 0.9",
             "Or set creative_mode = true / creative_auto = false in "
             "config.toml (⚙ Settings → All settings → search creative_mode)",
             "The fragment veto and the small-window oversized-rewrite brake "
@@ -2739,6 +2826,66 @@ GUI_TOPICS = [
                      "html rewrite", "css rewrite", "visual design"],
         "settings": ["creative_mode", "creative_auto", "temperature_answer"],
         "cli": ["ask", "auto", "new", "chat", "tui"],
+    },
+    {
+        "id": "strata-onboarding",
+        "title": "Connect Strata / Avalon (local MoE) on port 8080",
+        "summary": "Strata and Avalon serve an OpenAI-compatible API, by default "
+                   "at http://127.0.0.1:8080/v1. Scan finds them, asks for an "
+                   "API key only when the server requires one, and reads "
+                   "STRATA_API_KEY (or AVALON_API_KEY) when the field is empty. "
+                   "A key-protected server shows an API key required badge.",
+        "steps": [
+            "⚙ Settings → Model discovery → Scan local servers: the list "
+            "includes the Strata / Avalon (Local MoE) preset at "
+            "http://127.0.0.1:8080/v1",
+            "If the server answers API key required, paste the key into the "
+            "API key field next to the scan, or leave it empty and export "
+            "STRATA_API_KEY before starting Pedacito",
+            "Tick the models and import them: they become local-moe profiles, "
+            "and the Servers list keeps the API key required badge until a "
+            "key is available",
+            "Loading and unloading models use the profile's api_key, so set it "
+            "once in ⚙ Settings → Profiles, or rely on STRATA_API_KEY",
+            "Lemonade and Strata can share one machine: with auto_evict_servers "
+            "= true (the default), a run first unloads the other local "
+            "server's model, so the target server has the memory it needs; "
+            "set it to false to keep every model loaded",
+            "CLI equivalent: pedacito models scan --url http://127.0.0.1:8080/v1 "
+            "--api-key-env STRATA_API_KEY",
+        ],
+        "keywords": ["strata", "avalon", "local moe", "local-moe", "8080",
+                     "port 8080", "lemonade", "auto evict", "auto_evict_servers",
+                     "api key required", "auth required", "STRATA_API_KEY",
+                     "onboarding", "scan strata", "tiered moe"],
+        "settings": ["auto_evict_servers", "api_key", "api_key_env", "base_url"],
+        "cli": ["models scan", "config"],
+    },
+    {
+        "id": "model-catalog-refresh",
+        "title": "Keep hosted context windows and prices current (models.dev)",
+        "summary": "Hosted providers get their context window and $/Mtok prices "
+                   "from three tiers: the provider's own /models metadata (tier "
+                   "1), a 24-hour models.dev cache (tier 2) and a built-in "
+                   "static price table (tier 3). Explicit price settings always "
+                   "win.",
+        "steps": [
+            "Automatic: with auto_refresh_model_catalog = true (the default), "
+            "probing or refreshing a hosted provider quietly refreshes the "
+            "models.dev cache once it is older than 24 hours",
+            "GUI: ⚙ Settings → Model discovery → Add Hosted Provider → Refresh "
+            "catalog updates the cache now; the price column shows the input / "
+            "output $/Mtok and the context window per model",
+            "CLI: pedacito models refresh (add --json for the result)",
+            "Strictly offline: auto_refresh_model_catalog = false. Tier 2 cache "
+            "data and the built-in table still apply",
+        ],
+        "keywords": ["models refresh", "model catalog", "models.dev", "pricing",
+                     "prices", "cost", "context window", "catalog sync",
+                     "refresh catalog", "24 hours", "3-tier", "provider models",
+                     "price table"],
+        "settings": ["auto_refresh_model_catalog"],
+        "cli": ["models refresh", "models scan"],
     },
     {
         "id": "language-switch",
@@ -2930,6 +3077,9 @@ _SETTING_GUI = {
                   "Execution Overrides → edit_style",
     "tool_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                  "Execution Overrides → tool_mode",
+    "execution_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
+                      "Execution Overrides → execution_mode (or "
+                      "--execution-mode per run, TUI /mode live)",
     "best_of": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                "Execution Overrides → best_of",
     "fuzzy_match": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
@@ -2949,9 +3099,9 @@ _SETTING_GUI = {
 _REASONING_KEYS = {
     "disable_thinking", "thinking_suffix", "step_reasoning_first",
     "incremental_edit_loop", "edit_plan_brief", "dynamic_tool_pruning",
-    "prompt_pack", "answer_mode", "edit_style", "tool_mode", "best_of",
-    "fuzzy_match", "temperature", "temperature_answer", "max_output_tokens",
-    "context_tokens",
+    "prompt_pack", "answer_mode", "edit_style", "tool_mode", "execution_mode",
+    "best_of", "fuzzy_match", "temperature", "temperature_answer",
+    "max_output_tokens", "context_tokens",
 }
 _CONNECTION_KEYS = {
     "base_url", "api_key", "model", "tier", "vram_gb", "json_mode", "timeout",
@@ -2989,6 +3139,8 @@ _SETTING_KEYWORDS = {
                               "symbol edits"],
     "edit_plan_brief": ["edit plan", "brief before edits"],
     "step_reasoning_first": ["reasoning first", "reason before action"],
+    "execution_mode": ["execution mode", "interleaved", "two phase",
+                       "agentic loop", "agent loop", "task engine"],
     "max_read_tokens": ["read budget", "token budget", "small context"],
     "max_gathered_chars": ["gather budget", "context budget", "small window"],
     "max_total_model_calls": ["call cap", "model call budget"],
@@ -3019,6 +3171,21 @@ _SETTING_KEYWORDS = {
     "prompt_cache": ["prompt cache", "caching", "cache control"],
     "anthropic_native": ["anthropic", "claude", "messages api",
                          "native transport", "cache_control"],
+    "gemini_native": ["gemini", "google", "generateContent",
+                      "native transport", "x-goog-api-key"],
+    "openai_responses": ["openai", "responses api", "o3", "o4", "gpt-5",
+                         "reasoning", "previous_response_id"],
+    "auto_refresh_model_catalog": ["model catalog", "models.dev", "pricing",
+                                   "context window", "provider refresh"],
+    "api_key_keyring": ["keyring", "keychain", "credential", "secret",
+                        "api key", "password"],
+    "shell_allowlist_by_project": ["allow in this project", "project allow",
+                                   "shell rule", "always allow shell",
+                                   "per project shell", "skip prompt"],
+    "creative_temperature_delta": ["creative temperature", "design sway",
+                                   "creativity", "warmer", "design mode"],
+    "auto_evict_servers": ["evict", "unload other servers", "lemonade",
+                           "strata", "memory", "vram", "coexist"],
     "enable_prompt_cache": ["cache_prompt", "kv cache", "local server "
                             "cache", "llama.cpp cache", "faster local"],
     "enable_prompt_lookup": ["prompt lookup", "n-gram", "speculative "

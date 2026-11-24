@@ -58,7 +58,10 @@ RUN_KINDS = ("task", "explain", "auto", "new", "arena")
 EVENT_PHASE = {"step": "gather", "gather_done": "edit", "answer": "edit",
                "edit_intents": "edit", "incremental_edit": "edit",
                "verify": "verify", "tests": "verify",
-               "rehydrate": "gather", "fold": "gather"}
+               "rehydrate": "gather", "fold": "gather",
+               "interleaved_turn": "edit", "tool_call": "gather",
+               "tool_result": "gather", "edit_staged": "edit",
+               "gate_error": "verify"}
 # client.site -> phase, while a run is live (the call site is authoritative).
 SITE_PHASE = {"gather": "gather", "compaction": "gather", "answer": "edit",
               "verify": "verify", "repair": "repair"}
@@ -360,7 +363,11 @@ class Review:
 
 
 def before_text(fd) -> str:
-    """The file's text before the change, rebuilt from the diff rows."""
+    """The file's text before the change: the recorded original when the
+    diff carries one, else rebuilt from the diff rows."""
+    stored = getattr(fd, "before_text", "")
+    if stored:
+        return stored
     return "\n".join(r.a for r in fd.rows if r.kind not in ("insert", "skip"))
 
 
@@ -373,8 +380,18 @@ def pack_rows(rows) -> list:
         else:
             out.append([r.kind, r.a_no, r.a, r.b_no, r.b,
                         [list(s) for s in r.a_spans],
-                        [list(s) for s in r.b_spans], r.fold])
+                        [list(s) for s in r.b_spans], r.fold,
+                        getattr(r, "hunk", -1)])
     return out
+
+
+def pack_hunks(hunks) -> list:
+    """Compact JSON form of a file's hunks for the browser's per-hunk
+    checkboxes (empty for legacy diffs and display-only rename sources)."""
+    return [{"index": h.index, "a_start": h.a_start, "a_count": h.a_count,
+             "b_start": h.b_start, "b_count": h.b_count,
+             "added": h.added, "removed": h.removed, "rows": list(h.rows)}
+            for h in (hunks or [])]
 
 
 def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
@@ -558,6 +575,9 @@ class State:
         self.phase = ""
         self.gather_steps = 0
         self.actions: deque[dict] = deque(maxlen=60)
+        # Interleaved engine feed: the live tool-call cards in the Activity
+        # pane (bounded; /api/state carries the newest tail, SSE the deltas).
+        self.interleaved: deque[dict] = deque(maxlen=120)
         # Specialist routing (#50): the profile/model/tag of the most recent
         # `specialist_routed` event; cleared when a model swap hands the card
         # back to the worker's own model.
@@ -1195,6 +1215,7 @@ class State:
                 self.phase = "gather"
                 self.gather_steps = 0
                 self.actions.clear()
+                self.interleaved.clear()
                 self.folds = 0
                 self.llm_call = {}
             job = self.job
@@ -1297,6 +1318,10 @@ class State:
                 self.llm_call = {}
             self.bus.publish("status")
             return
+        if kind in ("interleaved_turn", "tool_call", "tool_result",
+                    "edit_staged", "gate_error", "finish"):
+            self._note_interleaved(kind, f)
+            return
         action = None
         step_n = None
         if kind == "step":
@@ -1365,6 +1390,61 @@ class State:
                 self.specialist = {}   # the worker got its card back
         if ping:
             self.bus.publish("status")
+
+    def _note_interleaved(self, kind: str, f: dict) -> None:
+        """One interleaved-engine event: keep a bounded feed for the Activity
+        pane's live tool-call cards and push it to SSE listeners. The phase
+        follows EVENT_PHASE like every other harness event; the /api/state
+        poll stays authoritative after a reconnect."""
+        rec: dict = {"kind": kind, "t": time.time(), "turn": f.get("turn", 0)}
+        if kind == "interleaved_turn":
+            rec.update(calls=[str(c) for c in (f.get("calls") or [])[:12]],
+                       tokens=int(f.get("tokens") or 0),
+                       mode=str(f.get("mode") or ""),
+                       text=bool(f.get("text")),
+                       note=str(f.get("note") or "")[:200])
+        elif kind == "tool_call":
+            rec.update(name=str(f.get("name") or ""),
+                       id=str(f.get("id") or ""),
+                       args=f.get("args") or {})
+        elif kind == "tool_result":
+            rec.update(name=str(f.get("name") or ""),
+                       id=str(f.get("id") or ""),
+                       ok=bool(f.get("ok")),
+                       chars=int(f.get("chars") or 0),
+                       preview=str(f.get("preview") or "")[:400],
+                       novel=bool(f.get("novel")),
+                       gate_errors=int(f.get("gate_errors") or 0))
+        elif kind == "edit_staged":
+            rec.update(file=str(f.get("file") or ""),
+                       added=int(f.get("added") or 0),
+                       removed=int(f.get("removed") or 0),
+                       applied=bool(f.get("applied")),
+                       deleted=bool(f.get("deleted")),
+                       fuzzy=bool(f.get("fuzzy")),
+                       message=str(f.get("message") or "")[:200],
+                       diff=str(f.get("diff") or "")[:4000])
+        elif kind == "gate_error":
+            rec.update(file=str(f.get("file") or ""),
+                       gate=str(f.get("gate") or ""),
+                       message=str(f.get("message") or "")[:300],
+                       rolled_back=bool(f.get("rolled_back")))
+        elif kind == "finish":
+            rec.update(ok=bool(f.get("ok")),
+                       stop_reason=str(f.get("stop_reason") or ""),
+                       summary=str(f.get("summary") or "")[:600],
+                       changed_files=[str(x) for x in
+                                      (f.get("changed_files") or [])[:30]],
+                       turns=int(f.get("turns") or 0),
+                       tool_calls=int(f.get("tool_calls") or 0),
+                       applied=bool(f.get("applied")),
+                       error=str(f.get("error") or "")[:300])
+        with self.lock:
+            self.interleaved.append(rec)
+            if kind in EVENT_PHASE:
+                self.phase = EVENT_PHASE[kind]
+        self.bus.publish("interleaved", **rec)
+        self.bus.publish("status")
 
     # --- auto-update notice & upgrade run (pedacito.update) ---------------------
 
@@ -1439,6 +1519,7 @@ class State:
             agent, client = self.agent, self.client
             job = self.job if self.job is not None and self.job.active else None
             actions = [dict(a) for a in self.actions][-12:]
+            interleaved = [dict(r) for r in self.interleaved][-40:]
             steps = self.gather_steps
             specialist = dict(self.specialist)
             stats = dict(getattr(client, "stats", None) or {}) if client is not None else {}
@@ -1472,7 +1553,7 @@ class State:
         return {"phase": phase, "steps": steps, "calls": stats.get("calls", 0),
                 "read_spans": read_spans,
                 "requirements": requirements[:8], "actions": actions,
-                "specialist": specialist}
+                "specialist": specialist, "interleaved": interleaved}
 
     # --- live permission broker ----------------------------------------------
 
@@ -1508,6 +1589,8 @@ class State:
                    "risk_level": str(info.get("risk_level") or "medium"),
                    "reason": str(info.get("reason") or ""),
                    "setting_key": setting_key,
+                   "suggested_pattern": str(info.get("suggested_pattern") or ""),
+                   "project_root": str(info.get("project_root") or ""),
                    "key": key, "created_at": time.time()}
             slot = {"event": threading.Event(), "decision": "", "req": req}
             self._perm_slots[pid] = slot
@@ -1535,6 +1618,10 @@ class State:
             return True, ""
         if decision == "allow_always":
             self._always_allow(category, key, setting_key)
+            self.bus.publish("status")
+            return True, ""
+        if decision == "allow_project":
+            self._allow_project_pattern(req)
             self.bus.publish("status")
             return True, ""
         self.bus.publish("status")
@@ -1585,6 +1672,37 @@ class State:
                 pass
         with self.lock:
             self.session_allow.add((category, key))
+
+    def _allow_project_pattern(self, req: dict) -> None:
+        """Apply an "Allow '<pattern>' in this project" decision: record the
+        scoped rule on the live config (matching commands in this project
+        never ask again, even across runs) and persist it to the user
+        config's `shell_allowlist_by_project` map. The exact command is also
+        session-allowed, so this run proceeds even if the write fails."""
+        pattern = str(req.get("suggested_pattern") or "")
+        root = str(req.get("project_root") or "")
+        if not pattern or not root:
+            return
+        key = security.normalize_project_root(root)
+        with self.lock:
+            cfg = self.cfg
+            if cfg is not None and key:
+                mapping: dict = {}
+                for k, v in (getattr(cfg, "shell_allowlist_by_project",
+                                     None) or {}).items():
+                    nk = security.normalize_project_root(k)
+                    if nk:
+                        mapping[nk] = tuple(v or ())
+                pats = mapping.get(key, ())
+                if pattern not in pats:
+                    mapping[key] = pats + (pattern,)
+                cfg.shell_allowlist_by_project = mapping
+            self.session_allow.add((str(req.get("category") or ""),
+                                    str(req.get("key") or "")))
+        try:                                    # best effort: in-memory wins
+            config_mod.add_project_shell_pattern(root, pattern)
+        except Exception:
+            pass
 
     def decide_permission(self, pid: str, decision: str) -> tuple[bool, str]:
         """Answer a pending request from the browser. Returns (ok, detail)."""
@@ -1699,6 +1817,7 @@ class State:
                     "renames_from": list(d.renames_from),
                     "edited": d.rel in rv.edits,
                     "clauses": list(getattr(d, "clauses", ())),
+                    "hunks": pack_hunks(getattr(d, "hunks", ())),
                 } for d in rv.diffs],
             }
 
@@ -1719,7 +1838,8 @@ class State:
             after = rv.edits.get(rel, fd.after_text)
             return {"rel": fd.rel, "rows": pack_rows(fd.rows),
                     "after": after, "added": fd.added,
-                    "removed": fd.removed, "message": fd.message}
+                    "removed": fd.removed, "message": fd.message,
+                    "hunks": pack_hunks(getattr(fd, "hunks", ()))}
 
     def review_rediff(self, rid: int, rel: str, text: str) -> dict | None:
         """Store the user's hand-edited version of a proposed file and return
@@ -1734,15 +1854,26 @@ class State:
             before = before_text(fd)
             text = text.replace("\r\n", "\n")
             rv.edits[rel] = text
-        rows, added, removed = review_mod.build_rows(before, text)
+        rows, added, removed, hunks = review_mod.build_diff(before, text)
         with self.lock:
             fd.rows, fd.added, fd.removed = rows, added, removed
             fd.after_text = text
+            fd.hunks = hunks
+            # A hand edit re-segments the file: any earlier hunk selection
+            # referred to the old segmentation and is dropped.
+            fd.hunk_selection = None
         return {"rel": rel, "rows": pack_rows(rows), "after": text,
-                "added": added, "removed": removed, "message": fd.message}
+                "added": added, "removed": removed, "message": fd.message,
+                "hunks": pack_hunks(hunks)}
 
-    def decide_review(self, rid: int, action: str, files: list[str] | None):
-        """Apply or reject the staged review. Returns (ok, detail)."""
+    def decide_review(self, rid: int, action: str, files: list[str] | None,
+                      accepted_hunks: dict | None = None):
+        """Apply or reject the staged review. Returns (ok, detail).
+
+        `accepted_hunks` ({rel: [hunk indices]}) narrows individual files to
+        some of their hunks; a file absent from the map is accepted whole.
+        A refused hunk selection (e.g. one that would break syntax) leaves
+        the staged diffs untouched so the review stays retryable."""
         with self.apply_lock:
             with self.lock:
                 rv = self.review
@@ -1754,15 +1885,22 @@ class State:
                 self.add_message("assistant", "Rejected staged changes",
                                  kind="review_rejected", review_id=rv.id)
                 return True, rv.detail
+            hmap = accepted_hunks if isinstance(accepted_hunks, dict) else {}
             if rv.partial_ok and files is not None:
-                keep = set(files)
+                keep = set(files) | set(hmap)
                 with self.lock:
                     all_clauses = {c for d in rv.diffs if not d.removed_source
                                    for c in getattr(d, "clauses", ())}
+                    snapshot = list(rv.diffs)
+                    fd_snap = [(d, d.after_text,
+                                getattr(d, "hunk_selection", None))
+                               for d in rv.diffs]
                     kept = [d for d in rv.diffs
                             if d.removed_source or d.rel in keep]
                     if not any(not d.removed_source for d in kept):
-                        return False, "Select at least one file to accept."
+                        return False, ("Select at least one file or hunk to accept."
+                                       if hmap else
+                                       "Select at least one file to accept.")
                     kept_clauses = {c for d in kept if not d.removed_source
                                     for c in getattr(d, "clauses", ())}
                     # R8: a clause none of whose files was accepted stays
@@ -1772,6 +1910,17 @@ class State:
                     for d in rv.diffs:
                         if d.rel in rv.edits:
                             d.after_text = rv.edits[d.rel]
+                    if hmap:
+                        ok, detail = review_mod.apply_hunk_selection(
+                            rv.diffs, hmap)
+                        if not ok:
+                            rv.diffs[:] = snapshot
+                            for d, after, sel in fd_snap:
+                                d.after_text = after
+                                if hasattr(d, "hunk_selection"):
+                                    d.hunk_selection = sel
+                            rv.unaccepted = []
+                            return False, detail
             elif rv.edits:
                 for d in rv.diffs:
                     if d.rel in rv.edits:
@@ -1905,6 +2054,12 @@ class State:
                      (workspace.list_backups(root)[:8] if root else [])]
         needs_setup = not USER_CONFIG.exists()
         engine_payload = self.engine()
+        # Resolving "auto" may read the model card from disk: outside the lock.
+        try:
+            resolved_mode = (config_mod.resolve_execution_mode(cfg)
+                             if cfg is not None else "two_phase")
+        except Exception:
+            resolved_mode = "two_phase"
         with self.lock:
             meta = self.index_meta
             indexed = idx is not None or meta["indexed"]
@@ -2057,6 +2212,10 @@ class State:
                                      if cfg else "default"),
                 "model_class": (config_mod.capability_profile(cfg)
                                 if cfg else ""),
+                "execution_mode": (str(getattr(cfg, "execution_mode",
+                                               "two_phase") or "two_phase")
+                                   if cfg else "two_phase"),
+                "resolved_execution_mode": resolved_mode,
                 "reasoning_capable": bool(cfg) and (
                     config_mod.is_local_moe(cfg)
                     or str(getattr(cfg, "reasoning_effort", "default"))
@@ -2119,7 +2278,8 @@ class State:
                 "files": [{"rel": d.rel, "added": d.added, "removed": d.removed,
                            "source": d.removed_source,
                            "edited": d.rel in rv.edits,
-                           "clauses": list(getattr(d, "clauses", ()))}
+                           "clauses": list(getattr(d, "clauses", ())),
+                           "hunks": pack_hunks(getattr(d, "hunks", ()))}
                           for d in rv.diffs]}
 
 

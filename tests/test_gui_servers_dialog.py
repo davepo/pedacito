@@ -107,6 +107,14 @@ def test_dialog_explains_that_load_creates_no_profile():
     assert "including models no profile references" in dialog
 
 
+def test_auth_required_servers_show_the_key_hint():
+    dialog = _dialog_src()
+    assert "s.auth_required === true" in dialog
+    assert "API key required" in dialog
+    assert ("Set api_key or STRATA_API_KEY in Settings -> Profiles to "
+            "load/unload models") in dialog
+
+
 # ------------------------------------------------------- live browser pin ----
 
 requires_pw = pytest.mark.skipif(
@@ -122,7 +130,7 @@ def test_dialog_titles_the_server_and_load_routes_by_registry_name(
                         lambda *a, **k: [_lemonade_state()])
     calls = []
 
-    def fake_load(target, model="", config=None):
+    def fake_load(target, model="", config=None, evict_others=False, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "load", "server": target,
                 "model": model, "detail": "loaded"}

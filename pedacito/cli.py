@@ -143,6 +143,13 @@ def _add_common(p, paths_nargs="+", dest="paths"):
                    help=i18n.t("cli.opt.lang"))
 
 
+def _add_execution_mode(p):
+    """--execution-mode: the task engine for this run (ask/auto/new/eval)."""
+    p.add_argument("--execution-mode", dest="execution_mode",
+                   choices=("two_phase", "interleaved", "auto"), default=None,
+                   help=i18n.t("cli.opt.execution_mode"))
+
+
 def _load_cli_images(args) -> list[dict]:
     """Load and validate any --image paths passed on the CLI."""
     paths = list(getattr(args, "image", None) or ())
@@ -307,6 +314,9 @@ def _config(args) -> Config:
     if getattr(args, "steps", None) is not None:
         cfg.max_steps = args.steps
         cfg.sources["max_steps"] = "--steps"
+    if getattr(args, "execution_mode", None):
+        cfg.execution_mode = str(args.execution_mode).strip().lower()
+        cfg.sources["execution_mode"] = "--execution-mode"
     if getattr(args, "max_tokens_budget", None) is not None:
         cfg.max_total_tokens = args.max_tokens_budget
         cfg.sources["max_total_tokens"] = "--max-tokens-budget"
@@ -380,6 +390,56 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
     if changed or missing or added or stats_dirty:
         idx.save()
     return idx
+
+
+def _evict_other_local_servers(cfg) -> bool:
+    """Auto-evict resident models on OTHER configured local servers before a
+    CLI run loads this profile (matching GUI jobs.py and TUI tui.py). Returns
+    True when at least one other local server was unloaded (VRAM freed)."""
+    if not bool(getattr(cfg, "auto_evict_servers", True)):
+        return False
+    base = str(getattr(cfg, "base_url", "") or "")
+    if not base:
+        return False
+    try:
+        from . import servers as servers_mod
+        if not servers_mod.is_local_url(base):
+            return False
+        configured = servers_mod.configured_local_servers(cfg)
+        target_key = servers_mod.normalize_url(base)
+        others = [s for s in configured
+                  if servers_mod.normalize_url(s.get("base_url", "")) != target_key]
+        if not others:
+            return False
+        res = servers_mod.evict_other_local_servers(base, cfg)
+        evicted = [r for r in (res.get("evicted") or []) if r.get("ok")]
+        failed = [r for r in (res.get("evicted") or []) if not r.get("ok")]
+        if evicted:
+            names = ", ".join(str(r.get("server") or r.get("model") or "server")
+                              for r in evicted)
+            print(f"[auto-evict: unloaded {names} before switching to "
+                  f"{cfg.active_profile or cfg.model}]", file=sys.stderr)
+        if failed:
+            for r in failed:
+                print(f"[auto-evict warning: could not unload "
+                      f"{r.get('server') or 'server'}: {r.get('detail', '')}]",
+                      file=sys.stderr)
+        return bool(evicted)
+    except Exception:
+        return False
+
+
+def _refit_after_evict(args, cfg) -> object:
+    """When auto-evict freed VRAM from another local server (e.g. Strata ->
+    Lemonade), reload `cfg` so `auto_fit` queries the target server's real
+    post-eviction context window instead of the pre-eviction clamp."""
+    try:
+        fresh = _config(args)
+        if getattr(fresh, "use_model_card", True):
+            modelcard.apply(fresh)
+        return fresh
+    except Exception:
+        return cfg
 
 
 def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
@@ -520,6 +580,12 @@ def _cmd_config(args, cfg) -> int:
         tier = f", tier {cfg.active_tier}" if cfg.active_tier else ""
         print(f"  active: {cfg.active_profile}{tier}")
 
+    # Apply the model card before displaying resolved settings so `config` and
+    # `config --check` show the exact temperature/sampler/tool choices runtime
+    # uses (rather than stale `[universal]` values the card overrides).
+    card = (modelcard.apply(cfg) if getattr(cfg, "use_model_card", True)
+            else modelcard.load(cfg))
+
     print("\nResolved settings (non-default marked):")
     width = max(len(k) for k in cfg.sources)
     for key in sorted(cfg.sources):
@@ -533,7 +599,8 @@ def _cmd_config(args, cfg) -> int:
 
     if cfg.roles:
         print("\nRoles: " + "; ".join(roles_mod.describe(cfg)))
-    card = modelcard.load(cfg)
+    if card is None:
+        card = modelcard.load(cfg)
     if card:
         print("\n" + modelcard.render(card))
     else:
@@ -676,6 +743,7 @@ def _switch_profile(args, ref, arg: str, kind: str = "profile") -> str:
     new_client = LLMClient(new_cfg)
     try:
         new_client.check(warn=False)
+        _evict_other_local_servers(new_cfg)
         new_client.warmup()
     except LLMError:
         args.profile, args.model = prev_profile, prev_model
@@ -1484,7 +1552,8 @@ def _cmd_worktree(args) -> int:
 def _cmd_diagnose(args) -> int:
     """`pedacito diagnose`."""
     from . import diagnostics
-    root = Path(args.root).expanduser().resolve() if args.root else Path(".").resolve()
+    target = getattr(args, "root", None) or getattr(args, "path", None)
+    root = Path(target).expanduser().resolve() if target else Path(".").resolve()
     files = [args.file] if getattr(args, "file", "") else None
     ok, report = diagnostics.run(root, Config(), files=files)
     print(report)
@@ -1559,6 +1628,28 @@ def _disable_auto_tune_opt_in(args, cfg=None) -> str:
     profile = str(getattr(args, "profile", "") or
                   (getattr(cfg, "active_profile", "") if cfg else "") or "")
     return config_editor.disable_auto_tune_opt_in(path, profile)
+
+
+def _cmd_models_refresh(args) -> int:
+    """`pedacito models refresh`: refresh the cached models.dev provider catalog."""
+    from . import model_catalog
+    try:
+        cfg = _light_config(args)
+    except ConfigError:
+        cfg = None
+    res = model_catalog.refresh_catalog(force=True, cfg=cfg)
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=1, default=str))
+        return 0 if res.get("ok") else 1
+    if res.get("ok"):
+        print(f"Refreshed model catalog ({res.get('count', 0)} models) -> {res.get('path', '')}")
+        return 0
+    print(
+        f"Failed to refresh model catalog: "
+        f"{res.get('error') or res.get('detail') or 'unknown error'}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _cmd_models_show(args) -> int:
@@ -1708,6 +1799,7 @@ def _cmd_calibrate(args, cfg) -> int:
         return 0
     client = LLMClient(cfg)
     client.check()
+    _evict_other_local_servers(cfg)
     client.warmup()
     card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
                                repeats=getattr(args, "repeats", None))
@@ -1758,18 +1850,24 @@ def _calibrate_all(args) -> int:
             print("Cancelled.")
             return 0
     done = 0
+    failed: list[str] = []
     try:
         for n, cfg in todo:
             if imagegen.profile_is_image_model(cfg):
                 print(f"\n=== probing image profile '{n}' ({cfg.model}) [image] ===",
                       file=sys.stderr)
-                card = modelcard.calibrate_image_model(cfg, verbose=True)
-                path = modelcard.save_card(card)
-                done += 1
-                m = card.get("measured") or {}
-                status = (f"verified ({m.get('latency_s', '?')}s)"
-                          if m.get("image_ok") else "probe failed")
-                print(f"Saved image card for '{n}' ({status}) to {path}")
+                try:
+                    card = modelcard.calibrate_image_model(cfg, verbose=True)
+                    path = modelcard.save_card(card)
+                    done += 1
+                    m = card.get("measured") or {}
+                    status = (f"verified ({m.get('latency_s', '?')}s)"
+                              if m.get("image_ok") else "probe failed")
+                    print(f"Saved image card for '{n}' ({status}) to {path}")
+                except Exception as e:
+                    failed.append(n)
+                    print(f"Image probe of '{n}' failed ({e}); skipping.",
+                          file=sys.stderr)
                 continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
@@ -1786,15 +1884,19 @@ def _calibrate_all(args) -> int:
                 print(f"Saved card for '{n}'"
                       + (f" (score {score:.2f})" if score is not None else "")
                       + f" to {path}")
+            except LLMError as e:
+                failed.append(n)
+                print(f"Calibration of '{n}' failed: {e}\n"
+                      "  Skipping and continuing with remaining profiles.",
+                      file=sys.stderr)
             finally:
                 llm_mod.unload_model(client)
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
-    except LLMError as e:
-        print(f"\nCalibration stopped: {e}", file=sys.stderr)
-        return 1
-    print(f"\nCalibrated {done} of {len(todo)} local profile(s).")
-    return 0
+    fail_note = (f" ({len(failed)} failed: {', '.join(failed)})"
+                 if failed else "")
+    print(f"\nCalibrated {done} of {len(todo)} local profile(s){fail_note}.")
+    return 0 if done > 0 or not failed else 1
 
 
 def _profile_base_urls() -> list[str]:
@@ -1815,6 +1917,75 @@ def _profile_base_urls() -> list[str]:
         if body.get("base_url"):
             urls.append(body["base_url"])
     return list(dict.fromkeys(urls))
+
+
+def _scan_auth() -> dict:
+    """Per-server Authorization headers for `models scan`, from the user
+    config's profiles plus STRATA_API_KEY/AVALON_API_KEY for Strata/Avalon
+    runtimes. Mirrors `settings_api._endpoint_auth` so the CLI and GUI scans
+    agree, and a key never crosses origins."""
+    from urllib.parse import urlparse
+
+    try:
+        text = USER_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        flat, profiles = config_editor.validate_text(text)
+    except ConfigError:
+        return {}
+
+    def origin(url):
+        try:
+            p = urlparse(str(url or "").strip())
+        except ValueError:
+            return None
+        scheme = (p.scheme or "").lower()
+        if scheme not in ("http", "https") or not p.hostname:
+            return None
+        try:
+            port = p.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return None
+        return (scheme, p.hostname.lower(), port)
+
+    flat_url = str(flat.get("base_url") or "")
+    flat_origin = origin(flat_url)
+
+    def key_for(body, fallback):
+        key = str(body.get("api_key") or "")
+        env = str(body.get("api_key_env") or "")
+        if env:
+            key = os.environ.get(env, "") or key
+        if not key and str(body.get("provider") or "").lower() in (
+                "strata", "avalon", "local-moe", "local_moe", "localmoe"):
+            for name in ("STRATA_API_KEY", "AVALON_API_KEY"):
+                key = os.environ.get(name, "") or key
+        if not key and fallback:
+            key = str(flat.get("api_key") or "")
+            env = str(flat.get("api_key_env") or "")
+            if env:
+                key = os.environ.get(env, "") or key
+        return key
+
+    auth: dict[str, dict] = {}
+    for body in (profiles or {}).values():
+        if not isinstance(body, dict):
+            continue
+        base = str(body.get("base_url") or flat_url or "")
+        if not base:
+            continue
+        same = bool(flat_origin) and origin(base) == flat_origin
+        key = key_for(body, same)
+        if key:
+            auth[discovery.normalize_url(base)] = {
+                "Authorization": f"Bearer {key}"}
+    if flat_url:
+        key = key_for(flat, False)
+        if key:
+            auth.setdefault(discovery.normalize_url(flat_url),
+                            {"Authorization": f"Bearer {key}"})
+    return auth
 
 
 def _ask_vram(label: str, base_url: str, args) -> int:
@@ -2015,15 +2186,23 @@ def _to_scan_entry(m: dict) -> dict:
     is_img = imagegen.is_image_model(m["id"], labels=m.get("labels"),
                                      recipe=m.get("recipe"),
                                      modality=m.get("modality"))
+    api_key_env = m.get("api_key_env")
+    if not api_key_env and m.get("requires_api_key"):
+        prov_low = str(m.get("provider") or m.get("server_label") or "").lower()
+        if prov_low == "strata":
+            api_key_env = "STRATA_API_KEY"
+        elif prov_low == "avalon":
+            api_key_env = "AVALON_API_KEY"
     entry: dict = {"model": m["id"], "base_url": m["base_url"],
                    "modality": "image" if is_img else None,
                    "server_label": m.get("server_label", ""),
+                   "provider": m.get("provider"),
                    "tier": m.get("tier") or "",
                    "vram_gb": m.get("vram_gb"),
                    "quant": m.get("quant"),
                    "size_gb": (f"{m['size_bytes'] / (1024 ** 3):.1f}"
                                if m.get("size_bytes") else None),
-                   "api_key_env": m.get("api_key_env"),
+                   "api_key_env": api_key_env,
                    "prompt_cache": m.get("prompt_cache"),
                    "json_mode": m.get("json_mode"),
                    "tool_mode": m.get("tool_mode")}
@@ -2038,22 +2217,30 @@ def _cmd_models_scan(args) -> int:
     local_urls = [u for u in urls if not _is_hosted_url(u)]
     hosted_urls = [u for u in urls if _is_hosted_url(u)]
 
+    auth = _scan_auth()
     servers = discovery.discover_servers(timeout=2.0, urls=local_urls,
-                                         profile_urls=_profile_base_urls())
+                                         profile_urls=_profile_base_urls(),
+                                         auth=auth)
     selected: list[dict] = []
     if servers:
         for label, base_url, _ids in servers:
             vram = _ask_vram(label, base_url, args)
-            models = discovery.describe_models(base_url, vram_gb=vram)
+            models = discovery.describe_models(base_url, vram_gb=vram, auth=auth)
             picked = _scan_filter(models, args)
             chosen = picked if getattr(args, "yes", False) \
                 else _interactive_pick(label, base_url, picked)
             for m in chosen:
                 m["server_label"] = label
                 m["vram_gb"] = vram
+                # The local-MoE/Lemonade runtimes are written as `provider` so
+                # the profile classifies (and routes) as its real daemon, not
+                # as a generic "custom" server.
+                if label in ("Strata", "Avalon", "Lemonade"):
+                    m["provider"] = label.lower()
                 if not m.get("tier"):
                     m["tier"] = _guess_tier(
-                        m["id"], {"model": m["id"], "base_url": base_url}) or ""
+                        m["id"], {"model": m["id"], "base_url": base_url,
+                                  "provider": m.get("provider", "")}) or ""
             selected.extend(chosen)
     elif not hosted_urls:
         print("No local model servers answered.", file=sys.stderr)
@@ -3377,6 +3564,8 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
 
     p_diag = sub.add_parser(
         "diagnose", help="run the project's detected linter/typechecker")
+    p_diag.add_argument("path", nargs="?", default=None,
+                        help="the project (default: current directory)")
     p_diag.add_argument("--root", default=None,
                         help="the project (default: current directory)")
     p_diag.add_argument("--file", default="",
@@ -3439,6 +3628,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                             ".pedacito/trajectories/ (redacted, local only) "
                             "for SFT/GRPO dataset filtering; same as "
                             "record_trajectories = true for this run only")
+    _add_execution_mode(p_ask)
 
     p_explain = sub.add_parser(
         "explain", help=t("cli.cmd.explain"))
@@ -3515,6 +3705,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                        help="expand the project description into a concrete, "
                             "sectioned spec (with interface contracts) before "
                             "planning")
+    _add_execution_mode(p_new)
 
     p_auto = sub.add_parser(
         "auto", help="autonomous loop: plan a goal, then implement its tasks "
@@ -3573,6 +3764,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_auto.add_argument("-y", "--yes", action="store_true",
                         help="assume yes: skip interactive confirmations, "
                              "including the Task-vs-Auto nudge")
+    _add_execution_mode(p_auto)
 
     p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
@@ -3652,10 +3844,12 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_models.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
                           default=argparse.SUPPRESS, help=t("cli.opt.lang"))
     p_models.add_argument("action", nargs="?", default="show",
-                          choices=["scan", "show"],
+                          choices=["scan", "show", "refresh"],
                           help="'scan' finds local servers and sets up "
-                               "profiles; 'show' (default) prints the active "
-                               "profile's snapshot and auto-tuned numbers")
+                               "profiles; 'refresh' updates the cached "
+                               "hosted model catalog; 'show' (default) prints "
+                               "the active profile's snapshot and auto-tuned "
+                               "numbers")
     p_models.add_argument("--json", action="store_true",
                           help="with show: print structured JSON")
     p_models.add_argument("--url", action="append", default=[], metavar="URL",
@@ -3938,6 +4132,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     for flag in ("--url", "--model", "--config", "--profile"):
         p_eval.add_argument(flag)
     p_eval.add_argument("--root", default=None)
+    _add_execution_mode(p_eval)
     p_eval.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
 
     p_bench = sub.add_parser(
@@ -4087,8 +4282,11 @@ def _main(argv=None) -> int:
     # `models` and `profile` read hardware/measurement state and must work on
     # a machine with no valid config (they only inspect the active profile).
     if args.cmd == "models":
-        if getattr(args, "action", "show") == "scan":
+        action = getattr(args, "action", "show")
+        if action == "scan":
             return _cmd_models_scan(args)
+        if action == "refresh":
+            return _cmd_models_refresh(args)
         return _cmd_models_show(args)
     if args.cmd == "profile":
         return _cmd_profile(args)
@@ -4375,6 +4573,7 @@ def _main(argv=None) -> int:
             spec = scaffold.load_spec(
                 prompt=args.task, spec_file=args.spec,
                 max_chars=cfg.max_spec_chars)
+            _evict_other_local_servers(cfg)
             # One run-scoped collector covers refine + plan + skeleton +
             # implementation, so the closing line aggregates the whole build.
             events_mod.begin_run()
@@ -4438,6 +4637,11 @@ def _main(argv=None) -> int:
             return 0
 
         idx = _get_index(args, cfg, client, rebuild=getattr(args, "reindex", False))
+        # Evict resident models on other local servers (e.g. Strata <-> Lemonade)
+        # before loading this profile so they never fight for VRAM/RAM.
+        if _evict_other_local_servers(cfg):
+            cfg = _refit_after_evict(args, cfg)
+            client = LLMClient(cfg)
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()
@@ -4732,6 +4936,16 @@ def _main(argv=None) -> int:
                           "edits/tests)", file=sys.stderr)
                     elog.emit("exit", code=1)
                     return _finish(1, ok=False)
+                if getattr(args, "apply", False) and getattr(
+                        tr, "budget_hit", False):
+                    bad = [r for r in (getattr(tr, "results", []) or [])
+                           if not getattr(r, "ok", True)]
+                    if bad or not getattr(tr, "applied", False):
+                        print(f"ERROR: task budget exhausted with "
+                              f"{len(bad)} failed edit block(s); run did not "
+                              "finish cleanly", file=sys.stderr)
+                        elog.emit("exit", code=1)
+                        return _finish(1, ok=False)
                 if (getattr(args, "apply", False)
                         and not getattr(tr, "applied", False)
                         and not loop._is_noop(getattr(tr, "reply", "") or "")):

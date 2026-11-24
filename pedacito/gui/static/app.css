@@ -760,6 +760,18 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
   border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
   font-size: 11px; cursor: pointer; }
 .code .skip:hover { color: var(--text); }
+/* Hunk-level sign-off: a header row per hunk, checkbox when selectable. */
+.code > .hunk-head { display: flex; align-items: center; gap: 8px;
+  padding: 3px 10px; font-size: 11px; color: var(--muted);
+  background: var(--surface-alt); border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border); user-select: none; }
+.code > .hunk-head input[type="checkbox"] { flex: none; width: 14px; height: 14px;
+  margin: 0; accent-color: var(--accent); cursor: pointer; }
+.code > .hunk-head .hunk-range { font-family: var(--mono); font-size: 10.5px; }
+.code > .hunk-head .tally { margin-left: auto; flex: none; }
+.code > .hunk-head .a { color: var(--success); }
+.code > .hunk-head .r { color: var(--danger); }
+.code > .hunk-head.off { opacity: .55; }
 #editBox { flex: 1 1 auto; width: 100%; font-family: var(--mono); font-size: 12px;
   border: none; border-radius: 0; background: var(--surface); padding: 8px; }
 
@@ -884,6 +896,59 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .atool.k-specialist { color: var(--accent); border-color: var(--accent); }
 .atool.k-model-swap { color: var(--cyan); border-color: var(--line2); }
 #engCount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Interleaved engine: compact collapsible live tool-call cards. Same theme
+   variables as the action feed above; <details> keeps each card collapsed
+   until the user opens it, so a long run stays scannable. */
+.ilv { display: flex; flex-direction: column; gap: 4px;
+  max-height: 260px; overflow-y: auto; font-size: 11.5px; }
+.ilv-turn { font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .6px; padding: 3px 0 1px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.ilv-turn:first-child { border-top: 0; }
+.ilv-note { text-transform: none; letter-spacing: 0; color: var(--warning); }
+.ilv-card { border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-alt); }
+.ilv-card > summary { display: flex; gap: 6px; align-items: baseline;
+  padding: 3px 8px; cursor: pointer; list-style: none;
+  color: var(--muted); }
+.ilv-card > summary::-webkit-details-marker { display: none; }
+.ilv-card > summary::before { content: '\25B8'; flex: none; font-size: 9px;
+  color: var(--muted); }
+.ilv-card[open] > summary::before { content: '\25BE'; }
+.ilv-card.ok { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.ilv-card.bad { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.ilv-card.pending { opacity: .75; }
+.ilv-name { flex: none; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .4px; color: var(--text); font-family: var(--mono); }
+.ilv-card.bad .ilv-name { color: var(--danger); }
+.ilv-card.edit .ilv-name { color: var(--warning); }
+.ilv-args { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-family: var(--mono); }
+.ilv-diffstat { flex: none; font-family: var(--mono); font-size: 10px;
+  color: var(--cyan); }
+.ilv-state { flex: none; font-size: 10px; font-weight: 700; color: var(--success); }
+.ilv-state.bad { color: var(--danger); }
+.ilv-state.pending { color: var(--muted); }
+.ilv-card.edit .ilv-state { color: var(--muted); font-weight: 600; }
+.ilv-card.edit.ok .ilv-state { color: var(--success); }
+.ilv-pre { margin: 0; padding: 5px 8px; border-top: 1px solid var(--border);
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.45;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow-y: auto; }
+.ilv-pre.diff { color: var(--muted); }
+.ilv-msg { padding: 4px 8px; border-top: 1px solid var(--border);
+  color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.ilv-msg.bad { color: var(--danger); }
+.ilv-gates { padding: 3px 8px; border-top: 1px solid var(--border);
+  color: var(--danger); font-size: 10.5px; }
+.ilv-card.finish { padding: 5px 8px; }
+.ilv-card.finish b { font-size: 11px; color: var(--text); }
+.ilv-card.finish.ok b { color: var(--success); }
+.ilv-card.finish.bad b { color: var(--danger); }
+.ilv-card.finish .ilv-msg { border-top: 0; padding: 3px 0 0; }
+.ilv-meta { font-size: 10px; color: var(--muted); padding-top: 2px;
+  font-family: var(--mono); overflow-wrap: anywhere; }
 
 /* ------------------------------------------------------------- workspace pane --
    Bottom-right panel: Files / Backups / Logs, plus 🌐 Preview when the project
@@ -1019,6 +1084,7 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .tag { font-size: 10.5px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line2);
   color: var(--muted); flex: none; }
 .tag.act { color: var(--success); border-color: var(--success); }
+.tag.warn { color: var(--warning); border-color: var(--warning); }
 .form { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px 10px;
   align-items: center; }
 .form > label { color: var(--muted); font-size: 12.5px; }
@@ -1038,6 +1104,20 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .note-box { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--surface-alt); font-size: 12.5px; margin-bottom: 10px; }
 .note-box.err { border-color: var(--danger); color: var(--danger); white-space: pre-wrap; }
+/* Collapsible Dual-GPU / Scout + Architect pairing card (Profiles tab).
+   Collapsed by default so the profile editor stays above the fold. */
+.pair-box { padding: 0; overflow: hidden; }
+.pair-head { display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; border: none; border-radius: 0; background: transparent;
+  color: var(--text); font: inherit; text-align: left; }
+.pair-head:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.pair-head b { font-size: 12.5px; }
+.pair-caret { color: var(--muted); width: 12px; flex: none; text-align: center; }
+.pair-status { max-width: 55%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.pair-body { padding: 2px 10px 10px; border-top: 1px solid var(--border); }
+.pair-body > .small-text { margin: 8px 0 0; }
+.auth-hint { color: var(--warning); }
 /* Hosted-provider dialog: connect & verify live, then import model-named
    profiles. Replaces the old inline quick-add card — the dialog is opened by
    the "+ Add Hosted Provider…" buttons in Model discovery and Profiles. */
@@ -1072,6 +1152,12 @@ details pre { background: var(--code-bg); border: 1px solid var(--border); borde
 .scan-table th:nth-child(2), .scan-table td:nth-child(2) { width: 1%; text-align: center; }
 .scan-table tr.scan-server td { background: var(--surface-alt); color: var(--muted);
   font-family: var(--mono); font-size: 11.5px; }
+/* server header: fold + URL row, and (only for a key-protected server) the
+   inline key field covering every model in that group */
+.sg-wrap { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+.sg-auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-family: var(--font); }
+.sg-auth .scan-key { width: 210px; height: 24px; font-size: 11.5px; }
 /* per-server bulk-pick controls sit flush right in the group header row */
 .scan-table tr.scan-server .sg-group { flex-wrap: nowrap; gap: 6px; }
 .scan-table tr.scan-server .sg-group button { flex: none; font-size: 10.5px; padding: 1px 7px; }

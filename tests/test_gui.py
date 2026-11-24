@@ -1306,6 +1306,226 @@ def test_frontend_has_the_new_project_auto_switch_hook():
     assert "localStorage.setItem('pedacito_mode', 'task')" in js
 
 
+# --- live hardware telemetry (fast endpoint, fresh actions, SSE push) ----------
+
+def _hw_memory(used_ram=10.0, used_vram=4.0):
+    return {
+        "ram": {"total_gb": 64.0, "used_gb": used_ram},
+        "vram": {"total_gb": 24.0, "used_gb": used_vram},
+        "ram_total_gb": 64.0, "ram_used_gb": used_ram,
+        "vram_total_gb": 24.0, "vram_used_gb": used_vram,
+        "available": True,
+    }
+
+
+def test_hardware_endpoint_returns_fresh_memory_without_probing_servers(
+        gui, monkeypatch):
+    """GET /api/hardware answers from the profiler alone: the chip's fast
+    poll must never contact a configured model server, and must bypass the
+    snapshot TTL memo (use_cache=False)."""
+    from pedacito import profiler as profiler_mod, servers
+    # A configured local server exists, so a probing implementation would
+    # have something to probe.
+    gui.post("/api/settings/setup",
+             {"base_url": "http://127.0.0.1:8123/v1", "model": "m",
+              "vram_gb": "8"})
+    calls = []
+
+    def fake_snapshot(*a, **k):
+        calls.append(k)
+        return _hw_memory()
+
+    def no_probes(*a, **k):
+        raise AssertionError("/api/hardware must not probe model servers")
+
+    monkeypatch.setattr(profiler_mod, "snapshot", fake_snapshot)
+    monkeypatch.setattr(servers, "list_server_states", no_probes)
+    status, j = gui.get("/api/hardware")
+    assert status == 200 and j["ok"] is True
+    assert calls and all(k.get("use_cache") is False for k in calls)
+    assert j["memory"] == j["hardware"] == _hw_memory()
+    assert j["vram"] == j["memory"]["vram"]
+    assert j["ram"] == j["memory"]["ram"]
+    assert j["badge"] == "VRAM: 4.0 / 24.0 GB | RAM: 10.0 / 64.0 GB"
+    assert "servers" not in j
+
+
+def test_hardware_endpoint_bypasses_the_snapshot_ttl(gui, monkeypatch):
+    """Two polls inside SNAPSHOT_TTL must each measure again: the second
+    answer reflects the new reading, not the memoized first one."""
+    from pedacito import profiler as profiler_mod, servers
+    readings = iter([10.0, 20.0])
+
+    def fake_reader(*a, **k):
+        return {"ram": {"total_gb": 64.0, "used_gb": next(readings),
+                        "available_gb": 40.0},
+                "vram": {"total_gb": 24.0, "used_gb": 4.0, "cards": []}}
+
+    monkeypatch.setattr(servers, "get_hardware_memory", fake_reader)
+    monkeypatch.setattr(profiler_mod, "_read_nvidia_smi", lambda **k: [])
+    monkeypatch.setattr(profiler_mod, "_read_macos_memory", lambda **k: None)
+    monkeypatch.setattr(profiler_mod, "_read_windows_memory", lambda **k: None)
+    profiler_mod.clear_snapshot_cache()
+    s1, j1 = gui.get("/api/hardware")
+    s2, j2 = gui.get("/api/hardware")
+    assert s1 == s2 == 200
+    assert j1["ram"]["used_gb"] == 10.0
+    assert j2["ram"]["used_gb"] == 20.0
+
+
+def test_server_actions_bust_the_snapshot_cache(gui, monkeypatch):
+    """Load, unload and pin answer with post-action memory: each clears the
+    burst memo and recomputes with use_cache=False."""
+    from pedacito import profiler as profiler_mod, servers
+    cleared, snaps = [], []
+    real_clear = profiler_mod.clear_snapshot_cache
+
+    def spy_clear():
+        cleared.append(True)
+        real_clear()
+
+    def spy_snapshot(*a, **k):
+        snaps.append(k)
+        return _hw_memory(used_ram=32.0, used_vram=20.0)
+
+    monkeypatch.setattr(profiler_mod, "clear_snapshot_cache", spy_clear)
+    monkeypatch.setattr(profiler_mod, "snapshot", spy_snapshot)
+    monkeypatch.setattr(servers, "list_server_states", lambda *a, **k: [])
+    monkeypatch.setattr(
+        servers, "load_server_model",
+        lambda target, model="", config=None, evict_others=False, kind="":
+        {"ok": True, "action": "load", "server": target, "model": model})
+    monkeypatch.setattr(
+        servers, "unload_server_model",
+        lambda target, model="", config=None, kind="":
+        {"ok": True, "action": "unload", "server": target, "model": model})
+    monkeypatch.setattr(
+        servers, "pin_server_model",
+        lambda target, model="", pinned=True, config=None, kind="":
+        {"ok": True, "action": "pin", "server": target, "model": model,
+         "pinned": pinned})
+    for path, body in (
+            ("/api/servers/load", {"server": "s", "model": "m"}),
+            ("/api/servers/unload", {"server": "s", "model": "m"}),
+            ("/api/servers/pin", {"server": "s", "model": "m",
+                                  "pinned": True})):
+        cleared.clear()
+        snaps.clear()
+        status, j = gui.post(path, body)
+        assert status == 200 and j["ok"] is True, (path, j)
+        assert cleared, f"{path} must clear the snapshot cache"
+        assert snaps and snaps[-1].get("use_cache") is False, path
+        assert j["memory"]["vram"]["used_gb"] == 20.0
+
+
+def test_unload_response_reflects_post_action_memory(gui, monkeypatch):
+    """End-to-end against the real TTL memo: a pre-action reading is cached,
+    then the unload response carries the freed memory even inside the TTL."""
+    from pedacito import profiler as profiler_mod, servers
+    state = {"used_vram": 20.0}
+
+    def fake_reader(*a, **k):
+        return {"ram": {"total_gb": 64.0, "used_gb": 32.0,
+                        "available_gb": 32.0},
+                "vram": {"total_gb": 24.0, "used_gb": state["used_vram"],
+                         "cards": []}}
+
+    monkeypatch.setattr(servers, "get_hardware_memory", fake_reader)
+    monkeypatch.setattr(profiler_mod, "_read_nvidia_smi", lambda **k: [])
+    monkeypatch.setattr(profiler_mod, "_read_macos_memory", lambda **k: None)
+    monkeypatch.setattr(profiler_mod, "_read_windows_memory", lambda **k: None)
+    monkeypatch.setattr(servers, "list_server_states", lambda *a, **k: [])
+    monkeypatch.setattr(
+        servers, "unload_server_model",
+        lambda target, model="", config=None, kind="":
+        {"ok": True, "action": "unload", "server": target, "model": model})
+    profiler_mod.clear_snapshot_cache()
+    # Seed the memo with the pre-action reading (the 2 s burst cache).
+    assert profiler_mod.snapshot()["vram"]["used_gb"] == 20.0
+    state["used_vram"] = 4.0                     # the unload freed the VRAM
+    status, j = gui.post("/api/servers/unload",
+                         {"server": "s", "model": "m"})
+    assert status == 200 and j["ok"] is True
+    assert j["vram"]["used_gb"] == 4.0
+    assert j["memory"]["vram"]["used_gb"] == 4.0
+
+
+def test_job_completion_pushes_a_hardware_event(gui, monkeypatch):
+    """A finished job emits a lightweight SSE 'hardware' event with a fresh
+    snapshot so the topbar chip follows without a page refresh."""
+    from pedacito import profiler as profiler_mod
+    monkeypatch.setattr(profiler_mod, "snapshot",
+                        lambda *a, **k: {"ram": {}, "vram": {},
+                                         "marker": "done"})
+    finished = threading.Event()
+    job = jobs.spawn("check", "hw push test", lambda j: finished.set())
+    assert job is not None
+    assert finished.wait(10)
+    assert gui.wait_idle(10)
+    hw = []
+    end = time.time() + 10
+    while time.time() < end and not hw:
+        events, _resync = core.STATE.bus.wait(0, timeout=0)
+        hw = [e for e in events if e["type"] == "hardware"]
+        if not hw:
+            time.sleep(0.05)
+    job.thread.join(5)
+    assert hw and hw[-1]["memory"]["marker"] == "done"
+
+
+def test_eviction_pushes_a_hardware_event(gui, monkeypatch):
+    """The auto-evict handshake pushes fresh memory right after unloading
+    the other servers, mid-run."""
+    from pedacito import profiler as profiler_mod, servers
+    monkeypatch.setattr(profiler_mod, "snapshot",
+                        lambda *a, **k: {"ram": {}, "vram": {},
+                                         "marker": "evicted"})
+    monkeypatch.setattr(
+        servers, "evict_other_local_servers",
+        lambda target, config: {"ok": True,
+                                "evicted": [{"server": "other"}],
+                                "skipped": []})
+    jobs._evict_other_servers(core.STATE.global_config())
+    events, _resync = core.STATE.bus.wait(0, timeout=0)
+    hw = [e for e in events if e["type"] == "hardware"]
+    assert hw and hw[-1]["memory"]["marker"] == "evicted"
+
+
+def test_frontend_wires_live_hardware_updates():
+    """app.js: one reactive S.memory store fed by the fast /api/hardware
+    poll (guarded, paused when hidden, immediate on visibilitychange), the
+    SSE push, and the Servers dialog's actions."""
+    js = (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+          / "app.js").read_text(encoding="utf-8")
+    assert "memory: null," in js
+    assert ("PDC.setMemory = (mem) => { if (mem) { S.memory = mem; emit(); } };"
+            in js)
+    assert "on('hardware', (ev) => PDC.setMemory(ev.memory));" in js
+    badge = js[js.index("function HardwareBadge"):
+               js.index("function serversDialog")]
+    assert "PDC.api('/api/hardware')" in badge
+    assert "setInterval(loadHw, 3000)" in badge
+    assert "hwInFlight" in badge                     # no overlapping requests
+    assert "document.hidden" in badge                # paused while hidden
+    assert ("document.addEventListener('visibilitychange', onVisibility)"
+            in badge)
+    assert "setInterval(loadServers, 15000)" in badge
+    assert "const mem = S.memory;" in badge
+    assert "PDC.setMemory(j.memory)" in badge        # registry poll feeds it
+    dialog = js[js.index("function serversDialog"):
+                js.index("\nfunction procsDialog")]
+    assert dialog.count("PDC.setMemory(j.memory)") == 2   # paint() + act()
+    # One delayed hardware read after a successful Load/Unload catches the
+    # ROCm/CUDA/OS reclamation lag without a manual refresh.
+    assert "path === '/api/servers/load' || path === '/api/servers/unload'" \
+        in dialog
+    assert "PDC.api('/api/hardware')" in dialog
+    assert "}, 1500);" in dialog
+    # Load and unload route by the registry name AND carry the server kind.
+    assert "{ server: s.name, kind: s.kind, model: sel.value }" in dialog
+    assert "{ server: s.name, kind: s.kind," in dialog
+
+
 @pytest.mark.network
 def test_carry_transcript_appends_after_existing_history(gui, fake_port):
     """Rebuilding a project that already has a session: the carried creation

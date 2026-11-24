@@ -284,3 +284,16 @@ def test_render_findings_joins_and_caps():
     assert diagnostics.render_findings({}, 4000) == ""
     both = diagnostics.render_findings({"a.py": ["one"], "b.py": ["two"]})
     assert both == "one\ntwo"
+
+
+def test_cli_diagnose_accepts_positional_path(tmp_path, monkeypatch, capsys):
+    """`pedacito diagnose <dir>` must work just like `pedacito diagnose --root <dir>`."""
+    from pedacito import cli
+    seen = []
+    monkeypatch.setattr(
+        diagnostics, "run",
+        lambda root, cfg, files=None: seen.append(root) or (True, "ok"))
+    rc = cli.main(["diagnose", str(tmp_path)])
+    assert rc == 0
+    assert seen == [tmp_path.resolve()]
+

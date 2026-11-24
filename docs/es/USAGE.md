@@ -69,7 +69,7 @@ La interfaz de Pedacito está disponible en inglés y español. Cámbiala donde 
 | **Técnicas para modelos pequeños** | Un ciclo de recuperación dirigido por el arnés, una máquina de estados de requisitos (`UNLOCATED → LOCATED → READ → EDITED → VERIFIED`), microciclos de edición anclados a símbolos, una compuerta de sintaxis por AST antes de que corra cualquier prueba, paquetes de reparación por traceback, conversaciones amigables con la caché de prompt KV y rehidratación de tramos exactos | [../../TECHNIQUES.es.md](../../TECHNIQUES.es.md) |
 | **Telemetría de Engine V2** | La GUI muestra la fase en vivo, el libro de requisitos y las búsquedas recientes mientras corre una tarea | [../../QUICKSTART.es.md](../../QUICKSTART.es.md#parte-a-la-gui) |
 | **Memoria del repositorio** | Comandos confirmados en `.pedacito/micro_facts.json`, con los hechos contradichos retirados automáticamente. Los esquemas de herramientas sin usar se podan para ahorrar tokens | [../../TECHNIQUES.es.md](../../TECHNIQUES.es.md) §14 y §15 |
-| **Escáner de servidores locales** | Encuentra LM Studio, Ollama, Lemonade y llama.cpp en cualquier puerto, y luego importa solo los modelos que marques | [Configuración del servidor de modelos](INSTALLATION.md#configuración-del-servidor-de-modelos) |
+| **Escáner de servidores locales** | Encuentra LM Studio, Ollama, Lemonade, llama.cpp y Strata / Avalon (preset en el puerto 8080, con respaldo en `STRATA_API_KEY`) en cualquier puerto, y luego importa solo los modelos que marques. Consulta [Strata / Avalon](INSTALLATION.md#configuración-del-servidor-de-modelos) | [Configuración del servidor de modelos](INSTALLATION.md#configuración-del-servidor-de-modelos) |
 | **Preajustes de proveedores alojados** | Configuración con un clic para Claude, ChatGPT, DeepSeek, Qwen, Gemini y OpenRouter. Las claves pueden venir de una variable de entorno en lugar del archivo de configuración | [Configurar](CONFIG.md#configurar) |
 | **Enrutamiento de roles** | Envía el trabajo de planificador, verificador o escalamiento a un perfil distinto, por trabajo o por proyecto | [../../MODEL_GUIDE.es.md](../../MODEL_GUIDE.es.md#enrutamiento-de-roles-híbrido-local--nube) |
 | **Asistente Auto-Tune** | Responde cuatro preguntas sobre tu hardware y tu base de código, previsualiza los presupuestos y luego aplícalos | [../../QUICKSTART.es.md](../../QUICKSTART.es.md#parte-a-la-gui) |
@@ -147,9 +147,10 @@ adicionales, así que funciona sin conexión. Ejecuta el mismo motor que los com
 
 #### Disponibilidad de perfiles en el selector
 
-El selector de perfiles valida los perfiles locales contra el mismo sondeo de `/api/servers`
-que actualiza la insignia de hardware, de modo que se actualiza cada 15 segundos sin
-una nueva petición ni intervalo de sondeo. Un perfil local cuyo servidor responde pero
+El selector de perfiles valida los perfiles locales contra el sondeo de `/api/servers`, que se ejecuta
+cada 15 segundos. La insignia de hardware tiene su propio sondeo más rápido de `/api/hardware`,
+cada 3 segundos y también enviado en vivo por SSE, así que la RAM y la VRAM se mantienen
+actualizadas por sí solas. Un perfil local cuyo servidor responde pero
 cuyo modelo no está en la lista de modelos del servidor se marca **· unavailable** y
 no puede seleccionarse; la API de cambio también lo rechaza con un 409. La descripción emergente
 nombra el modelo y el servidor. Un perfil cuyo servidor no es accesible se marca
@@ -177,6 +178,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 |---|---|
 | `pedacito gui [PROJECT]` | Abre el panel de control en el navegador |
 | `pedacito models scan` | Encuentra servidores locales, elige modelos, escribe perfiles y los mide |
+| `pedacito models refresh` | Actualiza ahora la caché del catálogo models.dev (ventanas de contexto y precios de proveedores alojados); si la descarga falla, se conserva la caché anterior |
 | `pedacito config --check` | Prueba la conexión y la generación. `--doctor` también sondea la salida estructurada. `--setup` ejecuta la configuración inicial; `--upgrade [--dry-run]` agrega a tu archivo las opciones recién documentadas |
 | `pedacito calibrate` | Mide el modelo activo (o los perfiles locales con `--all`) y guarda una tarjeta de modelo que ajusta los valores por defecto. Los modelos alojados se rechazan |
 | `pedacito profiles [--recommend]` | Lista los perfiles con sus puntuaciones y sugiere enrutamiento de roles |
@@ -829,7 +831,7 @@ de forma idéntica.
 |---|---|
 | **Encabezado** | Abre un proyecto (escribe una ruta, explora con **Browse…** las carpetas de la máquina o elige uno reciente), elige su perfil de modelo, mira la luz de estado del servidor de modelos y los totales de tokens/caché/costo de la sesión. |
 | **Chat** (izquierda) | Cinco modos junto al cuadro: **Task/Edit** (editar código; *review* o *write directly*, planificación auto/always/never, máximo de búsquedas), **Ask** (preguntas de solo lectura, la respuesta llega en streaming), **Auto** (meta → plan → implementar; solo plan o implementar, comando de verificación, rondas de reparación, topes de tareas/minutos, worktree, keep-going, pip-install; aplicar Auto acepta el límite de confianza de herramientas y habilita las herramientas de escritura/ejecución para la ejecución), **New** (inicia un proyecto desde cero en una carpeta: vista previa, compilar, compilar y luego revisar, solo esqueleto, y *complex* para el ciclo autónomo) y **How ?** (la referencia integrada de CLI/GUI/ajustes con etiquetas de temas, comandos copiables y enlaces *Open in Settings*; las respuestas quedan fuera del hilo de programación guardado). **Attach** (o arrastra) un archivo de texto como tarea, pregunta o especificación. **✨ Creative** sobre el compositor fuerza la persona Builder para ejecuciones de Task/Auto/New; con él desactivado, las tareas de diseño se siguen detectando automáticamente. Mientras corre una tarea, escribe para **steer** al modelo, responde sus preguntas aclaratorias en línea o **Stop**. |
-| **Changes** (centro) | Las ediciones propuestas como *Old code \| Updated code* lado a lado con resaltado a nivel de palabra. Acepta o rechaza todo el conjunto, desmarca archivos para aceptar solo algunos, o **Edit updated** para editar a mano un archivo antes de aceptar. Los archivos llevan insignias de cláusula (`R1`, `R2`, ...) que muestran a qué parte de la tarea sirven; una aceptación parcial señala las cláusulas sin aceptar. Primero se hacen respaldos y un archivo que cambió en disco desde la vista previa se rechaza. |
+| **Changes** (centro) | Las ediciones propuestas como *Old code \| Updated code* lado a lado con resaltado a nivel de palabra. Acepta o rechaza todo el conjunto, desmarca archivos o bloques sueltos para aceptar solo algunos, o **Edit updated** para editar a mano un archivo antes de aceptar. Los archivos llevan insignias de cláusula (`R1`, `R2`, ...) que muestran a qué parte de la tarea sirven; una aceptación parcial señala las cláusulas sin aceptar. Primero se hacen respaldos y un archivo que cambió en disco desde la vista previa se rechaza. |
 | **Activity** y **Plan** (derecha, arriba) | Fase y actividad en vivo de la tarea en ejecución. La lista de verificación de `auto`/plan con progreso; haz clic en **Edit** para cambiarla y luego en **Run** para implementarla. |
 | **Files**, **Backups**, **Logs** (derecha, pestañas inferiores) | Files: un árbol filtrable de los archivos indexados, con los archivos de la revisión pendiente resaltados. Backups: instantáneas restaurables. Logs: la terminal, todo lo que imprime pedacito, en vivo, con colores ANSI. |
 | **🌐 Preview** (derecha, pestaña inferior) | Aparece cuando el proyecto tiene páginas `.html`: un iframe de solo lectura de la página seleccionada (por defecto `index.html`), servido desde dentro de la raíz del proyecto. ⟳ Refresh la recarga, ↗ New tab la abre en una pestaña completa del navegador, y se recarga automáticamente cuando una ejecución termina o cambia archivos. Consulta [Live Preview](#live-preview). |
@@ -1110,3 +1112,5 @@ Cuando la ejecución rastreó cláusulas de requisitos, cada archivo lleva una i
 cláusula. Si aceptas solo algunos archivos, cualquier cláusula cuyos archivos hayan sido todos rechazados
 se marca como sin aceptar en el detalle de la firma, de modo que una aceptación parcial no pueda
 descartar en silencio la mitad de la tarea.
+
+**Firma por bloque.** En el panel Changes de la GUI, cada bloque de cambio de un archivo aparece como **Bloque N** (Hunk N), con una casilla *aceptar solo este bloque*. Al aceptar algunos bloques solo se escriben esos; el resto del archivo conserva su texto actual. La verificación SHA-256 sigue cubriendo todo el archivo antes de escribir nada.

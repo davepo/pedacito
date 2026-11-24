@@ -711,25 +711,36 @@ def test_state_exposes_the_detected_test_command(gui):
 
 
 # --- Pre-configured hosted provider profiles -----------------------------------
-# `/api/providers/add` turns one of the six catalog presets into a complete
-# profile; the user only supplies an API key or the env var that holds one.
+# `/api/providers/add` turns a catalog preset into a complete profile; the user
+# only supplies an API key or the env var that holds one.
 
 def test_provider_presets_endpoint_lists_the_major_clouds(gui):
     status, j = gui.get("/api/providers/presets")
     assert status == 200 and j["ok"] is True      # envelope the UI accepts
     assert [p["id"] for p in j["presets"]] == [
-        "anthropic", "openai", "deepseek", "qwen", "gemini", "openrouter"]
+        "anthropic", "openai", "deepseek", "qwen", "gemini", "openrouter",
+        "strata"]
     for p in j["presets"]:
         # the keys static/app.js's PDC.FALLBACK_PROVIDER_CATALOG mirrors: the
         # UI seeds from the fallback and merges this reply, so a key that
         # appears on only one side silently breaks one of the two
         assert {"id", "label", "provider", "base_url", "api_key_env",
                 "suggest", "context_tokens", "models"} <= set(p)
-        assert p["base_url"].startswith("https://")           # real hosted endpoints
         assert p["api_key_env"].endswith("_API_KEY")          # env fallback named
-        assert p["models"]                                    # curated ids, none empty
-        assert p["context_tokens"] >= 128000                  # generous cloud windows
+        assert p["context_tokens"] >= 128000                  # generous windows
         assert "api_key" not in p                             # catalog never holds secrets
+        if p["id"] == "strata":
+            # The local-MoE runtime is a first-class preset, not a cloud: its
+            # endpoint is local, and its live /v1/models answer is the catalog.
+            assert p["label"] == "Strata / Avalon (Local MoE)"
+            assert p["provider"] == "strata"
+            assert p["base_url"] == "http://127.0.0.1:8080/v1"
+            assert p["suggest"] == "strata"
+            assert p["context_tokens"] == 131072
+            assert p["models"] == []
+        else:
+            assert p["base_url"].startswith("https://")       # real hosted endpoints
+            assert p["models"]                            # curated ids, none empty
     anthropic = [p for p in j["presets"] if p["id"] == "anthropic"][0]
     assert anthropic["base_url"] == "https://api.anthropic.com/v1"
     assert anthropic["models"][0] == "claude-sonnet-4-5"
@@ -832,6 +843,59 @@ def test_js_fallback_catalog_mirrors_the_python_one():
                     "context_tokens: %d" % p["context_tokens"],
                     "models: [%s]" % quoted):
             assert frag in flat, (p["id"], frag)
+
+
+def _settings_js():
+    return (Path(__file__).resolve().parents[1] / "pedacito" / "gui" / "static"
+            / "settings.js").read_text(encoding="utf-8")
+
+
+def test_profiles_pairing_panel_starts_collapsed_with_a_status_pill():
+    js = _settings_js()
+    assert "var PAIR = { open: false," in js
+    scout = js[js.index("function scoutSection(f)"):
+               js.index("function profilesTab()")]
+    # The disclosure header is always there; the form itself only exists
+    # while open, so the profile editor does not pay its vertical space.
+    assert "'aria-expanded': PAIR.open ? 'true' : 'false'" in scout
+    assert "Dual-GPU / Scout + Architect Pairing" in scout
+    assert "Paired: " in scout and "Not configured" in scout
+    assert "if (!PAIR.open) return box;" in scout
+    assert "class: 'pair-body'" in scout
+
+
+def test_hosted_dialog_shows_context_price_and_a_catalog_refresh():
+    js = _settings_js()
+    rows = js[js.index("function hcRenderRows()"):js.index("function hcRender()")]
+    imp = js[js.index("function hcImport()"):js.index("function hcRenderRows()")]
+    assert "fmtCtx(ctx)" in rows and "fmtPricePair(m)" in rows
+    assert "price_input_per_mtok" in js and "price_output_per_mtok" in js
+    # the selected model's detected window travels with the import
+    assert "context_tokens: m.context_tokens || 0" in imp
+    assert "'/api/providers/refresh'" in js
+    assert "Refresh catalog" in js
+    assert "Provider catalog refreshed." in js
+
+
+def test_strata_preset_needs_an_explicit_model_for_a_one_click_add(gui):
+    # The local-MoE preset has no curated ids (its live /v1/models answer is
+    # the catalog), so an add without a model is refused with guidance
+    # instead of raising IndexError.
+    status, j = gui.post("/api/providers/add", {"preset_id": "strata"})
+    assert status == 400 and j["ok"] is False
+    assert "explicit model" in j["detail"]
+
+
+def test_import_hosted_models_keeps_the_context_window_picked_in_the_dialog(gui):
+    status, j = gui.post("/api/providers/import", {
+        "preset_id": "openai", "base_url": "https://api.openai.com/v1",
+        "api_key": "sk-openai",
+        "models": [{"model": "gpt-5.4", "profile_name": "gpt_main",
+                    "context_tokens": 123456}]})
+    assert status == 200 and j["imported"] == ["gpt_main"]
+    prof = tomllib.loads(gui.cfg_path.read_text(encoding="utf-8")
+                         )["profiles"]["gpt_main"]
+    assert prof["context_tokens"] == 123456
 
 
 
@@ -998,7 +1062,7 @@ def test_probe_flags_models_the_config_already_imports(gui):
 
 def test_import_names_every_profile_after_its_model(gui):
     preset = settings_api._preset_by_id("deepseek")
-    base = "http://127.0.0.1:9/v1"
+    base = "https://api.deepseek.com/v1"
     status, j = gui.post("/api/providers/import", {
         "preset_id": "deepseek", "base_url": base, "api_key": "sk-d",
         "models": [
@@ -1197,3 +1261,19 @@ def test_mcp_env_is_redacted_on_read_and_preserved_on_save(gui):
         "env": {"NEW_SECRET_TOKEN": "***REDACTED***"},
     })
     assert status == 400 and bad["ok"] is False
+
+
+def test_settings_js_shows_calibrated_temperature_over_global():
+    """Settings -> Profiles and All settings (profile target) must surface
+    calibrated model-card choices (such as arch_family temperature /
+    temperature_answer) instead of displaying stale `(global)` values."""
+    js = (Path(__file__).resolve().parents[1]
+          / "pedacito" / "gui" / "static" / "settings.js").read_text(
+              encoding="utf-8")
+    assert "function calibratedChoice(name)" in js
+    assert "X.tab === 'all' ? X.target : ''" in js
+    assert "cal.card_choices" in js
+    assert "name === 'temperature' || name === 'temperature_answer'" in js
+    assert "var cal = calibratedChoice(item.name);" in js
+    assert "Calibrated card active" in js
+

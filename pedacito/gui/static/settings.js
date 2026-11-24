@@ -24,16 +24,19 @@
   // scan is read-only, so re-rendering must not throw the results away.
   var SCAN = { busy: false, rows: [], err: '', custom: '', vram: '',
                pick: {}, name: {}, def: '', importing: false,
-               collapsed: false, collapsedGroups: {} };
+               collapsed: false, collapsedGroups: {}, apiKey: {} };
   // Same for the Auto-Tune wizard: the answers and the preview survive
   // switching to another settings tab and back.
   var TUNE = { hardware: 'hosted', model: 'medium', codebase: 'medium',
                priority: 'balanced', dual_gpu: 'none',
                result: null, err: '', busy: false };
-  // Dual-GPU Scout + Architect pairing form state (Profiles tab).
-  var PAIR = { architect: '', scout: '', starter: false, newName: 'scout',
-               base: 'http://localhost:11434/v1', model: 'qwen3:4b',
-               vram: '8', tier: 'small', busy: false, msg: '' };
+  // Dual-GPU Scout + Architect pairing form state (Profiles tab). The panel
+  // starts collapsed: it is a one-time setup that must not push the profile
+  // editor below the fold on every visit.
+  var PAIR = { open: false, architect: '', scout: '', starter: false,
+               newName: 'scout', base: 'http://localhost:11434/v1',
+               model: 'qwen3:4b', vram: '8', tier: 'small', busy: false,
+               msg: '' };
   // Named MCP servers tab: the server list and its live tool inventory are
   // loaded on first open and refreshed after every write.
   var MCP = { data: null, loading: false, err: '', test: {}, testing: {} };
@@ -44,9 +47,9 @@
   var CLOUD = { presets: (PDC.FALLBACK_PROVIDER_CATALOG || []).slice(),
                 fetched: false };
   var HC = { preset: '', base: '', key: '', env: '', busy: false,
-             probed: false, verified: false, err: '', models: [],
-             pick: {}, name: {}, def: '', search: '', importing: false,
-             modal: null, body: null };
+             refreshing: false, probed: false, verified: false, err: '',
+             models: [], pick: {}, name: {}, def: '', search: '',
+             importing: false, modal: null, body: null };
   // Updates tab: the last GET/POST /api/update answer. Kept outside X so
   // switching to another tab and back does not fire another check.
   var UPD = { data: null, loaded: false, busy: false, err: '' };
@@ -199,10 +202,34 @@
     });
     return el;
   }
+  // Card choice active for the currently selected profile when left unset in
+  // `[profiles.<name>]`, matching `modelcard.apply()`'s runtime precedence:
+  // `temperature` and `temperature_answer` override even a `[universal]` value
+  // (only an explicit per-profile key beats them); other card choices apply
+  // when `[universal]` leaves the key unset.
+  function calibratedChoice(name) {
+    var prof = (X.tab === 'profiles') ? X.profile
+      : (X.tab === 'all' ? X.target : '');
+    if (!prof) return null;
+    var cal = ((X.data && X.data.calibration) || {})[prof];
+    if (!cal || !cal.calibrated || cal.is_hosted || cal.is_image_model) return null;
+    var ch = cal.card_choices || {};
+    if (!(name in ch) || ch[name] === undefined || ch[name] === null) return null;
+    var overridesGlobal = (name === 'temperature' || name === 'temperature_answer');
+    var g = (file().settings || {})[name];
+    if (!overridesGlobal && g !== undefined) return null;
+    var fam = ch.arch_family ? ': ' + ch.arch_family : '';
+    return { value: ch[name], label: 'calibrated' + fam };
+  }
   function placeholderFor(item) {
     if (item.secret) {
       var body = (file().profiles || {})[X.profile] || {};
       return (body._secret_set || []).indexOf(item.name) >= 0 ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '';
+    }
+    var cal = calibratedChoice(item.name);
+    if (cal) {
+      var cv = Array.isArray(cal.value) ? cal.value.join(', ') : String(cal.value);
+      return cv + '  (' + cal.label + ')';
     }
     // what applies when this layer says nothing: the file's global value,
     // else the open project's resolved value, else the built-in default
@@ -225,8 +252,14 @@
     return item.default === null ? undefined : item.default;
   }
   // What the profile picker shows for the inherit option, so the user can
-  // see which universal value the profile takes when left unset.
+  // see which calibrated or universal value the profile takes when left unset.
   function inheritLabel(item) {
+    var cal = calibratedChoice(item.name);
+    if (cal) {
+      var cv = item.type === 'bool' ? (cal.value ? 'on' : 'off')
+        : (Array.isArray(cal.value) ? cal.value.join(', ') : String(cal.value));
+      return '(inherit \u2014 ' + cal.label + ': ' + cv + ')';
+    }
     var v = universalValue(item);
     if (item.type === 'bool') v = v ? 'on' : 'off';
     else if (v === undefined || v === null) v = '';
@@ -472,6 +505,23 @@
       hcRender();
     });
   }
+  function hcRefreshCatalog() {
+    if (HC.refreshing) return;
+    HC.refreshing = true; hcRender();
+    PDC.api('/api/providers/refresh', {}).then(function (j) {
+      HC.refreshing = false;
+      if (!j || j.ok === false) {
+        PDC.toast((j && (j.error || j.detail)) || t('settings.hosted.refresh_failed', null, 'Could not refresh the provider catalog.'), true);
+        hcRender(); return;
+      }
+      PDC.toast(t('settings.hosted.refreshed', null, 'Provider catalog refreshed.'));
+      hcRender();
+    }, function () {
+      HC.refreshing = false;
+      PDC.toast(t('settings.hosted.refresh_failed', null, 'Could not refresh the provider catalog.'), true);
+      hcRender();
+    });
+  }
   function hcImport() {
     if (HC.importing) return;
     var sel = hcPicked();
@@ -479,6 +529,7 @@
     var list = sel.map(function (m) {
       return { model: m.id,
                profile_name: HC.name[m.id] || m.suggested_profile_name || '',
+               context_tokens: m.context_tokens || 0,
                set_default: HC.def === m.id };
     });
     var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
@@ -514,7 +565,10 @@
     if (!HC.rows) return;                // filter box keeps focus and state
     var box = PDC.clear(HC.rows);
     var head = h('tr', {}, h('th', { text: 'import' }), h('th', { text: 'default' }),
-      h('th', { text: 'profile name' }), h('th', { text: 'model' }), h('th', { text: '' }));
+      h('th', { text: 'profile name' }), h('th', { text: 'model' }),
+      h('th', { text: t('settings.hosted.col_ctx', null, 'ctx') }),
+      h('th', { text: t('settings.hosted.col_price', null, '$/Mtok (in/out)') }),
+      h('th', { text: '' }));
     var tbody = h('tbody', {});
     hcVisible().forEach(function (m) {
       var nm = HC.name[m.id] === undefined
@@ -531,9 +585,14 @@
         onchange: function (e) { HC.pick[m.id] = e.target.checked; if (!e.target.checked && HC.def === m.id) HC.def = ''; hcRenderRows(); } });
       var rd = h('input', { type: 'radio', name: 'hcdefault', checked: HC.def === m.id, disabled: !!m.already_imported,
         onchange: function () { HC.def = m.id; if (!HC.pick[m.id]) HC.pick[m.id] = true; hcRenderRows(); } });
+      var ctx = parseInt(m.context_tokens, 10) || 0;
       tbody.appendChild(h('tr', { class: m.already_imported ? 'imp' : '' },
         h('td', {}, cb), h('td', {}, rd), h('td', {}, name),
         h('td', { class: 'mono small-text', text: m.id, title: m.id }),
+        h('td', { class: 'small-text', text: fmtCtx(ctx),
+          title: ctx ? PDC.fmtInt(ctx) + ' tokens' : 'context window not reported' }),
+        h('td', { class: 'small-text mono', text: fmtPricePair(m),
+          title: t('settings.hosted.price_title', null, 'estimated USD per million tokens (input / output)') }),
         h('td', {}, m.already_imported ? h('span', { class: 'tag', text: 'already imported' }) : null)));
     });
     box.appendChild(h('div', { class: 'hp-models' },
@@ -574,6 +633,11 @@
     box.appendChild(h('div', { class: 'hp-foot' },
       h('button', { class: 'primary', text: HC.busy ? 'Connecting\u2026' : 'Connect & Fetch Models',
         disabled: HC.busy, onclick: hcProbe }),
+      h('button', { class: 'small ghost',
+        text: HC.refreshing ? t('settings.hosted.refreshing', null, 'Refreshing\u2026') : t('settings.hosted.refresh_catalog', null, 'Refresh catalog'),
+        title: t('settings.hosted.refresh_catalog_title', null, 'Refresh cached context-window and pricing metadata from models.dev'),
+        disabled: HC.refreshing,
+        onclick: hcRefreshCatalog }),
       h('span', { class: 'muted small-text grow',
         text: HC.probed ? 'live model list from ' + HC.base.trim()
                         : 'one GET to <base URL>/models (8s timeout) \u2014 nothing is written yet' })));
@@ -604,7 +668,7 @@
     loadPresets();                            // at most one HTTP attempt; the
     hcSeed();                                 // fallback catalog is live
     HC.body = h('div', { class: 'hp-wrap' });
-    HC.modal = PDC.modal('Add Hosted Provider', HC.body, [{ label: 'Close' }], { wide: true });
+    HC.modal = PDC.modal(t('settings.hosted.title', null, 'Add Hosted Provider'), HC.body, [{ label: 'Close' }], { wide: true });
     hcRender();
     var f = HC.modal.box && HC.modal.box.querySelector('.hp-search');
     if (f) f.focus();
@@ -625,6 +689,33 @@
     if (!bytes) return '';
     var gb = bytes / 1073741824;
     return gb >= 1 ? gb.toFixed(1) + ' GB' : Math.round(bytes / 1048576) + ' MB';
+  }
+  // Compact context windows for the hosted-provider picker: 200k, 1M, or an
+  // honest dash when the provider/catalog reported nothing.
+  function fmtCtx(n) {
+    n = parseInt(n, 10) || 0;
+    if (n <= 0) return '\u2014';
+    if (n >= 1000000) {
+      var m = n / 1000000;
+      return (m % 1 ? m.toFixed(1) : String(m)) + 'M';
+    }
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+  }
+  // Estimated USD per million tokens. Three decimals keep cheap providers
+  // readable ($0.075, $0.150) without turning the column into noise.
+  function fmtPrice(v) {
+    v = Number(v);
+    if (!isFinite(v) || v <= 0) return '\u2014';
+    if (v < 0.01) return '$' + v.toFixed(4);
+    if (v < 1) return '$' + v.toFixed(3);
+    return '$' + v.toFixed(2);
+  }
+  function fmtPricePair(m) {
+    var pin = Number(m.price_input_per_mtok || 0);
+    var pout = Number(m.price_output_per_mtok || 0);
+    if (pin <= 0 && pout <= 0) return '\u2014';
+    return fmtPrice(pin) + ' / ' + fmtPrice(pout);
   }
   function discoveryTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
@@ -734,7 +825,7 @@
         h('label', { class: 'scan-vram' }, 'VRAM (GB)', vram)),
       // the hint gets its own line: inline in the row it competed with the
       // controls for width and clipped to half a sentence
-      h('div', { class: 'muted small-text scan-hint', text: 'probes LM Studio, Ollama, llama.cpp and your existing profiles' })));
+      h('div', { class: 'muted small-text scan-hint', text: t('settings.scan.hint', null, 'probes LM Studio, Ollama, Lemonade, Strata, llama.cpp and your existing profiles') })));
     if (SCAN.err) box.appendChild(h('div', { class: 'note-box err', text: SCAN.err }));
     if (SCAN.busy) { box.appendChild(h('div', { class: 'tip', text: 'Asking each server what it has\u2026' })); return box; }
     if (!SCAN.rows.length) return box;
@@ -765,6 +856,7 @@
           SCAN.err = '';
           SCAN.collapsed = false;
           SCAN.collapsedGroups = {};
+          SCAN.apiKey = {};
           render();
         }
       })));
@@ -786,22 +878,39 @@
       if (skey !== last) {
         last = skey;
         var grp = groupRows(skey);
+        // A key-protected Strata/Avalon still lists its models (via /health),
+        // but the import needs the key. The field lives on the server header
+        // so one key covers every row in that group.
+        var needsKey = grp.some(function (x) { return !!x.requires_api_key; });
+        var keyInp = null;
+        if (needsKey) {
+          keyInp = h('input', { type: 'password', class: 'scan-key mono',
+            value: SCAN.apiKey[skey] || '',
+            placeholder: t('settings.scan.api_key_placeholder', null, 'API key (or STRATA_API_KEY)'),
+            autocomplete: 'off', spellcheck: false });
+          keyInp.addEventListener('input', function () { SCAN.apiKey[skey] = keyInp.value; });
+        }
         tbody.appendChild(h('tr', { class: 'scan-server' }, h('td', { colspan: '7' },
-          h('div', { class: 'row sg-group' },
-            h('button', {
-              type: 'button',
-              class: 'small ghost scan-fold',
-              'aria-expanded': grpCollapsed ? 'false' : 'true',
-              title: t('settings.scan.toggle_group', null, "Expand or collapse this server's models"),
-              text: grpCollapsed ? '\u25B8' : '\u25BE',
-              onclick: function () {
-                SCAN.collapsedGroups[skey] = !SCAN.collapsedGroups[skey];
-                render();
-              }
-            }),
-            h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url + (grpCollapsed ? '  (' + grp.length + ')' : '') }),
-            h('button', { class: 'small ghost', text: 'select all', onclick: function () { setPicks(grp, true); } }),
-            h('button', { class: 'small ghost', text: 'unselect', onclick: function () { setPicks(grp, false); } })))));
+          h('div', { class: 'sg-wrap' },
+            h('div', { class: 'row sg-group' },
+              h('button', {
+                type: 'button',
+                class: 'small ghost scan-fold',
+                'aria-expanded': grpCollapsed ? 'false' : 'true',
+                title: t('settings.scan.toggle_group', null, "Expand or collapse this server's models"),
+                text: grpCollapsed ? '\u25B8' : '\u25BE',
+                onclick: function () {
+                  SCAN.collapsedGroups[skey] = !SCAN.collapsedGroups[skey];
+                  render();
+                }
+              }),
+              h('span', { class: 'grow mono small-text ellip', text: (r.provider || 'server') + '  \u00b7  ' + r.server_url + (grpCollapsed ? '  (' + grp.length + ')' : '') }),
+              h('button', { class: 'small ghost', text: 'select all', onclick: function () { setPicks(grp, true); } }),
+              h('button', { class: 'small ghost', text: 'unselect', onclick: function () { setPicks(grp, false); } })),
+            needsKey ? h('div', { class: 'row sg-auth' },
+              h('span', { class: 'tag warn', text: t('settings.scan.api_key_required', null, 'API key required') }),
+              keyInp,
+              h('span', { class: 'muted small-text', text: t('settings.scan.api_key_hint', null, 'The STRATA_API_KEY environment variable also works.') })) : null))));
       }
       if (grpCollapsed) return;
       var name = h('input', { type: 'text', class: 'mono', value: SCAN.name[k] === undefined ? r.suggested_profile_name : SCAN.name[k], disabled: r.already_imported });
@@ -831,7 +940,7 @@
     return box;
   }
   function doScan() {
-    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; SCAN.collapsed = false; SCAN.collapsedGroups = {}; render();
+    SCAN.busy = true; SCAN.err = ''; SCAN.rows = []; SCAN.collapsed = false; SCAN.collapsedGroups = {}; SCAN.apiKey = {}; render();
     var body = {};
     var extra = (SCAN.custom || '').trim();
     if (extra) body.urls = [extra];
@@ -859,18 +968,43 @@
       render();
     });
   }
+  function _isLoopbackUrl(u) {
+    var m = String(u || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^/:?#]+)/i);
+    if (!m) return false;
+    var host = m[1].toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1' || host === '[::1]';
+  }
+  function _localGpuVramGb() {
+    var mem = PDC.getMemory && PDC.getMemory();
+    var v = mem && mem.vram;
+    if (!v) return 0;
+    var cards = v.cards || [];
+    var gb = 0;
+    cards.forEach(function (c) { var t = Number(c.total_gb || 0); if (t > gb) gb = t; });
+    if (!gb) gb = Number(v.total_gb || 0);
+    return gb >= 1 ? Math.round(gb) : 0;
+  }
   function doImport() {
     var sel = pickedRows();
     if (!sel.length) return;
-    var vram = parseFloat(SCAN.vram) || 0;
+    var typedVram = parseFloat(SCAN.vram) || 0;
+    var localVram = typedVram ? 0 : _localGpuVramGb();
     var list = sel.map(function (r) {
       var k = rowKey(r);
       var pname = sanitizeName(SCAN.name[k] || r.suggested_profile_name);
       SCAN.name[k] = pname;
-      return { profile_name: pname, base_url: r.server_url,
-        model: r.model_id, context_length: r.context_length || 0, vram_gb: vram,
+      // Only attach this machine's detected GPU VRAM to loopback servers;
+      // a LAN server (e.g. a 24 GB homelab box from an 8 GB laptop) keeps
+      // vram_gb unset unless the user explicitly entered the server's VRAM.
+      var rowVram = typedVram || (_isLoopbackUrl(r.server_url) ? localVram : 0);
+      var item = { profile_name: pname, provider: r.provider || '',
+        base_url: r.server_url, model: r.model_id,
+        context_length: r.context_length || 0, vram_gb: rowVram,
         is_image_model: !!r.is_image_model,
         set_default: SCAN.def === k };
+      var key = (SCAN.apiKey[normUrl(r.server_url)] || '').trim();
+      if (key) item.api_key = key;
+      return item;
     });
     var bad = list.filter(function (m) { return !/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(m.profile_name); });
     if (bad.length) { PDC.toast('Profile names may use letters, digits, - and _: ' + bad.map(function (m) { return '"' + m.profile_name + '"'; }).join(', '), true); return; }
@@ -897,21 +1031,49 @@
       PDC.toast('Calibration is only for local models. Profile \'' + name + '\' (' + (p.model || '') + ') is a hosted provider model and uses provider-table defaults automatically.', true);
       return;
     }
-    var msg = cal.is_image_model
-      ? t('gui.cal.probe_image_confirm', { name: name },
-          'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.')
-      : 'Calibrate \u201c' + name + '\u201d?\n\n' + (mode === 'quick'
-          ? 'A short probe: a few timed calls to measure how fast this model answers, how long a prompt it can actually hold, and how reliably it uses tools. The result is stored in its model card and the tuned limits are written to the profile.'
-          : 'The full suite \u2014 slower and more calls, but it also checks tool calls that must happen in order.');
-    var okLabel = cal.is_image_model ? t('gui.cal.probe_image', null, 'Probe image') : 'Run it';
-    PDC.confirm(msg, okLabel).then(function (ok) {
-      if (!ok) return;
-      PDC.api('/api/models/calibrate', { profile: name, mode: mode }).then(function (j) {
-        if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
-        PDC.toast((cal.is_image_model ? 'Probing image profile "' : 'Calibrating "') + name + '" \u2014 watch the Output tab.');
-        PDC.refreshState();
+    if (cal.is_image_model) {
+      var imgMsg = t('gui.cal.probe_image_confirm', { name: name },
+        'Probe image profile \u201c' + name + '\u201d?\n\nRuns one fast 512\u00d7512 image check to verify the server and measure latency.');
+      PDC.confirm(imgMsg, t('gui.cal.probe_image', null, 'Probe image')).then(function (ok) {
+        if (!ok) return;
+        PDC.api('/api/models/calibrate', { profile: name, mode: 'quick' }).then(function (j) {
+          if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+          PDC.toast('Probing image profile "' + name + '" \u2014 watch the Output tab.');
+          PDC.refreshState();
+        });
       });
-    });
+      return;
+    }
+    var picked = (mode === 'full') ? 'full' : 'quick';
+    var rQuick = h('input', { type: 'radio', name: 'calMode', value: 'quick', checked: picked === 'quick',
+      onchange: function () { if (rQuick.checked) picked = 'quick'; } });
+    var rFull = h('input', { type: 'radio', name: 'calMode', value: 'full', checked: picked === 'full',
+      onchange: function () { if (rFull.checked) picked = 'full'; } });
+    var body = h('div', {},
+      h('p', { style: 'margin:0 0 10px', text: t('gui.cal.choose_mode', { name: name },
+        'Choose calibration depth for \u201c' + name + '\u201d. Progress streams to the Output tab and the tuned model card is saved automatically.') }),
+      h('label', { class: 'chk', style: 'display:flex;align-items:flex-start;gap:8px;margin-bottom:8px' },
+        rQuick,
+        h('span', {},
+          h('b', { text: t('gui.cal.mode_quick', null, 'Quick (recommended)') }),
+          h('div', { class: 'muted small-text', text: t('gui.cal.mode_quick_desc', null,
+            '1 pass per probe (~1\u20132 min). Measures tool calling, edit format, thinking A/B, specialties, temperature, and speed. Ideal for everyday setup and Strata / local-MoE servers.') }))),
+      h('label', { class: 'chk', style: 'display:flex;align-items:flex-start;gap:8px' },
+        rFull,
+        h('span', {},
+          h('b', { text: t('gui.cal.mode_full', null, 'Full suite') }),
+          h('div', { class: 'muted small-text', text: t('gui.cal.mode_full_desc', null,
+            '3 repeats per probe plus long-context needle and capability checks. More thorough, but slower (can take 5\u201315+ min on large or tiered MoE models).') }))));
+    PDC.modal(t('gui.cal.title', { name: name }, 'Calibrate \u201c' + name + '\u201d'), body, [
+      { label: t('gui.cal.cancel', null, 'Cancel') },
+      { label: t('gui.cal.run', null, 'Run calibration'), primary: true, onclick: function () {
+        PDC.api('/api/models/calibrate', { profile: name, mode: picked }).then(function (j) {
+          if (!j.ok) { PDC.toast(j.detail || 'could not start the calibration', true); return; }
+          PDC.toast('Calibrating "' + name + '" (' + picked + ') \u2014 watch the Output tab.');
+          PDC.refreshState();
+        });
+      } }
+    ], { narrow: true });
   }
   // Calibrate All Local Models: one background job walks every LOCAL profile
   // in turn (hosted ones use provider-table defaults and never calibrate).
@@ -949,12 +1111,21 @@
         list.appendChild(row);
       });
       var reChk = h('input', { type: 'checkbox' });
+      var modeSel = h('select', { 'aria-label': t('gui.cal.mode_label', null, 'Calibration mode') }, [
+        h('option', { value: 'quick', text: t('gui.cal.mode_quick', null, 'Quick (recommended)') }),
+        h('option', { value: 'full', text: t('gui.cal.mode_full', null, 'Full suite') })
+      ]);
+      modeSel.value = 'quick';
       var progress = h('div', { class: 'calall-progress muted small-text' });
       var body = h('div', {},
         h('p', { style: 'margin:0 0 8px', text: 'This loads each model in turn and may take several minutes. Each card is saved as soon as it finishes; progress streams to the Output tab.' }),
         list,
-        h('label', { class: 'chk', style: 'margin-top:8px' }, reChk,
-          'Re-calibrate models that already have a fresh card'),
+        h('div', { class: 'row', style: 'margin-top:8px;gap:12px;flex-wrap:wrap' },
+          h('label', { class: 'chk' }, reChk,
+            'Re-calibrate models that already have a fresh card'),
+          h('label', { class: 'row', style: 'gap:6px;align-items:center' },
+            h('span', { class: 'small-text muted', text: t('gui.cal.mode_label', null, 'Mode') }),
+            modeSel)),
         hostedCount ? h('div', { class: 'muted small-text', style: 'margin-top:6px',
           text: hostedCount + ' hosted profile(s) excluded \u2014 hosted provider models use provider-table defaults automatically.' }) : null,
         progress);
@@ -1001,7 +1172,7 @@
       function start() {
         if (started) return;
         started = true;
-        PDC.api('/api/calibrate/all', { recalibrate: reChk.checked, mode: 'quick' }).then(function (j) {
+        PDC.api('/api/calibrate/all', { recalibrate: reChk.checked, mode: modeSel.value || 'quick' }).then(function (j) {
           if (!j.ok) {
             PDC.toast(j.detail || 'could not start the calibration', true);
             started = false;
@@ -1010,6 +1181,7 @@
           if (foot) foot.innerHTML = '';
           progress.textContent = 'Starting\u2026';
           reChk.disabled = true;
+          modeSel.disabled = true;
           poll();
         });
       }
@@ -1065,13 +1237,36 @@
       PAIR.scout = (current.scout_profile && names.indexOf(current.scout_profile) >= 0)
         ? current.scout_profile : '__new__';
     }
+    var currentScout = String(current.scout_profile || '').trim();
+    var currentArch = String(current.default_profile || PAIR.architect || '').trim();
+    var statusText = currentScout
+      ? t('settings.pair.paired', { arch: currentArch || '?', scout: currentScout },
+          'Paired: ' + (currentArch || '?') + ' + ' + currentScout)
+      : t('settings.pair.not_configured', null, 'Not configured');
+    var head = h('button', {
+      type: 'button',
+      class: 'pair-head',
+      'aria-expanded': PAIR.open ? 'true' : 'false',
+      title: t('settings.pair.toggle_title', null, 'Show or hide the Scout + Architect pairing form'),
+      onclick: function () { PAIR.open = !PAIR.open; render(); }
+    },
+      h('span', { class: 'pair-caret', text: PAIR.open ? '\u25BE' : '\u25B8' }),
+      h('b', { text: t('settings.pair.title', null, 'Dual-GPU / Scout + Architect Pairing') }),
+      !PAIR.open ? h('span', { class: 'tag pair-status' + (currentScout ? ' act' : ''), text: statusText }) : null,
+      h('span', { class: 'grow' }),
+      h('span', { class: 'muted small-text',
+        text: PAIR.open ? t('settings.pair.hide', null, 'Hide') : t('settings.pair.configure', null, 'Configure') }));
+    var box = h('div', { class: 'note-box pair-box' }, head);
+    // Collapsed by default: the profile editor is what people come here for,
+    // so the one-time pairing setup stays out of the way until asked for.
+    if (!PAIR.open) return box;
     var archSel = h('select', {}, names.map(function (n) {
       return h('option', { value: n, text: n });
     }));
     archSel.value = PAIR.architect;
     archSel.addEventListener('change', function () { PAIR.architect = archSel.value; });
     var scoutOpts = names.map(function (n) { return [n, n]; });
-    scoutOpts.push(['__new__', '\u2795 Create a starter Scout profile\u2026']);
+    scoutOpts.push(['__new__', '\u2795 ' + t('settings.pair.create_starter', null, 'Create a starter Scout profile\u2026')]);
     var scoutSel = h('select', {}, scoutOpts.map(function (o) {
       return h('option', { value: o[0], text: o[1] });
     }));
@@ -1084,31 +1279,31 @@
       nm.addEventListener('input', function () { PAIR.newName = nm.value; });
       var base = h('input', { type: 'text', value: PAIR.base, class: 'grow', spellcheck: false });
       base.addEventListener('input', function () { PAIR.base = base.value; });
-      var model = h('input', { type: 'text', value: PAIR.model, class: 'grow', spellcheck: false, placeholder: 'model id on the second server' });
+      var model = h('input', { type: 'text', value: PAIR.model, class: 'grow', spellcheck: false, placeholder: t('settings.pair.model_ph', null, 'model id on the second server') });
       model.addEventListener('input', function () { PAIR.model = model.value; });
       var vram = h('input', { type: 'number', value: PAIR.vram, min: 1, placeholder: 'GB' });
       vram.addEventListener('input', function () { PAIR.vram = vram.value; });
-      var tier = h('select', {}, ['tiny', 'small', 'medium'].map(function (t) {
-        return h('option', { value: t, text: t });
+      var tier = h('select', {}, ['tiny', 'small', 'medium'].map(function (v) {
+        return h('option', { value: v, text: v });
       }));
       tier.value = PAIR.tier;
       tier.addEventListener('change', function () { PAIR.tier = tier.value; });
       starter.appendChild(h('div', { class: 'form' },
-        h('label', { text: 'Scout profile name' }), nm,
-        h('label', { text: 'Second server base URL' }), base,
-        h('label', { text: 'Scout model id' }), model,
-        h('label', { text: 'VRAM (GB)' }), vram,
-        h('label', { text: 'Tier' }), tier));
+        h('label', { text: t('settings.pair.starter_name', null, 'Scout profile name') }), nm,
+        h('label', { text: t('settings.pair.base_url', null, 'Second server base URL') }), base,
+        h('label', { text: t('settings.pair.model_id', null, 'Scout model id') }), model,
+        h('label', { text: t('settings.pair.vram', null, 'VRAM (GB)') }), vram,
+        h('label', { text: t('settings.pair.tier', null, 'Tier') }), tier));
       starter.appendChild(h('div', { class: 'muted small-text',
-        text: 'Starter default: http://localhost:11434/v1 (Ollama) or :1235/v1 for a second llama.cpp. The endpoint is never probed here, so an offline second GPU can be configured now.' }));
+        text: t('settings.pair.starter_hint', null, 'Starter default: http://localhost:11434/v1 (Ollama) or :1235/v1 for a second llama.cpp. The endpoint is never probed here, so an offline second GPU can be configured now.') }));
     }
     scoutSel.addEventListener('change', function () { PAIR.scout = scoutSel.value; paintStarter(); });
     paintStarter();
     var msg = h('div', { class: 'muted small-text', text: PAIR.msg || '' });
-    var saveBtn = h('button', { class: 'primary', text: PAIR.busy ? 'Saving\u2026' : 'Save pairing',
+    var saveBtn = h('button', { class: 'primary', text: PAIR.busy ? t('settings.pair.saving', null, 'Saving\u2026') : t('settings.pair.save', null, 'Save pairing'),
       disabled: PAIR.busy || !names.length || X.which !== 'user', onclick: function () {
         var scout = scoutSel.value === '__new__' ? PAIR.newName.trim() : scoutSel.value;
-        if (!PAIR.architect || !scout) { PDC.toast('Pick an architect and a scout.', true); return; }
+        if (!PAIR.architect || !scout) { PDC.toast(t('settings.pair.pick_error', null, 'Pick an architect and a scout.'), true); return; }
         var payload = { architect: PAIR.architect, scout: scout };
         if (scoutSel.value === '__new__') {
           payload.create_scout = true;
@@ -1124,22 +1319,22 @@
           X.data = j;
           PAIR.msg = 'Paired ' + j.scout.architect + ' (architect) + ' + j.scout.scout + ' (scout).';
           PAIR.scout = j.scout.scout;
-          PDC.toast('Scout + Architect pairing saved.');
+          PDC.toast(t('settings.pair.saved', null, 'Scout + Architect pairing saved.'));
           PDC.refreshState();             // the topbar Scout badge follows
           render();
         }, function () {
           PAIR.busy = false; PAIR.msg = 'The GUI server did not answer.'; render();
         });
       } });
-    return h('div', { class: 'note-box', style: 'margin-bottom:12px' },
-      h('b', { text: 'Dual-GPU / Scout + Architect Pairing' }),
+    box.appendChild(h('div', { class: 'pair-body' },
       h('div', { class: 'small-text',
-        text: 'The architect is the active planner/editor profile (typically a 24B-35B model on the 24 GB card). The scout is a 4B-9B model on a second GPU/port that answers gather lookup steps, so its reads never evict the architect\u2019s prefix. Saving writes default_profile + scout_profile in one comment-preserving edit and updates the topbar Scout badge.' }),
+        text: t('settings.pair.description', null, 'The architect is the active planner/editor profile (typically a 24B-35B model on the 24 GB card). The scout is a 4B-9B model on a second GPU/port that answers gather lookup steps, so its reads never evict the architect\u2019s prefix. Saving writes default_profile + scout_profile in one comment-preserving edit and updates the topbar Scout badge.') }),
       h('div', { class: 'row', style: 'margin-top:8px' },
-        h('label', { text: 'Architect' }), archSel,
-        h('label', { text: 'Scout' }), scoutSel, saveBtn),
-      X.which !== 'user' ? h('div', { class: 'muted small-text', text: 'The pairing is saved in the user config; switch Editing to User config to change it.' }) : null,
-      starter, msg);
+        h('label', { text: t('settings.pair.architect', null, 'Architect') }), archSel,
+        h('label', { text: t('settings.pair.scout', null, 'Scout') }), scoutSel, saveBtn),
+      X.which !== 'user' ? h('div', { class: 'muted small-text', text: t('settings.pair.user_only', null, 'The pairing is saved in the user config; switch Editing to User config to change it.') }) : null,
+      starter, msg));
+    return box;
   }
 
   function profilesTab() {
@@ -1236,11 +1431,24 @@
     }
     var mkDefault = h('button', { text: 'Make default', onclick: function () {
       save({ file: X.which, profile: null, changes: { default_profile: name } }, '/api/settings/set', '"' + name + '" is now the default profile.'); } });
+    var cal = ((X.data && X.data.calibration) || {})[name] || {};
+    var calCh = (cal.calibrated && !cal.is_hosted && !cal.is_image_model) ? (cal.card_choices || {}) : null;
+    var calBanner = null;
+    if (calCh && (calCh.temperature !== undefined || calCh.temperature_answer !== undefined)) {
+      var parts = [];
+      if (calCh.temperature !== undefined) parts.push('temperature ' + calCh.temperature);
+      if (calCh.temperature_answer !== undefined) parts.push('temperature_answer ' + calCh.temperature_answer);
+      if (calCh.context_tokens) parts.push('context ' + PDC.fmtInt(calCh.context_tokens));
+      var famTag = calCh.arch_family ? ' (' + calCh.arch_family + ')' : '';
+      calBanner = h('div', { class: 'muted small-text', style: 'margin:0 0 8px',
+        text: 'Calibrated card active' + famTag + ': ' + parts.join(' \u00b7 ') + ' \u2014 leave blank below to use these calibrated values, or type a number to override.' });
+    }
     return h('div', {},
       h('div', { class: 'ovr-group' },
         h('div', { class: 'ovr-head' },
           h('b', { text: 'Reasoning & Execution Overrides' }),
-          h('span', { class: 'muted small-text', text: 'how this model thinks and lands edits \u2014 each box offers \u201c(inherit \u2014 universal: \u2026)\u201d to drop the override again' })),
+          h('span', { class: 'muted small-text', text: 'how this model thinks and lands edits \u2014 blank fields use the calibrated card (if present), else universal defaults' })),
+        calBanner,
         ovr),
       h('div', { class: 'ovr-group' },
         h('div', { class: 'ovr-head' }, h('b', { text: 'Connection & Capabilities' })),
@@ -1744,7 +1952,10 @@
         groups[g].forEach(function (it) {
           var set = cur[it.name];
           var res = X.data.resolved[it.name] || {};
-          var src = set !== undefined ? 'set here' : ((res.source || 'default').replace(/\s*\(.*$/, '') || 'default');
+          var cal = X.target ? calibratedChoice(it.name) : null;
+          var src = set !== undefined ? 'set here'
+            : (cal ? cal.label
+               : ((res.source || 'default').replace(/\s*\(.*$/, '') || 'default'));
           var row = h('div', { class: 'set-row' });
           row.appendChild(h('span', { class: 'name', text: it.name, title: it.help }));
           var pending = pendingFor(it.name);

@@ -213,7 +213,7 @@ def test_profile_select_disables_unavailable_and_offline_options():
                 src.index("\nfunction serversDialog", src.index(
                     "function HardwareBadge"))]
     assert "S.profile_availability = j.profile_availability" in badge
-    assert "setInterval(load, 15000)" in badge
+    assert "setInterval(loadServers, 15000)" in badge
 
     block = src[src.index("function ProfileSelect"):
                 src.index("\n// ------------------------------------------------- calibration",

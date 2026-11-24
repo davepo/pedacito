@@ -130,27 +130,30 @@ PDC.FALLBACK_PROVIDER_CATALOG = [
   { id: 'anthropic', label: 'Claude (Anthropic)', provider: 'anthropic',
     base_url: 'https://api.anthropic.com/v1', api_key_env: 'ANTHROPIC_API_KEY',
     suggest: 'claude', context_tokens: 200000,
-    models: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4-5'] },
+    models: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'] },
   { id: 'openai', label: 'ChatGPT (OpenAI)', provider: 'openai',
     base_url: 'https://api.openai.com/v1', api_key_env: 'OPENAI_API_KEY',
-    suggest: 'openai', context_tokens: 272000,
-    models: ['gpt-5.4', 'gpt-5.4-mini', 'o3-mini', 'gpt-4.1', 'gpt-4.1-mini'] },
+    suggest: 'openai', context_tokens: 400000,
+    models: ['gpt-5.4', 'gpt-5.4-mini', 'o4-mini', 'o3', 'o3-mini', 'gpt-4.1', 'gpt-4.1-mini'] },
   { id: 'deepseek', label: 'DeepSeek', provider: 'openai',
     base_url: 'https://api.deepseek.com/v1', api_key_env: 'DEEPSEEK_API_KEY',
     suggest: 'deepseek', context_tokens: 128000,
-    models: ['deepseek-chat', 'deepseek-reasoner'] },
+    models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4', 'deepseek-v4-flash'] },
   { id: 'qwen', label: 'Qwen (DashScope)', provider: 'openai',
     base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
     api_key_env: 'DASHSCOPE_API_KEY', suggest: 'qwen', context_tokens: 256000,
-    models: ['qwen3-coder-plus', 'qwen-max', 'qwen-plus', 'qwen-flash'] },
-  { id: 'gemini', label: 'Google Gemini', provider: 'openai',
-    base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    api_key_env: 'GEMINI_API_KEY', suggest: 'gemini', context_tokens: 200000,
-    models: ['gemini-2.5-pro', 'gemini-2.5-flash'] },
+    models: ['qwen3-coder-plus', 'qwen3.8-flash', 'qwen-max', 'qwen-plus', 'qwen-flash'] },
+  { id: 'gemini', label: 'Google Gemini', provider: 'gemini',
+    base_url: 'https://generativelanguage.googleapis.com/v1beta',
+    api_key_env: 'GEMINI_API_KEY', suggest: 'gemini', context_tokens: 1000000,
+    models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-3-pro', 'gemini-3-flash'] },
   { id: 'openrouter', label: 'OpenRouter', provider: 'openai',
     base_url: 'https://openrouter.ai/api/v1', api_key_env: 'OPENROUTER_API_KEY',
     suggest: 'openrouter', context_tokens: 200000,
-    models: ['deepseek/deepseek-chat', 'qwen/qwen3-coder', 'anthropic/claude-3.7-sonnet'] },
+    models: ['deepseek/deepseek-chat', 'qwen/qwen3-coder', 'anthropic/claude-sonnet-4-5', 'google/gemini-2.5-pro'] },
+  { id: 'strata', label: 'Strata / Avalon (Local MoE)', provider: 'strata',
+    base_url: 'http://127.0.0.1:8080/v1', api_key_env: 'STRATA_API_KEY',
+    suggest: 'strata', context_tokens: 131072, models: [] },
 ];
 
 // ------------------------------------------------------------------- modal ---
@@ -278,12 +281,21 @@ function showPermissionModal(pp) {
     { label: label, stay: true,
       onclick: () => { PDC.decidePermission(pp.id, decision); return false; } },
     extra || {});
-  permModal = PDC.modal('Permission requested', body, [
+  const buttons = [
     btn('Allow Once', 'allow_once', { primary: true }),
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
-    btn('Deny & Redirect', 'deny', { danger: true }),
-  ], { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
+  ];
+  // Scoped persistence: "Allow '<pattern>' in this project" writes a
+  // shell_allowlist_by_project rule, so this command family never asks
+  // again here (installs/shells never get a suggestion).
+  if (pp.suggested_pattern && pp.project_root) {
+    buttons.push(btn(PDC.t('gui.perm.allow_project', { pattern: pp.suggested_pattern },
+      "Allow '" + pp.suggested_pattern + "' in this project"), 'allow_project', {}));
+  }
+  buttons.push(btn('Deny & Redirect', 'deny', { danger: true }));
+  permModal = PDC.modal('Permission requested', body, buttons,
+    { narrow: true, locked: true, onClose: () => { permModal = null; permShownId = ''; } });
 }
 
 // ------------------------------------------------------- markdown to vnodes ---
@@ -412,9 +424,10 @@ const savedCreative = (() => {
 const S = {
   status: {},
   profile_availability: {},               // profile -> available|unavailable|offline|unknown
+  memory: null,                           // live RAM/VRAM snapshot (topbar chip + dialog)
   msgs: [], msgTick: 0,                   // msgTick bumps on any message change
   plan: { path: '', exists: false, text: '', tasks: [] },
-  review: null, diff: null, diffRel: '', sel: {}, editing: false,
+  review: null, diff: null, diffRel: '', sel: {}, hsel: {}, editing: false,
   editAfterLoad: false,
   ws: { tab: localStorage.getItem('pedacito_ws_tab') || 'files', files: [],
         indexed: [], indexedSet: null, sig: '', filter: '', truncated: false,
@@ -467,6 +480,11 @@ function setBusy(on) {
   emit();
 }
 PDC.setBusy = setBusy;
+
+// One reactive memory store for every consumer (topbar chip, Servers dialog,
+// SSE pushes): a fresh snapshot replaces the old one and repaints the page.
+PDC.setMemory = (mem) => { if (mem) { S.memory = mem; emit(); } };
+PDC.getMemory = () => S.memory;
 
 // ----------------------------------------------------------- ANSI terminal ----
 function Term(el) {
@@ -903,6 +921,9 @@ function connect(seq) {
   on('term', (e) => termFeed(e.text));
   on('term_clear', () => { if (term) term.reset(''); });
   on('usage', () => refreshState());
+  // Live RAM/VRAM pushed after evictions and finished jobs: the topbar chip
+  // follows model switches without waiting for its next poll.
+  on('hardware', (ev) => PDC.setMemory(ev.memory));
   on('stream', (e) => {
     // Live token deltas from the model. Append locally so the drawer moves
     // several times a second without a /api/state round trip; the poll
@@ -919,6 +940,16 @@ function connect(seq) {
   on('security', (e) => {
     if (e && e.message) PDC.toast(e.message);
     refreshState();
+  });
+  on('interleaved', (e) => {
+    // Live tool-call cards from the interleaved engine. Append locally so
+    // the Activity pane moves without a /api/state round trip; the poll
+    // snapshot remains authoritative after a reconnect.
+    const eng = S.status && S.status.engine;
+    if (eng && e && e.kind) {
+      eng.interleaved = (eng.interleaved || []).concat([e]).slice(-120);
+      emit();
+    }
   });
   // Auto-update: the check's notice and the upgrade run's start/end resync
   // state; per-line subprocess output appends locally (like 'stream' does).
@@ -1517,6 +1548,33 @@ function handlePromptPaste(e) {
 }
 
 // ---- review (staged diff) ----
+// Hunk-level selection: S.hsel[rel] is an array of accepted hunk indices
+// when only part of a file is accepted; absent/null means "all hunks".
+// S.sel[rel] stays the file-level switch (false = the file is dropped).
+function hselOf(rel) {
+  const v = S.hsel[rel];
+  return Array.isArray(v) ? v : null;
+}
+function fileHunks(rel) {
+  const f = ((S.review && S.review.files) || []).find((x) => x.rel === rel);
+  return (f && f.hunks) || [];
+}
+function toggleHunk(rel, idx, on) {
+  const hunks = fileHunks(rel);
+  if (!hunks.length) return;
+  const cur = hselOf(rel);
+  const set = new Set(cur === null ? hunks.map((h) => h.index) : cur);
+  if (on) set.add(idx); else set.delete(idx);
+  if (set.size === hunks.length) delete S.hsel[rel];
+  else S.hsel[rel] = Array.from(set).sort((a, b) => a - b);
+  S.sel[rel] = set.size > 0;
+  emit();
+}
+function toggleFileSel(rel, on) {
+  S.sel[rel] = on;
+  if (on) delete S.hsel[rel]; else S.hsel[rel] = [];
+  emit();
+}
 function loadReview() {
   return PDC.api('/api/review').then((j) => {
     const meta = j.review || null;
@@ -1529,6 +1587,7 @@ function loadReview() {
     S.editing = false;
     S.editAfterLoad = false;
     S.sel = {};
+    S.hsel = {};
     meta.files.forEach((f) => { S.sel[f.rel] = true; });
     S.ui.folds = {};
     const fresh = !meta.files.some((f) => f.rel === S.diffRel);
@@ -1557,10 +1616,25 @@ function loadDiffFile(rel) {
 function decide(action) {
   if (!S.review) return;
   if (S.editing) { PDC.toast('Click "\u2716 Show diff" to keep your edit first.', true); return; }
-  const files = S.review.partial_ok
-    ? S.review.files.filter((f) => !f.source && S.sel[f.rel] !== false).map((f) => f.rel)
-    : null;
-  PDC.api('/api/review/decide', { id: S.review.id, action: action, files: files }).then((j) => {
+  let files = null, acceptedHunks = null;
+  if (S.review.partial_ok) {
+    files = [];
+    const partial = {};
+    S.review.files.forEach((f) => {
+      if (f.source || S.sel[f.rel] === false) return;
+      const hunks = f.hunks || [];
+      const sel = hselOf(f.rel);
+      if (sel === null || !hunks.length || sel.length === hunks.length) {
+        files.push(f.rel);
+      } else if (sel.length > 0) {
+        files.push(f.rel);
+        partial[f.rel] = sel;
+      }
+    });
+    if (Object.keys(partial).length) acceptedHunks = partial;
+  }
+  PDC.api('/api/review/decide', { id: S.review.id, action: action, files: files,
+                                  accepted_hunks: acceptedHunks }).then((j) => {
     if (j.ok) PDC.toast(action === 'apply' ? j.detail || 'Changes written.' : 'Rejected. No files were changed.');
     else PDC.toast(j.detail || 'failed', true);
     loadReview(); refreshState();
@@ -1575,7 +1649,10 @@ function toggleEdit() {
     S.editing = false;
     if (d._status === 200) {
       S.diff = d;
-      S.review.files.forEach((f) => { if (f.rel === S.diffRel) { f.added = d.added; f.removed = d.removed; f.edited = true; } });
+      // A hand edit re-segments the file: refresh hunks, drop any stale
+      // hunk selection (it referred to the old segmentation).
+      delete S.hsel[S.diffRel];
+      S.review.files.forEach((f) => { if (f.rel === S.diffRel) { f.added = d.added; f.removed = d.removed; f.edited = true; f.hunks = d.hunks || []; } });
     } else PDC.toast(d.detail || 'could not update', true);
     emit();
   });
@@ -3459,7 +3536,9 @@ PDC.consolidateSession = consolidateSession;
 // Background dev servers: the `.pedacito/procs/` registry, with a live log
 // tail and a Stop button, and the same start form `pedacito serve` uses.
 // Background servers, model-server lifecycle, and live VRAM/RAM telemetry.
-// The badge polls slowly (15 s); the modal refreshes after every action.
+// The chip reads the shared S.memory store: a fast hardware-only poll (3 s),
+// SSE pushes during runs, and the dialog's actions all feed it -- no manual
+// page refresh needed. The slow 15 s registry poll keeps profile availability.
 function _gb(n) { return Number(n || 0).toFixed(1); }
 function _gbShort(n) { return String(Math.round(Number(n || 0))); }
 function _memText(mem) {
@@ -3474,22 +3553,49 @@ function _memCompact(mem) {
 }
 
 function HardwareBadge() {
-  const [mem, setMem] = useState(null);
   useEffect(() => {
     let alive = true;
-    const load = () => PDC.api('/api/servers').then((j) => {
-      if (!alive || !j) return;
-      if (j.memory) setMem(j.memory);
-      // The same 15 s cycle refreshes the profile picker's disabled states.
-      if (j.profile_availability) {
-        S.profile_availability = j.profile_availability;
-        emit();
-      }
-    }, () => {});
-    load();
-    const timer = setInterval(load, 15000);
-    return () => { alive = false; clearInterval(timer); };
+    let hwInFlight = false;
+    // Fast hardware-only poll: fresh RAM/VRAM every 3 s without touching any
+    // model server. The in-flight guard keeps a slow answer from stacking
+    // requests, and a hidden tab pauses polling entirely.
+    const loadHw = () => {
+      if (!alive || hwInFlight || document.hidden) return;
+      hwInFlight = true;
+      PDC.api('/api/hardware').then((j) => {
+        hwInFlight = false;
+        if (alive && j) PDC.setMemory(j.memory);
+      }, () => { hwInFlight = false; });
+    };
+    // The slower registry poll refreshes the profile picker's disabled
+    // states; its memory reading feeds the same store.
+    const loadServers = () => {
+      if (!alive || document.hidden) return;
+      PDC.api('/api/servers').then((j) => {
+        if (!alive || !j) return;
+        PDC.setMemory(j.memory);
+        if (j.profile_availability) {
+          S.profile_availability = j.profile_availability;
+          emit();
+        }
+      }, () => {});
+    };
+    // Coming back to the tab: show the current memory immediately instead
+    // of waiting out the rest of the poll interval.
+    const onVisibility = () => { if (!document.hidden) loadHw(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    loadHw();
+    loadServers();
+    const hwTimer = setInterval(loadHw, 3000);
+    const srvTimer = setInterval(loadServers, 15000);
+    return () => {
+      alive = false;
+      clearInterval(hwTimer);
+      clearInterval(srvTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
+  const mem = S.memory;
   if (!mem) return null;
   const v = mem.vram || {}, r = mem.ram || {};
   const src = mem.sources || {};
@@ -3542,6 +3648,7 @@ function serversDialog() {
   function act(path, payload) {
     status.textContent = 'Working\u2026';
     PDC.api(path, payload).then((j) => {
+      PDC.setMemory(j.memory);
       if (j.skipped) {
         status.textContent = j.detail || 'nothing to do';
       } else if (!j.ok) {
@@ -3553,6 +3660,14 @@ function serversDialog() {
         status.textContent = verb
           + (payload.model || payload.server || 'model')
           + ' \u00B7 ' + _memText(j.memory || {});
+        // ROCm/CUDA/OS memory reclamation can lag the load/unload ack: one
+        // delayed hardware read shows it without a manual page refresh.
+        if (path === '/api/servers/load' || path === '/api/servers/unload') {
+          setTimeout(() => {
+            PDC.api('/api/hardware').then((h) => PDC.setMemory(h && h.memory),
+              () => {});
+          }, 1500);
+        }
       }
       paint(j);
     }, () => { status.textContent = 'The GUI server did not answer.'; });
@@ -3564,6 +3679,7 @@ function serversDialog() {
       status.textContent = 'Could not read the server registry.';
       return;
     }
+    PDC.setMemory(j.memory);
     if (!j.ok) {
       status.textContent = j.detail || 'Could not read the server registry.';
       // A refused load/unload/pin still answers 502 WITH fresh telemetry:
@@ -3591,19 +3707,27 @@ function serversDialog() {
         String(s.kind || '').toLowerCase()) >= 0;
       const loadBtn = h('button', { class: 'small primary', text: 'Load',
         disabled: !available.length,
-        onclick: () => act('/api/servers/load', { server: s.name, model: sel.value }) });
+        onclick: () => act('/api/servers/load',
+          { server: s.name, kind: s.kind, model: sel.value }) });
       const unloadBtn = h('button', { class: 'small danger', text: loaded.length > 1 ? 'Eject all' : 'Unload / Eject',
         disabled: !loaded.length,
         onclick: () => act('/api/servers/unload',
-          { server: s.name, model: loaded.length === 1 ? loaded[0] : '' }) });
+          { server: s.name, kind: s.kind,
+            model: loaded.length === 1 ? loaded[0] : '' }) });
       list.appendChild(h('div', { class: 'note-box', style: 'margin-bottom:8px' },
         h('div', { class: 'row' },
           h('b', { text: serverTitle(s) }),
           h('span', { class: 'tag' + (s.online ? ' act' : ''), text: s.online ? 'online' : 'offline' }),
           h('span', { class: 'tag', text: s.kind || 'custom' }),
+          s.auth_required === true ? h('span', {
+            class: 'tag warn',
+            text: PDC.t('gui.servers.auth_required', null, 'API key required') }) : null,
           h('span', { class: 'grow' }),
           unloadBtn),
         h('div', { class: 'mono small-text', style: 'margin-top:4px', text: s.base_url || '' }),
+        s.auth_required === true ? h('div', {
+          class: 'small-text auth-hint', style: 'margin-top:2px',
+          text: PDC.t('gui.servers.auth_hint', null, 'Set api_key or STRATA_API_KEY in Settings -> Profiles to load/unload models') }) : null,
         (s.profiles && s.profiles.length) ? h('div', {
           class: 'muted small-text', style: 'margin-top:2px',
           title: s.profiles.join(', '),
@@ -5159,7 +5283,8 @@ function DiffPane() {
             S.editing = false;
             if (d._status === 200) {
               const item = (S.review && S.review.files || []).find((x) => x.rel === fromRel);
-              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; }
+              if (item) { item.added = d.added; item.removed = d.removed; item.edited = true; item.hunks = d.hunks || []; }
+              delete S.hsel[fromRel];   // re-segmented: old hunk choices are stale
               S.editAfterLoad = !!editAfter;
               loadDiffFile(rel);
             } else {
@@ -5189,9 +5314,14 @@ function DiffPane() {
     return () => document.removeEventListener('keydown', onKey);
   }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
   const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
+  const canSelect = !!(R && R.pending && R.partial_ok);
+  const hselSig = JSON.stringify(hselOf(S.diffRel));
   const { oldRows, newRows, uniRows } = useMemo(() => {
     const oldR = [], newR = [], uniR = [];
     const rows = (D && D.rows) || [];
+    const hunks = (D && D.hunks) || [];
+    const hsel = hselOf(S.diffRel);
+    let lastHunk = -1;
     rows.forEach((r, i) => {
       const key = 'r' + i;
       if (r[0] === 'skip') {
@@ -5202,6 +5332,24 @@ function DiffPane() {
           onClick=${() => { S.ui.folds[foldKey] = true; emit(); }}>${label}</div>`;
         oldR.push(mk()); newR.push(mk()); uniR.push(mk());
         return;
+      }
+      // Hunk header before the first row of each hunk (fresh vnode per pane:
+      // one vnode cannot mount in two places).
+      const hi = r[8];
+      if (hi != null && hi >= 0 && hi !== lastHunk && hunks[hi]) {
+        lastHunk = hi;
+        const h = hunks[hi];
+        const hOn = hsel === null || hsel.indexOf(h.index) >= 0;
+        const range = '@@ -' + h.a_start + ',' + h.a_count + ' +' + h.b_start + ',' + h.b_count + ' @@';
+        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (canSelect && !hOn ? ' off' : '')}>
+          ${canSelect ? html`<input type="checkbox" checked=${hOn}
+            title=${PDC.t('gui.diff.hunk_title', null, 'accept this hunk only')}
+            onChange=${(e) => toggleHunk(S.diffRel, h.index, e.target.checked)} />` : null}
+          <span>${PDC.t('gui.diff.hunk', { n: h.index + 1 }, 'Hunk ' + (h.index + 1))}</span>
+          <span class="hunk-range">${range}</span>
+          <span class="tally"><span class="a">+${h.added}</span> <span class="r">\u2212${h.removed}</span></span>
+        </div>`;
+        oldR.push(mkH('a')); newR.push(mkH('b')); uniR.push(mkH('u'));
       }
       const kind = r[0], show = !r[7] || S.ui.folds[S.diffRel + '#' + r[7]] === true;
       if (kind === 'equal') {
@@ -5224,7 +5372,7 @@ function DiffPane() {
       }
     });
     return { oldRows: oldR, newRows: newR, uniRows: uniR };
-  }, [D, S.diffRel, foldSig]);
+  }, [D, S.diffRel, foldSig, hselSig, canSelect]);
 
   if (!R) {
     return html`
@@ -5236,7 +5384,11 @@ function DiffPane() {
   }
   const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
-  const nSel = R.partial_ok ? editable.filter((f) => S.sel[f.rel] !== false).length : editable.length;
+  const nSel = R.partial_ok ? editable.filter((f) => {
+    if (S.sel[f.rel] === false) return false;
+    const hs = hselOf(f.rel);
+    return hs === null || hs.length > 0;
+  }).length : editable.length;
   const acceptLabel = !R.partial_ok || nSel === editable.length
     ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
     : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
@@ -5272,8 +5424,9 @@ function DiffPane() {
                title=${f.message || ''} onClick=${() => switchDiffFile(f.rel, false)}>
             ${pending && R.partial_ok && !f.source ? html`
               <input type="checkbox" checked=${S.sel[f.rel] !== false} title="include in Accept"
+                     ref=${(el) => { if (el) { const hs = hselOf(f.rel); el.indeterminate = S.sel[f.rel] !== false && hs !== null && hs.length > 0; } }}
                      onclick=${(e) => e.stopPropagation()}
-                     onchange=${(e) => { S.sel[f.rel] = e.target.checked; emit(); }} />` : null}
+                     onchange=${(e) => toggleFileSel(f.rel, e.target.checked)} />` : null}
             <span>${f.rel}</span>
             ${(f.clauses || []).map((c) => html`
               <span key=${c} class="clause" title=${(R.clause_texts || {})[c] || c}>${c}</span>`)}
@@ -5332,6 +5485,95 @@ function actParts(a) {                 // "app.py L12-40" -> file + line badges
   return [html`<span key="f" class="tx">${d}</span>`];
 }
 
+function ilvBrief(args) {
+  if (!args || typeof args !== 'object') return '';
+  const v = args.file || args.path || args.pattern || args.command || args.query || '';
+  return String(v).slice(0, 80);
+}
+
+// Live tool-call cards for an interleaved run: one compact collapsible card
+// per tool call (paired with its result by id), plus edit, gate-error and
+// finish cards. <details> keeps them collapsed by default; the CSS uses the
+// same theme variables as the rest of the Activity pane.
+function InterleavedFeed({ items }) {
+  const cards = [];
+  const byId = {};
+  for (const e of items) {
+    if (e.kind === 'tool_call') {
+      const c = { kind: 'tool', name: e.name, id: e.id, args: e.args,
+                  turn: e.turn, pending: true };
+      if (e.id) byId[e.id] = c;
+      cards.push(c);
+    } else if (e.kind === 'tool_result') {
+      const c = e.id && byId[e.id];
+      if (c) Object.assign(c, { ok: e.ok, preview: e.preview, chars: e.chars,
+                                gate_errors: e.gate_errors, pending: false });
+      else cards.push({ kind: 'tool', name: e.name, id: e.id, ok: e.ok,
+                        preview: e.preview, chars: e.chars,
+                        gate_errors: e.gate_errors, turn: e.turn, pending: false });
+    } else if (e.kind === 'edit_staged' || e.kind === 'gate_error'
+               || e.kind === 'finish' || e.kind === 'interleaved_turn') {
+      cards.push({ ...e, kind: e.kind === 'edit_staged' ? 'edit'
+                   : e.kind === 'gate_error' ? 'gate'
+                   : e.kind === 'interleaved_turn' ? 'turn' : 'finish' });
+    }
+  }
+  if (!cards.length) return null;
+  return html`
+    <div class="eng-sec ilv-sec">
+      <b>${PDC.t('gui.activity.interleaved', null, 'Interleaved run')}</b>
+      <div class="ilv">
+        ${cards.map((c, i) => {
+          if (c.kind === 'turn') {
+            const names = Array.isArray(c.calls) ? c.calls : [];
+            return html`<div key=${i} class="ilv-turn">
+              ${PDC.t('gui.activity.turn', null, 'turn')} ${c.turn}
+              ${names.length ? ' \u00B7 ' + names.join(', ') : ''}
+              ${c.note ? html`<span class="ilv-note">${c.note}</span>` : null}</div>`;
+          }
+          if (c.kind === 'tool') return html`
+            <details key=${i} class=${'ilv-card' + (c.pending ? ' pending' : (c.ok === false ? ' bad' : ' ok'))}>
+              <summary>
+                <span class="ilv-name">${c.name}</span>
+                <span class="ilv-args">${ilvBrief(c.args)}</span>
+                <span class=${'ilv-state' + (c.pending ? ' pending' : (c.ok === false ? ' bad' : ''))}>
+                  ${c.pending ? '\u2026' : (c.ok === false ? '\u2717' : '\u2713')}</span>
+              </summary>
+              ${c.preview ? html`<pre class="ilv-pre">${c.preview}</pre>` : null}
+              ${c.gate_errors ? html`<div class="ilv-gates">${c.gate_errors} ${PDC.t('gui.activity.gate_errors', null, 'gate error(s)')}</div>` : null}
+            </details>`;
+          if (c.kind === 'edit') return html`
+            <details key=${i} class=${'ilv-card edit' + (c.applied ? ' ok' : '')}>
+              <summary>
+                <span class="ilv-name">${c.deleted ? PDC.t('gui.activity.delete', null, 'delete') : PDC.t('gui.activity.edit', null, 'edit')}</span>
+                <span class="ilv-args">${c.file}</span>
+                <span class="ilv-diffstat">+${c.added || 0} \u2212${c.removed || 0}</span>
+                <span class="ilv-state">${c.applied ? PDC.t('gui.activity.applied', null, 'applied') : PDC.t('gui.activity.staged', null, 'staged')}</span>
+              </summary>
+              ${c.message ? html`<div class="ilv-msg">${c.message}</div>` : null}
+              ${c.diff ? html`<pre class="ilv-pre diff">${c.diff}</pre>` : null}
+            </details>`;
+          if (c.kind === 'gate') return html`
+            <details key=${i} class="ilv-card bad" open>
+              <summary>
+                <span class="ilv-name">${PDC.t('gui.activity.gate_error', null, 'gate error')}</span>
+                <span class="ilv-args">${c.file}</span>
+              </summary>
+              <div class="ilv-msg">${c.gate ? c.gate + ': ' : ''}${c.message}${c.rolled_back ? ' (' + PDC.t('gui.activity.rolled_back', null, 'rolled back') + ')' : ''}</div>
+            </details>`;
+          if (c.kind === 'finish') return html`
+            <div key=${i} class=${'ilv-card finish ' + (c.ok ? 'ok' : 'bad')}>
+              <b>${c.ok ? PDC.t('gui.activity.finish_ok', null, 'Finished') : PDC.t('gui.activity.finish_bad', null, 'Stopped')} \u00B7 ${c.stop_reason}</b>
+              ${c.summary ? html`<div class="ilv-msg">${c.summary}</div>` : null}
+              <div class="ilv-meta">${c.turns || 0} ${PDC.t('gui.activity.turns', null, 'turns')} \u00B7 ${c.tool_calls || 0} ${PDC.t('gui.activity.tool_calls', null, 'tool calls')}${c.changed_files && c.changed_files.length ? ' \u00B7 ' + c.changed_files.join(', ') : ''}</div>
+              ${c.error ? html`<div class="ilv-msg bad">${c.error}</div>` : null}
+            </div>`;
+          return null;
+        })}
+      </div>
+    </div>`;
+}
+
 function ActivityPane() {
   const s = S.status, j = s.job, eng = s.engine || {};
   const lastActivity = useMemo(() => {
@@ -5382,6 +5624,7 @@ function ActivityPane() {
               + (eng.specialist.specialty || '?') + '\''}>${PDC.t('gui.activity.specialist', null, 'specialist')}
               <b>${eng.specialist.profile}</b></span>` : null}
         </div>
+        <${InterleavedFeed} items=${(eng.interleaved || []).slice(-40)} />
         ${reqs.length ? html`
           <div class="eng-sec"><b>${PDC.t('gui.activity.req_ledger', null, 'Requirement ledger')}</b><ol class="reqs">
             ${reqs.map((rq, i) => html`

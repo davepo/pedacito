@@ -349,22 +349,46 @@ def _url_origin(url: str) -> tuple[str, str, int] | None:
     return (scheme, parsed.hostname.lower(), port)
 
 
+def _resolve_profile_key(body: dict, fallback_flat: dict | None = None) -> str:
+    """Resolve an API key from a profile table (and optional universal table),
+    honouring ``api_key_env``, ``api_key_keyring``, and ``keyring:...``."""
+    from .. import secrets_store
+    for src, allow_inline in ((body or {}, True), (fallback_flat or {}, fallback_flat is not None)):
+        if not src:
+            continue
+        env = str(src.get("api_key_env") or "").strip()
+        if env:
+            val = os.environ.get(env, "")
+            if val:
+                return val
+        kr_ref = str(src.get("api_key_keyring") or "").strip()
+        raw_key = str(src.get("api_key") or "")
+        if kr_ref or secrets_store.is_keyring_ref(raw_key):
+            val = secrets_store.resolve_api_key(
+                api_key=raw_key, api_key_env="", api_key_keyring=kr_ref)
+            if val:
+                return val
+        elif allow_inline and raw_key:
+            return raw_key
+    return ""
+
+
 def _stored_api_key(which: str, profile: str, probe_url: str = "") -> str:
     probe_origin = _url_origin(probe_url) if probe_url else None
     try:
         text = _read_text(config_path(which))
         body = settings.profile_body(text, profile) if profile else {}
         flat, _ = settings.validate_text(text)
-        if body.get("api_key"):
+        if body.get("api_key") or body.get("api_key_keyring") or body.get("api_key_env"):
             stored_url = body.get("base_url") or flat.get("base_url") or ""
             if probe_origin is None or _url_origin(stored_url) == probe_origin:
-                return str(body["api_key"])
+                return _resolve_profile_key(body)
             return ""
-        if flat.get("api_key"):
+        if flat.get("api_key") or flat.get("api_key_keyring") or flat.get("api_key_env"):
             stored_url = ((body.get("base_url") if profile else "")
                           or flat.get("base_url") or "")
             if probe_origin is None or _url_origin(stored_url) == probe_origin:
-                return str(flat["api_key"])
+                return _resolve_profile_key(flat)
         return ""
     except (ConfigError, OSError):
         return ""
@@ -395,6 +419,67 @@ def probe_server(base_url: str, api_key: str, which: str = "user",
     return {"ok": True, "models": ids}
 
 
+def _endpoint_auth(flat: dict, profiles: dict) -> dict:
+    """Per-server Authorization headers for a discovery scan.
+
+    A profile's own `api_key`/`api_key_env` is attached to that profile's
+    endpoint only; a profile that points at the universal endpoint may inherit
+    `[universal]`'s key. Keys never cross origins, so scanning several local
+    servers cannot leak one server's credential to another. Strata/Avalon also
+    accept their conventional environment variables when the profile labels
+    itself as one of those runtimes. Returns `{normalized_url: headers}` for
+    `discovery.discover_servers(auth=...)` and `describe_models(auth=...)`.
+    """
+    from .. import discovery, secrets_store
+
+    flat_url = str(flat.get("base_url") or "")
+
+    def key_for(body: dict, fallback: bool) -> str:
+        raw_key = str(body.get("api_key") or "")
+        kr_ref = str(body.get("api_key_keyring") or "")
+        env = str(body.get("api_key_env") or "")
+        key = os.environ.get(env, "") if env else ""
+        if not key and (kr_ref or secrets_store.is_keyring_ref(raw_key)):
+            key = secrets_store.resolve_api_key(
+                api_key=raw_key, api_key_env="", api_key_keyring=kr_ref)
+        if not key:
+            key = raw_key
+        if not key and str(body.get("provider") or "").lower() in (
+                "strata", "avalon", "local-moe", "local_moe", "localmoe"):
+            for env in ("STRATA_API_KEY", "AVALON_API_KEY"):
+                key = os.environ.get(env, "") or key
+        if not key and fallback:
+            raw_flat = str(flat.get("api_key") or "")
+            kr_flat = str(flat.get("api_key_keyring") or "")
+            env = str(flat.get("api_key_env") or "")
+            key = os.environ.get(env, "") if env else ""
+            if not key and (kr_flat or secrets_store.is_keyring_ref(raw_flat)):
+                key = secrets_store.resolve_api_key(
+                    api_key=raw_flat, api_key_env="", api_key_keyring=kr_flat)
+            if not key:
+                key = raw_flat
+        return key
+
+    auth: dict[str, dict] = {}
+    for body in (profiles or {}).values():
+        if not isinstance(body, dict):
+            continue
+        base = str(body.get("base_url") or flat_url or "")
+        if not base:
+            continue
+        same_origin = bool(flat_url) and _url_origin(base) == _url_origin(flat_url)
+        key = key_for(body, same_origin)
+        if key:
+            auth[discovery.normalize_url(base)] = {
+                "Authorization": f"Bearer {key}"}
+    if flat_url:
+        key = key_for(flat, False)
+        if key:
+            auth.setdefault(discovery.normalize_url(flat_url),
+                            {"Authorization": f"Bearer {key}"})
+    return auth
+
+
 def list_profiles() -> dict:
     """The profiles table (identity + measured scores + recommendations) for
     the settings page, from the same renderer the CLI uses."""
@@ -404,19 +489,44 @@ def list_profiles() -> dict:
     return {"profiles": rows, "recommendations": profiles_mod.recommend(rows)}
 
 
+def _user_scan_config() -> tuple[dict, dict]:
+    """The user config's flat settings and profile bodies for a scan."""
+    try:
+        return settings.validate_text(_read_text(config_path("user")))
+    except ConfigError:
+        return {}, {}
+
+
+def _scan_profile_urls(flat: dict, profiles: dict) -> list[str]:
+    """Every server URL the user config already names, deduplicated."""
+    urls = [flat.get("base_url")] if flat.get("base_url") else []
+    urls += [body.get("base_url") for body in (profiles or {}).values()
+             if isinstance(body, dict) and body.get("base_url")]
+    return list(dict.fromkeys(str(u) for u in urls if u))
+
+
 def scan_servers() -> dict:
     """Discover servers and list each one's models with metadata (loaded,
-    size, context, embedding/too-big already dropped)."""
+    size, context, embedding/too-big already dropped).
+
+    Existing profiles are probed too, with their own API key: a Strata server
+    behind a key is not invisible just because it listens on a custom port or
+    its OpenAI listing rejects an unauthenticated probe."""
     from .. import discovery
+    flat, profiles = _user_scan_config()
+    auth = _endpoint_auth(flat, profiles)
     servers = []
     seen: set[str] = set()
-    for label, base_url, _ids in discovery.discover_servers(timeout=1.5):
+    for label, base_url, _ids in discovery.discover_servers(
+            timeout=1.5, profile_urls=_scan_profile_urls(flat, profiles),
+            auth=auth):
         key = _norm_url(base_url)
         if key in seen:
             continue          # the same server spelled two ways: probe once
         seen.add(key)
         servers.append({"label": label, "base_url": base_url,
-                        "models": discovery.describe_models(base_url)})
+                        "models": discovery.describe_models(base_url,
+                                                            auth=auth)})
     return {"servers": servers}
 
 
@@ -469,6 +579,22 @@ _BASELINE_SECTIONS = (
 )
 
 
+def _detected_local_vram_gb(default: int = 8) -> int:
+    """Whole GB of VRAM on this machine's largest local GPU, or `default` when
+    no GPU is detected (e.g. headless CI / CPU-only box)."""
+    try:
+        from .. import profiler
+        snap = profiler.snapshot()
+        vram = snap.get("vram") or {}
+        cards = vram.get("cards") or []
+        gb = max((float(c.get("total_gb") or 0) for c in cards),
+                 default=float(vram.get("total_gb") or 0))
+        whole = int(round(gb))
+        return whole if whole >= 1 else default
+    except Exception:
+        return default
+
+
 def baseline_text() -> str:
     """The clean baseline config.toml text: recommended Config() defaults,
     no model profiles and no per-role assignments."""
@@ -490,7 +616,8 @@ def baseline_text() -> str:
         lines.append(f"[{section}]")
         lines.append(f"# {blurb}")
         if section == "universal":
-            lines.append("vram_gb = 8   # whole GB of VRAM on the model machine;"
+            vram = _detected_local_vram_gb(8)
+            lines.append(f"vram_gb = {vram}   # whole GB of VRAM on the model machine;"
                          " auto_fit sizes the window from it (hosted APIs ignore it)")
         for key, note in keys:
             value = getattr(cfg, key)
@@ -1209,22 +1336,17 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
         vram = int(vram_gb or 0)
     except (TypeError, ValueError):
         vram = 0
-    try:
-        flat, existing = settings.validate_text(_read_text(config_path("user")))
-    except ConfigError:
-        flat, existing = {}, {}
+    flat, existing = _user_scan_config()
     # Re-find servers on custom ports from the same config the import reads:
-    # one source of truth, not the CLI's own config global.
-    profile_urls = []
-    if flat.get("base_url"):
-        profile_urls.append(flat["base_url"])
-    for body in existing.values():
-        if body.get("base_url"):
-            profile_urls.append(body["base_url"])
-    profile_urls = list(dict.fromkeys(profile_urls))
+    # one source of truth, not the CLI's own config global. The profiles'
+    # API keys travel with their URLs, so a key-protected local server
+    # (Strata/Avalon) is listed instead of answering 401 and disappearing.
+    profile_urls = _scan_profile_urls(flat, existing)
+    auth = _endpoint_auth(flat, existing)
     found = discovery.discover_servers(timeout=2.0, urls=explicit,
                                        profile_urls=profile_urls,
-                                       deadline=discovery_deadline)
+                                       deadline=discovery_deadline,
+                                       auth=auth)
     imported = {(_norm_url(b.get("base_url", flat.get("base_url", ""))),
                  str(b.get("model") or "")) for b in existing.values()}
     taken = set(existing)
@@ -1240,7 +1362,7 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
         seen_servers.add(skey)
         try:
             recs = discovery.describe_models(base_url, vram_gb=vram,
-                                             deadline=deadline)
+                                             deadline=deadline, auth=auth)
         except Exception:
             recs = []
         rows = []
@@ -1260,6 +1382,7 @@ def scan_models(urls=(), vram_gb=0, budget=20.0) -> dict:
                    "quant": str(rec.get("quant") or ""),
                    "modality": "image" if is_img else "text",
                    "is_image_model": bool(is_img),
+                   "requires_api_key": bool(rec.get("requires_api_key")),
                    "suggested_profile_name": name,
                    "already_imported": bool(already)}
             rows.append(row)
@@ -1274,6 +1397,20 @@ def _read_config_text(path: Path) -> str:
     template (so a first import produces a valid config)."""
     text = _read_text(path)
     return text if text.strip() else config_mod.TEMPLATE
+
+
+# The scan labels whose runtime a profile should name explicitly. A Strata
+# import must become provider="strata" (and thus tier="local-moe"), not a
+# bare "custom" profile the lifecycle router cannot reach.
+_LOCAL_PROVIDER_LABELS = ("strata", "avalon", "lemonade")
+
+
+def _normalize_provider_label(label: str) -> str:
+    """The profile `provider` value for a scan's label: the three local-MoE /
+    Lemonade runtimes map to their canonical spelling; any other label yields
+    "" so the name/model heuristic classifies the profile instead."""
+    low = str(label or "").strip().lower()
+    return low if low in _LOCAL_PROVIDER_LABELS else ""
 
 
 def import_models(models) -> dict:
@@ -1324,6 +1461,20 @@ def import_models(models) -> dict:
             values["modality"] = "image"
         else:
             imported_text = True
+        # The scan's provider label (Strata/Avalon/Lemonade) becomes the
+        # profile's provider, normalized BEFORE the tier guess so a Strata
+        # import lands on provider="strata" and tier="local-moe".
+        provider = _normalize_provider_label(sel.get("provider") or "")
+        if provider:
+            values["provider"] = provider
+        # A per-model key (or its env var) rides the import so a key-protected
+        # Strata/Avalon is usable the moment it is selected.
+        api_key = str(sel.get("api_key") or "").strip()
+        api_key_env = str(sel.get("api_key_env") or "").strip()
+        if api_key:
+            values["api_key"] = api_key
+        elif api_key_env:
+            values["api_key_env"] = api_key_env
         tier = str(sel.get("tier") or "").strip()
         if not tier:
             tier = config_mod._guess_tier(name, values) or ""
@@ -1388,36 +1539,40 @@ CLOUD_PROVIDERS: tuple[dict, ...] = (
         "base_url": "https://api.anthropic.com/v1",
         "api_key_env": "ANTHROPIC_API_KEY", "suggest": "claude",
         "context_tokens": 200000,
-        "models": ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"],
+        "models": ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5",
+                   "claude-sonnet-4-6", "claude-opus-4-6"],
     },
     {
         "id": "openai", "label": "ChatGPT (OpenAI)", "provider": "openai",
         "base_url": "https://api.openai.com/v1",
         "api_key_env": "OPENAI_API_KEY", "suggest": "openai",
-        "context_tokens": 272000,
-        "models": ["gpt-5.4", "gpt-5.4-mini", "o3-mini", "gpt-4.1",
-                   "gpt-4.1-mini"],
+        "context_tokens": 400000,
+        "models": ["gpt-5.4", "gpt-5.4-mini", "o4-mini", "o3", "o3-mini",
+                   "gpt-4.1", "gpt-4.1-mini"],
     },
     {
         "id": "deepseek", "label": "DeepSeek", "provider": "openai",
         "base_url": "https://api.deepseek.com/v1",
         "api_key_env": "DEEPSEEK_API_KEY", "suggest": "deepseek",
         "context_tokens": 128000,
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4",
+                   "deepseek-v4-flash"],
     },
     {
         "id": "qwen", "label": "Qwen (DashScope)", "provider": "openai",
         "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         "api_key_env": "DASHSCOPE_API_KEY", "suggest": "qwen",
         "context_tokens": 256000,
-        "models": ["qwen3-coder-plus", "qwen-max", "qwen-plus", "qwen-flash"],
+        "models": ["qwen3-coder-plus", "qwen3.8-flash", "qwen-max",
+                   "qwen-plus", "qwen-flash"],
     },
     {
-        "id": "gemini", "label": "Google Gemini", "provider": "openai",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "id": "gemini", "label": "Google Gemini", "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "api_key_env": "GEMINI_API_KEY", "suggest": "gemini",
-        "context_tokens": 200000,
-        "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+        "context_tokens": 1000000,
+        "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro",
+                   "gemini-3-flash"],
     },
     {
         "id": "openrouter", "label": "OpenRouter", "provider": "openai",
@@ -1425,7 +1580,19 @@ CLOUD_PROVIDERS: tuple[dict, ...] = (
         "api_key_env": "OPENROUTER_API_KEY", "suggest": "openrouter",
         "context_tokens": 200000,
         "models": ["deepseek/deepseek-chat", "qwen/qwen3-coder",
-                   "anthropic/claude-3.7-sonnet"],
+                   "anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"],
+    },
+    {
+        # A local MoE runtime is still an OpenAI-compatible server, so it gets
+        # the same one-click path as the clouds. The key is optional (Strata/
+        # Avalon only require it when their /health says so); the curated list
+        # is empty on purpose: the live /v1/models answer is the catalog.
+        "id": "strata", "label": "Strata / Avalon (Local MoE)",
+        "provider": "strata",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_key_env": "STRATA_API_KEY", "suggest": "strata",
+        "context_tokens": 131072,
+        "models": [],
     },
 )
 
@@ -1497,7 +1664,13 @@ def add_provider_preset(body: dict) -> dict:
     `deepseek_chat`, `gemini_2_5_flash`..."""
     body = body or {}
     preset = _preset_by_id(body.get("preset_id"))
-    model = str(body.get("model") or "").strip() or preset["models"][0]
+    model = str(body.get("model") or "").strip()
+    if not model and preset.get("models"):
+        model = preset["models"][0]
+    if not model:
+        raise ConfigError(
+            "This preset needs an explicit model id; connect once to read "
+            "the server's live catalog.")
     raw_name = str(body.get("profile_name") or "").strip()
     name = _sanitize_profile_name(
         raw_name or _preset_profile_suggestion(preset, model))
@@ -1578,10 +1751,108 @@ def _clean_model_id(raw) -> str:
 
 def _probe_headers(preset_id: str, base_url: str, key: str) -> dict:
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
-    if preset_id == "anthropic" or "anthropic.com" in str(base_url or "").lower():
+    low_url = str(base_url or "").lower()
+    if preset_id == "anthropic" or "anthropic.com" in low_url:
         headers["x-api-key"] = key
         headers["anthropic-version"] = _ANTHROPIC_VERSION
+    if preset_id == "gemini" or "generativelanguage.googleapis.com" in low_url:
+        headers["x-goog-api-key"] = key
     return headers
+
+
+def _pos_int(val) -> int:
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _per_tok_to_mtok(val) -> float | None:
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    return round(n * 1_000_000, 6)
+
+
+def _extract_provider_model_meta(item: dict) -> dict:
+    """Extract Tier 1 context window, output limit, and pricing directly from a
+    provider's ``/models`` item payload (OpenRouter, Gemini, Groq, Together, ...)."""
+    if not isinstance(item, dict):
+        return {}
+    top = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
+    ctx = _pos_int(
+        item.get("inputTokenLimit")
+        or item.get("context_length")
+        or top.get("context_length")
+        or item.get("context_window")
+        or item.get("max_model_len")
+    )
+    out_tok = _pos_int(
+        item.get("outputTokenLimit")
+        or top.get("max_completion_tokens")
+        or item.get("max_output_tokens")
+        or item.get("max_completion_tokens")
+        or item.get("max_tokens")
+    )
+    meta: dict = {}
+    if ctx > 0:
+        meta["context_tokens"] = ctx
+    if out_tok > 0:
+        meta["output_tokens"] = out_tok
+
+    pricing = item.get("pricing")
+    if isinstance(pricing, dict):
+        p_in = _per_tok_to_mtok(pricing.get("prompt"))
+        p_out = _per_tok_to_mtok(pricing.get("completion"))
+        p_cached = _per_tok_to_mtok(
+            pricing.get("input_cache_read")
+            if pricing.get("input_cache_read") is not None
+            else pricing.get("cache_read")
+        )
+        if p_in is not None:
+            meta["price_input_per_mtok"] = p_in
+        if p_out is not None:
+            meta["price_output_per_mtok"] = p_out
+        if p_cached is not None:
+            meta["price_cached_per_mtok"] = p_cached
+    return meta
+
+
+def _probe_gemini_native_models(base_url: str, key: str) -> dict[str, dict]:
+    """Best-effort GET to Gemini's native ``/v1beta/models`` to read per-model
+    ``inputTokenLimit`` and ``outputTokenLimit``."""
+    from .. import transport_gemini
+    url = transport_gemini.models_endpoint(base_url)
+    if not url:
+        return {}
+    try:
+        r = requests.get(
+            url,
+            headers={"x-goog-api-key": key, "Accept": "application/json"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception:
+        return {}
+    items = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return {}
+    out: dict[str, dict] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mid = _clean_model_id(it.get("name") or it.get("id") or "")
+        if not mid:
+            continue
+        meta = _extract_provider_model_meta(it)
+        if meta:
+            out[mid] = meta
+    return out
 
 
 def _existing_profile_index(which: str) -> tuple[set, set]:
@@ -1596,29 +1867,92 @@ def _existing_profile_index(which: str) -> tuple[set, set]:
     return set(profiles), imported
 
 
-def _provider_rows(items, base_url: str, taken: set, imported: set) -> list:
+def _provider_rows(items, base_url: str, taken: set, imported: set,
+                   *, preset: dict | None = None,
+                   native_meta: dict[str, dict] | None = None) -> list:
     """Probe payloads -> dialog rows: cleaned ids, obvious non-chat models
     dropped, one row per id, each carrying a unique model-derived profile
-    name and whether this (server, model) pair is already configured."""
+    name, whether this (server, model) pair is already configured, and
+    3-tier enriched context window / pricing metadata."""
+    from .. import model_catalog, providers
+
     skey = _norm_url(base_url)
+    preset_ctx = int((preset or {}).get("context_tokens") or 0)
     rows: list = []
     seen: set = set()
     for it in items or []:
         if isinstance(it, str):
             raw = it
+            item_dict: dict = {}
         elif isinstance(it, dict):
             raw = it.get("id") or it.get("name") or ""
+            item_dict = it
+            methods = it.get("supportedGenerationMethods")
+            if isinstance(methods, list) and methods \
+                    and "generateContent" not in methods:
+                continue
         else:
             raw = ""
+            item_dict = {}
         mid = _clean_model_id(raw)
         if not mid or mid in seen:
             continue
         if any(tok in mid.lower() for tok in _NON_CHAT_HINTS):
             continue        # embeddings/audio/moderation never lead a picker
         seen.add(mid)
-        rows.append({"id": mid,
-                     "suggested_profile_name": _suggest_profile_name(mid, taken),
-                     "already_imported": (skey, mid) in imported})
+
+        tier1 = _extract_provider_model_meta(item_dict)
+        if native_meta and mid in native_meta:
+            for k, v in native_meta[mid].items():
+                tier1.setdefault(k, v)
+        tier2 = model_catalog.lookup_model_meta(base_url, mid, allow_fetch=False)
+        tier3_prices, tier3_src = providers.default_prices_with_source(base_url, mid)
+
+        ctx = (tier1.get("context_tokens")
+               or tier2.get("context_tokens")
+               or preset_ctx)
+        out_tok = (tier1.get("output_tokens")
+                   or tier2.get("output_tokens")
+                   or 0)
+
+        has_t1_price = ("price_input_per_mtok" in tier1
+                        or "price_output_per_mtok" in tier1)
+        has_t2_price = bool(
+            tier2 and (tier2.get("price_input_per_mtok")
+                       or tier2.get("price_output_per_mtok")))
+        if has_t1_price:
+            p_in = float(tier1.get("price_input_per_mtok") or 0.0)
+            p_cached = float(tier1.get("price_cached_per_mtok")
+                             if tier1.get("price_cached_per_mtok") is not None
+                             else (tier2.get("price_cached_per_mtok") or 0.0))
+            p_out = float(tier1.get("price_output_per_mtok") or 0.0)
+        elif has_t2_price:
+            p_in = float(tier2.get("price_input_per_mtok") or 0.0)
+            p_cached = float(tier2.get("price_cached_per_mtok") or 0.0)
+            p_out = float(tier2.get("price_output_per_mtok") or 0.0)
+        else:
+            p_in = float(tier3_prices.get("price_input_per_mtok") or 0.0)
+            p_cached = float(tier3_prices.get("price_cached_per_mtok") or 0.0)
+            p_out = float(tier3_prices.get("price_output_per_mtok") or 0.0)
+
+        if tier1:
+            meta_source = "provider"
+        elif tier2:
+            meta_source = "catalog"
+        else:
+            meta_source = "builtin" if (tier3_src or preset_ctx) else "builtin"
+
+        rows.append({
+            "id": mid,
+            "suggested_profile_name": _suggest_profile_name(mid, taken),
+            "already_imported": (skey, mid) in imported,
+            "context_tokens": int(ctx or 0),
+            "output_tokens": int(out_tok or 0),
+            "price_input_per_mtok": p_in,
+            "price_cached_per_mtok": p_cached,
+            "price_output_per_mtok": p_out,
+            "meta_source": meta_source,
+        })
     return rows
 
 
@@ -1641,9 +1975,11 @@ def probe_provider(body: dict) -> dict:
     `os.environ[api_key_env]` (the preset's own env var when none was named).
     An unknown `preset_id` is refused; `custom` (or none) means "any
     OpenAI-compatible URL". Success: {"ok": True, "verified": True, "models":
-    [{"id", "suggested_profile_name", "already_imported"}]}. Failure: {"ok":
-    False, "error": "...", "models": <curated preset ids>} so the user can
-    still pick a model and fix the key later."""
+    [{"id", "suggested_profile_name", "already_imported", ...}]}. Failure:
+    {"ok": False, "error": "...", "models": <curated preset ids>} so the user
+    can still pick a model and fix the key later."""
+    from .. import model_catalog, secrets_store
+
     body = body or {}
     pid = str(body.get("preset_id") or "").strip().lower()
     preset = _preset_by_id(pid) if pid and pid != "custom" else None
@@ -1654,9 +1990,17 @@ def probe_provider(body: dict) -> dict:
     if _url_origin(base_url) is None:
         raise ConfigError("Provider base URL must use http or https.")
     api_key = str(body.get("api_key") or "").strip()
+    kr_ref = str(body.get("api_key_keyring") or "").strip()
     env = str(body.get("api_key_env") or "").strip() \
         or str((preset or {}).get("api_key_env") or "")
-    key = api_key or (os.environ.get(env, "") if _allowed_provider_env_var(env) else "")
+    key = ""
+    if api_key:
+        key = (secrets_store.resolve_api_key(api_key=api_key)
+               if secrets_store.is_keyring_ref(api_key) else api_key)
+    elif kr_ref:
+        key = secrets_store.resolve_api_key(api_key_keyring=kr_ref)
+    elif _allowed_provider_env_var(env):
+        key = os.environ.get(env, "")
     which = "project" if str(body.get("file") or "user") == "project" else "user"
     taken, imported = _existing_profile_index(which)
     error = ""
@@ -1674,14 +2018,49 @@ def probe_provider(body: dict) -> dict:
             items = []
     except Exception as e:
         error = f"{type(e).__name__}: {str(e)[:200]}"
+
+    native_meta: dict[str, dict] = {}
+    is_gemini = pid == "gemini" or "generativelanguage.googleapis.com" in base_url.lower()
+    if not error and is_gemini and "/openai" in base_url.lower():
+        native_meta = _probe_gemini_native_models(base_url, key)
+
+    with STATE.lock:
+        cfg = STATE.cfg
+    if not model_catalog.is_local_base_url(base_url) \
+            and model_catalog.catalog_enabled(cfg):
+        if model_catalog.read_cache(allow_stale=False) is None:
+            model_catalog.refresh_catalog(force=False, cfg=cfg)
+
     if error:
-        return {"ok": False, "verified": False, "error": error,
-                "base_url": base_url,
-                "models": _provider_rows([{"id": m} for m in
-                                          (preset or {}).get("models", [])],
-                                         base_url, taken, imported)}
-    return {"ok": True, "verified": True, "base_url": base_url, "preset": pid,
-            "models": _provider_rows(items, base_url, taken, imported)}
+        return {
+            "ok": False,
+            "verified": False,
+            "error": error,
+            "base_url": base_url,
+            "models": _provider_rows(
+                [{"id": m} for m in (preset or {}).get("models", [])],
+                base_url, taken, imported, preset=preset,
+            ),
+        }
+    return {
+        "ok": True,
+        "verified": True,
+        "base_url": base_url,
+        "preset": pid,
+        "models": _provider_rows(
+            items, base_url, taken, imported,
+            preset=preset, native_meta=native_meta,
+        ),
+    }
+
+
+def refresh_provider_catalog(body: dict | None = None) -> dict:
+    """``POST /api/providers/refresh``: force-refresh ``model_catalog.json``
+    from ``models.dev/api.json``."""
+    from .. import model_catalog
+    with STATE.lock:
+        cfg = STATE.cfg
+    return model_catalog.refresh_catalog(force=True, cfg=cfg)
 
 
 def import_hosted_models(body: dict) -> dict:
@@ -1692,8 +2071,10 @@ def import_hosted_models(body: dict) -> dict:
     env var) and the preset's hosted budgets.
 
     `body`: {preset_id?, base_url?, api_key?, api_key_env?, file?,
-             models: [{model, profile_name?, set_default?}]}. Names that
-    already exist are skipped, not duplicated."""
+             models: [{model, profile_name?, context_tokens?, set_default?}]}.
+    Names that already exist are skipped, not duplicated."""
+    from .. import model_catalog, providers
+
     body = body or {}
     pid = str(body.get("preset_id") or "").strip().lower()
     preset = _preset_by_id(pid) if pid and pid != "custom" else None
@@ -1716,6 +2097,28 @@ def import_hosted_models(body: dict) -> dict:
     imported: list[str] = []
     skipped: list[str] = []
     default = ""
+    # The "hosted provider" dialog can also be aimed at a local server. Strata/
+    # Avalon answer a public /health naming their service and context window;
+    # use it so a local-MoE server is not forced into tier="hosted".
+    from .. import servers as servers_mod
+    is_local = servers_mod.is_local_url(base_url)
+    local_provider = ""
+    local_ctx = 0
+    if is_local:
+        root = servers_mod._root(base_url)
+        try:
+            r = requests.get(root + "/health", timeout=1.5)
+            data = r.json() if getattr(r, "status_code", 0) == 200 else None
+        except Exception:
+            data = None
+        if isinstance(data, dict) and \
+                str(data.get("service") or "").lower() in ("strata", "avalon"):
+            local_provider = str(data["service"]).lower()
+            try:
+                local_ctx = int(data.get("max_context")
+                                or data.get("context_length") or 0)
+            except (TypeError, ValueError):
+                local_ctx = 0
     for sel in sels:
         if not isinstance(sel, dict):
             continue
@@ -1740,15 +2143,42 @@ def import_hosted_models(body: dict) -> dict:
             if sel.get("set_default"):
                 default = default or name
             continue
-        values: dict = {"base_url": base_url, "model": mid, "tier": "hosted",
-                        "json_mode": "object",
-                        "max_read_tokens": _CLOUD_READ_TOKENS}
-        if ctx > 0:
-            values["context_tokens"] = ctx
-        # The provider table wins where a surface deviates from the generic
-        # hosted default (Anthropic rejects json_object and cannot cache).
-        from .. import providers
-        values.update(providers.profile_overrides(base_url, mid))
+        if local_provider:
+            # A local Strata/Avalon reached through this dialog: a local-MoE
+            # runtime, not a cloud API. Its context window comes from /health.
+            values: dict = {"base_url": base_url, "model": mid,
+                            "provider": local_provider, "tier": "local-moe"}
+            if local_ctx > 0:
+                values["context_tokens"] = local_ctx
+        elif is_local:
+            # Any other local server (Lemonade/LM Studio/llama.cpp): classify
+            # it like the scan would, not as a hosted tier.
+            values = {"base_url": base_url, "model": mid}
+            tier = config_mod._guess_tier(name, values) or ""
+            if tier:
+                values["tier"] = tier
+        else:
+            values = {"base_url": base_url, "model": mid, "tier": "hosted",
+                      "json_mode": "object",
+                      "max_read_tokens": _CLOUD_READ_TOKENS}
+            try:
+                sel_ctx = int(sel.get("context_tokens")
+                              or sel.get("context_length") or 0)
+            except (TypeError, ValueError):
+                sel_ctx = 0
+            if sel_ctx <= 0:
+                meta = model_catalog.lookup_model_meta(
+                    base_url, mid, allow_fetch=False)
+                sel_ctx = int(meta.get("context_tokens") or 0)
+            if sel_ctx <= 0:
+                sel_ctx = ctx
+            if sel_ctx > 0:
+                values["context_tokens"] = sel_ctx
+            if (preset or {}).get("provider") == "gemini":
+                values["provider"] = "gemini"
+            # The provider table wins where a surface deviates from the generic
+            # hosted default (Anthropic rejects json_object and cannot cache).
+            values.update(providers.profile_overrides(base_url, mid))
         if api_key:
             values["api_key"] = api_key
         elif api_key_env:

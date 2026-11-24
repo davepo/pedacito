@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import cli, events, index as index_mod, loop, replay, security  # noqa: E402
+from pedacito import __version__, cli, events, index as index_mod, loop, replay, security  # noqa: E402
 from pedacito import trajectories  # noqa: E402
 from pedacito.agent import Agent  # noqa: E402
 from pedacito.config import Config  # noqa: E402
@@ -150,7 +150,7 @@ def test_config_knob_captures_without_a_flag(tmp_path):
     meta = data["metadata"]
     assert META_KEYS <= set(meta)
     assert meta["verify_passed"] is None
-    assert meta["harness_version"] == "0.3.1"
+    assert meta["harness_version"] == __version__
     assert meta["edit_format"] == "quote"
     assert meta["model_id"] == cfg.model
     assert meta["provider"] == "stub-provider"

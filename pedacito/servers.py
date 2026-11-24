@@ -45,6 +45,7 @@ import re
 import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -65,6 +66,15 @@ DEFAULT_EVICT_WAIT = 10.0
 
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 _LEMONADE_ENV_KEYS = ("LEMONADE_API_KEY", "LEMONADE_KEY")
+# Strata and Avalon read their key from these variables; accepting them means
+# a GUI started from the same shell can drive an already-running server
+# without copying the secret into config.toml.
+_STRATA_ENV_KEYS = ("STRATA_API_KEY", "AVALON_API_KEY")
+
+# Lifecycle runtimes with their own native endpoint. A shared URL that starts
+# as "custom"/"local" is upgraded to one of these when a later profile names it
+# explicitly, so load/unload route to the right daemon.
+_CONCRETE_KINDS = ("strata", "avalon", "lemonade", "llama-server")
 
 
 # --- small helpers ------------------------------------------------------------
@@ -152,14 +162,25 @@ def _headers_for(server, *, internal: bool = False) -> dict:
     kind = str(_mapping_get(server, "kind", "") or
                _mapping_get(server, "provider", "") or
                _mapping_get(server, "type", "")).lower()
-    key = str(_mapping_get(server, "api_key", "") or "")
+    raw_key = str(_mapping_get(server, "api_key", "") or "")
+    kr_ref = str(_mapping_get(server, "api_key_keyring", "") or "")
     env_name = str(_mapping_get(server, "api_key_env", "") or "")
+    key = ""
     if env_name:
-        key = os.environ.get(env_name, "") or key
+        key = os.environ.get(env_name, "")
+    if not key and (kr_ref or raw_key.strip().lower().startswith("keyring:")):
+        from . import secrets_store
+        key = secrets_store.resolve_api_key(
+            api_key=raw_key, api_key_env="", api_key_keyring=kr_ref)
+    if not key:
+        key = raw_key
     if kind in ("lemonade", "lemond"):
         env_names = _LEMONADE_ENV_KEYS + (
             ("LEMONADE_ADMIN_API_KEY",) if internal else ())
         for env_name in env_names:
+            key = os.environ.get(env_name, "") or key
+    elif kind in ("strata", "avalon", "local-moe", "local_moe", "localmoe"):
+        for env_name in _STRATA_ENV_KEYS:
             key = os.environ.get(env_name, "") or key
     return {"Authorization": f"Bearer {key}"} if key else {}
 
@@ -335,15 +356,17 @@ def configured_local_servers(config) -> list[dict]:
         if not base or not is_local_url(base):
             return
         key = normalize_url(base)
+        provider = provider_hint or _provider_of(name, body)
+        new_kind = _kind_for(name, provider, base)
         if key not in servers:
-            provider = provider_hint or _provider_of(name, body)
             servers[key] = {
                 "name": name or _host(base) or "local",
                 "provider": provider,
-                "kind": _kind_for(name, provider, base),
+                "kind": new_kind,
                 "base_url": base,
                 "api_key": str(_mapping_get(body, "api_key", "") or ""),
                 "api_key_env": str(_mapping_get(body, "api_key_env", "") or ""),
+                "api_key_keyring": str(_mapping_get(body, "api_key_keyring", "") or ""),
                 "load_cmd": str(_mapping_get(body, "load_cmd", "") or ""),
                 "unload_cmd": str(_mapping_get(body, "unload_cmd", "") or ""),
                 "models": [],
@@ -351,6 +374,14 @@ def configured_local_servers(config) -> list[dict]:
                 "active": False,
             }
         rec = servers[key]
+        # Several profiles may point at one URL. A later profile that names a
+        # concrete runtime upgrades a generic custom/local record, so lifecycle
+        # routing reaches the right native endpoint (Strata /v1/unload vs a
+        # bare OpenAI shim).
+        if rec.get("kind") in ("custom", "local") \
+                and new_kind in _CONCRETE_KINDS:
+            rec["kind"] = new_kind
+            rec["provider"] = provider
         model = str(_mapping_get(body, "model", "") or "")
         if model and model not in rec["models"]:
             rec["models"].append(model)
@@ -365,6 +396,9 @@ def configured_local_servers(config) -> list[dict]:
         if not rec.get("api_key_env"):
             rec["api_key_env"] = str(
                 _mapping_get(body, "api_key_env", "") or "")
+        if not rec.get("api_key_keyring"):
+            rec["api_key_keyring"] = str(
+                _mapping_get(body, "api_key_keyring", "") or "")
         if active:
             rec["active"] = True
             if not rec.get("load_cmd"):
@@ -421,6 +455,11 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         return [], [], []
     entries = []
     explicit_loaded: list[str] = []
+    # A single-model payload (`/health`, `/props`) may name its model while
+    # reporting `loaded: false` (Strata does when its idle timer unloaded it):
+    # that id belongs in the listing, never in the resident set.
+    named_ids: list[str] = []
+    named_not_loaded: set[str] = set()
     if isinstance(payload, list):
         entries = [m for m in payload if isinstance(m, dict)]
     elif isinstance(payload, dict):
@@ -443,12 +482,21 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         else:
             for key in ("model", "id", "name"):
                 if payload.get(key):
-                    explicit_loaded.append(str(payload[key]))
+                    named = str(payload[key])
+                    if payload.get("loaded") is False:
+                        named_ids.append(named)
+                        named_not_loaded.add(named)
+                    else:
+                        explicit_loaded.append(named)
                     break
     ids: list[str] = []
     loaded: list[str] = list(dict.fromkeys(explicit_loaded))
     loading: list[str] = []
-    for mid in loaded:
+    # A model the server explicitly reports as not resident. The single-model
+    # fallback below must not override that signal (Strata lists its idle
+    # model as `status: {"value": "unloaded"}` or `loaded: false`).
+    not_loaded: set[str] = set(named_not_loaded)
+    for mid in [*explicit_loaded, *named_ids]:
         if mid not in ids:
             ids.append(mid)
     for entry in entries:
@@ -464,7 +512,12 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
             if key in entry:
                 marker = bool(entry.get(key))
                 break
-        state = str(entry.get("state") or entry.get("status") or "").lower()
+        raw_status = entry.get("status")
+        if isinstance(raw_status, dict):
+            # Strata/Avalon (and llama.cpp's router) nest the marker:
+            # {"status": {"value": "loaded" | "unloaded" | "loading"}}.
+            raw_status = raw_status.get("value") or raw_status.get("state") or ""
+        state = str(entry.get("state") or raw_status or "").lower()
         if state in ("loading", "loading_in_memory", "loading_weights"):
             marker = False
             if mid not in loading:
@@ -474,6 +527,8 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
         elif marker is None and state in ("unloaded", "idle", "not_loaded",
                                           "not-loaded"):
             marker = False
+        if marker is not None and not marker:
+            not_loaded.add(mid)
         if marker:
             if mid not in loaded:
                 loaded.append(mid)
@@ -484,7 +539,8 @@ def _models_from_payload(payload, kind: str = "") -> tuple[
     if not loaded and ids and (len(ids) == 1 or kind in
                                ("llama-server", "strata", "avalon",
                                 "local-moe")):
-        loaded = [m for m in ids if m not in loading]
+        loaded = [m for m in ids
+                  if m not in loading and m not in not_loaded]
     return ids, loaded, loading
 
 
@@ -547,6 +603,7 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
     ids: list[str] = []
     loaded: list[str] = []
     loading: list[str] = []
+    auth_required = False
     kind_raw = (server.get("kind") or server.get("provider")
                 or server.get("type") or "")
     kind = (_kind_for("", str(kind_raw), base) if kind_raw else "custom")
@@ -557,7 +614,12 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
             resp = requests.get(url, headers=headers, timeout=left())
         except Exception:
             continue
-        if getattr(resp, "status_code", 0) != 200:
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status == 401:
+            # The OpenAI listing is behind an API key (Strata/Avalon): the
+            # server is still there, but the listing needs a credential.
+            auth_required = True
+        if status != 200:
             continue
         online = True
         try:
@@ -596,14 +658,41 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
             if getattr(resp, "status_code", 0) == 200:
                 online = True
                 try:
-                    got_ids, got_loaded, got_loading = _models_from_payload(
-                        resp.json(), kind)
+                    payload = resp.json()
                 except Exception:
-                    got_ids, got_loaded, got_loading = [], [], []
+                    payload = None
+                # Strata/Avalon name their service on the public /health
+                # endpoint. Upgrade the kind BEFORE parsing so the single-model
+                # fallback in _models_from_payload runs with the right runtime,
+                # and reuse this payload so /health is never requested twice.
+                if kind in ("custom", "local") and isinstance(payload, dict):
+                    service = str(payload.get("service") or "").lower()
+                    if service in ("strata", "avalon"):
+                        kind = service
+                got_ids, got_loaded, got_loading = _models_from_payload(
+                    payload, kind)
                 ids.extend(m for m in got_ids if m not in ids)
                 loaded.extend(m for m in got_loaded if m not in loaded)
                 loading.extend(m for m in got_loading if m not in loading)
                 break
+    if online and kind in ("custom", "local"):
+        # A profile created through a generic flow may not carry a provider
+        # label, yet /v1/models answered. Strata/Avalon name their service on
+        # the public /health endpoint, so upgrade the kind for the UI and
+        # lifecycle routing.
+        if left() > 0:
+            try:
+                resp = requests.get(root + "/health", headers=headers,
+                                    timeout=left())
+            except Exception:
+                resp = None
+            if getattr(resp, "status_code", 0) == 200:
+                try:
+                    service = str((resp.json() or {}).get("service") or "")
+                except Exception:
+                    service = ""
+                if service.lower() in ("strata", "avalon"):
+                    kind = service.lower()
     pinned = (_lemonade_pinned_models(root, headers, left)
               if online and kind in ("lemonade", "lemond") else [])
     out = dict(server)
@@ -619,6 +708,7 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
         "pinned_models": pinned,
         "loading_models": loading,
         "loaded": bool(loaded),
+        "auth_required": bool(auth_required),
     })
     if not online:
         out["error"] = "offline"
@@ -626,13 +716,22 @@ def _probe_server(server: dict, timeout: float = PROBE_TIMEOUT) -> dict:
 
 
 def list_server_states(config, timeout: float = PROBE_TIMEOUT) -> list[dict]:
-    """Probe every configured local server in turn.
+    """Probe every configured local server and report its live state.
 
     Each row carries its name/kind/base_url, `online`, the model ids it
     advertises, and `loaded_models` (the resident set). Hosted endpoints and
-    duplicate spellings of one server are not listed."""
-    return [_probe_server(s, timeout=timeout)
-            for s in configured_local_servers(config)]
+    duplicate spellings of one server are not listed.
+
+    With more than one server the probes run concurrently (a small thread
+    pool), so an offline or still-loading server never stalls the rest; the
+    results keep the configured order either way."""
+    configured = configured_local_servers(config)
+    if len(configured) <= 1:
+        return [_probe_server(s, timeout=timeout) for s in configured]
+    with ThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
+        # executor.map yields results in submission order, not finish order.
+        return list(pool.map(lambda s: _probe_server(s, timeout=timeout),
+                             configured))
 
 
 # --- lifecycle actions --------------------------------------------------------
@@ -782,24 +881,62 @@ def _llama_action(server: dict, action: str,
 
 def _generic_action(server: dict, action: str,
                     model: str) -> tuple[bool, str, str]:
-    """Strata/Avalon/custom: try the OpenAI-ish lifecycle endpoints first."""
+    """Strata/Avalon/custom: try the OpenAI-ish lifecycle endpoints first.
+
+    Strata/Avalon are single-model servers whose ``POST /v1/unload`` accepts
+    ``{}`` (and ``?wait=15`` to block until weights finish releasing) and
+    returns 404 if a ``model`` string does not match the server's exact
+    internal id. Try empty-body ``/v1/unload`` for those runtimes so cross-
+    server auto-evict never misfires on a profile/model spelling difference.
+
+    The alternate spelling is tried only when the server gave no answer at all
+    (404, connection failure or timeout), exactly like the Lemonade and
+    llama.cpp paths. A real answer -- notably Strata's 401 when the profile
+    has no API key -- is returned as-is instead of being flattened into "no
+    lifecycle endpoint answered", and a side-effecting load is never fired
+    twice after an error.
+    """
     root = _root(str(server.get("base_url") or ""))
     headers = _headers_for(server)
+    kind = str(server.get("kind") or server.get("provider")
+               or server.get("type") or "").lower()
+    is_strata = kind in ("strata", "avalon", "local-moe", "local_moe",
+                         "localmoe")
     candidates = []
     if action == "unload":
-        candidates = [("/v1/unload", {"model": model} if model else {}),
-                      ("/models/unload", {"model": model} if model else {})]
+        if is_strata:
+            candidates = [("/v1/unload?wait=15", {}),
+                          ("/v1/unload", {}),
+                          ("/models/unload", {"model": model} if model else {})]
+        else:
+            candidates = [("/v1/unload", {"model": model} if model else {})]
+            if model:
+                candidates.append(("/v1/unload", {}))
+            candidates.append(
+                ("/models/unload", {"model": model} if model else {}))
     else:
         candidates = [("/v1/load", {"model": model} if model else {}),
                       ("/models/load", {"model": model} if model else {})]
+    method, detail = "generic", "no lifecycle endpoint answered"
     for path, payload in candidates:
         url = root + path
-        ok, detail, _resp = _post_json(
+        ok, answer, resp = _post_json(
             url, headers, payload,
             timeout=LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT)
         if ok:
-            return True, f"POST {url}", detail
-    return False, "generic", "no lifecycle endpoint answered"
+            return True, f"POST {url}", answer
+        code = int(getattr(resp, "status_code", 0) or 0)
+        method = f"POST {url}"
+        detail = f"{code}: {answer}" if code and str(answer) else answer
+        lowered = str(detail or "").lower()
+        if "401" in lowered or "authentication" in lowered \
+                or "api key" in lowered:
+            detail = (f"{detail}; this server requires an API key -- set "
+                      "api_key (or api_key_env) in the profile")
+            break
+        if not _retry_next_spelling(resp, answer):
+            break
+    return False, method, detail
 
 
 def _server_action(server, action: str, model: str, config) -> dict:
@@ -866,16 +1003,55 @@ def _server_action(server, action: str, model: str, config) -> dict:
     }
 
 
-def load_server_model(server, model: str = "", config=None) -> dict:
+def _with_kind(server, kind: str, config):
+    """Return `server` with `kind` applied to a copy, resolving a name or
+    profile string through the config first (exactly like `pin_server_model`).
+    An empty `kind` returns `server` unchanged and never resolves it."""
+    if not kind:
+        return server
+    if isinstance(server, dict) and server.get("base_url"):
+        return {**server, "kind": kind}
+    resolved = _resolve_server(server, config)
+    if resolved:
+        return {**resolved, "kind": kind}
+    return server
+
+
+def _target_url(server, config) -> str:
+    """The normalized base_url of `server` (resolving a name/profile string),
+    or "" when it cannot be resolved."""
+    if isinstance(server, dict) and server.get("base_url"):
+        return normalize_url(str(server.get("base_url") or ""))
+    resolved = _resolve_server(server, config)
+    if resolved:
+        return normalize_url(str(resolved.get("base_url") or ""))
+    return ""
+
+
+def load_server_model(server, model: str = "", config=None, *,
+                      evict_others: bool = False, kind: str = "") -> dict:
     """Load `model` on one local server (or the server's configured model).
 
     Lemonade: POST /v1/load {"model_name": model}. llama.cpp: POST
     /models/load {"model": model}. Strata/Avalon/custom: /v1/load then
     /models/load, then the profile's optional `load_cmd`.
 
+    `kind` overrides the configured kind when a probe already identified the
+    server (the GUI's Servers panel does this). `evict_others` runs the
+    auto-evict handshake against every OTHER local server first -- respecting
+    Lemonade's pinned models and never touching the target itself -- so the
+    target's weights can claim the VRAM/RAM.
+
     After a successful load, the optional speed probe is scheduled once per
     (server, model) on a daemon thread unless `profile_probe_on_load` is
     false. It never blocks this call."""
+    if kind:
+        server = _with_kind(server, kind, config)
+    if evict_others and config is not None \
+            and bool(_mapping_get(config, "auto_evict_servers", True)):
+        url = _target_url(server, config)
+        if url:
+            evict_other_local_servers(url, config)
     result = _server_action(server, "load", model, config)
     if (result.get("ok") and config is not None
             and bool(getattr(config, "profile_probe_on_load", True))):
@@ -889,13 +1065,19 @@ def load_server_model(server, model: str = "", config=None) -> dict:
     return result
 
 
-def unload_server_model(server, model: str = "", config=None) -> dict:
+def unload_server_model(server, model: str = "", config=None, *,
+                        kind: str = "") -> dict:
     """Unload one model (or every resident model) from a local server.
 
     Lemonade: POST /v1/unload {"model_name": model}; without a model it asks
     the server to unload its resident set. llama.cpp: POST /models/unload
     {"model": model}. Strata/Avalon/custom: /v1/unload then /models/unload,
-    then the optional `unload_cmd`. Returns a JSON-safe result dict."""
+    then the optional `unload_cmd`. Returns a JSON-safe result dict.
+
+    `kind` overrides the configured kind when a probe already identified the
+    server; leave it empty to use the profile's own classification."""
+    if kind:
+        server = _with_kind(server, kind, config)
     if not model:
         # Resolve the resident set from a state dict/configured server so
         # Lemonade gets an explicit model_name per model where possible.
@@ -977,6 +1159,23 @@ def _memory_used(mem: dict) -> float:
                  + float(mem.get("ram", {}).get("used_gb", 0)), 2)
 
 
+def _evicted_servers_idle(states: list[dict], config) -> bool:
+    """True when every evicted server now reports no resident model -- a
+    clean-unload confirmation that lets the handshake stop polling even when
+    the memory counters have not dropped (Strata/Avalon keep a DDR5 working
+    set resident, so their unload may free no observable VRAM/RAM)."""
+    if not states:
+        return False
+    for state in states:
+        try:
+            probed = _probe_server(state)
+        except Exception:
+            return False
+        if probed.get("loaded_models"):
+            return False
+    return True
+
+
 def evict_other_local_servers(target_provider, config,
                               wait_seconds: float = DEFAULT_EVICT_WAIT,
                               poll: bool = True) -> dict:
@@ -1005,6 +1204,7 @@ def evict_other_local_servers(target_provider, config,
     target_url = normalize_url(target_state.get("base_url", "")) \
         if target_state else normalize_url(target)
     evicted: list[dict] = []
+    evicted_states: list[dict] = []
     skipped: list[str] = []
     for state in states:
         if target_url and normalize_url(state.get("base_url", "")) == target_url:
@@ -1029,6 +1229,7 @@ def evict_other_local_servers(target_provider, config,
                     evicted.append(unload_server_model(state, model_id, config))
             continue
         evicted.append(unload_server_model(state, "", config))
+        evicted_states.append(state)
     if not evicted or not poll:
         return {"ok": all(r.get("ok") for r in evicted),
                 "evicted": evicted, "skipped": skipped, "waited_s": 0.0,
@@ -1038,6 +1239,7 @@ def evict_other_local_servers(target_provider, config,
     started = time.monotonic()
     deadline = started + max(0.0, float(wait_seconds or 0))
     dropped = False
+    confirmed_idle = False
     # No GPU sysfs means there is no VRAM signal to observe; the unload
     # acknowledgement is the only reliable signal available. (RAM alone
     # fluctuates more than a model unload and would stall the run.)
@@ -1052,11 +1254,20 @@ def evict_other_local_servers(target_provider, config,
             dropped = True
             before = now
             break
+        # Strata/Avalon keep a DDR5-heavy working set resident even after the
+        # VRAM weights are gone, so the combined counter may never drop. A
+        # clean unload is just as well confirmed by the evicted server
+        # reporting no resident model; stop early instead of stalling the run
+        # for the full wait_seconds.
+        if evicted_states and _evicted_servers_idle(evicted_states, config):
+            confirmed_idle = True
+            before = now
+            break
     return {"ok": all(r.get("ok") for r in evicted),
             "evicted": evicted, "skipped": skipped,
             "waited_s": round(time.monotonic() - started, 2),
-            "memory_dropped": dropped, "target": target,
-            "memory": before}
+            "memory_dropped": dropped, "confirmed_idle": confirmed_idle,
+            "target": target, "memory": before}
 
 
 def server_summary(config, timeout: float = PROBE_TIMEOUT,

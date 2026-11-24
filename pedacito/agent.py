@@ -45,6 +45,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+from . import config as config_mod
 from . import diagnostics as diagnostics_mod
 from . import events as events_mod
 from . import fileio
@@ -1559,9 +1560,11 @@ class Agent:
         A no-op when the setting is None (the global temperature applies),
         when the client cannot override (replay), or when an outer override is
         already active (best_of's higher temperature for its extra candidates
-        must not be reset to the answer value). A creative/design answer runs
-        warm (>= 0.6) on local servers; hosted endpoints tune their own
-        sampling and receive no temperature key at all (see llm.py)."""
+        must not be reset to the answer value). A creative/design answer sways
+        RELATIVE to its calibrated baseline (see
+        config.effective_creative_temperature) on local servers; hosted
+        endpoints tune their own sampling and receive no temperature key at
+        all (see llm.py)."""
         client = self.client if client is None else client
         cfg = getattr(client, "cfg", None) or self.cfg
         value = getattr(cfg, setting, None)
@@ -1570,7 +1573,7 @@ class Agent:
                 and _is_local_server(cfg):
             base = float(value) if value is not None \
                 else float(getattr(cfg, "temperature", 0.3))
-            value = max(base, 0.6)
+            value = config_mod.effective_creative_temperature(cfg, base)
         if value is None or not hasattr(client, "temperature") \
                 or getattr(client, "_temp_override", None) is not None:
             return contextlib.nullcontext()
@@ -5232,6 +5235,23 @@ class Agent:
             if dropped:
                 notices.append(f"{dropped} older source item(s) trimmed")
             user = assemble(notes_prefix, repo_map, src)
+        effective_reply = self._answer_max_tokens(max_tokens)
+        if est(user) > limit > 0 and not hosted \
+                and getattr(self, "_creative_task", False):
+            # 4. creative mode boosts reply_room to >= 8192; on moderate-window
+            # local models (e.g. 13k context), reclaim headroom from that boost
+            # down to a 2048-token floor before failing over-budget.
+            min_reply = min(
+                reply_room, max(2048, int(max_tokens or self.cfg.max_tokens_answer)))
+            needed = est(user) - limit
+            if reply_room - needed >= min_reply:
+                new_room = max(min_reply, reply_room - needed - 64)
+                notices.append(
+                    f"creative reply budget lowered {reply_room} -> {new_room}")
+                reply_room = new_room
+                effective_reply = min(effective_reply, new_room)
+                limit = (self.cfg.context_tokens - reply_room
+                         - self.cfg.reserve_tokens // 2)
         if est(user) > limit > 0 and not hosted:
             over = est(user) - limit
             raise LLMError(
@@ -5257,7 +5277,7 @@ class Agent:
         user_content = imagegen_mod.make_multimodal_content(user, images)
         return self._chat_needs(
             lambda m: self.client.chat(
-                m, max_tokens=self._answer_max_tokens(max_tokens),
+                m, max_tokens=effective_reply,
                 stream=stream),
             [{"role": "system", "content": brief},
              {"role": "user", "content": user_content}])

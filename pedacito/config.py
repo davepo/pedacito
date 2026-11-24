@@ -130,6 +130,10 @@ class Config:
     # Storing the variable name instead of the secret keeps the key out of the
     # config file; `llm.py` reads it at request time.
     api_key_env: str = ""
+    # Optional OS keychain reference `<service>/<account>` (or `<account>`,
+    # defaulting the service to `pedacito`), resolved lazily via the optional
+    # `pedacito[keyring]` package. Alternative to `api_key = "keyring:..."`.
+    api_key_keyring: str = ""
     # Runtime/provider label for this server: "lemonade", "llama-server",
     # "strata", "avalon", "local-moe", "lmstudio", "ollama", ... It selects
     # the server-control endpoints in servers.py and the execution profile
@@ -141,6 +145,16 @@ class Config:
     # surface that supports prompt caching, streaming usage, extended thinking,
     # tools and images. false falls back to the OpenAI-compatible shim.
     anthropic_native: bool = True
+    # Route Google Gemini (generativelanguage.googleapis.com without /openai,
+    # or provider = "gemini") through the native /v1beta generateContent
+    # transport (thought parts, inline images, function declarations, thinking
+    # budgets, and cachedContent). false falls back to the OpenAI-compatible shim.
+    gemini_native: bool = True
+    # Opt-in OpenAI Responses API (/v1/responses) transport for o3/o4/GPT-5
+    # reasoning models, preserving encrypted reasoning state across multi-turn
+    # tool loops, prompt_cache_key, and reasoning/cached token accounting. Also
+    # active when provider = "openai-responses".
+    openai_responses: bool = False
     # Optional commands that start/stop a single-model local daemon when the
     # server has no HTTP load/unload endpoint. Run with shlex.split and
     # shell=False; {model} is replaced by the model id. Use them only for a
@@ -192,6 +206,15 @@ class Config:
     # trained on tool calling). `pedacito calibrate` measures both on your model
     # and the card picks; set it here to force one.
     tool_mode: str = "grammar"
+    # Which execution engine runs a task:
+    #   "two_phase" -- the classic gather-then-answer ladder. The default,
+    #     and the right engine for tiny/small/medium local models.
+    #   "interleaved" -- the agentic loop: one conversation where the model
+    #     reads, edits, runs tests and fixes until the task is done.
+    #   "auto" -- interleaved for hosted APIs, local-MoE servers and
+    #     calibrated large local models whose card chose native tool calls;
+    #     two_phase for everything else.
+    execution_mode: str = "two_phase"
     # Engine-level constrained JSON. On (the default), every schema
     # request -- the gather tool loop and plan calls -- is sent as
     # response_format {"type": "json_schema", "strict": true} so OpenAI-compatible
@@ -464,6 +487,15 @@ class Config:
     # Optional executable allowlist for `run`, e.g. ["pytest", "python"];
     # empty = any executable once allow_shell is on.
     shell_allowlist: tuple[str, ...] = ()
+    # Per-project shell allow-rules: a table mapping absolute project roots
+    # to pattern lists, e.g. { "/home/me/proj" = ["pytest *", "cargo test *"] }.
+    # A matching `run` command skips the permission prompt in that project
+    # only. Rules never cover package installs, shells or commands carrying
+    # chaining metacharacters (; && || | backticks $()). The GUI/TUI "allow
+    # in this project" answer writes them here. Trust-gated like
+    # shell_allowlist: a project config's rules apply only after `pedacito
+    # trust`.
+    shell_allowlist_by_project: dict = field(default_factory=dict)
     # Cap on command output fed back to the model, in characters.
     max_shell_output_chars: int = 8000
     # Let the gather loop capture the screen as text (pixel statistics, OCR,
@@ -577,6 +609,14 @@ class Config:
     # false (with creative_mode false) to keep the surgical edit discipline
     # for every task (/creative off).
     creative_auto: bool = True
+    # Extra temperature added to the answer baseline in Creative/design mode:
+    # the sway is RELATIVE to the profile's calibrated baseline, not a static
+    # floor. None = automatic by tier (+0.20 for tiny/small, +0.30 otherwise);
+    # an explicit float in [0.0, 0.8] overrides it. The sway is capped at 0.95
+    # (1.0 for an explicit delta) and never lowers the answer below its
+    # baseline, so a calibrated 0.6 Gemma becomes 0.9 while a 0.2 tiny model
+    # only nudges to 0.4.
+    creative_temperature_delta: float | None = None
     # Per-message OUTPUT ceiling the provider honours (hosted APIs cap one
     # reply far below their context window, e.g. ~8k tokens). When >0 and the
     # run targets a hosted API, auto_fit clamps reply budgets to it. Explicit
@@ -853,6 +893,11 @@ class Config:
     # Cache-write tokens (explicit prompt caching) are billed separately from
     # cache reads on Anthropic/DashScope-style providers.
     price_cache_write_per_mtok: float = 0.0
+    # Quietly refresh the local models.dev provider catalog cache
+    # (`model_catalog.json`, 24 h TTL) when probing or refreshing hosted
+    # providers so context windows and pricing stay current. Never blocks
+    # startup and never runs for local-only installs; false = offline only.
+    auto_refresh_model_catalog: bool = True
 
     # --- Context management ---------------------------------------------------
     # Prompt wording density: "tiny" | "small" | "full"; "" = chosen from the
@@ -1099,7 +1144,8 @@ PROFILE_SECTION = "profiles"
 # settings that are lists of strings (stored as tuples). `mcp_servers` is a
 # table when it uses the named [mcp_servers.<name>] format and a tuple when it
 # uses the legacy list-of-command-strings format, so it is coerced specially.
-_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers")
+_TABLE_FIELDS = ("sampler", "roles", "hooks", "lsp_servers", "mcp_servers",
+                 "shell_allowlist_by_project")
 _TUPLE_FIELDS = ("extra_extensions", "shell_allowlist",
                  "env_passthrough", "protected_paths", "shell_deny",
                  "browser_eval_hosts", "fetch_allowed_hosts",
@@ -1113,6 +1159,7 @@ _OPTIONAL_TYPES = {
     "temperature_answer": float,
     "temperature_repair": float,
     "hosted_temperature": float,
+    "creative_temperature_delta": float,
 }
 _NONE_WORDS = ("", "auto", "none", "default", "card")
 
@@ -1183,6 +1230,7 @@ _ENUM_FIELDS = {
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
     "reasoning_effort": ("default", "low", "medium", "high"),
+    "execution_mode": ("two_phase", "interleaved", "auto"),
     "update_channel": ("stable", "any"),
     "language": ("en", "es"),
     "llm_reply_language": ("match_ui", "auto", "en", "es"),
@@ -1416,6 +1464,21 @@ def _coerce(name: str, value, path: Path | None = None):
             if slug and slug not in out:
                 out.append(slug)
         return tuple(out)
+    if name == "shell_allowlist_by_project":
+        # { project root = [pattern, ...] }; keys stay as written (the
+        # consumer normalises them), values become tuples of strings.
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"{where}{name} must be a table mapping project roots to "
+                'allow-rule lists, e.g. { "/path/to/proj" = ["pytest *"] }')
+        out: dict = {}
+        for k, v in value.items():
+            if not isinstance(v, (list, tuple)):
+                raise ConfigError(
+                    f"{where}{name}[{k!r}] must be a list of patterns, "
+                    'e.g. ["pytest *", "cargo test *"]')
+            out[str(k)] = tuple(str(p) for p in v)
+        return out
     if name in _TUPLE_FIELDS:
         if not isinstance(value, (list, tuple)):
             example = ('["pytest", "python"]' if name == "shell_allowlist"
@@ -1504,11 +1567,12 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
-               "base_url", "api_key", "api_key_env",
+               "base_url", "api_key", "api_key_env", "api_key_keyring",
                "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
-               "shell_allowlist", "browser_eval_hosts",
+               "shell_allowlist", "shell_allowlist_by_project",
+               "browser_eval_hosts",
                "allow_fetch", "fetch_allowed_hosts",
                "enable_web", "wrap_observations", "redact_secrets",
                "security_outbound_mode", "protected_paths", "auto_plan_file",
@@ -1551,6 +1615,64 @@ def trust_project(config_path: Path) -> Path:
     tp.parent.mkdir(parents=True, exist_ok=True)
     tp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     return tp
+
+
+def add_project_shell_pattern(project_root, pattern: str) -> bool:
+    """Persist one scoped allow-rule into the user config's
+    `shell_allowlist_by_project` map, comment-preserving and with a `.bak`.
+    Returns True when the file changed; False when the rule was already
+    there or the config could not be read/validated/written (the caller's
+    live Config update still applies for this session). The user config is
+    always trusted, so no `pedacito trust` step is involved."""
+    from . import config_editor, fileio, security
+    root = security.normalize_project_root(project_root)
+    pattern = str(pattern or "").strip()
+    if not root or not pattern:
+        return False
+    path = Path(USER_CONFIG)
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return False
+    try:
+        data = tomllib.loads(text) if text.strip() else {}
+    except ValueError:
+        return False
+    existing: dict = {}
+    for scope in (data, data.get("universal") or {}):
+        if isinstance(scope, dict) and isinstance(
+                scope.get("shell_allowlist_by_project"), dict):
+            existing = scope["shell_allowlist_by_project"]
+            break
+    merged: dict = {}
+    for k, v in existing.items():
+        nk = security.normalize_project_root(k)
+        if not nk:
+            continue
+        pats = merged.setdefault(nk, [])
+        for p in (v if isinstance(v, (list, tuple)) else ()):
+            p = str(p).strip()
+            if p and p not in pats:
+                pats.append(p)
+    pats = merged.setdefault(root, [])
+    if pattern in pats:
+        return False
+    pats.append(pattern)
+    new_text = config_editor.set_values(
+        text, {"shell_allowlist_by_project": merged})
+    try:
+        config_editor.validate_text(new_text)
+    except ConfigError:
+        return False
+    try:
+        if path.exists():
+            fileio.write_bytes(path.with_name(path.name + ".bak"),
+                               path.read_bytes())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fileio.write_bytes(path, new_text.encode("utf-8"))
+    except OSError:
+        return False
+    return True
 
 
 _warned_untrusted: set[str] = set()
@@ -2078,11 +2200,24 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # Only the configured/loaded length is safe to fit to, not the
         # model's advertised maximum (max_context_length).
         detected = info.get("context_length")
+        host = _hostname(cfg.base_url)
+        is_loopback = host in _LOCAL_HOSTS
+        is_lan = (not is_loopback) and _endpoint_is_local(cfg.base_url)
+        vram_src = cfg.sources.get("vram_gb", "default")
+        vram_on_profile = (
+            ("profile " in vram_src and "explicit" in vram_src)
+            or vram_src.startswith(("--", "env ")))
+        # When talking to a LAN server (e.g. an 8 GB laptop targeting a 24 GB
+        # homelab box), `[universal] vram_gb` describes the CLIENT, not the
+        # server. Unless the profile itself pinned `vram_gb`, trust the LAN
+        # server's own reported context window instead of clamping with the
+        # client's VRAM.
+        use_vram_estimate = not (is_lan and not vram_on_profile)
         hw_ctx = (hardware_context_tokens(
                       cfg.vram_gb, model_bytes,
                       cfg.k_cache_quant, cfg.v_cache_quant,
                       int(cfg.kv_cache_bytes_per_token or 0))
-                  if model_bytes > 0 else 0)
+                  if (model_bytes > 0 and use_vram_estimate) else 0)
         user_ctx = _is_explicit_limit(origin)
         server_ctx = None
         if detected and cfg.auto_detect_context and not user_ctx:
@@ -2098,7 +2233,7 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         # the user supplied a length: it is a heuristic that can be off 2-4x
         # (GQA, cache quantization), so a configured length below it only
         # produces a speed warning.
-        if model_bytes > 0:
+        if model_bytes > 0 and use_vram_estimate:
             size_gb = model_bytes / _GIB
             mem = f"{cfg.vram_gb} GB VRAM"
             kv_hint = ""
@@ -2110,6 +2245,26 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
                 kv_hint = (f"; KV cache K={cfg.k_cache_quant or 'f16'}, "
                            f"V={cfg.v_cache_quant or 'f16'}")
             if hw_ctx <= 0:
+                if is_loopback and not vram_on_profile:
+                    try:
+                        from . import servers as servers_mod
+                        hw_mem = servers_mod.get_hardware_memory()
+                        cards = (hw_mem.get("vram") or {}).get("cards") or []
+                        gpu_gb = max(
+                            (float(c.get("total_gb") or 0) for c in cards),
+                            default=float((hw_mem.get("vram") or {}).get(
+                                "total_gb") or 0))
+                        gpu_whole = int(round(gpu_gb))
+                        if gpu_whole > int(cfg.vram_gb or 0):
+                            print(
+                                f"[config warning] vram_gb is {cfg.vram_gb}, "
+                                f"but this machine's GPU reports {gpu_whole} "
+                                f"GB VRAM -- set vram_gb = {gpu_whole} in "
+                                "config.toml so auto-fit does not under-size "
+                                "context and reply budgets.",
+                                file=sys.stderr)
+                    except Exception:
+                        pass
                 # No VRAM headroom: the fallback window is a guess, not a
                 # measurement. When the server reports a real window, clamp
                 # to it (BUG-209) -- deriving 200k-char source budgets from a
@@ -2768,6 +2923,59 @@ detect_local_moe = is_local_moe
 local_moe = is_local_moe
 
 
+def resolve_execution_mode(cfg) -> str:
+    """The execution engine a config actually runs: "two_phase" or
+    "interleaved". Explicit modes pass through unchanged; "auto" picks
+    interleaved for hosted APIs, local-MoE servers and calibrated large
+    local models whose card chose native tool calls, and two_phase for
+    tiny/small/medium local models and anything uncalibrated or
+    unclassifiable (the safe default)."""
+    mode = str(getattr(cfg, "execution_mode", "two_phase")
+               or "two_phase").strip().lower()
+    if mode in ("two_phase", "interleaved"):
+        return mode
+    if mode != "auto":
+        return "two_phase"
+    try:
+        if is_hosted(cfg) or is_local_moe(cfg):
+            return "interleaved"
+    except Exception:
+        return "two_phase"
+    tier = str(getattr(cfg, "active_tier", "") or "")
+    if not tier:
+        name = str(getattr(cfg, "active_profile", "") or "")
+        profiles = getattr(cfg, "profiles", None) or {}
+        body = dict(profiles.get(name) or {}) if isinstance(profiles, dict) else {}
+        body.setdefault("model", getattr(cfg, "model", "") or "")
+        body.setdefault("base_url", getattr(cfg, "base_url", "") or "")
+        body.setdefault("provider", getattr(cfg, "provider", "") or "")
+        tier = _guess_tier(name, body) or ""
+    if tier != "large":
+        return "two_phase"
+    # A large local model only interleaves when calibration says its native
+    # tool-call channel works; an uncalibrated one stays on two_phase.
+    card = getattr(cfg, "_card", None)
+    if not isinstance(card, dict):
+        try:
+            from . import modelcard
+            card = modelcard.load(cfg)
+        except Exception:
+            card = None
+    if not isinstance(card, dict) or card.get("_needs_recalibrate"):
+        return "two_phase"
+    choices = card.get("choices") or {}
+    if choices.get("tool_mode") != "native":
+        return "two_phase"
+    measured = card.get("measured") or {}
+    native = measured.get("tool_choice_native")
+    try:
+        if native is not None and float(native) < 0.85:
+            return "two_phase"
+    except (TypeError, ValueError):
+        return "two_phase"
+    return "interleaved"
+
+
 def local_moe_output_budget(complex_plan: bool = False) -> int:
     """The default output budget for a local-MoE reply: 8192 tokens so a
     reasoning block is never cut mid-thought, 16384 for a complex/auto plan."""
@@ -2835,6 +3043,35 @@ def apply_local_moe_defaults(cfg) -> bool:
     return True
 
 
+def effective_tier(cfg) -> str:
+    """The tier a run actually uses: the active profile's preset tier (or a
+    top-level `tier`), falling back to the raw `tier` field. Empty when none."""
+    return str(getattr(cfg, "active_tier", "") or getattr(cfg, "tier", "") or "")
+
+
+def effective_creative_temperature(cfg, base_temp: float) -> float:
+    """The answer temperature for a Creative/design task on a LOCAL server.
+
+    Sways RELATIVE to the profile's calibrated baseline (`base_temp`) instead
+    of a static 0.6 floor: a calibrated 0.6 Gemma becomes 0.9, while a 0.2
+    tiny model only nudges to 0.4. The delta is `creative_temperature_delta`
+    when set, else automatic by tier (+0.20 for tiny/small, +0.30 otherwise).
+    The sway is capped at 0.95 (1.0 for an explicit delta) and never lowers
+    the answer below its baseline."""
+    base = float(base_temp)
+    explicit = getattr(cfg, "creative_temperature_delta", None) \
+        if cfg is not None else None
+    if explicit is not None:
+        delta = float(explicit)
+    else:
+        delta = 0.2 if effective_tier(cfg) in ("tiny", "small") else 0.3
+    delta = min(max(delta, 0.0), 0.8)
+    value = round(base + delta, 2)
+    cap = 1.0 if explicit is not None else 0.95
+    value = min(value, cap, 1.0)
+    return max(value, base)
+
+
 def _apply_preset(name: str, body: dict, origin: str) -> tuple[dict, str]:
     """Return (settings, tier) for a profile, with its tier preset underneath.
 
@@ -2873,7 +3110,11 @@ def _toml_literal(value) -> str:
     if isinstance(value, (tuple, list)):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{k} = {_toml_literal(v)}"
+        def _key(k) -> str:
+            k = str(k)
+            # TOML bare keys are [A-Za-z0-9_-]+; project roots need quoting.
+            return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else json.dumps(k)
+        return "{" + ", ".join(f"{_key(k)} = {_toml_literal(v)}"
                                for k, v in value.items()) + "}"
     return json.dumps(str(value))
 
@@ -3156,7 +3397,10 @@ json_mode = "schema"
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
 # tool_mode = "grammar"     # "native" = the model's tool-call channel
-temperature = 0.2
+# execution_mode = "two_phase"  # "interleaved" = agentic read/edit/test loop;
+#                               # "auto" picks by model class: hosted, local-MoE
+#                               # and calibrated large -> interleaved, else two_phase
+# temperature = 0.2
 # temperature_answer = 0.3  # answer phase; 0 = greedy, unset = temperature
 # Hosted APIs (non-local base_url) get NO sampling keys by default -- the
 # provider applies the defaults it tuned for the model. Opt back in with
@@ -3224,6 +3468,11 @@ check_for_updates = true
 # update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
 # includes them (PEDACITO_UPDATE_CHANNEL overrides).
 update_channel = "stable"
+# Hosted native transports and provider catalog sync:
+# gemini_native = true
+# openai_responses = false
+# auto_refresh_model_catalog = true
+# api_key_keyring = ""          # e.g. "pedacito/openai" (requires pedacito[keyring])
 # language: interface language, "en" or "es". Menus, messages and the GUI/TUI
 # chrome localise from pedacito/locales/<code>.json; the CLI flag, PEDACITO_LANG
 # (alias PEDACITO_LANGUAGE) and this key feed i18n.detect_lang.
@@ -3285,6 +3534,7 @@ serve_wait = 3.0
 shell_timeout = 120
 shell_idle_seconds = 10
 shell_allowlist = []
+shell_allowlist_by_project = {}
 max_shell_output_chars = 8000
 # Gather-phase `run_test`: scoped pytest runs for live tracebacks. Off = the
 # GUI permission broker is asked per call (category test_execution).

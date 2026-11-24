@@ -1,6 +1,6 @@
 [project]
 name = "pedacito"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local-first AI coding harness and multi-model specialist orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"   # tomllib
@@ -49,8 +49,11 @@ vision = ["Pillow>=10"]
 # Headless browser automation for the opt-in `browser` action. After
 # installing, run `python -m playwright install chromium` for the browser.
 browser = ["playwright>=1.40"]
-# Every optional feature in one step: vision + browser.
-full = ["Pillow>=10", "playwright>=1.40"]
+# Optional OS keychain support for `api_key = "keyring:<service>/<account>"`
+# and `api_key_keyring`.
+keyring = ["keyring>=25"]
+# Every optional feature in one step: vision + browser + keyring.
+full = ["Pillow>=10", "playwright>=1.40", "keyring>=25"]
 
 [tool.pytest.ini_options]
 markers = ["network: tests that spawn the fake LLM server (fast, local)"]

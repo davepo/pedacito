@@ -1705,13 +1705,18 @@ def _profile_availability(config, states) -> dict:
     return out
 
 
-def _server_payload(config, memory=None) -> dict:
+def _server_payload(config, memory=None, fresh_memory=False) -> dict:
     from .. import profiler
     from .. import servers
     # snapshot() is a superset of get_hardware_memory(): same RAM/VRAM shape,
     # plus nvidia-smi / vm_stat / winapi numbers and a source per number.
     # That is what fills the NVIDIA and macOS/Windows live telemetry bar.
-    snap = memory if memory is not None else profiler.snapshot()
+    if fresh_memory:
+        # Post-action telemetry (load/unload/pin): the burst memo may still
+        # hold the pre-action reading, so drop it and measure again.
+        profiler.clear_snapshot_cache()
+    snap = (memory if memory is not None
+            else profiler.snapshot(use_cache=not fresh_memory))
     out = servers.server_summary(config, memory=snap)
     out["memory"] = snap
     out["hardware"] = snap
@@ -1741,6 +1746,21 @@ def _servers_get(q, body=None):
                      "servers": []}
 
 
+@get("/api/hardware")
+def _hardware_get(q, body=None):
+    """Live RAM/VRAM only: a fresh profiler snapshot, no server probes.
+
+    The topbar chip polls this every few seconds, so it must never contact a
+    model server -- a sleeping or loading one would stall the numbers behind
+    sequential HTTP probes. `use_cache=False` bypasses the snapshot TTL memo
+    so each answer reflects the memory right now."""
+    from .. import profiler, servers
+    snap = profiler.snapshot(use_cache=False)
+    return 200, {"ok": True, "memory": snap, "hardware": snap,
+                 "vram": snap["vram"], "ram": snap["ram"],
+                 "badge": servers.memory_badge(snap)}
+
+
 def _server_target(body):
     return (body.get("server") or body.get("name")
             or body.get("profile") or body.get("base_url") or "")
@@ -1754,8 +1774,11 @@ def _servers_load(q, body):
     config = _servers_config()
     target = _server_target(body)
     model = str(body.get("model") or "").strip()
-    result = servers.load_server_model(target, model, config)
-    payload = _server_payload(config)
+    evict_others = bool(body.get("evict_others", True))
+    kind = str(body.get("kind") or "").strip()
+    result = servers.load_server_model(
+        target, model, config, evict_others=evict_others, kind=kind)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     return (200 if result.get("ok") else 502), payload
 
@@ -1768,8 +1791,9 @@ def _servers_unload(q, body):
     config = _servers_config()
     target = _server_target(body)
     model = str(body.get("model") or "").strip()
+    kind = str(body.get("kind") or "").strip()
     if target:
-        result = servers.unload_server_model(target, model, config)
+        result = servers.unload_server_model(target, model, config, kind=kind)
         results = [result]
     else:
         results = servers.unload_all_local_servers(config)
@@ -1777,7 +1801,7 @@ def _servers_unload(q, body):
                   "action": "unload", "server": "all",
                   "detail": f"{sum(1 for r in results if r.get('ok'))} of "
                             f"{len(results)} server(s) acknowledged"}
-    payload = _server_payload(config)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     payload["results"] = results
     return (200 if result.get("ok") or not results else 502), payload
@@ -1793,7 +1817,7 @@ def _servers_pin(q, body):
     pinned = bool(body.get("pinned", True))
     kind = str(body.get("kind") or "").strip()
     result = servers.pin_server_model(target, model, pinned, config, kind=kind)
-    payload = _server_payload(config)
+    payload = _server_payload(config, fresh_memory=True)
     payload.update(result)
     return (200 if result.get("ok") else 502), payload
 
@@ -2243,10 +2267,12 @@ def _answer(q, body):
 @post("/api/permission/decide")
 def _permission_decide(q, body):
     """Answer a live permission request: decision is one of allow_once,
-    allow_run, allow_always, deny. Unblocks the parked worker thread."""
+    allow_run, allow_always, allow_project, deny. Unblocks the parked worker
+    thread."""
     pid = str(body.get("id") or "")
     decision = str(body.get("decision") or "")
-    if decision not in ("allow_once", "allow_run", "allow_always", "deny"):
+    if decision not in ("allow_once", "allow_run", "allow_always",
+                        "allow_project", "deny"):
         return 400, {"ok": False, "detail": f"unknown decision {decision!r}"}
     ok, detail = STATE.decide_permission(pid, decision)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
@@ -2259,9 +2285,22 @@ def _decide(q, body):
     except (TypeError, ValueError):
         return 400, {"ok": False, "detail": "id must be an integer."}
     files = body.get("files")
+    raw_hunks = body.get("accepted_hunks")
+    hunks = None
+    if isinstance(raw_hunks, dict):
+        hunks = {}
+        for rel, ids in raw_hunks.items():
+            if not isinstance(ids, list) or any(
+                    not isinstance(i, int) or isinstance(i, bool)
+                    for i in ids):
+                return 400, {"ok": False, "detail":
+                             "accepted_hunks must map file paths to lists "
+                             "of hunk indices."}
+            hunks[str(rel)] = ids
     ok, detail = STATE.decide_review(
         rid, str(body.get("action", "")),
-        list(files) if isinstance(files, list) else None)
+        list(files) if isinstance(files, list) else None,
+        accepted_hunks=hunks)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
@@ -2591,7 +2630,12 @@ def _models(q, body):
 @post("/api/settings/discover")
 def _discover(q, body):
     from ..discovery import discover_servers
-    found = discover_servers(timeout=1.5)
+    flat, profiles = settings_api._user_scan_config()
+    auth = settings_api._endpoint_auth(flat, profiles)
+    found = discover_servers(
+        timeout=1.5,
+        profile_urls=settings_api._scan_profile_urls(flat, profiles),
+        auth=auth)
     return 200, {"servers": [{"label": a, "base_url": b, "models": c}
                              for a, b, c in found]}
 
@@ -2725,6 +2769,13 @@ def _provider_import(q, body):
         return 200, {"ok": True, **settings_api.import_hosted_models(body or {})}
     except ConfigError as e:
         return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/providers/refresh")
+def _provider_refresh(q, body):
+    """Force-refresh the cached models.dev provider catalog (model_catalog.json)."""
+    res = settings_api.refresh_provider_catalog(body or {})
+    return (200 if res.get("ok") else 502), res
 
 
 # --- built-in model benchmarks -------------------------------------------------

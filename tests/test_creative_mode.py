@@ -269,6 +269,53 @@ def test_creative_warmth_is_local_only(tmp_path):
     assert [t for s, t in client.log if s == "answer"] == [0.3]  # ... no warmth
 
 
+# ============================================ D2: relative creative sway
+# Creative Mode sways RELATIVE to the calibrated baseline instead of a static
+# 0.6 floor: a calibrated 0.6 Gemma becomes 0.9, a default 0.3 profile becomes
+# 0.6, and a tiny/small tier sways gently (+0.20) instead of +0.30.
+
+def test_effective_creative_temperature_sways_relative():
+    from pedacito import config as config_mod
+    cfg = Config()
+    # no tier -> +0.30
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.6
+    # calibrated Gemma 4 baseline (0.6) -> 0.9, no longer stuck at 0.6
+    assert config_mod.effective_creative_temperature(cfg, 0.6) == 0.9
+    # tiny/small tier -> +0.20
+    cfg.tier = "small"
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.5
+    # explicit delta overrides the automatic tier delta
+    cfg.tier = ""
+    cfg.creative_temperature_delta = 0.15
+    assert config_mod.effective_creative_temperature(cfg, 0.3) == 0.45
+    # an explicit delta may push past the 0.95 auto cap, up to 1.0
+    cfg.creative_temperature_delta = 0.3
+    assert config_mod.effective_creative_temperature(cfg, 0.8) == 1.0
+    # the sway never lowers the answer below its baseline
+    cfg.creative_temperature_delta = None
+    cfg.tier = ""
+    assert config_mod.effective_creative_temperature(cfg, 0.98) == 0.98
+
+
+def test_calibrated_gemma_sways_to_nine_in_creative_mode(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.6)
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.9]
+
+
+def test_small_tier_sways_gently_in_creative_mode(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.3, tier="small")
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.5]
+
+
+def test_explicit_creative_delta_overrides_auto_delta(tmp_path):
+    agent, client, _cfg = _agent(tmp_path, temperature_answer=0.3,
+                                 creative_temperature_delta=0.15)
+    agent.answer("redesign the landing page", "src", stream=False)
+    assert [t for s, t in client.log if s == "answer"] == [0.45]
+
+
 def test_gather_marks_the_task_creative(tmp_path):
     agent, _client, _cfg = _agent(tmp_path, steps=[{"action": "done"}])
     agent.gather("redesign the landing page", verbose=False)
@@ -423,3 +470,18 @@ def test_preview_missing_file_and_no_project(gui, tmp_path):
     status, body = gui.get("/api/preview")
     assert status == 200 and body["files"] == []
     assert gui.req("GET", "/preview/index.html")[0] == 404
+
+
+def test_creative_reclaims_reply_floor_on_moderate_local_context(tmp_path):
+    """On a 13k-token local model (e.g. Gemma 4 at 13,219 ctx), a ~5.5k
+    pinned/task creative prompt must shrink the 8192 creative reply boost
+    cleanly instead of crashing over-budget before making a model call."""
+    agent, client, _cfg = _agent(
+        tmp_path, context_tokens=13219, reserve_tokens=2048,
+        max_tokens_answer=3000, creative_mode=True)
+    big_pin = "def f():\n    return 1\n" * 800       # ~5k untrimmable tokens
+    agent.pinned_context = big_pin
+    agent.answer("polish the neon UI across index.html, style.css, game.js",
+                 big_pin, stream=False)
+    assert len(client.budgets) == 1
+    assert 2048 <= client.budgets[0] < 8192

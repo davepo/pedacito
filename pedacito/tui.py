@@ -126,6 +126,7 @@ _TAB_PREFIX = {
     "/aut": "/auto-route ",
     "/cre": "/creative ",
     "/eff": "/effort ",
+    "/mod": "/mode ",
     "/ser": "/servers",
     "/unl": "/unload ",
     "/hy": "/hybrid ",
@@ -137,7 +138,8 @@ _TAB_PREFIX = {
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
     "/consolidate", "/compact", "/profile", "/profiles", "/model",
-    "/auto-route", "/think", "/effort", "/creative", "/servers", "/unload",
+    "/auto-route", "/think", "/effort", "/mode", "/exec-mode",
+    "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
     "/theme", "/lang", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
@@ -212,6 +214,9 @@ Pedacito TUI commands
   /think [on|off]           thinking on/off (off sets disable_thinking)
   /effort [LEVEL]           reasoning effort: default, low, medium or high
                             (forwarded to local-moe and reasoning APIs)
+  /mode [MODE]              execution engine: two_phase, interleaved or auto
+                            (alias /exec-mode; no argument shows the active
+                            and the resolved mode)
   /servers                  live VRAM/RAM and each local server's status
   /servers pin|unpin SERVER [MODEL]
                             pin/unpin a loaded Lemonade model; LRU eviction
@@ -315,6 +320,9 @@ Comandos de Pedacito TUI
   /arena apply a|b          aplicar los cambios del modelo ganador
   /think [on|off]           activar o desactivar el razonamiento del modelo
   /effort [NIVEL]           esfuerzo de razonamiento: default, low, medium, high
+  /mode [MODO]              motor de ejecución: two_phase, interleaved o auto
+                            (alias /exec-mode; sin argumento muestra el modo
+                            activo y el resuelto)
   /servers                  VRAM/RAM en vivo y estado de servidores locales
   /unload [SERVIDOR]        descargar modelos del servidor local
   /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
@@ -1845,9 +1853,17 @@ class TuiSession:
         key = str(info.get("key") or category)
         if key in self._session_allows or f"{category}:*" in self._session_allows:
             return True, f"Allowed for this session ({label})."
+        pattern = str(info.get("suggested_pattern") or "")
+        if not pattern and category in (security.CAT_SHELL,
+                                        security.CAT_TEST_EXECUTION):
+            pattern = security.suggest_shell_pattern(detail)
+        root = str(info.get("project_root") or "") or str(self.root)
+        opts = "y = once / a = session / n = deny"
+        if pattern:
+            opts += " / " + i18n.t("tui.perm.allow_project", lang=self.lang,
+                                   pattern=pattern)
         banner = (f"[Permission Required: {category} ({label}) "
-                  f"\u2014 {detail[:160]}] Allow? "
-                  f"(y = once / a = session / n = deny):")
+                  f"\u2014 {detail[:160]}] Allow? ({opts}):")
         self._set_banner(banner)
         self._append(banner, "activity")
         self._redraw(force=True)
@@ -1867,6 +1883,26 @@ class TuiSession:
             self._append("permission: allowed for this session", "receipt")
             self._dirty = True
             return True, f"Allowed for this session ({label})."
+        if first in ("p", "project") and pattern:
+            from . import config as config_mod
+            norm = security.normalize_project_root(root)
+            cfg = self.cfg
+            if cfg is not None and norm:
+                mapping = dict(getattr(cfg, "shell_allowlist_by_project",
+                                       None) or {})
+                pats = tuple(mapping.get(norm, ()) or ())
+                if pattern not in pats:
+                    mapping[norm] = pats + (pattern,)
+                cfg.shell_allowlist_by_project = mapping
+            try:                                # best effort: in-memory wins
+                config_mod.add_project_shell_pattern(root, pattern)
+            except Exception:
+                pass
+            self._session_allows.add(key)
+            self._append(f"permission: allowed in this project ({pattern})",
+                         "receipt")
+            self._dirty = True
+            return True, f"Allowed in this project ({pattern})."
         self._append("permission: denied", "receipt")
         self._dirty = True
         return False, security.DENIED_MESSAGE
@@ -3380,6 +3416,9 @@ class TuiSession:
         if cmd == "effort":
             self._effort(arg)
             return
+        if cmd in ("mode", "exec-mode"):
+            self._mode(arg)
+            return
         if cmd == "hybrid":
             self._hybrid(arg)
             return
@@ -3484,6 +3523,8 @@ class TuiSession:
             f"  class   : {self._model_class()}"
             f", effort {getattr(self.cfg, 'reasoning_effort', 'default') or 'default'}"
             f", streams {getattr(self.cfg, 'max_concurrency', 0) or 'auto'}",
+            f"  mode    : {getattr(self.cfg, 'execution_mode', 'two_phase') or 'two_phase'}"
+            f" \u2192 {self._resolved_execution_mode()}",
         ]
         card = getattr(self.cfg, "_card", None)
         if not isinstance(card, dict):
@@ -3522,6 +3563,13 @@ class TuiSession:
         try:
             from . import config as config_mod
             return config_mod.capability_profile(self.cfg)
+        except Exception:
+            return "?"
+
+    def _resolved_execution_mode(self) -> str:
+        try:
+            from . import config as config_mod
+            return config_mod.resolve_execution_mode(self.cfg)
         except Exception:
             return "?"
 
@@ -3751,6 +3799,35 @@ class TuiSession:
             + (" \u2014 no field is sent at default"
                if value == "default" else " \u2014 sent as reasoning_effort"),
             "system")
+
+    def _mode(self, arg: str) -> None:
+        """`/mode [two_phase|interleaved|auto]` (alias `/exec-mode`): switch
+        the task execution engine live. No argument shows the configured mode
+        and what it resolves to for the active model."""
+        from . import config as config_mod
+        value = arg.strip().lower().replace("-", "_")
+        if not value:
+            current = str(getattr(self.cfg, "execution_mode", "two_phase")
+                          or "two_phase")
+            self._append(
+                f"Execution mode: {current} "
+                f"(resolved: {self._resolved_execution_mode()})\n"
+                "Usage: /mode two_phase|interleaved|auto", "system")
+            return
+        if value not in ("two_phase", "interleaved", "auto"):
+            self._append("Usage: /mode two_phase|interleaved|auto", "error")
+            return
+        self.cfg.execution_mode = value
+        try:
+            self.cfg.sources["execution_mode"] = "tui /mode"
+        except Exception:
+            pass
+        try:
+            resolved = config_mod.resolve_execution_mode(self.cfg)
+        except Exception:
+            resolved = value
+        self._append(f"Execution mode: {value} (resolved: {resolved})",
+                     "system")
 
     def _hybrid(self, arg: str) -> None:
         """`/hybrid [off | <architect_provider> <architect_model>]`: arm the

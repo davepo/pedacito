@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -177,6 +178,93 @@ def test_load_and_strata_hook_payload(monkeypatch, tmp_path):
     result = servers.unload_server_model("strata", "qwen3.8-flash", cfg)
     assert result["ok"] is True and result["method"] == "command unload_cmd"
     assert marker.read_text(encoding="utf-8") == "qwen3.8-flash"
+
+
+def test_strata_load_401_is_reported_and_not_retried(monkeypatch):
+    """A reachable server's 401 is the actionable answer (the profile has no
+    key); the generic path must not hide it behind "no lifecycle endpoint
+    answered" nor fire the side-effecting load a second time."""
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        return SimpleNamespace(
+            status_code=401,
+            text='{"error": {"type": "authentication_error", '
+                 '"message": "missing or wrong API key"}}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    result = servers.load_server_model("strata", "qwen3.8-flash", cfg)
+    assert result["ok"] is False
+    assert calls == ["http://127.0.0.1:8001/v1/load"]
+    assert "401" in result["detail"]
+    assert "api_key" in result["detail"]
+
+
+def test_strata_load_404_tries_the_alternate_spelling(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/v1/load"):
+            return SimpleNamespace(status_code=404, text="not found")
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    result = servers.load_server_model("strata", "qwen3.8-flash", cfg)
+    assert result["ok"] is True
+    assert calls == ["http://127.0.0.1:8001/v1/load",
+                     "http://127.0.0.1:8001/models/load"]
+
+
+def test_strata_key_comes_from_the_environment(monkeypatch):
+    seen = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.update(headers or {})
+        return _Resp()
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    monkeypatch.setenv("STRATA_API_KEY", "secret-strata")
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    assert servers.load_server_model("strata", "qwen3.8-flash", cfg)["ok"]
+    assert seen["Authorization"] == "Bearer secret-strata"
+
+
+def test_probe_upgrades_a_keyless_strata_profile_to_its_runtime(monkeypatch):
+    """A profile imported through the generic provider dialog may have no
+    provider label. The public /health identifies Strata, so the Servers
+    dialog labels it and routes its lifecycle instead of calling it custom."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "qwen3.8-flash", "status": {"value": "loaded"}}]})
+        if url.endswith("/health"):
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "service": "strata", "model": "qwen3.8-flash",
+                "loaded": True})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "qwen3_8-flash": {"base_url": "http://127.0.0.1:8001/v1",
+                          "model": "qwen3.8-flash"},
+    }, active="qwen3_8-flash")
+    state = servers.list_server_states(cfg)[0]
+    assert state["kind"] == "strata"
+    assert state["online"] is True
+    assert state["models"] == ["qwen3.8-flash"]
 
 
 def _lemonade_cfg():
@@ -593,6 +681,150 @@ def test_evict_other_local_servers_skips_pinned_residents(monkeypatch):
     assert "lemonade2 (pinned: stay)" in reasons
 
 
+def test_configured_local_servers_upgrades_a_shared_url_to_a_concrete_kind():
+    """Two profiles point at one URL; the first is generic, the second names
+    Strata. The shared record must be upgraded so load/unload route to the
+    native /v1/unload rather than a bare OpenAI shim."""
+    cfg = _cfg_with({
+        "generic": {"base_url": "http://127.0.0.1:8001/v1",
+                    "model": "qwen3.8-flash"},
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="")
+    shared = next(s for s in servers.configured_local_servers(cfg)
+                  if s["base_url"] == "http://127.0.0.1:8001/v1")
+    assert shared["kind"] == "strata"
+    assert shared["provider"] == "strata"
+
+
+def test_configured_local_servers_keeps_custom_when_no_concrete_kind_follows():
+    """A later generic profile must not upgrade a shared URL; only a concrete
+    runtime label ("strata"/"avalon"/"lemonade"/"llama-server") does."""
+    cfg = _cfg_with({
+        "a": {"base_url": "http://127.0.0.1:8001/v1", "model": "m1"},
+        "b": {"base_url": "http://127.0.0.1:8001/v1", "model": "m2"},
+    }, active="")
+    shared = next(s for s in servers.configured_local_servers(cfg)
+                  if s["base_url"] == "http://127.0.0.1:8001/v1")
+    assert shared["kind"] == "custom"
+    assert shared["provider"] in ("", "a")
+
+
+def test_probe_surfaces_auth_required_and_reuses_the_health_fallback(monkeypatch):
+    """A key-protected Strata answers 401 on /v1/models; the /health fallback
+    must both upgrade the kind and mark auth_required, requesting /health only
+    once (no second probe for the custom/local upgrade)."""
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=401, json=lambda: {})
+        if url.endswith("/health"):
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "service": "strata", "model": "qwen3.8-flash",
+                "loaded": True})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "proxy": {"base_url": "http://127.0.0.1:8001/v1",
+                  "model": "qwen3.8-flash"},
+    }, active="proxy")
+    state = servers.list_server_states(cfg)[0]
+    assert state["auth_required"] is True
+    assert state["kind"] == "strata"
+    assert state["models"] == ["qwen3.8-flash"]
+    assert calls.count("http://127.0.0.1:8001/health") == 1
+
+
+def test_load_server_model_evicts_others_before_loading(monkeypatch):
+    monkeypatch.setattr(servers, "_server_action", lambda *a, **k: {
+        "ok": True, "base_url": "http://127.0.0.1:8001/v1",
+        "model": "qwen3.8-flash"})
+    evicted = []
+    monkeypatch.setattr(servers, "evict_other_local_servers",
+                        lambda target, c, **kw: evicted.append(target)
+                        or {"ok": True, "evicted": []})
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    cfg.auto_evict_servers = True
+    result = servers.load_server_model(
+        "strata", "qwen3.8-flash", cfg, evict_others=True)
+    assert result["ok"] is True
+    assert evicted == ["http://127.0.0.1:8001"]
+
+    # With auto_evict off the handshake is not run at all.
+    evicted.clear()
+    cfg.auto_evict_servers = False
+    servers.load_server_model("strata", "qwen3.8-flash", cfg, evict_others=True)
+    assert evicted == []
+
+
+def test_load_server_model_applies_a_kind_override_without_mutating(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(servers, "_server_action",
+                        lambda server, *a, **k: (
+                            seen.update(server), {"ok": True})[1])
+    row = {"name": "proxy", "kind": "custom", "provider": "custom",
+           "base_url": "http://127.0.0.1:8000/v1",
+           "models": ["qwen3-8b"], "loaded_models": ["qwen3-8b"]}
+    servers.load_server_model(row, "qwen3-8b", None, kind="lemonade")
+    assert seen["kind"] == "lemonade"
+    assert row["kind"] == "custom"          # the caller's row is untouched
+
+
+def test_unload_server_model_applies_a_kind_override_without_mutating(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(servers, "_server_action",
+                        lambda server, *a, **k: (
+                            seen.update(server), {"ok": True})[1])
+    row = {"name": "proxy", "kind": "custom", "provider": "custom",
+           "base_url": "http://127.0.0.1:8000/v1",
+           "models": ["qwen3-8b"], "loaded_models": ["qwen3-8b"]}
+    servers.unload_server_model(row, "qwen3-8b", None, kind="lemonade")
+    assert seen["kind"] == "lemonade"
+    assert row["kind"] == "custom"
+
+
+def test_evict_confirms_idle_when_memory_does_not_drop(monkeypatch):
+    """Strata/Avalon keep a DDR5 working set resident, so the combined
+    VRAM+RAM counter may not drop after an unload. A clean unload is also
+    confirmed by the evicted server reporting loaded_models == [], which must
+    end the poll instead of stalling for the full wait_seconds."""
+    target = {"name": "strata", "kind": "strata", "provider": "strata",
+              "base_url": "http://127.0.0.1:8001/v1", "online": True,
+              "models": ["qwen3.8-flash"], "loaded_models": ["qwen3.8-flash"],
+              "active": True}
+    other = {"name": "lemonade", "kind": "lemonade", "provider": "lemonade",
+             "base_url": "http://127.0.0.1:8000/v1", "online": True,
+             "models": ["gemma-3-27b"], "loaded_models": ["gemma-3-27b"],
+             "active": False}
+    monkeypatch.setattr(servers, "list_server_states",
+                        lambda cfg, timeout=servers.PROBE_TIMEOUT:
+                        [target, other])
+    monkeypatch.setattr(servers, "get_hardware_memory", lambda *a, **k: {
+        "ram": {"used_gb": 1.0, "total_gb": 2.0},
+        "vram": {"used_gb": 1.0, "total_gb": 2.0}})
+    monkeypatch.setattr(servers, "unload_server_model",
+                        lambda state, model="", config=None, kind="":
+                        {"ok": True, "server": state.get("name"),
+                         "action": "unload", "detail": "done"})
+    # The evicted server confirms the unload on the next probe.
+    monkeypatch.setattr(servers, "_probe_server",
+                        lambda state, timeout=servers.PROBE_TIMEOUT:
+                        {**state, "loaded_models": []})
+    monkeypatch.setattr(servers.time, "sleep", lambda s: None)
+    cfg = _cfg_with({}, active="")
+    cfg.auto_evict_servers = True
+    result = servers.evict_other_local_servers("strata", cfg, wait_seconds=5.0)
+    assert result["ok"] is True
+    assert result["confirmed_idle"] is True
+    assert result["waited_s"] < 5.0
+
+
 def test_active_profile_provider_sets_the_server_record_kind(monkeypatch):
     """The active profile is expanded into cfg, but a hand-built config (and
     the GUI's profile switch) may carry only cfg.base_url/model. Its own
@@ -676,6 +908,112 @@ def test_list_server_states_detects_resident_models(monkeypatch):
     assert state["online"] is True and state["kind"] == "strata"
     assert state["models"] == ["qwen3.8-flash", "gemma-3-27b"]
     assert state["loaded_models"] == ["qwen3.8-flash"]
+
+
+def test_list_server_states_probes_concurrently_and_preserves_order(
+        monkeypatch):
+    """An offline or still-loading server must not stall the rest: with
+    several configured servers the probes overlap on a small thread pool,
+    and the rows keep the configured order even when they finish shuffled."""
+    cfg = _cfg_with({
+        "slow": {"base_url": "http://127.0.0.1:8001/v1",
+                 "model": "m", "provider": "strata"},
+        "fast-a": {"base_url": "http://127.0.0.1:8002/v1",
+                   "model": "m", "provider": "lemonade"},
+        "fast-b": {"base_url": "http://127.0.0.1:8003/v1",
+                   "model": "m", "provider": "strata"},
+    }, active="slow")
+    # A 3-party barrier only clears when all three probes are in flight at the
+    # same time (sequential probing would time out with BrokenBarrierError).
+    in_flight = threading.Barrier(3, timeout=5.0)
+    fast_done = threading.Event()
+    finished: list[str] = []
+    threads: set[str] = set()
+    lock = threading.Lock()
+
+    def fake_probe(server, timeout=servers.PROBE_TIMEOUT):
+        name = server["name"]
+        in_flight.wait()
+        if name == "slow":
+            fast_done.wait(timeout=5.0)
+        with lock:
+            threads.add(threading.current_thread().name)
+            finished.append(name)
+            if "fast-a" in finished and "fast-b" in finished:
+                fast_done.set()
+        return {**server, "online": True, "status": "online",
+                "models": [], "loaded_models": []}
+
+    monkeypatch.setattr(servers, "_probe_server", fake_probe)
+    states = servers.list_server_states(cfg)
+    # Configured order survives the shuffled completion order (slow finished last).
+    assert [s["name"] for s in states] == ["slow", "fast-a", "fast-b"]
+    assert finished[-1] == "slow"
+    assert len(threads) == 3
+
+
+def test_list_server_states_single_server_still_probes(monkeypatch):
+    """The one-server path skips the pool but keeps the same row shape."""
+    cfg = _cfg_with({
+        "solo": {"base_url": "http://127.0.0.1:8001/v1",
+                 "model": "m", "provider": "strata"},
+    }, active="solo")
+    seen = []
+
+    def fake_probe(server, timeout=servers.PROBE_TIMEOUT):
+        seen.append((server["name"], threading.current_thread().name))
+        return {**server, "online": False, "status": "offline",
+                "models": [], "loaded_models": []}
+
+    monkeypatch.setattr(servers, "_probe_server", fake_probe)
+    states = servers.list_server_states(cfg)
+    assert [s["name"] for s in states] == ["solo"]
+    assert states[0]["online"] is False
+    assert seen == [("solo", threading.current_thread().name)]
+
+
+def test_models_from_payload_honors_a_health_loaded_flag():
+    """Strata's public /health names the model and says whether it is
+    resident. `loaded: false` must keep the id visible but out of the resident
+    set, so the UI offers Load instead of Eject."""
+    ids, loaded, loading = servers._models_from_payload(
+        {"model": "qwen3.8-flash", "loaded": False}, "strata")
+    assert ids == ["qwen3.8-flash"] and loaded == [] and loading == []
+    ids, loaded, _ = servers._models_from_payload(
+        {"model": "qwen3.8-flash", "loaded": True}, "strata")
+    assert ids == ["qwen3.8-flash"] and loaded == ["qwen3.8-flash"]
+
+
+def test_list_server_states_reads_strata_nested_status(monkeypatch):
+    """Strata lists its one model with `status: {"value": ...}`. An unloaded
+    model must not be treated as resident by the single-model runtime
+    fallback: the Servers dialog would otherwise disable Load."""
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return SimpleNamespace(status_code=200, json=lambda: {"data": [
+                {"id": "qwen3.8-flash", "status": {"value": "unloaded"}}]})
+        return SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8001/v1",
+                   "model": "qwen3.8-flash", "provider": "strata"},
+    }, active="strata")
+    state = servers.list_server_states(cfg)[0]
+    assert state["models"] == ["qwen3.8-flash"]
+    assert state["loaded_models"] == [] and state["loaded"] is False
+
+    # The loaded marker is read the same way.
+    fake_get = (lambda url, headers=None, timeout=None:
+                SimpleNamespace(status_code=200, json=lambda: {"data": [
+                    {"id": "qwen3.8-flash",
+                     "status": {"value": "loaded"}}]})
+                if url.endswith("/v1/models")
+                else SimpleNamespace(status_code=404, json=lambda: {}))
+    monkeypatch.setattr(servers.requests, "get", fake_get)
+    state = servers.list_server_states(cfg)[0]
+    assert state["loaded_models"] == ["qwen3.8-flash"]
+    assert state["loaded"] is True
 
 
 def test_list_server_states_surfaces_loading_models(monkeypatch):
@@ -878,7 +1216,7 @@ def test_gui_unload_endpoint_updates_telemetry(gui, monkeypatch):
                                           "loaded_models": []}])
     calls = []
 
-    def fake_unload(target, model="", config=None):
+    def fake_unload(target, model="", config=None, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "unload", "server": target,
                 "model": model, "detail": "done"}
@@ -929,7 +1267,7 @@ def test_gui_load_endpoint_returns_telemetry(gui, monkeypatch):
                         lambda *a, **k: [_gui_state()])
     calls = []
 
-    def fake_load(target, model="", config=None):
+    def fake_load(target, model="", config=None, evict_others=False, kind=""):
         calls.append((target, model))
         return {"ok": True, "action": "load", "server": target,
                 "model": model, "detail": "loaded"}
@@ -974,3 +1312,38 @@ def test_gui_refused_action_still_paints_the_server_registry(gui, monkeypatch):
     assert "if (!j.ok) {" in paint
     assert "if (!(j.servers || []).length) return;" in paint
     assert "if (!j || !j.ok)" not in paint
+
+
+def test_strata_unload_sends_empty_body_with_wait_and_cli_evicts(monkeypatch):
+    """Strata's POST /v1/unload accepts `{}` (and `?wait=15`) and returns 404
+    if a mismatched `model` string is sent. And CLI `_evict_other_local_servers`
+    must evict Strata before switching to Lemonade (and vice versa)."""
+    posted = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posted.append((url, json))
+        return SimpleNamespace(status_code=200, text='{"status":"unloaded"}')
+
+    monkeypatch.setattr(servers.requests, "post", fake_post)
+    cfg = _cfg_with({
+        "strata": {"base_url": "http://127.0.0.1:8090/v1",
+                   "model": "qwen3.8-flash-next-iq3_s",
+                   "provider": "strata", "api_key": "sk-s"},
+        "lemon": {"base_url": "http://127.0.0.1:11434/v1",
+                  "model": "DaisyRose-27B-GGUF-Q4_K_XL",
+                  "provider": "lemonade"},
+    }, active="lemon")
+    res = servers.unload_server_model("strata", "wrong-spelling", cfg)
+    assert res["ok"] is True
+    assert posted[0] == ("http://127.0.0.1:8090/v1/unload?wait=15", {})
+
+    # CLI eviction helper triggers evict_other_local_servers for multi-server cfg
+    from pedacito import cli
+    evicted_targets = []
+    monkeypatch.setattr(
+        servers, "evict_other_local_servers",
+        lambda target, c, **kw: evicted_targets.append(target)
+        or {"ok": True, "evicted": [{"ok": True, "server": "strata"}]})
+    cli._evict_other_local_servers(cfg)
+    assert evicted_targets == ["http://127.0.0.1:11434/v1"]
+

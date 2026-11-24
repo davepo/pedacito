@@ -718,22 +718,19 @@ def test_unload_model_lemonade_then_lmstudio_then_ollama(monkeypatch):
         def __init__(self, code):
             self.status_code = code
 
-    # Lemonade's native endpoint is tried FIRST and ends the handshake.
-    def lemonade(url, headers=None, json=None, timeout=None):
-        calls.append((url, json, timeout))
-        if url.endswith("/api/v1/unload"):
-            return R(200)
-        raise AssertionError("native Lemonade unload should win first")
-
-    monkeypatch.setattr(llm_mod.requests, "post", lemonade)
+    # The server control plane is delegated to FIRST; on ok it ends the
+    # handshake with the model id and the legacy fallback never fires.
+    monkeypatch.setattr(
+        "pedacito.servers.unload_server_model",
+        lambda server, model, config=None, kind="": (
+            calls.append(("control-plane", model)), {"ok": True})[1])
     assert llm_mod.unload_model(client) == "m"
-    assert len(calls) == 1
-    assert calls[0][0] == "http://127.0.0.1:11434/api/v1/unload"
-    assert calls[0][1] == {"model": "m"}
-    assert calls[0][2] == 2                      # short timeout, best-effort
+    assert calls == [("control-plane", "m")]
 
-    # Not Lemonade: LM Studio's native unload answers next.
+    # Control plane failed: LM Studio's native unload answers next.
     calls.clear()
+    monkeypatch.setattr("pedacito.servers.unload_server_model",
+                        lambda *a, **k: {"ok": False})
 
     def lmstudio(url, **kw):
         calls.append(url)
