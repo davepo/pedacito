@@ -203,9 +203,12 @@ class Config:
     # Also accepted: "json_object", "json" (-> "object"), "json_schema" (-> "schema").
     json_mode: str = "schema"
     # How lookup steps are produced: "grammar" (a JSON schema constrains the
-    # sampler) or "native" (the model's own tool-call channel: better for models
-    # trained on tool calling). `pedacito calibrate` measures both on your model
-    # and the card picks; set it here to force one.
+    # sampler), "native" (the model's own tool-call channel: better for models
+    # trained on tool calling), or "plain" (a deterministic plain-word gather
+    # format -- `action read / file x.py / lines 10 to 40` or `key: value`
+    # lines -- for models that emit words more reliably than JSON). `pedacito
+    # calibrate` measures all of them on your model and the card picks; set it
+    # here to force one.
     tool_mode: str = "grammar"
     # Which execution engine runs a task:
     #   "two_phase" -- the classic gather-then-answer ladder. The default,
@@ -1043,6 +1046,14 @@ class Config:
     # Zero-edit runs recorded for one profile before escalation is suggested
     # (the per-profile failure statistic). 0 = off.
     escalation_zero_edit_runs: int = 3
+    # Proactive two-path escalation routing (arXiv:2611.16414): BEFORE the
+    # task runs, a zero-token structural-complexity gate (import fan-out,
+    # multi-file touch count, cross-module boundaries, open-ended
+    # architectural keywords) escalates the task straight to the `escalate`
+    # role, and a boundary-fewshot Scout classifier keeps well-defined
+    # single-file execution tasks local. Needs `roles.escalate` configured;
+    # off by default so existing reactive-only escalation is unchanged.
+    proactive_escalation: bool = False
     # Hook commands per event, e.g. hooks = { post_edit = ["ruff format {file}"] }
     # -- run without a shell, JSON event on stdin.
     hooks: dict = field(default_factory=dict)
@@ -1411,9 +1422,9 @@ def _coerce(name: str, value, path: Path | None = None):
         return norm
     if name == "tool_mode":
         norm = str(value).strip().lower()
-        if norm not in ("grammar", "native"):
-            raise ConfigError(f"{where}{name} must be 'grammar' or 'native', "
-                              f"got {value!r}")
+        if norm not in ("grammar", "native", "plain"):
+            raise ConfigError(f"{where}{name} must be 'grammar', 'native' or "
+                              f"'plain', got {value!r}")
         return norm
     if name == "edit_style":
         norm = str(value).strip().lower()
@@ -2929,6 +2940,33 @@ def is_local_moe(cfg=None, model=None, provider=None, base_url=None,
     return any(p.search(model_s) for p in _LOCAL_MOE_PATTERNS)
 
 
+# Sparse-MoE model-id markers beyond the tiered local-moe server patterns:
+# the A3B/A4B/A2B "active params" spellings (qwen3-30b-a3b), Mixtral's
+# `mixtral`/`8x7b`, and the generic `moe` token. Used by the execution-direct
+# prompting helper (`is_sparse_moe`) so a sparse expert model gets strictly
+# direct, execution-focused prompts instead of verbose planning boilerplate.
+_SPARSE_MOE_PATTERNS = (
+    re.compile(r"a\d+b", re.IGNORECASE),           # a3b, a4b, a2b
+    re.compile(r"\bmixtral\b", re.IGNORECASE),
+    re.compile(r"\d+x\d+b", re.IGNORECASE),        # 8x7b, 8x22b
+    re.compile(r"(?:^|[\s/_.-])moe(?:$|[\s/_.-])", re.IGNORECASE),
+)
+
+
+def is_sparse_moe(cfg=None, model=None, provider=None, base_url=None,
+                  profile=None) -> bool:
+    """True for a sparse Mixture-of-Experts model: a tiered local-moe server
+    (`is_local_moe`), or a model id that names sparse experts (a3b/a4b/a2b,
+    mixtral, NxMb, moe). Sparse-MoE profiles keep prompts strictly direct and
+    execution-focused and skip `plan_threshold` pre-splits unless a task is
+    truly multi-module."""
+    if is_local_moe(cfg, model, provider, base_url, profile):
+        return True
+    model_s, _provider_s, _base_s, _profile_s = _local_moe_texts(
+        cfg, model, provider, base_url, profile)
+    return any(p.search(model_s) for p in _SPARSE_MOE_PATTERNS)
+
+
 def capability_profile(cfg=None, model=None, provider=None, base_url=None,
                        profile=None) -> str:
     """Classify a model/provider as "local-moe", "local-dense" or "hosted".
@@ -3431,7 +3469,9 @@ json_mode = "schema"
 # response_format json_schema so the server constrains sampling to valid
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
-# tool_mode = "grammar"     # "native" = the model's tool-call channel
+# tool_mode = "grammar"     # "native" = the model's tool-call channel;
+#                           # "plain" = plain-word gather format (action read /
+#                           # file x.py / lines 10 to 40, or key: value lines)
 # execution_mode = "two_phase"  # "interleaved" = agentic read/edit/test loop;
 #                               # "auto" picks by model class: hosted, local-MoE
 #                               # and calibrated large -> interleaved, else two_phase

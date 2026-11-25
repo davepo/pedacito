@@ -76,6 +76,30 @@ MAX_OBSERVATION_CHARS = 12000
 FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".cjs", ".jsx", ".ts",
                  ".tsx", ".mts", ".cts", ".css")
 
+# Task wording that makes a task an "edit task" for the pre-stop gate: a run
+# that finishes with zero edits on one of these is worth an intercept. Generic
+# verbs that double as common function names ("add", "build", "make", "write")
+# are deliberately excluded so "explain what add does" is not read as an edit.
+_EDIT_TASK_RE = re.compile(
+    r"\b(fix|change|modify|implement|refactor|rename|update|remove|delete|"
+    r"rewrite|patch|convert|replace|correct|repair|extend|migrate|upgrade|"
+    r"optimize|simplify|extract|translate|improve|adjust|tweak|rework|create)"
+    r"\w*\b", re.I)
+
+# An explicit "nothing needed to change" explanation: a finish that says why
+# no edit landed is legitimate and must not be intercepted.
+_NOTHING_TO_DO_RE = re.compile(
+    r"\b(no (change|edit|fix|code|modification|update)s? "
+    r"(?:was|were|is|are)? ?(?:needed|necessary|required)?|"
+    r"nothing (?:to (?:change|do|fix)|changed|needed|to be done)|"
+    r"already (?:correct|works|implemented|present|done|handled|fixed|exists|"
+    r"in place|up to date|up-to-date)|"
+    r"read[- ]only|cannot (?:change|modify|write|edit)|can't (?:change|modify|"
+    r"write|edit)|out of scope|not (?:needed|necessary|required|applicable)|"
+    r"correct as is|left (?:it|the (?:code|file)|things) (?:unchanged|as is)|"
+    r"no work (?:was )?required|does not (?:need|require) (?:a|any) change)\b",
+    re.I)
+
 # Names a model sometimes uses for a tool we do offer under another name.
 _ALIASES = {
     "edit": "edit_file", "edit_files": "edit_file", "str_replace": "edit_file",
@@ -1014,6 +1038,8 @@ class _ToolRunner:
         self.gates = gates
         self.tests_run = 0
         self.tests_green: bool | None = None
+        self.last_edit_revision = 0        # ws.revision at the last edit
+        self.last_test_revision = -1       # ws.revision at the last test run
         self.turn = 0
         self.read_files: set[str] = set()
         self._named: set[str] | None = None
@@ -1048,7 +1074,14 @@ class _ToolRunner:
                 "run" if name == "run_test" else name, outcome.text, self.cfg)
         elif name in ("read", "grep", "find", "outline", "diff"):
             outcome.text = safety.frame(name, outcome.text, self.cfg)
+        full = outcome.text
         outcome.text = _cap(outcome.text)
+        if name in tools_mod.SCRATCH_SPILL_ACTIONS \
+                and len(full) > MAX_OBSERVATION_CHARS:
+            spilled = tools_mod.spill_observation(
+                self.cfg, full, name, MAX_OBSERVATION_CHARS)
+            if spilled is not full:
+                outcome.text = spilled
         return outcome
 
     def _not_found(self, name: str) -> str:
@@ -1107,6 +1140,9 @@ class _ToolRunner:
         scope = _as_text(_arg(args, "path", "file", "scope"))
         if not pattern.strip():
             return ToolOutcome("ERROR: grep needs a `pattern`.", ok=False)
+        if tools_mod.is_scratch_log(scope) \
+                or scope.strip().rstrip("/").lower().startswith(".pedacito/scratch"):
+            return ToolOutcome(tools_mod.grep_scratch(self.ws.root, pattern))
         if not self.ws.apply and self.ws.has_changes():
             return ToolOutcome(self._grep_overlay(pattern, scope))
         obs = tools_mod.tool_grep(self.index, pattern, scope, cfg=self.cfg,
@@ -1331,6 +1367,7 @@ class _ToolRunner:
                     "unchanged. Fix it and call edit_file again.", ok=False,
                     rolled_back=True, file=rel, gate_errors=msgs)
         self._reindex(rel, deleted=res.deleted)
+        self.last_edit_revision = self.ws.revision
         added = sum(1 for ln in res.diff.splitlines()
                     if ln.startswith("+") and not ln.startswith("+++"))
         removed = sum(1 for ln in res.diff.splitlines()
@@ -1450,6 +1487,7 @@ class _ToolRunner:
         if m:
             self.tests_run += 1
             self.tests_green = int(m.group(1)) == 0
+            self.last_test_revision = self.ws.revision
             if self.tests_green:
                 try:
                     self.agent.live_evidence_ok = True
@@ -1597,6 +1635,7 @@ class _Loop:
         self.seen: set[str] = set()
         self.no_progress = 0
         self.finish_refused = False
+        self.pre_stop_intercepts = 0       # bounded (max 2) pre-stop gate
         self.text_nudges = 0
         self.folds = 0
         self.t0 = time.time()
@@ -1818,10 +1857,20 @@ class _Loop:
 
     def _text_only(self, turn: ModelTurn) -> str:
         """A reply with no tool call. Nudge once (it may be a plan); a second
-        consecutive one is taken as the final answer."""
+        consecutive one is taken as the final answer, unless the pre-stop
+        gate intercepts it (0 edits on an edit task, or edits after the last
+        test run)."""
         text = turn.content.strip()
         self.text_nudges += 1
         if self.text_nudges >= 2:
+            reason = self._pre_stop_reason(text)
+            if reason:
+                self.pre_stop_intercepts += 1
+                self.text_nudges = 1
+                self._append({"turn": turn, "calls": [], "results": [],
+                              "content": text, "nudge": reason})
+                self.no_progress += 1
+                return self._progress_stop()
             self.result.summary = text
             return STOP_TEXT
         self._append({"turn": turn, "calls": [], "results": [],
@@ -1892,6 +1941,31 @@ class _Loop:
         self.no_progress = 0 if progressed else self.no_progress + 1
         return self._progress_stop()
 
+    def _is_edit_task(self) -> bool:
+        return bool(_EDIT_TASK_RE.search(self.task or ""))
+
+    def _pre_stop_reason(self, summary: str = "") -> str:
+        """The deterministic pre-stop gate (AutoHarness, arXiv:2611.22299).
+        Returns a reason to intercept the stop, or "" when the stop may be
+        accepted. Bounded to max 2 intercepts per run."""
+        if self.pre_stop_intercepts >= 2:
+            return ""
+        ws = self.ws
+        # (a) an edit task that staged/wrote nothing, with no read-only or
+        # nothing-to-change explanation, in apply mode.
+        if ws.apply and self._is_edit_task() and not ws.changed_files() \
+                and not _NOTHING_TO_DO_RE.search(summary or ""):
+            return ("NOT FINISHED: the task asks for a code change, but no "
+                    "file was changed. Make the edit, or explain specifically "
+                    "why nothing needs to change and call `finish` again.")
+        # (b) edits landed after the last test run and no test re-ran.
+        if self.runner.tests_run > 0 \
+                and self.runner.last_edit_revision > self.runner.last_test_revision:
+            return ("NOT FINISHED: you edited code after the last test run and "
+                    "did not re-run the tests. Call `run_test` to confirm the "
+                    "change is still green, then call `finish` again.")
+        return ""
+
     def _finish(self, call: ToolCall) -> ToolOutcome:
         out = self.runner.run(call)
         open_issues = self.gates.outstanding()
@@ -1905,6 +1979,13 @@ class _Loop:
                 "the code before:\n" + "\n".join(f"- {i}" for i in open_issues[:15])
                 + "\nFix them, then call `finish` again. (Calling `finish` "
                 "once more ends the run as it stands.)")
+            return out
+        reason = self._pre_stop_reason(out.summary)
+        if reason:
+            self.pre_stop_intercepts += 1
+            out.finish = False
+            out.ok = False
+            out.text = reason
         return out
 
     # ---------------------------------------------------------- finish
@@ -2029,6 +2110,10 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
     do_apply = bool(apply) and not review
     cfg = agent.cfg
     root = agent.index.root
+    try:
+        cfg._root = str(root)
+    except Exception:
+        pass
     ws = VirtualWorkspace(root, apply=do_apply, cfg=cfg, backup_dir=backup_dir)
     if do_apply and getattr(agent, "events", None) is None:
         with contextlib.suppress(Exception):

@@ -136,6 +136,11 @@ def _confidence(rec: dict) -> str:
     return ""
 
 
+def _arch_family(rec: dict) -> str:
+    """The model card's `choices.arch_family` for a profile record, or ''."""
+    return str((rec.get("card_choices") or {}).get("arch_family") or "")
+
+
 def recommend(profiles: list[dict]) -> dict:
     """Role -> {"name", "reason"} following the B4 rules, or None when no
     profile clears the rule. Suggestions only; `apply_roles` writes them."""
@@ -165,19 +170,37 @@ def recommend(profiles: list[dict]) -> dict:
 
     # Specialists: highest score overall (local or hosted), different from the
     # worker, only when it beats the worker by the gain floor; speed breaks
-    # ties. The same profile is picked for escalate/verifier/planner.
+    # ties. For the second-opinion / recovery roles (escalate/verifier/
+    # planner) a candidate whose model card names a DIFFERENT `arch_family`
+    # (Qwen worker + Gemma/Mistral verifier) is preferred over a same-family
+    # one, reducing correlated failure modes. The same profile is picked for
+    # escalate/verifier/planner.
     scored = [p for p in profiles if _score(p) is not None
               and (worker is None or p["name"] != worker["name"])]
-    specialist = max(
-        scored, key=lambda p: (_score(p), p.get("tok_per_s") or 0.0)) \
-        if scored else None
-    if worker is not None and specialist is not None \
-            and _score(specialist) + 1e-9 >= _score(worker) + _ESCALATE_MIN_GAIN:
+    eligible = ([p for p in scored
+                 if _score(p) + 1e-9 >= _score(worker) + _ESCALATE_MIN_GAIN]
+                if worker is not None else scored)
+    specialist = None
+    family_note = ""
+    if eligible:
+        worker_family = _arch_family(worker) if worker is not None else ""
+        diff = [p for p in eligible
+                if worker_family and _arch_family(p)
+                and _arch_family(p) != worker_family]
+        pick = max(diff, key=lambda p: (_score(p), p.get("tok_per_s") or 0.0)) \
+            if diff else max(eligible, key=lambda p: (_score(p),
+                                                      p.get("tok_per_s") or 0.0))
+        specialist = pick
+        if diff and pick in diff:
+            family_note = (f" (different architecture family "
+                           f"'{_arch_family(pick)}' vs the worker's "
+                           f"'{worker_family}', to de-correlate failures)")
+    if worker is not None and specialist is not None:
         for role in ("escalate", "verifier", "planner"):
             recs[role] = {
                 "name": specialist["name"],
                 "reason": f"highest score ({_score(specialist):.2f}) "
-                          f"that beats the worker by >= 0.1"}
+                          f"that beats the worker by >= 0.1{family_note}"}
     else:
         for role in ("escalate", "verifier", "planner"):
             recs[role] = {

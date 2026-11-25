@@ -44,6 +44,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import config as config_mod
 from . import diagnostics as diagnostics_mod
@@ -69,6 +70,7 @@ from .llm import (IMAGE_TOKENS_ESTIMATE, CancelledError, LLMError,
                   _append_message_text, _is_local_server,
                   estimate_messages, estimate_tokens)
 from .tools import TOOL_HELP, dispatch, mcp_injection, schema_for
+from . import tools as tools_mod
 
 # Re-asks after a gather step reply dies at the output cap or has no salvageable
 # JSON, before giving up and answering from what was gathered.
@@ -2479,6 +2481,10 @@ class Agent:
                 "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
         system = prompts_mod.gather_system(
             self.cfg, base if base is not None else GATHER_BASE, TOOL_HELP) + hint
+        if getattr(self.cfg, "tool_mode", "grammar") == "plain":
+            # The plain-word step protocol replaces the JSON grammar: tell the
+            # model the exact words instead of relying on response_format.
+            system += tools_mod.plain_step_instructions()
         project_notes = instructions_mod.render(root, self.cfg)
         todo_notes = todo_mod.render(root, self.cfg,
                                      limit=int(getattr(
@@ -2898,8 +2904,18 @@ class Agent:
                 if verbose:
                     print(f"  [steering delivered: {note[:70]}]", file=sys.stderr)
             model_calls += 1
+            plain = getattr(self.cfg, "tool_mode", "grammar") == "plain"
+            raw = ""
             try:
-                stepjson = gclient.chat_json(messages, step_schema,
+                if plain:
+                    raw = gclient.chat(messages,
+                                       max_tokens=self.cfg.max_tokens_step,
+                                       stream=False, disable_thinking=True)
+                    stepjson = tools_mod.parse_plain_step(raw, step_schema)
+                    if stepjson is None:
+                        stepjson = {}
+                else:
+                    stepjson = gclient.chat_json(messages, step_schema,
                                                  self.cfg.max_tokens_step,
                                                  disable_thinking=True)
             except CancelledError:
@@ -2936,6 +2952,26 @@ class Agent:
             stepjson = {k: v for k, v in stepjson.items() if v is not None}
             action = str(stepjson.get("action") or "").strip()
             why = str(stepjson.get("reasoning") or "").strip()
+            if plain and not action:
+                # A plain-word reply with no recognisable action: re-ask once
+                # with the exact format, then give up and move to the answer.
+                malformed_streak += 1
+                self.steps_log.append(f"{step}. (no action parsed from plain reply)")
+                obs = ("[I could not read an action from your reply. Reply in "
+                       "plain words, ONE action only, e.g. `action read / file "
+                       "src/app.py / lines 10 to 40`, or `action done` when you "
+                       "have enough.]")
+                messages.append({"role": "assistant",
+                                 "content": (raw or "(no reply)")})
+                messages.append({"role": "user",
+                                 "content": f"{obs}\n\n{nudge(step + 1)}"})
+                budget = max(0, budget - len(obs))
+                self._fit(messages, gclient)
+                if malformed_streak >= _MAX_MALFORMED_STEPS:
+                    break
+                if note_progress(False):
+                    break
+                continue
             sig = _step_signature(stepjson)
             is_repeat = sig == last_sig
             if is_repeat:
@@ -4993,9 +5029,10 @@ class Agent:
     def best_of(self, task: str, first_reply: str, gathered: str = "",
                 verbose: bool = True) -> str:
         """Best-of-N for weak models: sample N-1 more candidate replies at a
-        higher temperature, score every candidate with the deterministic
-        checks (blocks dry-apply, no placeholder/unread/stale errors,
-        requirements addressed), and keep the best. N = cfg.best_of."""
+        higher temperature, score every candidate by staging it in a
+        `VirtualWorkspace` overlay (real deterministic gates + a narrow test
+        pass/fail when verify tests are enabled -- the real working tree is
+        never touched), and keep the best. N = cfg.best_of."""
         from . import verify as verify_mod
         n = int(getattr(self.cfg, "best_of", 1) or 1)
         if n <= 1 or not parse_edits(first_reply):
@@ -5025,9 +5062,14 @@ class Agent:
         best, best_score = first_reply, None
         scores = []
         for cand in candidates:
-            results = self._apply_once(cand, dry_run=True)
-            score, _f = verify_mod.score_candidate(self, task, cand, results,
-                                                   gathered)
+            shadow = self._shadow_score(cand, task, gathered)
+            if shadow is not None:
+                score = shadow
+            else:
+                # Fall back to the dry-apply score when the overlay cannot run.
+                results = self._apply_once(cand, dry_run=True)
+                score, _f = verify_mod.score_candidate(self, task, cand,
+                                                       results, gathered)
             scores.append(round(score, 1))
             if best_score is None or score > best_score:
                 best, best_score = cand, score
@@ -5036,6 +5078,77 @@ class Agent:
                   f"kept #{candidates.index(best) + 1}]", file=sys.stderr)
         self._emit("best_of", scores=scores, kept=candidates.index(best))
         return best
+
+    def _shadow_score(self, cand: str, task: str, gathered: str) -> float | None:
+        """Score `cand` by staging its edits in a `VirtualWorkspace` overlay:
+        the deterministic gates (syntax, undefined names, placeholders,
+        unread/stale citations, coverage) plus a narrow test pass/fail when
+        `verify_tests` is on. The real working tree is never touched. Returns
+        None when the overlay cannot run (the caller falls back to dry-apply)."""
+        from . import verify as verify_mod
+        from .workspace_overlay import VirtualWorkspace
+        edits = parse_edits(cand)
+        if not edits:
+            return 0.0 if cand.strip() else -5.0
+        _failed, resolved = self._resolve_symbol_anchors(edits)
+        if not resolved:
+            return 0.0 if cand.strip() else -5.0
+        try:
+            ws = VirtualWorkspace(self.index.root, apply=False, cfg=self.cfg)
+        except Exception:
+            return None
+        try:
+            for e in resolved:
+                try:
+                    ws.apply_edit(e)
+                except Exception:
+                    pass
+            results = ws.to_edit_results()
+            findings = verify_mod.check(self, task, cand, results, gathered)
+            ok = sum(1 for r in results if r.ok)
+            bad = sum(1 for r in results if not r.ok)
+            score = 10.0 + 4.0 * ok - 6.0 * bad
+            score -= 8.0 * sum(1 for f in findings if f.severity == "error")
+            score -= 2.0 * sum(1 for f in findings
+                               if f.severity == "warn" and f.kind != "auto_heal")
+            # Narrow test pass/fail: verify_tests runs the project's tests
+            # against a temp mirror with the staged edits laid over.
+            if getattr(self.cfg, "verify_tests", False) and results:
+                green = self._shadow_tests(ws)
+                if green is True:
+                    score += 6.0
+                elif green is False:
+                    score -= 10.0
+            return score
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _shadow_tests(self, ws) -> bool | None:
+        """Run the project's tests against the staged overlay mirror. Returns
+        True/False for a definitive pass/fail, None when tests cannot run."""
+        from . import tools as tools_mod
+
+        class _ShadowIndex:
+            def __init__(self, root):
+                self.root = Path(root)
+                self.files = []
+
+        try:
+            with ws.exec_root() as root:
+                obs = tools_mod.tool_run_test(_ShadowIndex(root), self.cfg, "",
+                                              "")
+        except Exception:
+            return None
+        m = re.search(r"^EXIT: (-?\d+)", obs or "", re.M)
+        if not m:
+            return None
+        rc = int(m.group(1))
+        if rc == 5:            # "no tests collected" says nothing about green
+            return None
+        return rc == 0
 
     # ---- answer helpers
     def _answer_sys(self, task: str = "") -> str:

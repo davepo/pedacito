@@ -4704,6 +4704,31 @@ def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
     cfg._pending_escalation_reason = ""
     kw = dict(apply=apply, review=review, answer_system=answer_system,
               is_repair=is_repair)
+    # Proactive two-path escalation (arXiv:2611.16414): a structurally complex
+    # task goes straight to the `escalate` role, skipping the worker attempt.
+    # Off by default (cfg.proactive_escalation), so reactive-only escalation
+    # is byte-for-byte unchanged.
+    if getattr(cfg, "proactive_escalation", False):
+        esc = roles_mod.client_for(cfg, "escalate", client)
+        reason = roles_mod.proactive_escalation_reason(cfg, task, idx)
+        if reason and esc is not client and apply and not review:
+            print(f"\n[proactive escalation: {reason}; running on the "
+                  "`escalate` role's model]", file=sys.stderr)
+            workspace.log_event(root, f"proactive escalation to the escalate "
+                                      f"role: {reason}", "WARN")
+            from .agent import Agent
+            cfg._task_mutations = []
+            try:
+                return _run_task_once(root, cfg, esc, Agent(idx, esc, cfg), idx,
+                                      task, **kw)
+            except LLMError as e:
+                # The escalate model is unreachable mid-run: fall back to the
+                # ordinary worker ladder rather than dropping the task.
+                print(f"[proactive escalation failed ({str(e).splitlines()[0][:100]})"
+                      f"; running on the worker]", file=sys.stderr)
+        if reason and esc is not client:
+            # A dry run / review still records the suggestion for telemetry.
+            cfg._task_escalation_reason = reason
     try:
         tr = _run_task_once(root, cfg, client, agent, idx, task, **kw)
     except (BudgetExceeded, CancelledError):

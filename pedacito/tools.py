@@ -880,6 +880,279 @@ def _as_int(value, default: int = 0) -> int:
             return default
 
 
+# ---------------------------------------------------------------- plain steps
+# `tool_mode = "plain"` (arXiv:2611.17169): a deterministic plain-word gather
+# format for local models that emit words more reliably than JSON. Two shapes
+# are accepted and return the SAME internal step dict the JSON/grammar path
+# produces (action, file, start, end, pattern, symbol, to, command, content,
+# reasoning, ...):
+#
+#   slash-delimited:  action read / file src/main.py / lines 10 to 40
+#   key: value lines: action: read
+#                     file: src/main.py
+#                     start: 10
+#                     end: 40
+#                     reasoning: need the dispatch loop
+#
+_PLAIN_FIELD_ALIASES = {
+    "action": "action",
+    "file": "file", "path": "file", "filename": "file",
+    "start": "start", "start_line": "start", "line": "start",
+    "end": "end", "end_line": "end",
+    "pattern": "pattern", "query": "pattern", "search": "pattern",
+    "symbol": "symbol",
+    "to": "to",
+    "command": "command", "cmd": "command",
+    "content": "content",
+    "reasoning": "reasoning", "reason": "reasoning", "why": "reasoning",
+    "target": "target",
+    "filter": "filter",
+    "url": "url",
+}
+
+_PLAIN_INT_FIELDS = ("start", "end")
+
+_PLAIN_KEYS = ("file", "path", "filename", "lines", "start", "start_line",
+               "end", "end_line", "pattern", "query", "symbol", "to",
+               "command", "cmd", "content", "reasoning", "reason", "why",
+               "target", "filter", "url", "action")
+
+_PLAIN_SEP_RE = re.compile(
+    r"\s*/\s*(?=(?:file|path|filename|lines|start|start_line|end|end_line|"
+    r"pattern|query|symbol|to|command|cmd|content|reasoning|reason|why|"
+    r"target|filter|url)\b)", re.I)
+
+
+def _plain_kv(text: str) -> bool:
+    """True when the text looks like `key: value` lines rather than the
+    slash-delimited shape."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"(?P<k>[A-Za-z_][\w]*)\s*:\s*(?P<v>.*)$", line)
+        if m and m.group("k").lower() in _PLAIN_FIELD_ALIASES:
+            return True
+    return False
+
+
+def _plain_pair(seg: str) -> tuple[str, str]:
+    """One `<key>: <value>` or `<key> <value>` segment -> (key, value)."""
+    seg = seg.strip()
+    m = re.match(r"(?P<k>[A-Za-z_][\w]*)\s*[:=]\s*(?P<v>.*)$", seg, re.DOTALL)
+    if m:
+        return m.group("k").lower(), m.group("v").strip()
+    parts = seg.split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
+
+
+def _plain_lines_value(value: str) -> tuple[int, int]:
+    """`lines 10 to 40`, `lines 10-40`, `lines 10` -> (start, end)."""
+    m = re.search(
+        r"(?P<a>\d+)\s*(?:to|-|through|\.\.)\s*(?P<b>\d+)", value, re.I)
+    if m:
+        return int(m.group("a")), int(m.group("b"))
+    m = re.search(r"\d+", value)
+    if m:
+        n = int(m.group())
+        return n, n
+    return 0, 0
+
+
+def parse_plain_step(text: str, schema=None) -> dict | None:
+    """Parse a plain-word gather step into the same dict `chat_json` returns.
+
+    Returns None when no `action` could be extracted. Unknown keys are
+    ignored; start/end are coerced to ints; `lines X to Y` sets both."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Strip one surrounding code fence if present.
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if "\n" in raw:
+            head = raw.split("\n", 1)[0].strip()
+            if head and not _PLAIN_FIELD_ALIASES.get(head.split(":")[0].lower()):
+                raw = raw.split("\n", 1)[1]
+    fields: dict[str, str] = {}
+    if _plain_kv(raw):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"(?P<k>[A-Za-z_][\w]*)\s*:\s*(?P<v>.*)$", line, re.DOTALL)
+            if m and m.group("k").lower() in _PLAIN_FIELD_ALIASES:
+                fields[m.group("k").lower()] = m.group("v").strip()
+    else:
+        segs = [s.strip() for s in _PLAIN_SEP_RE.split(raw) if s.strip()]
+        for seg in segs:
+            key, val = _plain_pair(seg)
+            if key:
+                fields[key] = val
+    if not fields:
+        return None
+    # `action` may sit in any segment; `lines` folds into start/end.
+    if "lines" in fields and "start" not in fields and "end" not in fields:
+        start, end = _plain_lines_value(fields["lines"])
+        if start:
+            fields["start"], fields["end"] = str(start), str(end)
+    action = fields.pop("action", "").strip().lower() if "action" in fields \
+        else ""
+    if not action:
+        # The slash shape may have put the action value in the first segment
+        # with no explicit `action` key; that is handled by `_plain_pair` only
+        # when a key precedes it. Require an explicit action.
+        return None
+    step: dict = {"action": action}
+    for raw_key, value in fields.items():
+        key = _PLAIN_FIELD_ALIASES.get(raw_key)
+        if not key or key == "action" or key == "lines":
+            continue
+        if key in _PLAIN_INT_FIELDS:
+            step[key] = _as_int(value, 0)
+        else:
+            step[key] = value
+    if "start" in step or "end" in step:
+        step.setdefault("start", 1)
+        step.setdefault("end", 0)
+    return step
+
+
+def plain_step_instructions() -> str:
+    """The plain-word step protocol the gather system prompt appends when
+    `tool_mode = "plain"`."""
+    return ("\n\nReply in PLAIN WORDS, not JSON. One action per reply, in "
+            "exactly one of these two forms:\n"
+            "  action read / file src/main.py / lines 10 to 40\n"
+            "  action: read\n  file: src/main.py\n  start: 10\n  end: 40\n"
+            "The action comes first. Use `lines 10 to 40` (or start/end) for "
+            "ranges, `pattern` for grep/find, `symbol` for callers/context/"
+            "rename, `command` for run, `content` for write/append/todo. "
+            "Reply with `action done` when you have enough. No JSON, no "
+            "prose around the step.")
+
+
+# ------------------------------------------------------- scratchpad offloading
+# Oversized tool observations (run, run_test, grep, diff, fetch) are spilled to
+# <root>/.pedacito/scratch/<obs_id>.log and the model is handed a compact
+# head + tail + count stub naming the file, so it can `read`/`grep` exact lines
+# on demand instead of carrying a wall of output in the context window.
+SCRATCH_SPILL_ACTIONS = frozenset(
+    {"run", "run_test", "grep", "diff", "git_diff", "fetch", "fetch_url",
+     "web_search", "diagnose", "serve"})
+
+SCRATCH_REL_PREFIX = ".pedacito/scratch/"
+
+
+def scratch_dir(root) -> Path:
+    """`.pedacito/scratch/` under `root` (the only `.pedacito/` subtree the
+    model may READ, never write)."""
+    return Path(root) / ".pedacito" / "scratch"
+
+
+def is_scratch_log(rel: str) -> bool:
+    """True when `rel` names a scratch log the model may read back."""
+    p = str(rel or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    if not p.lower().startswith(SCRATCH_REL_PREFIX):
+        return False
+    tail = p[len(SCRATCH_REL_PREFIX):]
+    return bool(tail) and "/" not in tail and tail.endswith(".log")
+
+
+def spill_observation(cfg, obs: str, action: str, cap: int) -> str:
+    """Spill an oversized observation to a scratch log and return the compact
+    stub, or return `obs` unchanged when it fits / cannot be spilled."""
+    if not obs or len(obs) <= cap:
+        return obs
+    root = getattr(cfg, "_root", None)
+    if not root:
+        return obs
+    try:
+        import hashlib
+        d = scratch_dir(root)
+        d.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(obs.encode("utf-8", "replace")).hexdigest()[:8]
+        obs_id = f"{int(time.time())}_{digest}"
+        path = d / f"{obs_id}.log"
+        fileio.write_bytes(path, obs.encode("utf-8"))
+    except OSError:
+        return obs
+    rel = SCRATCH_REL_PREFIX + f"{obs_id}.log"
+    lines = obs.count("\n") + (0 if obs.endswith("\n") else 1)
+    head_cap = max(1, cap // 3)
+    tail_cap = max(1, cap - head_cap - 120)
+    head = obs[:head_cap]
+    h_nl = head.rfind("\n")
+    if h_nl > head_cap // 2:
+        head = head[:h_nl]
+    tail = obs[-tail_cap:]
+    t_nl = tail.find("\n")
+    if 0 <= t_nl < tail_cap // 2:
+        tail = tail[t_nl + 1:]
+    return (f"{head}\n... [full {action} output ({len(obs)} chars, {lines} "
+            f"lines) saved to {rel} -- `read {rel}` or `grep` it for exact "
+            f"lines] ...\n{tail}")
+
+
+def read_scratch_log(root, rel: str, start: int = 1, end: int = 0,
+                     max_lines: int = 200) -> str:
+    """Line-numbered content of a `.pedacito/scratch/*.log` file, read-only."""
+    if not is_scratch_log(rel):
+        return f"ERROR: not a scratch log: {rel}"
+    path = Path(root) / rel
+    if not path.is_file():
+        return f"ERROR: scratch log not found: {rel}"
+    try:
+        lines = fileio.read_lines(path)
+    except OSError as e:
+        return f"ERROR: could not read {rel}: {e}"
+    if lines and lines[-1] == "" and len(lines) > 1:
+        lines = lines[:-1]
+    elif lines == [""]:
+        lines = []
+    if not lines:
+        return f"{rel} is empty (0 lines)."
+    start = max(1, start)
+    end = end or len(lines)
+    end = min(end, len(lines), start + max_lines - 1)
+    body = _numbered(lines[start - 1:end], start)
+    note = ""
+    if end < len(lines):
+        note = (f"\n[showing lines {start}-{end} of {len(lines)}; call read "
+                f"with start={end + 1} for more]")
+    return f"{rel} lines {start}-{end} of {len(lines)}:\n{body}{note}"
+
+
+def grep_scratch(root, pattern: str) -> str:
+    """Grep across every `.pedacito/scratch/*.log` file (read-only)."""
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        rx = re.compile(re.escape(pattern))
+    d = scratch_dir(root)
+    hits: list[str] = []
+    for path in sorted(d.glob("*.log")) if d.is_dir() else []:
+        try:
+            for i, line in enumerate(fileio.read_lines(path), 1):
+                if rx.search(line):
+                    hits.append(f".pedacito/scratch/{path.name}:{i}: "
+                                f"{line.strip()[:200]}")
+                    if len(hits) >= GREP_MAX_HITS:
+                        return _grep_result("", hits)
+        except OSError:
+            continue
+    if not hits:
+        return f"No matches for {pattern!r} in .pedacito/scratch/."
+    return _grep_result("", hits)
+
+
+
+
 def _root_rel(index, name) -> str | None:
     """Resolve a model-supplied path to a project-relative POSIX path, or None
     when it is empty or escapes the root (`..`, absolute, or via a symlink).
@@ -1467,6 +1740,10 @@ def tool_read(index, cfg, file: str, start: int, end: int,
         return ("ERROR: read needs a `file` (optionally with start/end), or a "
                 "`symbol` with `file` empty. Use `grep` or `outline` to locate "
                 "code first.")
+    # A `.pedacito/scratch/*.log` file (the harness's spilled tool output) is
+    # read-only and never indexed: read it straight from disk.
+    if file.strip() and is_scratch_log(file):
+        return read_scratch_log(index.root, file, start, end, max_lines)
     rel = None
     if file.strip():
         cand = _root_rel(index, file)
@@ -1718,6 +1995,10 @@ def tool_grep(index, pattern: str, scope: str = "", cfg=None,
     if not pattern.strip():
         return ("ERROR: grep needs a `pattern` (a regex or plain text). To look "
                 "inside one file, use `outline`, or `read` it.")
+    if is_scratch_log(scope) \
+            or scope.strip().rstrip("/").lower().startswith(".pedacito/scratch"):
+        # The harness's spilled tool output is read-only and never indexed.
+        return grep_scratch(index.root, pattern)
     ref_target = _file_reference_target(index, pattern, scope)
     if ref_target:
         return _file_references(index, ref_target)

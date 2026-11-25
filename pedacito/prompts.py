@@ -30,6 +30,21 @@ from . import fileio
 
 PACKS = ("tiny", "small", "full")
 
+
+def is_sparse_moe(cfg) -> bool:
+    """True for a sparse Mixture-of-Experts model (tiered local-moe server, or
+    a model id naming sparse experts: a3b/a4b/a2b, mixtral, NxMb, moe). Sparse
+    MoE profiles keep prompts strictly direct and execution-focused: no
+    verbose "plan before coding" boilerplate, no unnecessary `plan_threshold`
+    pre-splits. Re-exported from `config` so prompt and plan code share one
+    predicate."""
+    from .config import is_sparse_moe as _cfg_is_sparse_moe
+    try:
+        return bool(_cfg_is_sparse_moe(cfg))
+    except Exception:
+        return False
+
+
 _TIER_PACK = {"tiny": "tiny", "small": "small"}
 
 
@@ -786,7 +801,9 @@ def edit_format(cfg, full: str, pack: str | None = None,
         text = _SMALL_EDIT
     else:
         text = full
-    if getattr(cfg, "edit_plan_brief", False):
+    if getattr(cfg, "edit_plan_brief", False) and not is_sparse_moe(cfg):
+        # Sparse-MoE models execute directly: skip the "write 1-3 lines of
+        # plan before the blocks" boilerplate and keep the brief execution-only.
         text = plan_brief(text)
     if getattr(cfg, "edit_style", None) == "anchor":
         text = anchor_brief(text)

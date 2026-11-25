@@ -292,7 +292,20 @@ def prune(root: Path, keep_sessions: int = 0, keep_backups: int = 0,
     last `log_max_bytes`. Returns how many of each were (or would be) removed.
     Backups are the undo path: only the oldest beyond the limit go."""
     import shutil
-    removed = {"sessions": 0, "backups": 0, "events": 0, "log_bytes": 0}
+    removed = {"sessions": 0, "backups": 0, "events": 0, "scratch": 0,
+               "log_bytes": 0}
+    # Spilled tool-output logs are transient: `prune` always clears them.
+    scratch = state_dir(root, "scratch")
+    if scratch.is_dir():
+        for p in scratch.glob("*.log"):
+            removed["scratch"] += 1
+            if not dry_run:
+                p.unlink(missing_ok=True)
+        if not dry_run:
+            try:
+                scratch.rmdir()      # remove only when it is now empty
+            except OSError:
+                pass
     if keep_sessions > 0:
         d = state_dir(root, SESSION_DIR)
         files = sorted(d.glob("*.md"), reverse=True) if d.is_dir() else []

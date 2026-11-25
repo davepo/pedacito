@@ -30,6 +30,17 @@ from pathlib import Path
 
 from . import loop, rank, verify, workspace
 
+
+def _sparse_moe(cfg) -> bool:
+    """True for a sparse Mixture-of-Experts profile (the same predicate
+    prompts.py re-exports from `config`)."""
+    from .prompts import is_sparse_moe
+    try:
+        return bool(is_sparse_moe(cfg))
+    except Exception:
+        return False
+
+
 # A task this wide is planned even with auto-planning off (`plan_threshold` 0,
 # the default and what a strong model's card picks): one context window cannot
 # hold the lookups for that many files, and "did the first, half-did the
@@ -100,6 +111,11 @@ def should_plan(task: str, idx, cfg) -> bool:
         named = 0
     reqs = len(requirement_titles(task, limit=8))
     if n > 0:
+        if _sparse_moe(cfg):
+            # A sparse-MoE model executes directly: ignore the small
+            # plan_threshold split and only pre-split truly multi-module
+            # (multi-file) tasks -- a capacity decision, not a skill one.
+            return named >= WIDE_TASK_FILES
         return named >= n or reqs >= n
     sources = getattr(cfg, "sources", None) or {}
     if sources.get("plan_threshold", "default") not in ("default",
