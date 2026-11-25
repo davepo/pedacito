@@ -30,7 +30,8 @@ def _repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=str(root),
-                   check=True, capture_output=True, text=True)
+                   check=True, capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")
     assert _git(root, "config", "user.email", "test@example.com").returncode == 0
     assert _git(root, "config", "user.name", "Pedacito Test").returncode == 0
     (root / "README.md").write_text("# demo\n", encoding="utf-8")

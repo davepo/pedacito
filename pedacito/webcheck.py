@@ -1800,11 +1800,20 @@ def _unreferenced_sibling_findings(root: Path, htmls, jss, csss
                 if not external and target:
                     referenced.add(target)
                     break
+    html_dirs = {Path(rel).parent.as_posix() for rel, _ in htmls}
     out: list[Finding] = []
-    for rel, _text in [*jss, *csss]:
+    for rel, text in [*jss, *csss]:
         if rel in referenced:
             continue
-        kind = "JS" if rel.endswith((".js", ".mjs", ".cjs")) else "CSS"
+        # Only flag true siblings of an HTML page (same folder); a file under
+        # `src/input.css` may legitimately feed a PostCSS/Tailwind/bundler build.
+        if Path(rel).parent.as_posix() not in html_dirs:
+            continue
+        is_js = rel.endswith((".js", ".mjs", ".cjs"))
+        if not is_js and re.search(
+                r"@(?:tailwind|apply|plugin|source|theme)\b", text or ""):
+            continue
+        kind = "JS" if is_js else "CSS"
         out.append(Finding(
             rel, 1,
             f"this {kind} file is not referenced by any .html file (and no "

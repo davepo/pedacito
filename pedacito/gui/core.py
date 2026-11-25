@@ -1922,7 +1922,9 @@ class State:
                     all_clauses = {c for d in rv.diffs if not d.removed_source
                                    for c in getattr(d, "clauses", ())}
                     snapshot = list(rv.diffs)
-                    fd_snap = [(d, d.after_text, d.added, d.removed,
+                    fd_snap = [(d, d.after_text,
+                                getattr(d, "added", None),
+                                getattr(d, "removed", None),
                                 getattr(d, "hunk_selection", None))
                                for d in rv.diffs]
                     kept = [d for d in rv.diffs
@@ -1942,8 +1944,10 @@ class State:
                             rv.diffs[:] = snapshot
                             for d, after, added, removed, sel in fd_snap:
                                 d.after_text = after
-                                d.added = added
-                                d.removed = removed
+                                if added is not None:
+                                    d.added = added
+                                if removed is not None:
+                                    d.removed = removed
                                 if hasattr(d, "hunk_selection"):
                                     d.hunk_selection = sel
                             rv.unaccepted = []
