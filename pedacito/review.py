@@ -76,6 +76,7 @@ class Hunk:
     added: int
     removed: int
     rows: list[int] = field(default_factory=list)
+    clauses: tuple[str, ...] = ()
 
 
 @dataclass
@@ -347,17 +348,112 @@ def apply_hunk_selection(diffs: list[FileDiff],
                 return False, (f"Not written: accepting only part of {fd.rel} "
                                f"would leave invalid syntax ({err}). Accept "
                                "the whole file or adjust the hunk selection.")
-        plans.append((fd, text, tuple(ids)))
+        plans.append((fd, text, tuple(ids), hunks))
         any_writable = True
     if not any_writable:
         return False, "Select at least one file or hunk to accept."
-    for fd, text, ids in plans:
+    for fd, text, ids, hunks in plans:
         fd.after_text = text
         fd.hunk_selection = ids
+        if len(ids) < len(hunks):
+            fd.added = sum(hunks[i].added for i in ids)
+            fd.removed = sum(hunks[i].removed for i in ids)
     return True, ""
 
 
-def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
+def hunk_clauses_for_file(fd: FileDiff,
+                          clause_texts: dict | None = None) -> dict[int, tuple[str, ...]]:
+    """Attribute a file's clauses to individual hunks when the file has
+    multiple hunks. Returns {hunk_index: (clause_id, ...)}.
+
+    If a hunk carries explicit `h.clauses`, those win. Otherwise, when
+    `clause_texts` (or a RequirementTracker's terms) are available, each clause
+    on `fd.clauses` is matched against the changed lines of each hunk; any
+    clause that matches no specific hunk (or when `clause_texts` is empty and
+    the file has a single clause) falls back to all hunks (or positional 1-to-1
+    when len(clauses) == len(hunks) and no terms matched)."""
+    hunks = getattr(fd, "hunks", None) or []
+    f_clauses = tuple(getattr(fd, "clauses", ()) or ())
+    if not hunks:
+        return {}
+    out: dict[int, list[str]] = {h.index: list(getattr(h, "clauses", ()) or ())
+                                 for h in hunks}
+    if any(out.values()) or not f_clauses:
+        return {k: tuple(v) for k, v in out.items()}
+    if len(hunks) == 1:
+        return {hunks[0].index: f_clauses}
+
+    rows = getattr(fd, "rows", None) or []
+    hunk_bodies: dict[int, str] = {}
+    for h in hunks:
+        parts: list[str] = []
+        for ri in h.rows:
+            if 0 <= ri < len(rows):
+                r = rows[ri]
+                if r.kind != "equal":
+                    parts.append(f"{r.a}\n{r.b}")
+        if not parts:
+            for ri in h.rows:
+                if 0 <= ri < len(rows):
+                    r = rows[ri]
+                    parts.append(f"{r.a}\n{r.b}")
+        hunk_bodies[h.index] = "\n".join(parts)
+
+    clause_texts = clause_texts or {}
+    unmatched: list[str] = []
+    for cid in f_clauses:
+        ctext = str(clause_texts.get(cid) or "")
+        tokens = [w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", ctext)
+                  if w.lower() not in {"the", "and", "for", "with", "from",
+                                       "into", "that", "this", "add", "fix",
+                                       "make", "update", "change", "set",
+                                       "use", "file", "line", "lines", "def",
+                                       "return", "function", "class"}]
+        rel_base = fd.rel.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+        tokens = [w for w in tokens if w.lower() != rel_base
+                  and w.lower() != fd.rel.lower()]
+        matched_hunks: list[int] = []
+        if tokens:
+            best_score = 0
+            scores: dict[int, int] = {}
+            for h in hunks:
+                body_low = hunk_bodies.get(h.index, "").lower()
+                sc = sum(2 if ("_" in tok or any(c.isupper() for c in tok[1:]))
+                         else 1
+                         for tok in set(tokens)
+                         if re.search(r"(?<![\w])" + re.escape(tok.lower()) + r"(?![\w])",
+                                      body_low))
+                scores[h.index] = sc
+                if sc > best_score:
+                    best_score = sc
+            if best_score > 0:
+                matched_hunks = [hi for hi, sc in scores.items()
+                                 if sc == best_score]
+        if matched_hunks:
+            for hi in matched_hunks:
+                if cid not in out[hi]:
+                    out[hi].append(cid)
+        else:
+            unmatched.append(cid)
+
+    if unmatched:
+        if len(unmatched) == len(f_clauses) and len(f_clauses) == len(hunks):
+            for h, cid in zip(hunks, f_clauses):
+                if cid not in out[h.index]:
+                    out[h.index].append(cid)
+        else:
+            empty_hunks = [h.index for h in hunks if not out[h.index]]
+            targets = empty_hunks if len(unmatched) == 1 and len(empty_hunks) == 1 \
+                else [h.index for h in hunks]
+            for cid in unmatched:
+                for hi in targets:
+                    if cid not in out[hi]:
+                        out[hi].append(cid)
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def diffs_from_results(results, root=None, clauses=None,
+                       clause_texts=None) -> list[FileDiff]:
     """Convert edits.Result objects (from apply_edits(dry_run=True)) into
     FileDiffs. Only successful results with computed before/after text count.
 
@@ -372,10 +468,15 @@ def diffs_from_results(results, root=None, clauses=None) -> list[FileDiff]:
             continue
         rows, added, removed, hunks = build_diff(r.before, r.after)
         ids = tuple(clauses.get(r.file, ()))
-        out.append(FileDiff(r.file, rows, added, removed, r.sha, r.after,
-                            r.message, renames_from=tuple(r.renames_from),
-                            clauses=ids, deleted=getattr(r, "deleted", False),
-                            hunks=hunks, before_text=r.before))
+        fd = FileDiff(r.file, rows, added, removed, r.sha, r.after,
+                      r.message, renames_from=tuple(r.renames_from),
+                      clauses=ids, deleted=getattr(r, "deleted", False),
+                      hunks=hunks, before_text=r.before)
+        if ids and hunks:
+            hc = hunk_clauses_for_file(fd, clause_texts)
+            for h in hunks:
+                h.clauses = hc.get(h.index, ())
+        out.append(fd)
         if root is None:
             continue
         for old in r.renames_from:
@@ -960,7 +1061,8 @@ def _apply_page_selection(diffs: list, accepted, accepted_hunks) -> tuple[bool, 
     review stays retryable (the same contract as the GUI's decide_review)."""
     hmap = accepted_hunks if isinstance(accepted_hunks, dict) else {}
     snapshot = list(diffs)
-    fd_snap = [(fd, fd.after_text, getattr(fd, "hunk_selection", None))
+    fd_snap = [(fd, fd.after_text, fd.added, fd.removed,
+                getattr(fd, "hunk_selection", None))
                for fd in diffs]
     if isinstance(accepted, list):
         keep = set(accepted) | set(hmap)
@@ -969,8 +1071,10 @@ def _apply_page_selection(diffs: list, accepted, accepted_hunks) -> tuple[bool, 
     ok, detail = apply_hunk_selection(diffs, hmap)
     if not ok:
         diffs[:] = snapshot
-        for fd, after, sel in fd_snap:
+        for fd, after, added, removed, sel in fd_snap:
             fd.after_text = after
+            fd.added = added
+            fd.removed = removed
             if hasattr(fd, "hunk_selection"):
                 fd.hunk_selection = sel
     return ok, detail

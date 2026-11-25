@@ -1340,10 +1340,32 @@
   function profilesTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
     var defName = (f.settings || {}).default_profile || '';
+    var calMap = (X.data && X.data.calibration) || {};
     var list = h('div', { class: 'plist' });
     names.forEach(function (n) {
-      list.appendChild(h('div', { class: 'pitem' + (n === X.profile ? ' on' : ''), onclick: function () { X.profile = n; X.pending = {}; render(); } },
-        h('span', { class: 'grow', text: n }),
+      var cal = calMap[n] || {};
+      var p = f.profiles[n] || {};
+      var model = p.model ? ' (' + p.model + ')' : '';
+      var scoreChip = null;
+      if (cal.is_image_model) {
+        scoreChip = h('span', { class: 'tag image', text: '\uD83C\uDFA8', title: calTitle(cal) });
+      } else if (cal.is_hosted) {
+        scoreChip = h('span', { class: 'tag hosted', text: '\u2601', title: calTitle(cal) });
+      } else if (cal.calibrated) {
+        var scoreText = '\u2713 ' + Number(cal.card_score || 0).toFixed(2);
+        scoreChip = h('span', {
+          class: 'tag ' + (cal.calibrated_stale ? 'warn' : 'act'),
+          text: scoreText,
+          title: calTitle(cal)
+        });
+      }
+      list.appendChild(h('div', {
+        class: 'pitem' + (n === X.profile ? ' on' : ''),
+        title: n + model,
+        onclick: function () { X.profile = n; X.pending = {}; render(); }
+      },
+        h('span', { class: 'pname grow ellip', text: n, title: n + model }),
+        scoreChip,
         n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
         n === defName ? h('span', { class: 'tag', text: 'default' }) : null));
     });
