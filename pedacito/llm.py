@@ -30,7 +30,6 @@ Only dependency is `requests`.
 from __future__ import annotations
 
 import base64
-import ipaddress
 import json
 import os
 import random
@@ -567,46 +566,19 @@ def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
 
 # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab behind a
 # CGNAT gateway is still the user's box), and IPv6 unique-local addresses.
-_LAN_V4_NETS = tuple(ipaddress.ip_network(n) for n in
-                    ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                     "100.64.0.0/10"))
-_LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
-
+# The canonical predicate lives in config._endpoint_is_local; this module just
+# delegates so every caller agrees on what "local" means.
 
 def _is_local_server(cfg) -> bool:
     """True for endpoints the user self-hosts, where the acceleration keys make
-    sense: loopback or private-LAN addresses (the inverse of `_is_remote`, which
-    only knows the loopback spellings, plus RFC1918/carve-out ranges), or a
-    provider table entry that names a local runtime."""
-    try:
-        host = (urlparse(cfg.base_url).hostname or "").lower()
-    except ValueError:
-        return False
-    if host.endswith(".local"):        # mDNS names, the usual LAN spelling
-        return True
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ""):
-        return True
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab
-        # behind a CGNAT gateway is still the user's box), loopback spellings,
-        # link-local, and IPv6 unique-local. `is_private` alone is too broad:
-        # the IANA carve-outs (203.0.113/24, 198.51.100/24, 192.0.2/24, ...)
-        # read as "private" to the stdlib but route nowhere a user self-hosts.
-        nets = (_LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS)
-        if addr.is_loopback or addr.is_link_local \
-                or any(addr in net for net in nets):
-            return True
-        # A numeric address outside every LAN range is only local if the
-        # user's provider entry says so: choosing "llamacpp" for a tunneled
-        # box is an explicit statement that the endpoint is self-hosted.
-    name = str(getattr(cfg, "provider", "") or "").lower().replace("_", "")
-    return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
-                                   "vllm", "lmstudio", "ollama",
-                                   "strata", "avalon"))
+    sense: loopback, private-LAN/CGNAT/mDNS addresses, or a provider table
+    entry that names a local runtime. Delegates to the one canonical predicate
+    in config.py so the acceleration/sampling keys, hosted detection, tier
+    heuristics and server discovery never disagree."""
+    from .config import _endpoint_is_local
+    return _endpoint_is_local(
+        str(getattr(cfg, "base_url", "") or ""),
+        str(getattr(cfg, "provider", "") or ""))
 
 
 def is_external_provider(cfg) -> bool:

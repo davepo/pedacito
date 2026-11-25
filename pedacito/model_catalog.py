@@ -14,7 +14,6 @@ Mirrors ``pedacito/update.py``'s zero-startup-cost, silent-fallback contract:
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
@@ -30,8 +29,6 @@ CATALOG_URL = "https://models.dev/api.json"
 FETCH_TIMEOUT = 3.0
 CACHE_TTL = 24 * 3600.0
 CACHE_NAME = "model_catalog.json"
-
-_LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 
 # Map URL host substrings -> models.dev provider IDs in priority order.
 _HOST_TO_PROVIDER_IDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -62,15 +59,10 @@ def _host(base_url: str) -> str:
 
 
 def is_local_base_url(base_url: str) -> bool:
-    """True for empty, loopback, mDNS ``.local``, or private/LAN addresses."""
-    host = _host(base_url)
-    if host in _LOCAL_HOSTS or host.endswith(".local"):
-        return True
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return addr.is_loopback or addr.is_link_local or addr.is_private
+    """True for empty, loopback, mDNS ``.local``, private/LAN, or CGNAT
+    (100.64.0.0/10, Tailscale) addresses. Delegates to the one canonical
+    predicate in config.py."""
+    return config_mod._endpoint_is_local(base_url)
 
 
 def cache_path() -> Path:

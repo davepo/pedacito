@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import difflib
 import inspect
+import ipaddress
 import json
 import os
 import re
@@ -1874,7 +1875,7 @@ def load(root: Path | None = None, explicit: Path | None = None,
     # Hosted APIs (DeepSeek in particular) reject response_format json_schema,
     # so switch to "object" unless the user spelled json_mode somewhere.
     host = _hostname(cfg.base_url)
-    remote = host not in _LOCAL_HOSTS
+    remote = not _endpoint_is_local(cfg.base_url, cfg.provider)
     deepseek = "deepseek" in cfg.model.lower() or "deepseek" in host
 
     # Provider compatibility quirks (C4) from the C0 table, applied before the
@@ -1971,7 +1972,7 @@ def fill_default_prices(cfg: Config) -> None:
     is remote; any explicit price wins, and local servers stay at 0."""
     if any(cfg.sources.get(k, "default") != "default" for k in _PRICE_FIELDS):
         return
-    if _hostname(cfg.base_url) in _LOCAL_HOSTS:
+    if _endpoint_is_local(cfg.base_url, getattr(cfg, "provider", "")):
         return
     try:
         from . import providers as providers_mod
@@ -2052,7 +2053,7 @@ def is_hosted(cfg: Config) -> bool:
         return True
     if cfg.json_mode == "object":
         return True
-    return _hostname(cfg.base_url) not in _LOCAL_HOSTS
+    return not _endpoint_is_local(cfg.base_url, getattr(cfg, "provider", ""))
 
 
 _GIB = 1024 ** 3
@@ -2202,7 +2203,8 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         detected = info.get("context_length")
         host = _hostname(cfg.base_url)
         is_loopback = host in _LOCAL_HOSTS
-        is_lan = (not is_loopback) and _endpoint_is_local(cfg.base_url)
+        is_lan = (not is_loopback) and _endpoint_is_local(
+            cfg.base_url, cfg.provider)
         vram_src = cfg.sources.get("vram_gb", "default")
         vram_on_profile = (
             ("profile " in vram_src and "explicit" in vram_src)
@@ -2780,19 +2782,52 @@ def _guess_tier(name: str, body: dict) -> str | None:
     return None
 
 
-def _endpoint_is_local(base_url: str) -> bool:
-    """True for a loopback/private-LAN/mDNS endpoint (the places a user
-    self-hosts a model server). Used to keep the tier heuristic from calling
-    a local model 'hosted' because of its name."""
+# Real self-host ranges: RFC 1918 plus RFC 6598 carrier-grade NAT (a homelab
+# behind a CGNAT gateway -- or a Tailscale 100.x address -- is still the user's
+# box), and IPv6 unique-local addresses. Deliberately NOT `addr.is_private`:
+# Python 3.11.4+ reports `is_private == False` for 100.64.0.0/10, yet still
+# flags the IANA documentation carve-outs (192.0.2.0/24, 198.51.100.0/24,
+# 203.0.113.0/24) that route nowhere a user self-hosts.
+_LAN_V4_NETS = tuple(ipaddress.ip_network(n) for n in
+                     ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                      "100.64.0.0/10"))
+_LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
+
+# Runtime/provider labels that name a self-hosted server, whatever the URL says
+# (a tunneled box still runs on the user's hardware). Matched case-insensitively
+# after underscores are stripped, so "llama_cpp" folds to "llamacpp".
+_LOCAL_PROVIDER_LABELS = ("local", "llamacpp", "llama.cpp", "lemonade",
+                          "lemond", "vllm", "lmstudio", "ollama",
+                          "strata", "avalon")
+
+
+def _endpoint_is_local(base_url: str, provider: str = "") -> bool:
+    """True for a loopback/private-LAN/CGNAT/mDNS endpoint (the places a user
+    self-hosts a model server), or for an explicit local provider label. The
+    ONE canonical predicate every call site delegates to, so the tier
+    heuristic, the acceleration/sampling keys, and hosted detection all agree.
+
+    IPv4 recognises loopback, link-local, RFC 1918 (10/8, 172.16/12,
+    192.168/16) and RFC 6598 CGNAT/Tailscale (100.64.0.0/10). It does NOT rely
+    on `addr.is_private`, which in Python 3.11.4+ drops 100.64.0.0/10
+    (`is_private == False`) yet still flags the IANA documentation carve-outs.
+    IPv6 recognises loopback, link-local and ULA (fc00::/7).
+    """
     host = _hostname(base_url)
     if host in _LOCAL_HOSTS or host.endswith(".local"):
         return True
     try:
-        import ipaddress
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return addr.is_loopback or addr.is_link_local or addr.is_private
+        addr = None
+    if addr is not None:
+        if addr.is_loopback or addr.is_link_local:
+            return True
+        nets = _LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS
+        if any(addr in net for net in nets):
+            return True
+    name = str(provider or "").lower().replace("_", "")
+    return any(label in name for label in _LOCAL_PROVIDER_LABELS)
 
 
 # --- model capability profiles ------------------------------------------------

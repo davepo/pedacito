@@ -2135,9 +2135,8 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
 
 
 def _is_hosted_url(url: str) -> bool:
-    from urllib.parse import urlparse
-    host = (urlparse(url or "").hostname or "").lower()
-    return bool(host) and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+    from .config import _endpoint_is_local
+    return not _endpoint_is_local(url or "")
 
 
 def _host_label(url: str) -> str:

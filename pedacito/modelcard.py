@@ -99,12 +99,36 @@ def _card_is_image(card) -> bool:
     return imagegen.is_image_model(card.get("model") or "")
 
 
+def _card_missing_temperatures(card) -> bool:
+    """True for a CURRENT-version, non-image, LOCAL text card whose ``choices``
+    record neither calibrated temperature. Cards saved before the calibrated
+    temperature work (WP-3305) fall here and must re-calibrate; hosted cards
+    (never temperature-calibrated) and image cards (no chat surface) do not."""
+    if not isinstance(card, dict):
+        return False
+    if card.get("version") != CARD_VERSION:
+        return False
+    if _card_is_image(card):
+        return False
+    url = str(card.get("url") or "")
+    if not url:
+        return False
+    from .config import _endpoint_is_local
+    if not _endpoint_is_local(url):
+        return False
+    choices = card.get("choices")
+    return (isinstance(choices, dict)
+            and "temperature" not in choices
+            and "temperature_answer" not in choices)
+
+
 def card_meta(card: dict | None) -> dict:
     """Calibration-badge metadata for one saved card (or None): whether it is
     calibrated, when ("YYYY-MM-DD HH:MM"), its age in whole days, whether it
-    is stale (older than the TTL or from an old card version), the overall
-    score, and whether it is an image-generator card. An absent card yields
-    the all-empty/zero form."""
+    is stale (older than the TTL, from an old card version, or a local text
+    card saved before calibrated temperatures), the overall score, and whether
+    it is an image-generator card. An absent card yields the all-empty/zero
+    form."""
     if not isinstance(card, dict):
         return {"calibrated": False, "calibrated_at": "",
                 "calibrated_age_days": 0, "calibrated_stale": False,
@@ -114,7 +138,8 @@ def card_meta(card: dict | None) -> dict:
     ts = float(card.get("ts", 0) or 0)
     age_days = int((time.time() - ts) / 86400) if ts else 0
     at = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
-    stale = age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
+    stale = (age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
+             or _card_missing_temperatures(card))
     measured = card.get("measured") or {}
     score = float(measured.get("overall") or 0.0)
     is_image = _card_is_image(card)
@@ -1283,7 +1308,8 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     except Exception:
         info = {}
     hosted = is_hosted(cfg) and not _endpoint_is_local(
-        str(getattr(cfg, "base_url", "") or ""))
+        str(getattr(cfg, "base_url", "") or ""),
+        str(getattr(cfg, "provider", "") or ""))
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
     allow_hf = bool(getattr(cfg, "auto_refresh_model_catalog", True))
@@ -1474,6 +1500,8 @@ def render(card: dict) -> str:
              f"overall {m.get('overall', '?')})"]
     if card.get("_needs_recalibrate"):
         lines.append("  (v1 card: re-calibrate to record per-probe means)")
+    if _card_missing_temperatures(card):
+        lines.append("  (calibrated before temperature recording: re-calibrate)")
     lines.append("  choices: " + ", ".join(f"{k}={v}" for k, v in c.items()))
     tags = m.get("specialties") or c.get("specialties")
     if tags:
