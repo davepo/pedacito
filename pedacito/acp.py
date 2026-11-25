@@ -465,14 +465,6 @@ class AcpServer:
                 "events": True,
             },
         }
-        watcher = threading.Thread(
-            target=self._prompt_worker, args=(prompt, msg),
-            daemon=True, name="pedacito-acp-prompt")
-        with self._lock:
-            self._watchers.append(watcher)
-        watcher.start()
-
-    def _prompt_worker(self, prompt: _Prompt, msg: dict) -> None:
         try:
             frame = self.server.dispatch(msg)
         except Exception as exc:           # dispatcher bug != dead session
@@ -483,6 +475,16 @@ class AcpServer:
             # answers with a stopReason the client can act on.
             prompt.frame = frame
             prompt.event.set()
+            self._finish_prompt(prompt)
+            return
+        watcher = threading.Thread(
+            target=self._prompt_worker, args=(prompt,),
+            daemon=True, name="pedacito-acp-prompt")
+        with self._lock:
+            self._watchers.append(watcher)
+        watcher.start()
+
+    def _prompt_worker(self, prompt: _Prompt) -> None:
         prompt.event.wait()
         self._finish_prompt(prompt)
 
