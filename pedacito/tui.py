@@ -47,6 +47,7 @@ from pathlib import Path
 from . import checkpoints as checkpoints_mod
 from . import events as events_mod
 from . import gitinfo
+from . import gitops
 from . import i18n
 from . import index as index_mod
 from . import llm as llm_mod
@@ -144,6 +145,7 @@ _SLASH_COMMANDS = [
     "/theme", "/lang", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/git",
     "/update",
     "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
@@ -251,6 +253,9 @@ Pedacito TUI commands
   /security ack             acknowledge every current secret finding
   /security gitignore       add .env patterns to .gitignore
   /diff                     git status and working-tree diff
+  /git [status|stage PATH|unstage PATH|commit [MSG]|branch NAME]
+                            guided local git: stage, scan for secrets and
+                            commit (never pushes), or create a branch
   /checkpoints [N]          show the time-travel checkpoint tree
   /undo                     restore the state before the last run (or the
                             newest .pedacito/backups snapshot on old projects)
@@ -343,6 +348,9 @@ Comandos de Pedacito TUI
   /rules [list|set|clear]   ver o editar .pedacito/rules.md
   /security [ack|gitignore] escanear secretos o archivos .env expuestos
   /diff                     estado de git y diff del árbol de trabajo
+  /git [status|stage RUTA|unstage RUTA|commit [MSG]|branch NOMBRE]
+                            git local guiado: preparar, escanear secretos y
+                            confirmar (nunca hace push) o crear una rama
   /checkpoints [N]          mostrar el árbol de checkpoints
   /undo                     restaurar el estado anterior a la última ejecución
   /checkout ID              restaurar el espacio de trabajo desde un checkpoint
@@ -3455,6 +3463,9 @@ class TuiSession:
         if cmd == "diff":
             self._diff()
             return
+        if cmd == "git":
+            self._git(arg)
+            return
         if cmd == "checkpoints":
             self._checkpoints(arg)
             return
@@ -4538,6 +4549,69 @@ class TuiSession:
                         backups[0]).as_posix(), "diff")
             return
         self._append("No git changes or backup snapshots to show.", "system")
+
+    def _git(self, arg: str = "") -> None:
+        """`/git [status|stage PATH|unstage PATH|commit [MSG]|branch NAME]`."""
+        text = str(arg or "").strip()
+        sub, _, rest = text.partition(" ")
+        sub = sub.lower() or "status"
+        rest = rest.strip()
+        try:
+            if sub == "status":
+                st = gitops.status_hunks(self.root)
+                if not st["dirty"]:
+                    self._append(f"git: branch {st['branch'] or '?'} is clean "
+                                 "(nothing to commit)", "system")
+                    return
+                self._append(f"git: branch {st['branch'] or '?'}", "system")
+                for label in ("staged", "unstaged", "untracked", "conflicts"):
+                    for path in st[label]:
+                        self._append(f"  {label:<9} {path}", "diff")
+                return
+            if sub in ("stage", "add", "unstage", "reset"):
+                if not rest:
+                    self._append(f"Usage: /git {sub} PATH", "error")
+                    return
+                if sub in ("stage", "add"):
+                    result = gitops.stage_files(self.root, [rest])
+                    self._append("git: staged " + ", ".join(result["staged"]),
+                                 "system")
+                else:
+                    result = gitops.unstage_files(self.root, [rest])
+                    self._append("git: unstaged "
+                                 + ", ".join(result["unstaged"]), "system")
+                return
+            if sub == "commit":
+                findings = gitops.scan_staged_secrets(self.root)
+                if findings:
+                    self._append("git: refusing to commit; the staged diff "
+                                 "contains possible secrets. Run /security to "
+                                 "review them.", "error")
+                    for finding in findings[:5]:
+                        self._append(
+                            f"  {finding.kind} {finding.file}:{finding.line} "
+                            f"{finding.masked_preview}", "error")
+                    return
+                message = rest or gitops.draft_commit_message(self.root)
+                result = gitops.create_commit(self.root, message)
+                sha = str(result.get("commit") or "")[:12]
+                self._append(f"git: committed {sha} {result['message']}",
+                             "system")
+                self._append("Nothing was pushed; push when ready.",
+                             "system")
+                return
+            if sub == "branch":
+                if not rest:
+                    self._append("Usage: /git branch NAME", "error")
+                    return
+                result = gitops.create_branch(self.root, rest)
+                self._append("git: created and switched to branch "
+                             + result["branch"], "system")
+                return
+            self._append("Usage: /git [status|stage PATH|unstage PATH|"
+                         "commit [MSG]|branch NAME]", "error")
+        except (gitops.GitOpsError, OSError) as exc:
+            self._append(f"git: {exc}", "error")
 
     def _checkpoints(self, arg: str = "") -> None:
         limit = 0
