@@ -168,6 +168,7 @@ class AcpServer:
         server.out = self.out
 
         self._write_lock = threading.Lock()
+        self._closed = False
         self._lock = threading.RLock()
         self._sessions: dict[str, dict] = {}
         self._prompts: dict[str, _Prompt] = {}
@@ -185,7 +186,7 @@ class AcpServer:
     # ------------------------------------------------------------------ #
     @property
     def closed(self) -> bool:
-        return self.out.closed
+        return self._closed
 
     def _write(self, obj: dict) -> None:
         """Serialize exactly one JSON-RPC frame, atomically."""
@@ -194,12 +195,13 @@ class AcpServer:
         except (TypeError, ValueError):
             return
         with self._write_lock:
-            if self.out.closed:
+            if self._closed:
                 return
             try:
                 self._out.write(line)
                 self._out.flush()
             except (ValueError, OSError):
+                self._closed = True
                 self.out.close()
 
     def _notify(self, method: str, params: dict) -> None:
@@ -812,6 +814,8 @@ class AcpServer:
         with self._lock:
             self._prompts.clear()
             self._pending_perms.clear()
+        with self._write_lock:
+            self._closed = True
         self.out.close()
 
 
