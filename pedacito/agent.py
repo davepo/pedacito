@@ -2484,7 +2484,11 @@ class Agent:
         if getattr(self.cfg, "tool_mode", "grammar") == "plain":
             # The plain-word step protocol replaces the JSON grammar: tell the
             # model the exact words instead of relying on response_format.
-            system += tools_mod.plain_step_instructions()
+            # R4-BUG-03: do not advertise write/append while gather is
+            # read-only; small models otherwise try an edit step and get it
+            # rejected. Edits belong to the answer phase after `action done`.
+            system += tools_mod.plain_step_instructions(
+                allow_write=bool(getattr(self.cfg, "allow_write", False)))
         project_notes = instructions_mod.render(root, self.cfg)
         todo_notes = todo_mod.render(root, self.cfg,
                                      limit=int(getattr(

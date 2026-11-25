@@ -922,6 +922,46 @@ _PLAIN_SEP_RE = re.compile(
     r"pattern|query|symbol|to|command|cmd|content|reasoning|reason|why|"
     r"target|filter|url)\b)", re.I)
 
+# R4-BUG-03: small models often answer with a bare verb line (`done`,
+# `outline calcbox/ops.py`) instead of the taught `action ...` prefix. These
+# are the gather verbs a shorthand line may start with; when a schema is
+# supplied its action enum narrows the set.
+_PLAIN_SHORTHAND_VERBS = frozenset({
+    "read", "grep", "find", "symbol", "callers", "context", "outline",
+    "usages", "sessions", "diff", "git", "git_diff", "diagnose",
+    "write", "append",
+    "move", "delete", "undo", "rename", "rename_symbol", "run", "run_test",
+    "screenshot", "browser", "todo", "remember", "skill", "task", "fetch",
+    "fetch_url", "web_search", "question", "mcp", "mcp_call", "serve",
+    "generate_image", "lsp", "done",
+})
+
+# The field a shorthand's first bare value fills (`read a.py` -> file).
+_PLAIN_SHORTHAND_FIELD = {
+    "read": "file", "outline": "file", "diff": "file", "git_diff": "file",
+    "find": "pattern", "grep": "pattern", "git": "pattern",
+    "symbol": "symbol", "callers": "symbol", "context": "symbol",
+    "usages": "symbol",
+    "rename": "symbol", "rename_symbol": "symbol", "skill": "symbol",
+    "lsp": "symbol", "mcp": "symbol", "mcp_call": "server",
+    "run": "command", "diagnose": "command", "serve": "command",
+    "screenshot": "command", "browser": "command",
+    "run_test": "target", "todo": "content", "remember": "content",
+    "task": "content", "question": "content",
+    "fetch": "pattern", "fetch_url": "url", "web_search": "query",
+    "write": "file", "append": "file", "move": "file", "delete": "file",
+    "undo": "file", "generate_image": "prompt",
+}
+
+# `read calcbox/ops.py lines 1 to 23`: a range glued to the bare value.
+_PLAIN_GLUED_RANGE_RE = re.compile(
+    r"^(?P<head>.*\S)\s+(?:lines?|l)\s*(?P<a>\d+)"
+    r"(?:\s*(?:to|-|through|\.\.)\s*(?P<b>\d+))?\s*$", re.I)
+
+_PLAIN_EDIT_BLOCK_MARKERS = (
+    "<<<<<<< SEARCH", "<<<<<<< SYMBOL", "<<<<<<< AFTER_SYMBOL", "--- FILE:",
+)
+
 
 def _plain_kv(text: str) -> bool:
     """True when the text looks like `key: value` lines rather than the
@@ -961,11 +1001,125 @@ def _plain_lines_value(value: str) -> tuple[int, int]:
     return 0, 0
 
 
+def _plain_allowed_actions(schema) -> frozenset[str]:
+    """Action verbs a shorthand line may start with: the schema's action enum
+    when it carries one, otherwise every gather verb."""
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            action = props.get("action")
+            if isinstance(action, dict):
+                enum = action.get("enum")
+                if isinstance(enum, (list, tuple, set, frozenset)):
+                    allowed = frozenset(
+                        str(v).strip().lower() for v in enum
+                        if str(v).strip())
+                    if allowed:
+                        return allowed
+    return _PLAIN_SHORTHAND_VERBS
+
+
+def _plain_step_from_fields(fields: dict[str, str]) -> dict | None:
+    """Assemble the step dict both plain shapes feed (`action` required)."""
+    # `action` may sit in any segment; `lines` folds into start/end.
+    if "lines" in fields and "start" not in fields and "end" not in fields:
+        start, end = _plain_lines_value(fields["lines"])
+        if start:
+            fields["start"], fields["end"] = str(start), str(end)
+    action = fields.pop("action", "").strip().lower() if "action" in fields \
+        else ""
+    if not action:
+        return None
+    step: dict = {"action": action}
+    for raw_key, value in fields.items():
+        key = _PLAIN_FIELD_ALIASES.get(raw_key)
+        if not key or key == "action" or key == "lines":
+            continue
+        if key in _PLAIN_INT_FIELDS:
+            step[key] = _as_int(value, 0)
+        else:
+            step[key] = value
+    if "start" in step or "end" in step:
+        step.setdefault("start", 1)
+        step.setdefault("end", 0)
+    return step
+
+
+def _plain_shorthand(raw: str, schema=None) -> dict | None:
+    """Parse a verb-leading line that omits the literal `action` word.
+
+    Only the first non-empty line is considered, so prose or an edit block's
+    body cannot be mistaken for a step. Never called before the canonical
+    `action ...` / `key: value` shapes have been tried."""
+    lines = [ln.strip() for ln in raw.splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        return None
+    m = re.match(r"(?P<verb>[A-Za-z_]\w*)\s*:?\s*(?P<rest>.*)$", lines[0],
+                 re.DOTALL)
+    if not m:
+        return None
+    verb = m.group("verb").lower()
+    if verb not in _plain_allowed_actions(schema):
+        return None
+    rest = m.group("rest").strip()
+    if verb == "done":
+        step = {"action": "done"}
+        tail = rest.lstrip(" /|:-").strip()
+        if tail:
+            step["reasoning"] = tail
+        return step
+    fields: dict[str, str] = {}
+    primary = _PLAIN_SHORTHAND_FIELD.get(verb, "")
+    for seg in (s.strip() for s in re.split(r"\s+[/|]\s+", rest)):
+        if not seg:
+            continue
+        # A range glued to the bare value: `read a.py lines 1 to 23`.
+        glued = _PLAIN_GLUED_RANGE_RE.match(seg)
+        if glued:
+            seg = glued.group("head").strip()
+            fields["start"] = glued.group("a")
+            fields["end"] = glued.group("b") or glued.group("a")
+        if not seg:
+            continue
+        head = seg.split(None, 1)[0].rstrip(":=").lower()
+        if head in _PLAIN_FIELD_ALIASES or head == "lines":
+            key, val = _plain_pair(seg)
+            fields[key] = val
+            continue
+        if re.fullmatch(r"\d+\s*(?:to|-|through|\.\.)\s*\d+", seg, re.I):
+            start, end = _plain_lines_value(seg)
+            fields["start"], fields["end"] = str(start), str(end)
+            continue
+        if primary and primary not in fields:
+            fields[primary] = seg
+        elif primary != "file" and "file" not in fields:
+            # `grep MAX_RETRIES src/sync.py`: the second bare value is a file.
+            fields["file"] = seg
+    fields["action"] = verb
+    return _plain_step_from_fields(fields)
+
+
+def _plain_edit_block_done(raw: str) -> dict | None:
+    """R4-BUG-03: a reply already carrying edit blocks is a gather `done` in
+    disguise -- advance to the answer phase instead of burning recoveries."""
+    upper = (raw or "").upper()
+    if any(marker in upper for marker in _PLAIN_EDIT_BLOCK_MARKERS):
+        return {"action": "done",
+                "reasoning": "model emitted edit blocks; advancing to answer "
+                             "phase"}
+    return None
+
+
 def parse_plain_step(text: str, schema=None) -> dict | None:
     """Parse a plain-word gather step into the same dict `chat_json` returns.
 
-    Returns None when no `action` could be extracted. Unknown keys are
-    ignored; start/end are coerced to ints; `lines X to Y` sets both."""
+    Accepts the taught `action ...` / `key: value` shapes plus R4-BUG-03
+    shorthand (`done`, `read a.py lines 1 to 23`, `outline a.py`). A reply
+    that already contains edit blocks becomes `done` so `two_phase` gather
+    transitions on the first try. Returns None when no action was found.
+    Unknown keys are ignored; start/end are coerced to ints; `lines X to Y`
+    sets both."""
     raw = (text or "").strip()
     if not raw:
         return None
@@ -992,46 +1146,39 @@ def parse_plain_step(text: str, schema=None) -> dict | None:
             if key:
                 fields[key] = val
     if not fields:
-        return None
-    # `action` may sit in any segment; `lines` folds into start/end.
-    if "lines" in fields and "start" not in fields and "end" not in fields:
-        start, end = _plain_lines_value(fields["lines"])
-        if start:
-            fields["start"], fields["end"] = str(start), str(end)
-    action = fields.pop("action", "").strip().lower() if "action" in fields \
-        else ""
-    if not action:
-        # The slash shape may have put the action value in the first segment
-        # with no explicit `action` key; that is handled by `_plain_pair` only
-        # when a key precedes it. Require an explicit action.
-        return None
-    step: dict = {"action": action}
-    for raw_key, value in fields.items():
-        key = _PLAIN_FIELD_ALIASES.get(raw_key)
-        if not key or key == "action" or key == "lines":
-            continue
-        if key in _PLAIN_INT_FIELDS:
-            step[key] = _as_int(value, 0)
-        else:
-            step[key] = value
-    if "start" in step or "end" in step:
-        step.setdefault("start", 1)
-        step.setdefault("end", 0)
-    return step
+        return (_plain_shorthand(raw, schema)
+                or _plain_edit_block_done(raw))
+    step = _plain_step_from_fields(fields)
+    if step is not None:
+        return step
+    # No explicit `action` field: a shorthand verb may lead the line, and an
+    # edit-block reply means the model is ready for the answer phase.
+    return _plain_shorthand(raw, schema) or _plain_edit_block_done(raw)
 
 
-def plain_step_instructions() -> str:
+def plain_step_instructions(allow_write: bool = False) -> str:
     """The plain-word step protocol the gather system prompt appends when
-    `tool_mode = "plain"`."""
+    `tool_mode = "plain"`.
+
+    `allow_write=False` (the default, and always the case in a read-only
+    `two_phase` gather) keeps the prompt from advertising `write`/`append`,
+    which small models otherwise attempt and then get rejected for."""
+    content_hint = ("`content` for write/append/todo" if allow_write
+                    else "`content` for todo")
+    edits_hint = ("" if allow_write else
+                  " File edits are not part of gather: they happen after "
+                  "`action done`.")
     return ("\n\nReply in PLAIN WORDS, not JSON. One action per reply, in "
             "exactly one of these two forms:\n"
             "  action read / file src/main.py / lines 10 to 40\n"
             "  action: read\n  file: src/main.py\n  start: 10\n  end: 40\n"
             "The action comes first. Use `lines 10 to 40` (or start/end) for "
             "ranges, `pattern` for grep/find, `symbol` for callers/context/"
-            "rename, `command` for run, `content` for write/append/todo. "
-            "Reply with `action done` when you have enough. No JSON, no "
-            "prose around the step.")
+            f"rename, `command` for run, {content_hint}.{edits_hint} "
+            "A shorthand line without the word `action` also works: `read "
+            "src/main.py / lines 10 to 40`, `outline src/main.py`, or just "
+            "`done`. Reply with `action done` when you have enough. No JSON, "
+            "no prose around the step.")
 
 
 # ------------------------------------------------------- scratchpad offloading
