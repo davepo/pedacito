@@ -1448,6 +1448,13 @@ class TuiSession:
         state = "expanded" if expand else "collapsed"
         ids = ", ".join(f"[{c['id']}]" for c in changed)
         self._append(f"Tool card(s) {ids} {state}.", "system")
+        if expand and self.headless:
+            for card in changed:
+                output = str(card.get("output") or "").strip()
+                if not output:
+                    continue
+                for ln in output.splitlines():
+                    self._append(f"    \u2502 {ln}", "system")
 
     def _wrap_transcript_line(self, kind: str, text: str,
                              width: int) -> list[str]:

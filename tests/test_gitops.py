@@ -155,6 +155,42 @@ def test_draft_commit_message_uses_a_client_then_falls_back(tmp_path):
         .startswith(("feat:", "chore:", "docs:", "test:"))
 
 
+def test_draft_commit_message_disables_thinking_and_retries_when_empty(tmp_path):
+    root = _repo(tmp_path)
+    (root / "think.py").write_text("x = 1\n", encoding="utf-8")
+    gitops.stage_files(root, ["think.py"])
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, max_tokens=0, disable_thinking=False):
+            self.calls.append((max_tokens, disable_thinking))
+            return "" if max_tokens < 512 else "feat: think module"
+
+    client = Client()
+    assert gitops.draft_commit_message(root, client=client) == "feat: think module"
+    assert client.calls == [(120, True), (512, True)]
+
+
+def test_draft_commit_message_falls_back_on_client_without_thinking_kwarg(tmp_path):
+    root = _repo(tmp_path)
+    (root / "legacy.py").write_text("x = 1\n", encoding="utf-8")
+    gitops.stage_files(root, ["legacy.py"])
+
+    class Legacy:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, max_tokens=0):
+            self.calls.append(max_tokens)
+            return "fix: legacy reply"
+
+    client = Legacy()
+    assert gitops.draft_commit_message(root, client=client) == "fix: legacy reply"
+    assert client.calls == [120]
+
+
 def test_create_branch_switches_and_invalid_names_are_rejected(tmp_path):
     root = _repo(tmp_path)
     result = gitops.create_branch(root, "feature/gitops")
@@ -232,6 +268,39 @@ def test_draft_pr_is_grounded_in_commits_and_files(tmp_path, monkeypatch):
     assert "draft file" in draft["title"].lower()
     assert "draft.txt" in draft["body"]
     assert draft["branch"] == "feature/draft"
+
+
+def test_draft_pr_disables_thinking_and_falls_back_without_kwarg(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    gitops.create_branch(root, "feature/think-pr")
+    (root / "pr_think.txt").write_text("change\n", encoding="utf-8")
+    gitops.stage_files(root, ["pr_think.txt"])
+    gitops.create_commit(root, "feat: add pr think file")
+
+    real_which = shutil.which
+    monkeypatch.setattr(
+        gitops.shutil, "which",
+        lambda name: "/usr/bin/gh" if name == "gh" else real_which(name))
+
+    class Thinking:
+        def __init__(self):
+            self.kwargs = []
+
+        def chat(self, messages, max_tokens=0, disable_thinking=False):
+            self.kwargs.append((max_tokens, disable_thinking))
+            return "TITLE: feat: model title\nBODY:\nModel body."
+
+    class Legacy:
+        def chat(self, messages, max_tokens=0):
+            return "TITLE: feat: legacy title\nBODY:\nLegacy body."
+
+    thinking = Thinking()
+    draft = gitops.draft_pr(root, client=thinking, base="main")
+    assert thinking.kwargs == [(500, True)]
+    assert draft["title"] == "feat: model title"
+
+    draft = gitops.draft_pr(root, client=Legacy(), base="main")
+    assert draft["title"] == "feat: legacy title"
 
 
 # --- GUI endpoints -------------------------------------------------------------

@@ -203,7 +203,7 @@ def test_collapsible_tool_cards_ctrl_o_and_slash_commands(tmp_path):
         # /collapse 1 collapses card 1
         session.handle_line("/collapse 1")
         assert session.tool_cards[0]["expanded"] is False
-        assert "def main():" not in session.render_frame()
+        assert "def main():" not in session._render_tool_card_text(session.tool_cards[0])
 
         # /expand all expands both cards
         session.handle_line("/expand all")
@@ -215,6 +215,34 @@ def test_collapsible_tool_cards_ctrl_o_and_slash_commands(tmp_path):
         # /collapse all collapses all cards
         session.handle_line("/collapse all")
         assert not any(c["expanded"] for c in session.tool_cards)
+    finally:
+        session.close()
+
+
+def test_headless_expand_emits_card_detail_into_transcript(tmp_path):
+    out = io.StringIO()
+    session = TuiSession(
+        tmp_path, _cfg(), headless=True,
+        width=110, height=28, stdout=out,
+    )
+    try:
+        session._apply_event("step", {
+            "n": 1,
+            "action": "read",
+            "detail": "src/app.py L10-60",
+            "duration_ms": 42,
+            "output": "def main():\n    return 42",
+        })
+        session._redraw(force=True)
+        out.seek(0)
+        out.truncate()
+
+        session.handle_line("/expand 1")
+        session._redraw(force=True)
+        emitted = out.getvalue()
+        assert "Tool card(s) [1] expanded." in emitted
+        assert "    \u2502 def main():" in emitted
+        assert "    \u2502     return 42" in emitted
     finally:
         session.close()
 

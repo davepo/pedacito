@@ -357,6 +357,17 @@ def _bounded_diff(status: dict, *, staged: bool = True) -> str:
     return text
 
 
+def _chat_without_thinking(client, messages, **kwargs):
+    """Call `client.chat` with `disable_thinking=True` when it accepts it.
+
+    Minimal client objects may not take the keyword; those get the plain call.
+    """
+    try:
+        return client.chat(messages, disable_thinking=True, **kwargs)
+    except TypeError:
+        return client.chat(messages, **kwargs)
+
+
 def draft_commit_message(root, client=None, cfg=None) -> str:
     """A concise Conventional Commit message for the staged change.
 
@@ -393,7 +404,11 @@ def draft_commit_message(root, client=None, cfg=None) -> str:
             f"Staged diff:\n{_bounded_diff(status)}")},
     ]
     try:
-        raw = client.chat(messages, max_tokens=120)
+        raw = _chat_without_thinking(client, messages, max_tokens=120)
+        if not str(raw or "").strip():
+            # A reasoning model that ignores `disable_thinking` can spend the
+            # whole budget thinking; retry once with more room for the reply.
+            raw = _chat_without_thinking(client, messages, max_tokens=512)
     except Exception:
         return offline
     if isinstance(raw, dict):
@@ -600,7 +615,7 @@ def draft_pr(root, client=None, cfg=None, *, base: str = "main") -> dict:
                 + f"\n\nBranch diff:\n{diff}")},
         ]
         try:
-            raw = client.chat(messages, max_tokens=500)
+            raw = _chat_without_thinking(client, messages, max_tokens=500)
         except Exception:
             title, body = offline_title, offline_body
         else:
