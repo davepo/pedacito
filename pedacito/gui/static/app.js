@@ -60,6 +60,19 @@ PDC.fmtTokens = (n) => {
   return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 };
 
+// Captain Picard Mode: relabels primary action buttons to 'Make it so.' while
+// preserving the original semantic label in the button's title tooltip.
+PDC.isPicardMode = () => !!(S && S.status && S.status.picard_mode);
+PDC.picardText = (normalText) => PDC.isPicardMode() ? 'Make it so.' : normalText;
+PDC.picardTitle = (normalText, baseTitle) => {
+  if (!PDC.isPicardMode()) return baseTitle || '';
+  const sem = String(normalText || '').trim();
+  const base = String(baseTitle || '').trim();
+  if (!sem) return base;
+  if (!base) return sem;
+  return base.toLowerCase().indexOf(sem.toLowerCase()) >= 0 ? base : (sem + ' \u2014 ' + base);
+};
+
 // ------------------------------------------------------------------- i18n ----
 PDC.lang = (document.documentElement.lang === 'es') ? 'es' : 'en';
 PDC.i18n = { en: {}, es: {} };
@@ -165,8 +178,12 @@ PDC.modal = (title, body, buttons, opts) => {
   const onKey = (e) => { if (e.key === 'Escape' && !opts.locked) close(); };
   const foot = h('div', { class: 'modal-foot' });
   (buttons || []).forEach((b) => {
+    const usePicard = !!(b.primary && !b.danger && !b.noPicard);
+    const shownLabel = usePicard ? PDC.picardText(b.label) : b.label;
+    const shownTitle = usePicard ? PDC.picardTitle(b.label, b.title) : (b.title || '');
     foot.appendChild(h('button', {
-      class: b.primary ? 'primary' : (b.danger ? 'danger' : ''), text: b.label,
+      class: b.primary ? 'primary' : (b.danger ? 'danger' : ''), text: shownLabel,
+      title: shownTitle || null,
       onclick: () => { const keep = b.onclick && b.onclick(close); if (keep !== false && !b.stay) close(); }
     }));
   });
@@ -192,10 +209,25 @@ PDC.modal = (title, body, buttons, opts) => {
 
 PDC.confirm = (text, okLabel, danger) => new Promise((resolve) => {
   let done = false;
+  const semLabel = okLabel || 'OK';
   PDC.modal('Please confirm', h('p', { text: text, style: 'white-space:pre-wrap;margin:0' }), [
     { label: 'Cancel', onclick: () => { done = true; resolve(false); } },
-    { label: okLabel || 'OK', primary: !danger, danger: !!danger, onclick: () => { done = true; resolve(true); } }
+    { label: PDC.picardText(semLabel), title: PDC.picardTitle(semLabel), primary: !danger, danger: !!danger, onclick: () => { done = true; resolve(true); } }
   ], { narrow: true, onClose: () => { if (!done) resolve(false); } });
+});
+
+PDC.prompt = (title, initial, okLabel, placeholder) => new Promise((resolve) => {
+  let done = false;
+  const semLabel = okLabel || 'OK';
+  const inp = h('input', { type: 'text', value: initial || '', class: 'grow', placeholder: placeholder || '' });
+  const m = PDC.modal(title || 'Prompt', h('div', { class: 'row' }, inp), [
+    { label: 'Cancel', onclick: () => { done = true; resolve(null); } },
+    { label: PDC.picardText(semLabel), title: PDC.picardTitle(semLabel), primary: true, onclick: () => { done = true; resolve(inp.value.trim()); } }
+  ], { narrow: true, onClose: () => { if (!done) resolve(null); } });
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); done = true; m.close(); resolve(inp.value.trim()); }
+  });
+  setTimeout(() => { inp.focus(); }, 30);
 });
 
 // Folder browser (used by the header, settings and the New-project option).
@@ -282,7 +314,7 @@ function showPermissionModal(pp) {
       onclick: () => { PDC.decidePermission(pp.id, decision); return false; } },
     extra || {});
   const buttons = [
-    btn('Allow Once', 'allow_once', { primary: true }),
+    btn(PDC.picardText('Allow Once'), 'allow_once', { primary: true, title: PDC.picardTitle('Allow Once') }),
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
   ];
@@ -387,6 +419,24 @@ function writeUpdateDismissed(version) {
     else localStorage.removeItem(UPDATE_DISMISSED_KEY);
   } catch (e) {}
 }
+const REMINDER_DISMISSED_KEY = 'pedacito_update_reminder_dismissed_at';
+const REMINDER_TTL_MS = 7 * 24 * 3600 * 1000;
+function readReminderDismissedAt() {
+  try { return Number(localStorage.getItem(REMINDER_DISMISSED_KEY) || 0) || 0; }
+  catch (e) { return 0; }
+}
+function isReminderDismissed(ts) {
+  const t = Number(ts || 0);
+  return t > 0 && (Date.now() - t) < REMINDER_TTL_MS;
+}
+function dismissUpdateReminder() {
+  const now = Date.now();
+  try { localStorage.setItem(REMINDER_DISMISSED_KEY, String(now)); } catch (e) {}
+  if (S && S.ui) S.ui.reminderDismissedAt = now;
+  emit();
+}
+PDC.isReminderDismissed = isReminderDismissed;
+PDC.dismissUpdateReminder = dismissUpdateReminder;
 const UPDATE_STAGE_RANK = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2,
                             c: 3, rc: 3, pre: 3, preview: 3,
                             post: 5, rev: 5, r: 5 };
@@ -457,6 +507,8 @@ const S = {
         // (a newer release re-shows the banner), the upgrade output drawer,
         // and manual instructions when no upgrade command can be run.
         updateDismissed: savedUpdateDismissed,
+        reminderDismissedAt: readReminderDismissedAt(),
+        reminderChecking: false,
         updateDrawerOpen: false, updateManual: '', updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
@@ -2041,7 +2093,8 @@ function openGitDialog() {
     const tools = h('div', { class: 'row', style: 'margin-top:6px' },
       h('label', { class: 'chk' }, stageAll, 'stage all'),
       h('button', { class: 'small', text: 'Draft message', onclick: draft }),
-      h('button', { class: 'small primary', text: 'Commit',
+      h('button', { class: 'small primary', text: PDC.picardText('Commit'),
+        title: PDC.picardTitle('Commit') || null,
         onclick: () => doCommit(false) }));
     commitBox.appendChild(tools);
     body.appendChild(commitBox);
@@ -4801,6 +4854,35 @@ function MessageList() {
 
 function Hello() {
   const s = S.status;
+  const info = s.update;
+  const dismissedVer = S.ui.updateDismissed;
+  const updateBannerShowing = !!(info && info.update_available
+    && (!dismissedVer || isNewerVersion(info.latest, dismissedVer)));
+  const showDevReminder = s.show_update_reminder !== false
+    && !updateBannerShowing
+    && !isReminderDismissed(S.ui.reminderDismissedAt);
+  const checkFromWelcome = () => {
+    if (S.ui.reminderChecking) return;
+    S.ui.reminderChecking = true;
+    emit();
+    PDC.api('/api/update/check', {}).then((j) => {
+      S.ui.reminderChecking = false;
+      const u = j && j.update;
+      if (u && u.detail === 'disabled') {
+        PDC.toast(PDC.t('gui.update.disabled_toast', null, 'Update checks are disabled (check_for_updates = false).'));
+      } else if (u && u.ok && u.update_available) {
+        PDC.toast(PDC.t('gui.update.available', { version: u.latest }, 'Pedacito v' + u.latest + ' is available'));
+      } else if (u && u.ok) {
+        PDC.toast(PDC.t('gui.update.up_to_date_toast', null, 'Pedacito is up to date.'));
+      } else {
+        PDC.toast(PDC.t('gui.update.offline_toast', null, 'Could not reach PyPI right now.'));
+      }
+      refreshState();
+    }, () => {
+      S.ui.reminderChecking = false;
+      emit();
+    });
+  };
   return html`
     <div class="hello">
       <h3>Welcome to pedacito</h3>
@@ -4815,6 +4897,17 @@ function Hello() {
       ${s.needs_setup
         ? html`<button class="primary" onClick=${() => callSettings()}>Set up your model server</button>`
         : 'Open a project above (Browse\u2026 helps).'}
+      ${showDevReminder ? html`
+        <div class="note-box small-text" id="activeDevReminder" style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="grow">${PDC.t('gui.update.active_dev_tip', null,
+            'Tip: Pedacito is in active development with frequent bug fixes and updates \u2014 run `pedacito update` regularly to stay current.')}</span>
+          <button class="small" disabled=${!!S.ui.reminderChecking} onClick=${checkFromWelcome}>
+            ${S.ui.reminderChecking
+              ? PDC.t('gui.update.checking', null, 'Checking\u2026')
+              : PDC.t('gui.update.check_btn', null, 'Check for updates')}</button>
+          <button class="ghost small" title=${PDC.t('gui.update.dismiss_reminder_title', null, 'hide this reminder for 7 days')}
+                  onClick=${dismissUpdateReminder}>\u2715</button>
+        </div>` : null}
     </div>`;
 }
 
@@ -5361,13 +5454,20 @@ function Composer() {
           <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
         </label>
         <span class="grow muted small-text" id="sendHint">${isHow ? PDC.t('gui.composer.how_hint', null, 'answers stay out of this chat thread') : (steerable ? PDC.t('gui.composer.steer_hint', null, 'delivered at the next lookup step') : '')}</span>
-        <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
-                disabled=${!!(j && j.cancelled && !isHow)}
-                onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
-          ${isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
-              : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
-              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)))}
-        </button>
+        ${(() => {
+          const sendSem = isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
+            : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
+            : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)));
+          const usePicard = !j && !(isHow && S.how.loading);
+          const sendLabel = usePicard ? PDC.picardText(sendSem) : sendSem;
+          const sendTitle = usePicard ? PDC.picardTitle(sendSem) : '';
+          return html`<button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
+                  title=${sendTitle || null}
+                  disabled=${!!(j && j.cancelled && !isHow)}
+                  onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
+            ${sendLabel}
+          </button>`;
+        })()}
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />
       </div>
@@ -5672,7 +5772,8 @@ function DiffPane() {
                     onClick=${toggleEdit}>${S.editing ? '\u2716 ' + PDC.t('gui.diff.show_diff', null, 'Show diff') : '\u270E ' + PDC.t('gui.diff.edit_proposed', null, 'Edit proposed')}</button>
             <button class="small danger" onClick=${() => decide('reject')}>${R.files.length > 1 ? PDC.t('gui.diff.reject_all', null, 'Reject all') : PDC.t('gui.diff.reject', null, 'Reject')}</button>
             <button class="small primary" disabled=${nSel === 0}
-                    onClick=${() => decide('apply')}>${acceptLabel}</button>` : null}
+                    title=${PDC.picardTitle(acceptLabel) || null}
+                    onClick=${() => decide('apply')}>${PDC.picardText(acceptLabel)}</button>` : null}
         </div>
       </div>
       <div id="fileStrip">

@@ -526,5 +526,22 @@
   "profiles.col.tok_s": "tok/s",
   "profiles.col.context": "context",
   "profiles.col.status": "status",
-  "profiles.recommend_title": "Recommendations (suggestions -- confirm before applying):"
+  "profiles.recommend_title": "Recommendations (suggestions -- confirm before applying):",
+  "tui.hint_bar_picard": "Enter: Make it so. | Shift/Alt+Enter: newline | PgUp/PgDn/Wheel: scroll | Tab: complete | F3: [EN|es] | /help | /quit",
+  "tui.picard.on": "Captain Picard Mode: ON \u2014 Make it so.",
+  "tui.picard.off": "Captain Picard Mode: OFF",
+  "tui.picard.usage": "Usage: /picard [on|off]",
+  "settings.picard_mode": "Captain Picard Mode",
+  "settings.picard_mode_hint": "Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save, Apply, Run, and Commit buttons to 'Make it so.'",
+  "settings.picard_on": "Captain Picard Mode: Make it so.",
+  "settings.picard_off": "Captain Picard Mode: OFF",
+  "gui.update.active_dev_tip": "Tip: Pedacito is in active development with frequent bug fixes and updates \u2014 run `pedacito update` regularly to stay current.",
+  "gui.update.check_btn": "Check for updates",
+  "gui.update.checking": "Checking\u2026",
+  "gui.update.dismiss_reminder_title": "hide this reminder for 7 days",
+  "gui.update.disabled_toast": "Update checks are disabled (check_for_updates = false).",
+  "gui.update.up_to_date_toast": "Pedacito is up to date.",
+  "gui.update.offline_toast": "Could not reach PyPI right now.",
+  "update.active_dev_reminder": "Tip: Pedacito is in active development with frequent bug fixes and updates -- run `pedacito update` regularly to stay current.",
+  "update.available_reminder": "Update available: {installed} -> {latest} -- run `pedacito update --run`."
 }

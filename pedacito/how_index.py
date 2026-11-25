@@ -533,7 +533,7 @@ CLI_COMMANDS = [
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /verify on|off|status, "
             "/skills, /memory, /procs, /diff, /undo, /image, /attach, "
-            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /picard, /clear, /quit",
             "/attach [PATH | list | clear] (or @image.png) stages "
             "PNG/JPEG/WebP/GIF images for the next task (max 4, 10 MB each)",
             "Multi-line input: Shift+Enter, Alt+Enter, Ctrl+J or a trailing "
@@ -1829,13 +1829,15 @@ GUI_TOPICS = [
             "output plus the manual command instead",
             "Dismiss hides the banner until an even newer release appears",
             "Opt out entirely: ⚙ Settings → Updates → check_for_updates → "
-            "off (zero network calls; the banner never appears)",
+            "off (zero network calls; the banner never appears); "
+            "show_update_reminder = false hides the active-development update "
+            "reminder on interactive exit and in the GUI",
         ],
         "keywords": ["update", "upgrade", "new version", "new release",
                      "update pedacito", "upgrade pedacito", "check for "
-                     "updates", "check_for_updates", "update banner",
-                     "pipx upgrade", "restart"],
-        "settings": ["check_for_updates"],
+                     "updates", "check_for_updates", "show_update_reminder",
+                     "update banner", "pipx upgrade", "restart"],
+        "settings": ["check_for_updates", "show_update_reminder"],
         "cli": ["update"],
     },
     {
@@ -3407,9 +3409,15 @@ _SETTING_GUI = {
                                "routing)",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
+    "picard_mode": "⚙ Settings → Captain Picard Mode checkbox, or TUI /picard "
+                   "on|off, or ⚙ Settings → All settings → Graphical interface "
+                   "→ picard_mode",
     "check_for_updates": "⚙ Settings → All settings → Updates → "
                          "check_for_updates (off = fully offline: no release "
                          "check, no update banner)",
+    "show_update_reminder": "⚙ Settings → All settings → Updates → "
+                            "show_update_reminder (off = hide the "
+                            "active-development update reminder)",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
                         "& Execution Overrides → disable_thinking (Thinking)",
     "thinking_suffix": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
@@ -3483,6 +3491,10 @@ _SETTING_KEYWORDS = {
     "check_for_updates": ["update", "upgrade", "new version", "new release",
                           "check for updates", "update check", "phone home",
                           "offline", "opt out", "update banner"],
+    "show_update_reminder": ["update reminder", "active development",
+                             "reminder", "exit reminder", "update tip"],
+    "picard_mode": ["picard", "make it so", "captain picard", "star trek",
+                    "button labels"],
     "review": ["review page", "diff review", "approve changes"],
     "backup": ["backup", "snapshot", "undo", "restore"],
     "allow_shell": ["run commands", "shell", "tool permission", "allow run"],

@@ -2311,6 +2311,12 @@ class State:
                 "update": dict(self.update) if self.update else None,
                 "update_run": dict(self.update_run),
                 "check_for_updates": update_mod.updates_enabled(cfg),
+                "show_update_reminder": (
+                    bool(getattr(cfg, "show_update_reminder", True))
+                    if cfg else True),
+                "picard_mode": (
+                    bool(getattr(cfg, "picard_mode", False))
+                    if cfg else False),
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),

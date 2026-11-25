@@ -78,6 +78,13 @@ All notable changes to Pedacito (`pdc`) are documented here.
 - **Localization** — `pedacito profiles` headers and the recommendations title are
   translated through `i18n` (`profiles.col.*`), and `en.json` and `es.json` keep
   identical key sets.
+- **Captain Picard Mode & Active-Development Update Reminder** — `picard_mode`
+  (default `false`, TUI `/picard [on|off]`, GUI Settings toggle) relabels primary
+  submit, OK, Save, Apply, Run and Commit buttons to `"Make it so."` while keeping
+  the semantic label in tooltips. `show_update_reminder` (default `true`) shows a
+  concise 1-line active-development reminder on interactive TUI/chat exit (never in
+  `--headless`, `--json`, `rpc`, `acp`, or non-TTY pipes) and a subtle dismissible
+  notice in the GUI.
 - **Telemetry** — a `creative_mode` telemetry event records creative runs.
 - **`pedacito how` covers v0.3.3** — cards for `commit`, `pr`, `diag` and
   `parsers`, and topics for guided git, ACP, `parsers prefetch`, `tool_mode =

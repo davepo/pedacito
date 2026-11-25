@@ -124,7 +124,8 @@ _SWAP_ARROW = "\u2192"
 _TAB_PREFIX = {
     "/con": "/consolidate ",
     "/pro": "/profile ",
-    "/pi": "/pin ",
+    "/pin": "/pin ",
+    "/pic": "/picard ",
     "/ru": "/rules ",
     "/aut": "/auto-route ",
     "/cre": "/creative ",
@@ -146,7 +147,7 @@ _SLASH_COMMANDS = [
     "/auto-route", "/think", "/effort", "/mode", "/exec-mode",
     "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
-    "/theme", "/lang", "/image", "/attach",
+    "/theme", "/lang", "/picard", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
     "/git",
@@ -237,6 +238,7 @@ Pedacito TUI commands
   /theme [NAME]             list color themes, or switch to NAME and save it
                             (shared with the GUI Theme Manager)
   /lang [en|es]             switch interface language (F3 toggles EN/ES)
+  /picard [on|off]          toggle Captain Picard Mode ('Make it so.')
   /image PROMPT [--out FILE] [--size WxH]
                             generate an image with the configured image profile
   /attach [PATH|list|clear] attach an image (PNG/JPEG/WebP/GIF, <=10 MB, max 4)
@@ -345,6 +347,7 @@ Comandos de Pedacito TUI
   /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
   /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
   /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
+  /picard [on|off]          activar o desactivar el Modo Capitán Picard ('Make it so.')
   /image PROMPT [--out ARCHIVO] [--size WxH]
                             generar una imagen con el perfil de imagen configurado
   /attach [RUTA|list|clear] adjuntar una imagen (PNG/JPEG/WebP/GIF, <=10 MB, máx 4)
@@ -1233,6 +1236,9 @@ class TuiSession:
                                lang=self.lang,
                                n=len(self.pending_images))
             img_badge = f" {sep} {self._style(img_label, 'accent')}"
+        picard_badge = ""
+        if bool(getattr(self.cfg, "picard_mode", False)):
+            picard_badge = f" {sep} {self._style('[Picard]', 'accent', bold=True)}"
         line2 = (f" {self._style(line2_auto_route + ':', 'muted')} "
                  f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
                  f"{sep} {self._style(line2_scout + ':', 'muted')} "
@@ -1243,7 +1249,7 @@ class TuiSession:
                  f"{self._style(sidebar, 'text')} "
                  f"{sep} {self._style(lang_label + ':', 'muted')} "
                  f"{self._style(lang_pill, 'accent')}"
-                 f"{img_badge}")
+                 f"{img_badge}{picard_badge}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -1816,7 +1822,10 @@ class TuiSession:
 
         header = self.header_lines(width)
         footer = self.telemetry_lines(width)
-        hint = i18n.t("tui.hint_bar", lang=self.lang)
+        hint_key = ("tui.hint_bar_picard"
+                    if bool(getattr(self.cfg, "picard_mode", False))
+                    else "tui.hint_bar")
+        hint = i18n.t(hint_key, lang=self.lang)
         transcript_heading = i18n.t("tui.transcript", lang=self.lang)
         max_prompt_rows = max(
             1, min(MAX_PROMPT_ROWS, height - len(header) - len(footer) - 3))
@@ -2287,8 +2296,11 @@ class TuiSession:
         if pattern:
             opts += " / " + i18n.t("tui.perm.allow_project", lang=self.lang,
                                    pattern=pattern)
+        allow_cue = ("Make it so?"
+                     if bool(getattr(self.cfg, "picard_mode", False))
+                     else "Allow?")
         banner = (f"[Permission Required: {category} ({label}) "
-                  f"\u2014 {detail[:160]}] Allow? ({opts}):")
+                  f"\u2014 {detail[:160]}] {allow_cue} ({opts}):")
         self._set_banner(banner)
         self._append(banner, "activity")
         self._redraw(force=True)
@@ -3866,7 +3878,11 @@ class TuiSession:
                          "for one pass)", "system")
             self.run_auto(goal)
             return
-        question = "Run as a single-pass Task instead? [Y/n]:"
+        question = (
+            "Run as a single-pass Task instead? \u2014 Make it so? [Y/n]:"
+            if bool(getattr(self.cfg, "picard_mode", False))
+            else "Run as a single-pass Task instead? [Y/n]:"
+        )
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)
@@ -4119,6 +4135,9 @@ class TuiSession:
             return
         if cmd == "lang":
             self._lang_command(arg)
+            return
+        if cmd == "picard":
+            self._picard_command(arg)
             return
         if cmd == "image":
             self._image_command(arg)
@@ -5593,6 +5612,15 @@ class TuiSession:
                          "system")
 
     def _confirm(self, question: str) -> bool:
+        if bool(getattr(self.cfg, "picard_mode", False)):
+            if re.search(r"[\(\[]y/N[\)\]]", question):
+                question = re.sub(
+                    r"\s*[\(\[]y/N[\)\]]\s*:?\s*$",
+                    " Make it so? [y/N]:",
+                    question,
+                )
+            elif "Make it so?" not in question:
+                question = question.rstrip(" :") + " \u2014 Make it so? [y/N]:"
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)
@@ -5778,7 +5806,44 @@ class TuiSession:
                     pass
         finally:
             self.close()
+            if not self.headless and bool(
+                getattr(self.cfg, "show_update_reminder", True)
+            ):
+                reminder = update_mod.active_dev_reminder(
+                    self.cfg, lang=self.lang)
+                if reminder:
+                    self._write(reminder + "\n")
         return 0
+
+    def _picard_command(self, arg: str) -> None:
+        """`/picard [on|off]`: toggle Captain Picard Mode live."""
+        raw = str(arg or "").strip().lower()
+        cur = bool(getattr(self.cfg, "picard_mode", False))
+        if raw in ("", "toggle"):
+            nxt = not cur
+        elif raw in ("on", "true", "yes", "1", "engage"):
+            nxt = True
+        elif raw in ("off", "false", "no", "0"):
+            nxt = False
+        else:
+            self._append(i18n.t("tui.picard.usage", lang=self.lang), "error")
+            return
+        self.cfg.picard_mode = nxt
+        try:
+            self.cfg.sources["picard_mode"] = "tui /picard"
+        except Exception:
+            pass
+        if nxt:
+            self._append(
+                i18n.t("tui.picard.on", lang=self.lang),
+                "system",
+            )
+        else:
+            self._append(
+                i18n.t("tui.picard.off", lang=self.lang),
+                "system",
+            )
+        self._dirty = True
 
     def _set_lang(self, new_lang: str, *, persist: bool = True) -> str:
         """Switch the TUI's active interface language, persist it, and log a notice."""

@@ -5455,6 +5455,12 @@ def _main(argv=None) -> int:
                       file=sys.stderr)
             except LLMError as e:
                 print(f"\nERROR: {e}", file=sys.stderr)
+        if (sys.stdin.isatty() and sys.stdout.isatty()
+                and bool(getattr(cfg, "show_update_reminder", True))):
+            reminder = update_mod.active_dev_reminder(
+                cfg, lang=getattr(cfg, "language", "en"))
+            if reminder:
+                print(reminder, file=sys.stderr)
         strict = _strict_replay_error(args, client)
         if strict:
             print(f"ERROR: {strict}", file=sys.stderr)

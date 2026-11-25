@@ -1094,6 +1094,9 @@ class Config:
     # `benchmarks/` folder beside the currently open project (or ./benchmarks
     # when no project is open). Each run gets its own generated subfolder.
     benchmarks_dir: str = ""
+    # Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save, Apply,
+    # Run, and Commit buttons to 'Make it so.'
+    picard_mode: bool = False
 
     # --- Telemetry and retention (local only) --------------------------------
     # One-line telemetry ribbon on stderr after each task (context bar,
@@ -1117,6 +1120,10 @@ class Config:
     # alpha/beta tags, "any" also considers them. PEDACITO_UPDATE_CHANNEL
     # overrides it like any other setting.
     update_channel: str = "stable"
+    # Active-development update reminder: show a concise 1-line reminder on
+    # interactive TUI/chat exit and a subtle dismissible notice in the GUI
+    # reminding users to run `pedacito update` regularly. false opts out.
+    show_update_reminder: bool = True
 
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
@@ -3559,6 +3566,12 @@ check_for_updates = true
 # update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
 # includes them (PEDACITO_UPDATE_CHANNEL overrides).
 update_channel = "stable"
+# show_update_reminder: show a 1-line active-development reminder on interactive
+# exit and a subtle dismissible notice in the GUI. false opts out.
+# show_update_reminder = true
+# picard_mode: Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save,
+# Apply, Run, and Commit buttons to 'Make it so.'
+# picard_mode = false
 # Hosted native transports and provider catalog sync:
 # gemini_native = true
 # openai_responses = false
