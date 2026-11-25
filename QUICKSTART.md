@@ -1121,6 +1121,7 @@ only the map is stale.
 | `pedacito chat PROJ` | Interactive session; the index stays warm |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript + activity/plan sidebar + Context Meter, token burn and tok/s telemetry. `/help` lists the slash commands; `--headless` is scriptable |
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and agents; the index stays warm |
+| `pedacito acp [PROJ]` | Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout for editor and agent hosts; text, `@file` resources, images, streamed updates and permission prompts |
 | `pedacito mcp list` | Show the tools of the named MCP servers and their trust flags |
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |

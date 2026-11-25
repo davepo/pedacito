@@ -266,7 +266,7 @@ def _config(args) -> Config:
     if getattr(args, "no_refs", False):
         cfg.include_references = False
     if getattr(args, "jsonl", False) or getattr(args, "rpc", False) or \
-            getattr(args, "cmd", "") == "rpc":
+            getattr(args, "cmd", "") in ("rpc", "acp"):
         # Event tee is the RPC transport itself; the log must be alive.
         cfg.log_events = True
     for spec in getattr(args, "role", None) or []:
@@ -979,7 +979,7 @@ def _print_telemetry_ribbon(args, locals_ref: dict) -> None:
         if not getattr(cfg, "show_telemetry", True):
             return
         if getattr(args, "jsonl", False) or getattr(args, "rpc", False) \
-                or getattr(args, "cmd", "") == "rpc":
+                or getattr(args, "cmd", "") in ("rpc", "acp"):
             return
         if not hasattr(client, "telemetry"):
             return
@@ -3208,7 +3208,7 @@ def _cmd_rename(args) -> int:
 
 
 def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
-             elog) -> int:
+             elog, *, acp: bool = False) -> int:
     """`pedacito rpc` / `pedacito chat --rpc`: the bidirectional JSONL-RPC
     loop over stdio (protocol in `pedacito/rpc.py`). The project index, the
     model profiles and the session ledger stay warm between requests; every
@@ -3216,7 +3216,9 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
     so an editor or another agent can drive this process without parsing
     prose. Clients can `ask`, `steer` a running task at its next step
     boundary, answer `permission_request` events, `cancel` without killing
-    the session, and switch profiles in place."""
+    the session, and switch profiles in place. `pedacito acp` calls this with
+    ``acp=True`` so the Agent Client Protocol bridge drives the same engine
+    wiring and only changes the wire format (see `pedacito/acp.py`)."""
     from . import explain as explain_mod
     from . import rpc as rpc_mod
     from . import security
@@ -3227,9 +3229,13 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         s = server_box.get("s")
         return s._tag_for(None) if s is not None else None
 
-    real_stdout = sys.stdout
-    out = rpc_mod.RpcOut(real_stdout, _tag)
-    elog.tee = out
+    real_stdout = getattr(args, "_protocol_out", None) or sys.stdout
+    out = None if acp else rpc_mod.RpcOut(
+        real_stdout, _tag,
+        id_tag=lambda: (server_box["s"]._id_for(None)
+                        if "s" in server_box else None))
+    if out is not None:
+        elog.tee = out
     sys.stdout = sys.stderr   # anything that forgets to say stderr still
                               # cannot corrupt the JSONL stream
 
@@ -3344,9 +3350,42 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         switch=_rpc_switch, ensure_lock=_ensure_lock,
         save_checkpoint=save_checkpoint, always_apply=_always_apply,
         consolidate=_rpc_consolidate,
-        permission_timeout=float(timeout), output=out, input_stream=sys.stdin)
+        permission_timeout=float(timeout), output=out, input_stream=sys.stdin,
+        events=getattr(args, "events", "on") != "off")
     server_box["s"] = server
     server.set_client(client)
+    if acp:
+        from . import acp as acp_mod
+
+        def _acp_set_profile(ref):
+            return _rpc_switch(ref, "main")
+
+        def _acp_set_execution_mode(mode):
+            cur = locals_ref["cfg"]
+            cur.execution_mode = str(mode).strip().lower()
+            return cur.execution_mode
+
+        def _acp_set_images(images):
+            cur = locals_ref["cfg"]
+            if images:
+                cur._task_images = list(images)
+            else:
+                cur.__dict__.pop("_task_images", None)
+
+        bridge = acp_mod.AcpServer(
+            server, project_root=root, input_stream=sys.stdin,
+            output_stream=real_stdout,
+            set_profile=_acp_set_profile,
+            set_execution_mode=_acp_set_execution_mode,
+            on_images=_acp_set_images)
+        elog.tee = bridge.out
+        print("pedacito acp: Agent Client Protocol (JSON-RPC 2.0) over "
+              "stdin/stdout - Ctrl-D to exit.", file=sys.stderr)
+        try:
+            return bridge.serve()
+        finally:
+            elog.tee = None
+            sys.stdout = real_stdout
     print("pedacito rpc: JSONL-RPC over stdin/stdout - one request per line "
           "({\"id\":1,\"method\":\"status\"}), Ctrl-D to exit.",
           file=sys.stderr)
@@ -3355,6 +3394,14 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
     finally:
         elog.tee = None
         sys.stdout = real_stdout
+
+
+def cmd_acp(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
+            elog) -> int:
+    """`pedacito acp`: the Agent Client Protocol bridge over the same warm
+    engine as `pedacito rpc` (protocol in `pedacito/acp.py`)."""
+    return _cmd_rpc(args, cfg, client, idx, root, locals_ref, run,
+                    save_checkpoint, elog, acp=True)
 
 
 def _configure_stdio() -> None:
@@ -3810,11 +3857,32 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                        help="how long a gated tool waits for a "
                             "permission_reply before being denied "
                             f"(default {_PT})")
+    p_rpc.add_argument("--events", choices=("on", "off"), default="on",
+                       help="stream the engine's incremental events (default "
+                            "on); 'off' keeps only the terminal frames")
+    p_rpc.add_argument("--describe", action="store_true",
+                       help="print the JSON protocol description (methods and "
+                            "envelope) and exit 0")
     # The RPC protocol carries these per-request; the defaults below only
     # mirror `chat`: never write, never review, no terminal steering.
     p_rpc.set_defaults(apply=False, review=False, no_review=True,
                        refine=False, plan=False, no_plan=False,
                        resume=False, jsonl=False, rpc=True)
+
+    p_acp = sub.add_parser(
+        "acp", help="Agent Client Protocol (JSON-RPC 2.0) over stdio for "
+                    "editor/agent hosts; wraps the rpc engine")
+    _add_common(p_acp, paths_nargs="?")
+    from .rpc import PERMISSION_TIMEOUT as _PT_ACP
+    p_acp.add_argument("--permission-timeout", type=float, default=None,
+                       metavar="SECONDS",
+                       help="how long a gated tool waits for a "
+                            "session/request_permission answer before being "
+                            f"denied (default {_PT_ACP})")
+    _add_execution_mode(p_acp)
+    p_acp.set_defaults(apply=False, review=False, no_review=True,
+                       refine=False, plan=False, no_plan=True,
+                       resume=False, jsonl=False, rpc=False)
 
     p_cal = sub.add_parser(
         "calibrate", help="measure the configured model (tool choice, edit "
@@ -4249,6 +4317,20 @@ def _main(argv=None) -> int:
         args.project = str(project)
         args.paths = [args.project]
 
+    # `pedacito rpc --describe` is a pure protocol-introspection command: no
+    # model, config or index is needed (and none must be touched to print it).
+    if args.cmd == "rpc" and getattr(args, "describe", False):
+        from . import rpc as rpc_mod
+        print(json.dumps(rpc_mod.describe(), indent=2))
+        return 0
+
+    # `acp` owns stdout for JSON-RPC 2.0. Point every human line at stderr
+    # before config/index work starts, so not even setup chatter can corrupt
+    # the protocol stream; `_cmd_rpc` recovers the real stream from `args`.
+    if args.cmd == "acp":
+        args._protocol_out = sys.stdout
+        sys.stdout = sys.stderr
+
     # `config --setup` repairs a broken config, so it runs before _config().
     if args.cmd == "config" and getattr(args, "setup", False):
         try:
@@ -4644,7 +4726,8 @@ def _main(argv=None) -> int:
         # Load the model here with a clear message rather than stalling
         # silently inside the first gather step.
         client.warmup()
-        if args.cmd in ("ask", "chat", "auto", "rpc") and cfg.refresh_summaries:
+        if args.cmd in ("ask", "chat", "auto", "rpc", "acp") \
+                and cfg.refresh_summaries:
             index_mod.refresh_summaries(
                 idx, roles_mod.client_for(cfg, "summarizer", client), cfg,
                 limit=int(cfg.refresh_summaries))
@@ -4784,6 +4867,10 @@ def _main(argv=None) -> int:
                 extra={"steps": list(getattr(tr, "steps", []) or [])[:60],
                        "applied": bool(getattr(tr, "applied", False))})
 
+        if args.cmd == "acp":
+            # Agent Client Protocol bridge over the exact same warm engine.
+            return cmd_acp(args, cfg, client, idx, root, locals_ref,
+                           run, save_checkpoint, elog)
         if args.cmd == "rpc" or getattr(args, "rpc", False):
             # machine-client transport instead of the terminal REPL
             return _cmd_rpc(args, cfg, client, idx, root, locals_ref,

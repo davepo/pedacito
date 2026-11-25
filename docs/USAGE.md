@@ -189,6 +189,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
+| `pedacito acp [PROJ]` | Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout: `initialize`, `session/new`, `session/prompt` with text/`@file`/image blocks, streamed `session/update` notifications and `session/request_permission` round-trips; the same warm engine as `rpc` |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito undo PROJ` | Restore the workspace to the state immediately before the last run; `--list` shows the checkpoint tree |
 | `pedacito checkpoints` | List time-travel checkpoints and the active head; `--limit` and `--json` shape the output |

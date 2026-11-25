@@ -95,6 +95,9 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 **Docs ownership.** `docs/` (INSTALLATION, ARCHITECTURE, USAGE, CONFIG, SKILLS_AND_TOOLS, SECURITY and CONTRIBUTING) is the canonical reference for settings, commands and guarantees. The three root guides, [QUICKSTART.md](QUICKSTART.md), [MODEL_GUIDE.md](MODEL_GUIDE.md) and [TECHNIQUES.md](TECHNIQUES.md), remain the canonical task-oriented guides: first runs, model pairing and tuning, and small-model techniques. This README is the index, and [CHANGELOG.md](CHANGELOG.md) is the history. New reference prose goes to `docs/`, new walkthroughs go to the root guides, and each set links to the other instead of copying text.
 
 Run `pdc --help` for every command, or `pdc how "your question"` for built-in help.
+Machine clients can drive one warm session over stdio: `pedacito rpc` speaks
+newline-delimited JSONL-RPC, and `pedacito acp` speaks JSON-RPC 2.0 Agent
+Client Protocol for editors and agent hosts.
 
 ## Contributing
 

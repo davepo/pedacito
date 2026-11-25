@@ -62,6 +62,8 @@ class Harness:
         box = {}
         self.out = rpc.RpcOut(self.buf,
                               lambda: box["s"]._tag_for(None)
+                              if "s" in box else None,
+                              id_tag=lambda: box["s"]._id_for(None)
                               if "s" in box else None)
         self.saved = []
 
@@ -487,3 +489,100 @@ def test_turn_id_resolves_every_documented_prefix():
     assert rpc._turn_id(True) is None
     assert rpc._turn_id("req") is None
     assert rpc._turn_id("nope") is None
+
+
+# ---------------------------------------------------------------------------
+# WP-3302: explain/question, id fidelity, --events and --describe
+# ---------------------------------------------------------------------------
+def test_explain_accepts_question_param():
+    """R2-BUG-05: `explain` customers send `question`; it used to be refused
+    with "missing params.task" even though `ask` accepted `task`."""
+    h = Harness()
+    h.inp.feed({"id": "q1", "method": "explain",
+                "params": {"question": "why does sync retry?"}})
+    reply = h.wait(lambda f: f["kind"] == "reply", "reply frame")
+    assert reply["id"] == "q1" and reply["req_id"] == "q1"
+    assert "about why does sync retry?" in reply["reply"]
+    res = h.respond("q1")
+    assert res["ok"] and res["result"]["reply"] == reply["reply"]
+    h.stop()
+
+
+def test_streamed_events_preserve_the_original_request_id():
+    """R2-BUG-06: frames used to carry only the string `req_id`, so a
+    JSON-RPC 2.0 client could not pair an update with its integer request
+    id. Both spellings now travel together."""
+    def run(h, task, apply, refine, plan, r):
+        h.out.write(json.dumps({"t": 0.1, "kind": "step",
+                                "action": "read"}) + "\n")
+        return r
+
+    h = Harness(run=run)
+    h.inp.feed({"id": 42, "method": "ask", "params": {"task": "fix it"}})
+    step = h.wait(lambda f: f["kind"] == "step", "streamed step")
+    assert step["id"] == 42 and step["req_id"] == "42"
+    result = h.wait(lambda f: f["kind"] == "result", "result frame")
+    assert result["id"] == 42 and result["req_id"] == "42"
+    res = h.respond(42)
+    assert res["id"] == 42
+    h.stop()
+
+
+def test_events_false_drops_incremental_frames_for_one_request():
+    def run(h, task, apply, refine, plan, r):
+        h.out.write(json.dumps({"kind": "step", "action": "read"}) + "\n")
+        return r
+
+    h = Harness(run=run)
+    h.inp.feed({"id": 1, "method": "ask",
+                "params": {"task": "quiet", "events": False}})
+    res = h.respond(1)
+    assert res["ok"] and res["result"]["reply"] == "all done"
+    assert [f["kind"] for f in h.frames() if f["kind"] == "step"] == []
+    # the terminal result frame still arrives, exactly once
+    results = [f for f in h.frames() if f["kind"] == "result"]
+    assert len(results) == 1 and results[0]["req_id"] == "1"
+    h.stop()
+
+
+def test_server_events_off_is_the_floor_and_string_off_works():
+    def run(h, task, apply, refine, plan, r):
+        h.out.write(json.dumps({"kind": "step", "action": "read"}) + "\n")
+        return r
+
+    h = Harness(run=run, events=False)
+    h.inp.feed({"id": 1, "method": "ask",
+                "params": {"task": "quiet", "events": True}})
+    res = h.respond(1)
+    assert res["ok"]
+    assert [f for f in h.frames() if f["kind"] == "step"] == []
+    h.stop()
+
+
+def test_describe_exposes_methods_and_envelope(capsys):
+    desc = rpc.describe()
+    assert set(rpc._METHODS) <= set(desc["methods"])
+    assert "events" in desc
+    assert desc["envelope"]["response"]["kind"] == "rpc_response"
+    assert desc["methods"]["explain"]["params"]["question"]
+
+    from pedacito import cli
+    rc = cli.main(["rpc", "--describe"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    printed = json.loads(out)              # stdout is pure JSON
+    assert "methods" in printed and "envelope" in printed
+
+
+def test_rpc_parser_has_events_and_describe_flags():
+    from pedacito import cli
+    ap = cli.build_parser()
+    default = ap.parse_args(["rpc"])
+    assert default.events == "on" and default.describe is False
+    quiet = ap.parse_args(["rpc", "--events", "off", "--describe"])
+    assert quiet.events == "off" and quiet.describe is True
+    acp_args = ap.parse_args(["acp", ".", "--execution-mode", "interleaved",
+                              "--permission-timeout", "3"])
+    assert acp_args.cmd == "acp"
+    assert acp_args.execution_mode == "interleaved"
+    assert acp_args.permission_timeout == 3.0
