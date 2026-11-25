@@ -2071,8 +2071,24 @@ _GIB = 1024 ** 3
 
 
 def missing_hardware(cfg: Config) -> list[str]:
-    """Mandatory hardware settings still unset; always empty for hosted APIs."""
+    """Mandatory hardware settings still unset; always empty for hosted APIs.
+
+    A non-loopback LAN/Tailscale server runs on another machine, so the
+    client's `vram_gb` does not describe the GPU serving the model: auto_fit
+    already ignores it for those endpoints, and requiring it here would block
+    every command on a profile that legitimately has none. An explicitly
+    configured `context_tokens` likewise supplies the window auto_fit would
+    otherwise derive from VRAM, so VRAM is not mandatory then either.
+    """
     if is_hosted(cfg):
+        return []
+    host = _hostname(cfg.base_url)
+    is_loopback = host in _LOCAL_HOSTS
+    is_lan = (not is_loopback) and _endpoint_is_local(
+        cfg.base_url, getattr(cfg, "provider", ""))
+    if is_lan:
+        return []
+    if _is_explicit_limit(cfg.sources.get("context_tokens", "default")):
         return []
     return ["vram_gb"] if int(cfg.vram_gb or 0) <= 0 else []
 

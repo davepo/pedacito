@@ -135,11 +135,56 @@ def test_load_tailscale_lemonade_skips_hosted_price_fill(tmp_path):
     assert float(cfg.price_output_per_mtok or 0) == 0.0
 
 
-def test_missing_hardware_treats_tailscale_as_local():
-    cfg = Config(base_url="http://100.107.251.107:11434/v1",
-                 provider="lemonade", vram_gb=0, model="qwen3-8b")
+@pytest.mark.parametrize("url", [
+    "http://100.107.251.107:11434/v1",   # Tailscale CGNAT
+    "http://192.168.1.50:11434/v1",      # RFC 1918 LAN
+])
+def test_missing_hardware_treats_lan_as_local(url, tmp_path):
+    """A LAN/Tailscale server's VRAM is not the client's to declare.
+
+    `vram_gb` describes the machine running the model, but a profile pointing
+    at a remote homelab box has no way to know it and auto_fit already ignores
+    the client's value there. Requiring it made every execution command abort.
+    """
+    cfg = Config(base_url=url, provider="lemonade", vram_gb=0,
+                 model="qwen3-8b")
     assert config_mod.is_hosted(cfg) is False
+    assert config_mod.missing_hardware(cfg) == []
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[profiles.default]\n'
+        f'base_url = "{url}"\n'
+        'provider = "lemonade"\n'
+        'model = "qwen3-8b"\n',
+        encoding="utf-8")
+    loaded = config_mod.load(explicit=cfg_path, require_hardware=True,
+                             warn_budgets=False, upgrade_user_config=False)
+    assert config_mod.missing_hardware(loaded) == []
+    assert loaded.json_mode == "schema"
+    assert config_mod.is_hosted(loaded) is False
+
+
+def test_missing_hardware_still_requires_vram_for_loopback(tmp_path):
+    """A loopback server runs on this machine, so VRAM is still mandatory
+    unless the context window was configured explicitly."""
+    cfg = Config(base_url="http://127.0.0.1:11434/v1",
+                 provider="lemonade", vram_gb=0, model="qwen3-8b")
     assert config_mod.missing_hardware(cfg) == ["vram_gb"]
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[profiles.default]\n'
+        'base_url = "http://127.0.0.1:11434/v1"\n'
+        'provider = "lemonade"\n'
+        'model = "qwen3-8b"\n'
+        'context_tokens = 32768\n',
+        encoding="utf-8")
+    loaded = config_mod.load(explicit=cfg_path, require_hardware=True,
+                             warn_budgets=False, upgrade_user_config=False)
+    assert config_mod._is_explicit_limit(
+        loaded.sources["context_tokens"]) is True
+    assert config_mod.missing_hardware(loaded) == []
 
 
 # ------------------------------------------------ calibration on a Tailscale box
