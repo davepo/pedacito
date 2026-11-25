@@ -2,7 +2,7 @@
 
 # Pedacito
 
-[![PyPI](https://img.shields.io/badge/PyPI-v0.3.2-blue)](https://pypi.org/project/pedacito/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.3.3-blue)](https://pypi.org/project/pedacito/)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB)
 [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 ![Local-First](https://img.shields.io/badge/Local--First-yes-brightgreen)
@@ -38,6 +38,19 @@ Primero inicia un servidor de modelos (LM Studio, Ollama, Lemonade o llama.cpp).
 > [!TIP]
 > ¿Prefieres español? Usa el selector `EN | ES` en la barra superior de la GUI, presiona `F3` en la TUI o ejecuta
 > `pdc --lang es gui`. Consulta [Idioma y localización](docs/es/CONFIG.md#idioma-y-localización-language-llm_reply_language).
+
+## Novedades de la v0.3.3
+
+| Función | Qué obtienes | Más información |
+|---|---|---|
+| **Puente Agent Client Protocol** | `pedacito acp` habla JSON-RPC 2.0 por stdio para editores y hosts de agentes: `session/new`, `session/prompt` con bloques de texto, `@file` e imagen, eventos `session/update` en streaming y `session/request_permission`. Envuelve el mismo motor caliente que `rpc`, que gana `--events` y `--describe`. | [Puente ACP](docs/es/USAGE.md#acp-puente-de-agent-client-protocol) |
+| **TUI enriquecida sin dependencias** | Diffs en línea con resaltado de sintaxis, tarjetas plegables de llamadas a herramientas (`Ctrl+O`, `/expand`, `/collapse`), un selector difuso `@` para archivos, símbolos e imágenes, y zonas de ratón SGR clicables para el cambio de idioma, las pestañas de la barra lateral y la barra de desplazamiento. | [`tui`](docs/es/USAGE.md#tui-sesión-de-terminal-en-pantalla-dividida) |
+| **Endpoints locales, LAN y Tailscale** | Una sola regla de localidad cubre loopback, `.local`, RFC 1918, Tailscale/CGNAT (`100.64.0.0/10`), link-local y ULA de IPv6. Las tarjetas locales sin temperatura calibrada se marcan como obsoletas para recalibrar. | [Endpoints locales](docs/es/CONFIG.md#endpoints-locales-lan-y-tailscale) |
+| **Mejoras para modelos pequeños y MoE disperso** | `tool_mode = "plain"` (pasos de búsqueda en palabras simples, comparados A/B por `calibrate`), un enrutador `proactive_escalation` opcional, `best_of` probado en sombra y un verificador previo al cierre en modo intercalado. La salida grande de herramientas se vuelca a `.pedacito/scratch/`, que el modelo puede leer pero nunca escribir. | [Configuración](docs/es/CONFIG.md#referencia-de-configuración) |
+| **Git guiado, reforzado** | `pedacito commit` y `pedacito pr` ejecutan un escaneo previo de secretos antes de cada commit y PR, nunca hacen push ni force-push, y los comparten `/git` en la TUI y el cajón Git de la GUI. `undo` se niega a rebobinar más allá de un HEAD de git movido sin `--force`. | [Git y pull requests](docs/es/USAGE.md#git-commit-y-pull-requests) |
+| **Ejecuciones fiables y pulido de la CLI** | Checkpoints previos a la ejecución para árboles divergentes, `restore --checkpoint`, respaldo offline de tree-sitter con `parsers prefetch`, `pedacito diag`, `models --profile/--model`, `new --no-complex`, semántica honesta de lotes parciales y un límite duro `--max-minutes`. | [Analizadores sin conexión y diag](docs/es/USAGE.md#analizadores-sin-conexión-parsers-prefetch-y-diag) |
+| **GUI reforzada** | Aprobación de revisión por bloque parcial con procedencia por bloque, tarjetas de hilo persistentes, traspasos deterministas con `/compact`, un diseño adaptable a pantallas estrechas y desconexiones de cliente silenciosas. | [Página de revisión](docs/es/USAGE.md#página-de-revisión) |
+| **Nota de Windows PowerShell 5.1** | En PowerShell 5.1, `2>&1` envuelve las líneas de stderr como registros de error; usa `2>$null` para una salida JSON limpia. | [stderr en Windows](docs/es/USAGE.md#windows-powershell-51-capturar-stderr-21) |
 
 ## Novedades de la v0.3.2
 

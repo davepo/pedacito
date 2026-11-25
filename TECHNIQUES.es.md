@@ -564,6 +564,64 @@ El registro en segundo plano mantiene vivo un servidor de desarrollo entre tarea
 
 **Prevención.** La secuencia Win32 está fijada por pruebas con kernel32 falso que corren en todas las plataformas (`tests/test_windows_portability.py`): rechazo + nota de error, el recorrido de huérfanos con una trampa de reutilización, reanudar-solo-hilos-propios, el orden generar-envolver-reanudar y el re-generar ante fallo de reanudación. Una prueba de crisol solo de Windows pone al propio proceso de prueba dentro de un job (la forma del runner) y ejecuta el escenario de huérfanos. Dos trampas de portabilidad que los falsos no pueden ver, detectadas solo al ejecutar sobre un intérprete `nt` real (Wine): `subprocess.CREATE_SUSPENDED` no existe, y la API de instantáneas de hilos es `Thread32First`/`Thread32Next`: NO hay variante ancha (solo las instantáneas de procesos tienen `W`). Cubierto por `tests/test_processes_crucible.py` y `tests/test_windows_portability.py`.
 
+### 52. Un solo predicado de localidad para cada decisión de endpoint
+
+**Problema.** Cuatro módulos decidían por su cuenta si un `base_url` era un servidor local, y no coincidían.
+Python 3.11.4+ informa que una dirección de Tailscale (RFC 6598, `100.64.0.0/10`) no es privada, así que un
+equipo propio en una tailnet se trataba como una API alojada: se quitaban sus claves de muestreo, se retenía
+`cache_prompt` y su calibración se tomaba como remota.
+
+**Técnica.** Un predicado, `_endpoint_is_local`, que comprueba loopback, `.local`, RFC 1918 y RFC 6598 de forma
+explícita, sin depender de `addr.is_private`, más link-local y unique-local de IPv6 (`fc00::/7`) y las etiquetas
+explícitas de proveedor local. Cada punto de llamada (config, llm, modelcard, servers, model_catalog, cli) lo
+delega. Una tarjeta de modelo local sin temperatura calibrada se marca como obsoleta, así que el valor se mide
+de nuevo en lugar de adivinarse.
+
+**Prevención.** El predicado tiene una prueba basada en tabla para cada rango y cada punto de llamada. Añadir
+una nueva regla de "local" implica editar una sola función.
+
+### 53. Pasos de recolección en palabras simples, elegidos por medición
+
+**Problema.** Algunos modelos pequeños producen un paso de recolección JSON mal formado en una gran parte de los
+turnos, y cada paso mal formado cuesta un reintento.
+
+**Técnica.** `tool_mode = "plain"` pide cada paso como una línea de palabras simples (`read app.py 1 40`,
+`grep parse_args`). `calibrate` ejecuta los formatos grammar y plain sobre las mismas sondas y conserva el que
+puntúa mejor, con la misma regla de adoptar solo si es claramente mejor que `tool_mode` y
+`step_reasoning_first`. El formato es una propiedad medida del modelo, no una suposición.
+
+### 54. Volcar la pared, conservar un puntero: descarga a scratch
+
+**Problema.** Un solo `run` o `grep` puede devolver miles de líneas, y cargarlas todas en la ventana de contexto
+desplaza la tarea.
+
+**Técnica.** Una observación por encima de `max_observation_tokens` de una acción de observación se escribe en
+`.pedacito/scratch/<id>.log`. El modelo recibe el inicio, el final, el número de líneas y el nombre del archivo,
+y lee líneas exactas bajo demanda con `read` o `grep`. El directorio es de solo lectura para el modelo: no puede
+escribir allí, y solo son legibles los archivos `*.log` directos. La salida volcada son datos, nunca un lugar
+donde plantar instrucciones para pasos posteriores.
+
+### 55. Comprobación determinista antes de `finish`
+
+**Problema.** Una ejecución intercalada puede declarar la tarea terminada mientras una verificación que podría
+haber ejecutado sigue en rojo.
+
+**Técnica.** Cuando el modelo llama a `finish` en modo `interleaved`, primero se ejecuta un verificador previo al
+cierre, acotado y determinista (las comprobaciones acotadas de las que ya depende la tarea). Un fallo se devuelve
+al modelo como observación y el bucle continúa. El número de rondas está limitado, así que el verificador nunca
+puede atrapar la ejecución en un bucle.
+
+### 56. Enrutamiento proactivo de dos vías (opcional)
+
+**Problema.** La escalada reactiva espera a que un modelo pequeño falle, lo que cuesta un intento fallido en
+tareas que eran difíciles desde el principio.
+
+**Técnica.** Con `proactive_escalation = true`, una compuerta estructural sin tokens (fan-out de importaciones,
+archivos tocados, límites entre módulos, palabras de arquitectura abiertas) escala la tarea directamente al rol
+`escalate`. Un clasificador Scout de pocos ejemplos en la frontera mantiene en local las tareas bien definidas de
+un solo archivo. Ambas vías se ejecutan una vez por tarea, y la opción está desactivada por defecto, así que el
+comportamiento reactivo existente no cambia.
+
 ## Referencia rápida: técnicas 5, 11, 17 a 51
 
 | Técnica | Sección | Cómo desactivarla | Dónde se ve |

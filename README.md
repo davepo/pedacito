@@ -2,7 +2,7 @@
 
 # Pedacito
 
-[![PyPI](https://img.shields.io/badge/PyPI-v0.3.2-blue)](https://pypi.org/project/pedacito/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.3.3-blue)](https://pypi.org/project/pedacito/)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB)
 [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 ![Local-First](https://img.shields.io/badge/Local--First-yes-brightgreen)
@@ -38,6 +38,19 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 > [!TIP]
 > Prefer Spanish? Use the `EN | ES` switcher in the GUI top bar, press `F3` in the TUI, or run
 > `pdc --lang es gui`. See [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language).
+
+## What's new in v0.3.3
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Agent Client Protocol bridge** | `pedacito acp` speaks JSON-RPC 2.0 over stdio for editors and agent hosts: `session/new`, `session/prompt` with text, `@file` and image blocks, streamed `session/update` events and `session/request_permission`. It wraps the same warm engine as `rpc`, which gains `--events` and `--describe`. | [ACP bridge](docs/USAGE.md#acp-agent-client-protocol-bridge) |
+| **Rich zero-dependency TUI** | Inline syntax-highlighted diffs, collapsible tool-call cards (`Ctrl+O`, `/expand`, `/collapse`), an `@` fuzzy picker for files, symbols and images, and clickable SGR mouse zones for the language switch, sidebar tabs and scrollbar. | [`tui`](docs/USAGE.md#tui-split-screen-terminal-session) |
+| **Local, LAN & Tailscale endpoints** | One locality rule covers loopback, `.local`, RFC 1918, Tailscale/CGNAT (`100.64.0.0/10`), link-local and IPv6 ULA. Local cards without a calibrated temperature are marked stale for recalibration. | [Local endpoints](docs/CONFIG.md#local-lan-and-tailscale-endpoints) |
+| **Small-model & sparse-MoE upgrades** | `tool_mode = "plain"` (plain-word gather steps, A/B-tested by `calibrate`), an opt-in `proactive_escalation` router, shadow-tested `best_of`, and an interleaved pre-stop verifier. Oversized tool output spills to `.pedacito/scratch/`, which the model can read but never write. | [Configuration](docs/CONFIG.md#configuration-reference) |
+| **Guided git, hardened** | `pedacito commit` and `pedacito pr` run a secret pre-flight scan before every commit and PR, never push or force-push, and are shared by the TUI `/git` and the GUI Git drawer. `undo` refuses to rewind past a moved git HEAD without `--force`. | [Git and pull requests](docs/USAGE.md#git-commit-and-pull-requests) |
+| **Reliable runs & CLI polish** | Pre-run checkpoints for divergent trees, `restore --checkpoint`, offline tree-sitter fallback with `parsers prefetch`, `pedacito diag`, `models --profile/--model`, `new --no-complex`, honest partial-batch semantics and a hard `--max-minutes` clamp. | [Offline parsers and diag](docs/USAGE.md#offline-parsers-parsers-prefetch-and-diag) |
+| **GUI hardening** | Partial-hunk review sign-off with per-hunk provenance, persistent thread cards, deterministic `/compact` handoffs, a responsive narrow layout, and quiet client disconnects. | [Review page](docs/USAGE.md#review-page) |
+| **Windows PowerShell 5.1 note** | On PowerShell 5.1, `2>&1` wraps stderr lines as error records; use `2>$null` for clean JSON output. | [Windows stderr](docs/USAGE.md#windows-powershell-51-capturing-stderr-21) |
 
 ## What's new in v0.3.2
 

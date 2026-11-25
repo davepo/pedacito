@@ -20,7 +20,7 @@ Pedacito necesita **Python 3.11 o superior**. No necesita Node.js para el arnés
 
 Requiere Python 3.11+.
 
-Instalación rápida desde PyPI (0.3.2):
+Instalación rápida desde PyPI (0.3.3):
 
 ```bash
 pip install pedacito                     # Windows: py -m pip install pedacito

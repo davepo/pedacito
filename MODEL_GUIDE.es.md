@@ -653,7 +653,7 @@ La tarjeta define estos valores:
 - `prompt_pack`, que controla cuánto texto de instrucciones recibe el modelo
 - `answer_mode`, si la respuesta continúa la conversación de búsqueda
 - `verify_answer` y `best_of`, que agregan verificaciones y muestras extra para modelos más débiles
-- `tool_mode`, `grammar` o `native`
+- `tool_mode`, `grammar`, `native` o `plain` (v0.3.3: el formato de palabras simples para modelos pequeños que tropiezan con JSON)
 - `fuzzy_match` y `edit_style`
 - `disable_thinking`, cuando el A/B de razonamiento muestra que el modelo lo necesita desactivado
 - `specialties`, las etiquetas con las que el enrutamiento automático por especialista asocia tareas
@@ -679,6 +679,25 @@ trabajo en segundo plano. `pedacito models scan` también calibra cada modelo lo
 una ejecución rápida por defecto, de modo que obtienes una tarjeta al agregar modelos.
 
 ---
+
+## Modelos pequeños, MoE disperso y equipos remotos (v0.3.3)
+
+- **Los servidores Tailscale y LAN cuentan como locales.** Un `base_url` en una dirección de Tailscale
+  (`100.64.0.0/10`), una dirección LAN o un nombre `.local` recibe el muestreador local, `cache_prompt` y
+  las reglas de MoE local. Los APIs alojados no cambian. Una tarjeta local sin temperatura calibrada se
+  marca como obsoleta, así que ejecuta `pedacito calibrate --recalibrate` una vez tras actualizar.
+- **`tool_mode = "plain"`** pide cada paso de búsqueda en palabras simples (`read app.py 1 40`). Muchos
+  modelos pequeños que tropiezan con JSON funcionan mejor así. `calibrate` hace la comparación A/B con
+  `grammar` y conserva el formato que puntúa más alto, sin que tengas que elegir a mano.
+- **`best_of` y diversidad de familias.** Los candidatos de `best_of` se prueban en un espacio de trabajo
+  virtual en sombra. Las recomendaciones de roles prefieren una familia de arquitectura distinta cuando
+  hay una disponible, para que los roles no compartan todos los puntos ciegos de una misma familia.
+- **`proactive_escalation` (opcional).** Una compuerta de complejidad sin tokens envía las tareas difíciles
+  (muchas importaciones, muchos archivos, límites de módulo, palabras de arquitectura abiertas)
+  directamente al rol `escalate`, y un Scout mantiene en local el trabajo bien definido de un solo archivo.
+  Necesita `roles.escalate` con un modelo más potente y está desactivado por defecto.
+- **Los modelos MoE dispersos** (detectados como `is_sparse_moe`) reciben un prompt de ejecución directa.
+  Las ejecuciones `interleaved` además pasan un verificador acotado y determinista antes de aceptar `finish`.
 
 ## Compara modelos con los benchmarks de diagnóstico
 

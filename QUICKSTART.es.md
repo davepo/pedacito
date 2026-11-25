@@ -1097,6 +1097,22 @@ solo el mapa está desactualizado.
 
 ---
 
+## Novedades de la v0.3.3
+
+- **TUI enriquecida, sin paquetes extra.** Las ediciones se muestran como diffs en línea, y las llamadas
+  a herramientas son tarjetas de una línea que puedes abrir con `Ctrl+O` (o con `/expand` y
+  `/collapse`). Escribe `@` para abrir un selector difuso de archivos e imágenes. Los clics del ratón
+  funcionan en `[EN|es]`, en las pestañas de la barra lateral y en la barra de desplazamiento.
+- **Git guiado.** `pedacito commit` y `pedacito pr` escanean secretos antes de confirmar o abrir un pull
+  request. Ninguno de los dos hace push nunca.
+- **Editores y hosts de agentes.** `pedacito acp` es un puente Agent Client Protocol por stdio, construido
+  sobre el mismo motor que `rpc`.
+- **Servidores Tailscale y LAN.** Una dirección `100.64.x.x` (Tailscale) cuenta como endpoint local. Una
+  tarjeta de modelo local sin temperatura calibrada se marca como obsoleta; ejecuta
+  `pedacito calibrate --recalibrate` una vez.
+- **Windows PowerShell 5.1.** `2>&1` envuelve las líneas de stderr como errores. Para una salida JSON
+  limpia usa `2>$null`, o ejecuta el comando en PowerShell 7 o `cmd.exe`.
+
 ## Comandos de un vistazo
 
 | Comando | Qué hace |
@@ -1106,6 +1122,7 @@ solo el mapa está desactualizado.
 | `pedacito config --check` | ¿El servidor está activo y el modelo funciona? |
 | `pedacito config --doctor` | También sondea la salida estructurada, la ventana de contexto, el tokenizador y el sandbox |
 | `pedacito config --upgrade [--dry-run]` | Agrega a tu configuración las opciones recién documentadas, comentadas; `--dry-run` solo las lista |
+| `pedacito models [--profile NAME] [--model ID]` | Muestra los números ajustados del perfil activo (o de uno indicado); `--json` los imprime como JSON |
 | `pedacito models scan` | Encuentra servidores locales o una API alojada, elige modelos, escribe perfiles y los mide |
 | `pedacito calibrate` | Mide el modelo y guarda una tarjeta de modelo que ajusta los valores por defecto; `--all` recorre cada perfil local (los modelos alojados se rechazan) |
 | `pedacito profiles [--recommend]` | Lista los perfiles y sus puntuaciones; sugiere roles |
@@ -1121,7 +1138,7 @@ solo el mapa está desactualizado.
 | `pedacito tui PROJ` | TUI en pantalla dividida: transcripción + barra lateral de actividad/plan + Context Meter, consumo de tokens y telemetría de tok/s. `/help` lista los comandos slash; `--headless` es programable |
 | `pedacito rpc [PROJ]` | JSONL-RPC por stdin/stdout para editores y agentes; el índice se mantiene caliente |
 | `pedacito mcp list` | Muestra las herramientas de los servidores MCP con nombre y sus indicadores de confianza |
-| `pedacito new DIR -t "..."` | Inicia un proyecto desde cero (o `--spec FILE`) |
+| `pedacito new DIR -t "..."` | Inicia un proyecto desde cero (o `--spec FILE`); `--no-complex` (alias `--single`) desactiva la escalada automática a Complex |
 | `pedacito auto PROJ -t "..."` | Planifica una meta y luego la implementa tarea por tarea |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Renombra un símbolo en todo el proyecto. Sin llamada al modelo; vista previa por defecto; `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba |
@@ -1133,6 +1150,11 @@ solo el mapa está desactualizado.
 | `pedacito webcheck PROJ` | Verificaciones estáticas de archivos web: ids del DOM, carga de scripts, scripts faltantes, enlaces de módulos ES y vínculos |
 | `pedacito domcheck PROJ` | Verificación de humo del DOM headless: carga la página de entrada en Chromium headless, comprueba que el grafo de módulos se monta, informa errores de consola, controles sin enlazar y fallos silenciosos de Web Audio (requiere Playwright) |
 | `pedacito diagnose` | Ejecuta el linter o verificador de tipos del proyecto |
+| `pedacito diag [PROJ]` | Alias corto de `diagnose` |
+| `pedacito parsers prefetch [--languages ...]` | Precarga las gramáticas de tree-sitter para que la herramienta funcione sin conexión o aislada; informa ok o failed por lenguaje |
+| `pedacito acp [PROJ]` | Protocolo Agent Client Protocol (JSON-RPC 2.0) por stdin/stdout para editores y hosts de agentes; texto, recursos `@file`, imágenes, actualizaciones en streaming y avisos de permiso |
+| `pedacito commit [--all] [-m MSG] [-y]` | Escanea el diff preparado en busca de secretos y luego crea un commit local. Nunca hace push; `--no-model` redacta sin conexión y `--allow-secrets` es la excepción explícita |
+| `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Redacta título y cuerpo del PR a partir del diff y los commits de la rama, y luego lo abre con `gh`. Nunca hace push de la rama |
 | `pedacito prune PROJ` | Elimina sesiones, respaldos y eventos antiguos |
 | `pedacito reset PROJ [--reindex]` | Borra el estado de ejecución de `.pedacito/`. El código y la configuración permanecen |
 | `pedacito trust PROJ` | Aprueba el `.pedacito.toml` de un proyecto para que se apliquen sus ajustes de ejecución y sus interruptores de capacidades |

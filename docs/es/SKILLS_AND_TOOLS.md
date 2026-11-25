@@ -13,6 +13,7 @@ las skills personalizadas, los servidores MCP con nombre, los hooks JSON y la so
 - [Servidores MCP con nombre](#servidores-mcp-con-nombre)
 - [Hooks JSON](#hooks-json)
 - [Acción de generación de imágenes](#acción-de-generación-de-imágenes)
+- [Formatos de recolección y observaciones grandes (v0.3.3)](#formatos-de-recolección-y-observaciones-grandes-v033)
 - [Sobrescritura de prompts](#sobrescritura-de-prompts)
 
 ## Skills incluidas
@@ -111,6 +112,22 @@ perfil de imagen configurado (`image_profile`, o un perfil `modality = "image"` 
 `allow_image_gen = true` o bien un intermediario de permisos en vivo (GUI/TUI) puede aprobar cada llamada. Sin perfil de imagen, el esquema de
 herramientas no cambia. La escritura usa la misma contención del espacio de trabajo y escritura atómica que cualquier otra escritura de archivos.
 Consulta [Generación local de imágenes](CONFIG.md#generación-local-de-imágenes-image_profile-allow_image_gen).
+
+## Formatos de recolección y observaciones grandes (v0.3.3)
+
+El bucle de recolección puede pedir cada paso de búsqueda en uno de tres formatos, según `tool_mode`:
+
+- `grammar` (por defecto): un paso JSON, restringido por el servidor cuando `enforce_json_schema` está activo.
+- `native`: el propio canal de llamadas a herramientas del modelo.
+- `plain`: palabras simples y breves, por ejemplo `read app.py 1 40` o `grep parse_args`. Conviene a modelos
+  pequeños que tropiezan con JSON. `calibrate` lo compara A/B con `grammar` y conserva el formato que
+  puntúa mejor.
+
+Cualquier observación por encima de `max_observation_tokens` de `run`, `run_test`, `grep`, `diff`, `git_diff`,
+`fetch`, `web_search`, `diagnose` o `serve` se vuelca a `.pedacito/scratch/<id>.log`. El modelo recibe el
+inicio, el final, el número de líneas y el nombre del archivo. Después puede usar `read` o `grep` sobre
+líneas exactas de ese archivo, y solo sobre archivos `*.log` directos bajo `.pedacito/scratch/`. El modelo
+nunca puede escribir en ese directorio. Consulta [Seguridad](SECURITY.md#commits-pull-requests-undo-y-archivos-scratch-v033).
 
 ## Sobrescritura de prompts
 

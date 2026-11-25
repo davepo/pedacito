@@ -254,6 +254,26 @@ models into — and creative/design tasks run at ≥ 0.6 (see
 repeats itself, the retry gets one gentle `presence_penalty = 0.15` nudge
 instead of a cold temperature or a heavy repeat penalty.
 
+## Local, LAN and Tailscale endpoints
+
+Every decision that depends on "is this a local server?" goes through one
+predicate, so the tier heuristic, the sampling rules, the acceleration keys and
+the calibration stale check all agree. An endpoint counts as local when its host
+is loopback, a `.local` name, an RFC 1918 address (`10/8`, `172.16/12`,
+`192.168/16`), a Tailscale or other RFC 6598 CGNAT address (`100.64.0.0/10`), a
+link-local address, an IPv6 unique-local address (`fc00::/7`), or a provider label
+that names a local runtime:
+
+```toml
+[profiles.homebox]
+base_url = "http://100.101.102.103:1234/v1"   # a Tailscale address counts as local
+model = "qwen3.5-27b"
+```
+
+Local endpoints keep the local sampler, `cache_prompt` and the local-MoE rules.
+A local model card that has no calibrated temperature is marked **stale**, so
+run `pedacito calibrate --recalibrate` once after upgrading to v0.3.3.
+
 ## Local inference acceleration
 
 Hosted caching reuses a provider-side prefix; a self-hosted server can do the
@@ -858,6 +878,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_subagents` | false | The `task` action (read-only helper with a fresh window). |
 | `allow_fetch` / `fetch_allowed_hosts` | false / `[]` | The `fetch` action and the hosts it may read. |
 | `roles` | `{}` | Per-job profiles: `planner`, `verifier`, `summarizer`, `repair`, `escalate`, `fallback`. |
+| `proactive_escalation` | false | Opt-in (v0.3.3) two-path router that runs once per task. A zero-token structural gate (import fan-out, files touched, module boundaries, open-ended architecture words) sends a hard task straight to the `escalate` role; a boundary-fewshot Scout classifier keeps well-defined single-file tasks local. Needs `roles.escalate`; `false` leaves reactive escalation unchanged. |
 | `auto_escalate` / `escalation_zero_edit_runs` | true / 3 | Widen the `escalate` retry beyond "no edit landed": a semantic repair failure, two no-progress leases, or this many consecutive zero-edit runs on one profile earn one retry even when edits applied. Every reason emits an `escalation_suggested` event even without a configured role; 0 disables the zero-edit statistic. |
 | `hooks` / `hook_timeout` | `{}` / 10 | Your commands at events, each capped at this many seconds (see [Hooks](#hooks); project-level hooks need `pedacito trust`). |
 | `scrub_env` / `env_passthrough` | true / `[]` | Minimal environment for model-chosen commands. |
@@ -876,10 +897,10 @@ config --reference` prints the annotated template. Key settings:
 | `log_events` / `keep_events` | true / 20 | Local JSONL telemetry under `.pedacito/events/`. |
 | `summary_workers` / `refresh_summaries` | 0 / 12 | Concurrent summaries (0 = auto: hosted 4, local 1); units re-summarised after a task. |
 | `summary_batch` | 1 | Short units summarised N per request while indexing (fewer round-trips; unparsed lines fall back to single requests). |
-| `max_observation_tokens` | 0 | Ceiling on one non-read observation, in tokens (0 = auto: a quarter of the window, 300-2200). |
+| `max_observation_tokens` | 0 | Ceiling on one non-read observation, in tokens (0 = auto: a quarter of the window, 300-2200). An observation over the ceiling (run, run_test, grep, diff, fetch, diagnose, serve) is spilled to `.pedacito/scratch/*.log` (v0.3.3) and the model gets a head, a tail and the file name to `read` or `grep` on demand. |
 | `plan_threshold` / `max_replans` | 0 / 1 | Auto-plan tasks naming this many files or requirements; tasks naming 5+ files auto-plan even at 0 unless this is set explicitly (`--plan` forces one task, `--no-plan` opts out); planner revisions after a failed step. |
 | `allow_steering` | true | Deliver lines typed mid-task to the model in `chat`. |
-| `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `calibrate` picks. |
+| `tool_mode` | `grammar` | `native` sends lookup steps through the model's tool-call channel; `plain` (v0.3.3) sends them as short plain words (`read app.py 1 40`), which suits small models that stumble on JSON; `calibrate` A/B-tests the formats and keeps the one that scores better. Valid values: `grammar`, `native`, `plain`. |
 | `execution_mode` | `two_phase` | The task engine: `two_phase` (gather then answer), `interleaved` (one agentic read/edit/test conversation) or `auto` (interleaved for hosted APIs, local-MoE servers and calibrated large local models whose card chose native tool calls; `two_phase` for tiny/small/medium and uncalibrated local models). `--execution-mode` overrides it per run; the TUI's `/mode` switches it live. |
 | `step_reasoning_first` | true | `true` puts `reasoning` before the action in each lookup step (the model says what it needs, then picks); unset lets the model card decide. `calibrate` measures both orders with the same adopt-only-if-0.1-better rule as `tool_mode`. |
 | `fewshot_steps` | unset | `true` shows three worked steps from your project (grep a symbol, read it, done) once in the first user turn, even under grammar or native tool calls; unset lets the model card decide. About 70 extra prompt tokens on every lookup call (the server caches them after the first, but a prompt-token count such as `eval`'s still includes them on each call). `calibrate` adopts it only if it picks the right action 0.1 more often with no loss of well-formed steps. |

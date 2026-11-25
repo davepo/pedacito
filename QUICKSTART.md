@@ -1098,6 +1098,22 @@ only the map is stale.
 
 ---
 
+## What's new in v0.3.3
+
+- **Rich TUI, still no extra packages.** Edits show as inline diffs, and tool
+  calls are one-line cards you can open with `Ctrl+O` (or `/expand` and
+  `/collapse`). Type `@` to open a fuzzy picker over files and images. Mouse
+  clicks work on `[EN|es]`, the sidebar tabs and the scrollbar.
+- **Guided git.** `pedacito commit` and `pedacito pr` scan for secrets before
+  they commit or open a pull request. Neither one ever pushes.
+- **Editors and agent hosts.** `pedacito acp` is an Agent Client Protocol bridge
+  over stdio, built on the same engine as `rpc`.
+- **Tailscale and LAN servers.** A `100.64.x.x` (Tailscale) address counts as a
+  local endpoint. A local model card with no calibrated temperature is marked
+  stale; run `pedacito calibrate --recalibrate` once.
+- **Windows PowerShell 5.1.** `2>&1` wraps stderr lines as errors. For clean
+  JSON output use `2>$null`, or run the command in PowerShell 7 or `cmd.exe`.
+
 ## Commands at a glance
 
 | Command | What it does |
@@ -1107,6 +1123,7 @@ only the map is stale.
 | `pedacito config --check` | Is the server up, and does the model work? |
 | `pedacito config --doctor` | Also probe structured output, context window, tokenizer, and sandbox |
 | `pedacito config --upgrade [--dry-run]` | Add newly documented options to your config, commented out; `--dry-run` only lists them |
+| `pedacito models [--profile NAME] [--model ID]` | Show the active (or a named) profile's tuned numbers; `--json` prints them as JSON |
 | `pedacito models scan` | Find local servers or a hosted API, pick models, write profiles, measure them |
 | `pedacito calibrate` | Measure the model and save a model card that tunes defaults; `--all` walks every local profile (hosted models are refused) |
 | `pedacito profiles [--recommend]` | List profiles and their scores; suggest roles |
@@ -1123,7 +1140,7 @@ only the map is stale.
 | `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and agents; the index stays warm |
 | `pedacito acp [PROJ]` | Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout for editor and agent hosts; text, `@file` resources, images, streamed updates and permission prompts |
 | `pedacito mcp list` | Show the tools of the named MCP servers and their trust flags |
-| `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`) |
+| `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`); `--no-complex` (alias `--single`) turns off the automatic Complex escalation |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito commit [--all] [-m MSG] [-y]` | Secret-scan the staged diff, then create a local commit. Never pushes; `--no-model` drafts offline and `--allow-secrets` is the explicit override |
@@ -1137,6 +1154,8 @@ only the map is stale.
 | `pedacito webcheck PROJ` | Static checks for web files: DOM ids, script loading, missing scripts, ES module bindings and links |
 | `pedacito domcheck PROJ` | Headless DOM smoke check: load the entry page in headless Chromium, prove the module graph mounts, report console errors, unbound controls and silent Web Audio failures (needs Playwright) |
 | `pedacito diagnose` | Run the project's linter or type checker |
+| `pedacito diag [PROJ]` | Short alias of `diagnose` |
+| `pedacito parsers prefetch [--languages ...]` | Pre-warm the tree-sitter grammars so the tool works offline or air-gapped; reports ok or failed per language |
 | `pedacito prune PROJ` | Delete old sessions, backups, and events |
 | `pedacito reset PROJ [--reindex]` | Wipe `.pedacito/` runtime state. Code and config stay |
 | `pedacito trust PROJ` | Approve a project's `.pedacito.toml` so its execution settings and capability toggles apply |

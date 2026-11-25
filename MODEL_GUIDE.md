@@ -653,7 +653,7 @@ The card sets these values:
 - `prompt_pack`, which controls how much instruction text the model gets
 - `answer_mode`, whether the answer continues the lookup conversation
 - `verify_answer` and `best_of`, which add checks and extra samples for weaker models
-- `tool_mode`, `grammar` or `native`
+- `tool_mode`, `grammar`, `native` or `plain` (v0.3.3: the plain-word format for small models that stumble on JSON)
 - `fuzzy_match` and `edit_style`
 - `disable_thinking`, when the thinking A/B shows the model needs it off
 - `specialties`, the tags specialist auto-routing matches tasks against
@@ -679,6 +679,29 @@ background job. `pedacito models scan` also calibrates each new local model with
 a quick run by default, so you get a card as you add models.
 
 ---
+
+## Small models, sparse MoE and remote boxes (v0.3.3)
+
+- **Tailscale and LAN servers count as local.** A `base_url` on a Tailscale
+  address (`100.64.0.0/10`), a LAN address or a `.local` name gets the local
+  sampler, `cache_prompt` and the local-MoE rules. Hosted APIs are unchanged.
+  A local card that lacks a calibrated temperature is marked stale, so run
+  `pedacito calibrate --recalibrate` once after upgrading.
+- **`tool_mode = "plain"`** asks for each gather step in plain words
+  (`read app.py 1 40`). Small models that stumble on JSON often do better this
+  way. `calibrate` runs the A/B against `grammar` and keeps the format that
+  scores higher, so you do not need to choose by hand.
+- **`best_of` and family diversity.** `best_of` candidates are shadow-tested in a
+  virtual workspace. Role recommendations prefer a different architecture family
+  when one is available, so the roles do not all share one family's blind spots.
+- **`proactive_escalation` (opt-in).** A zero-token complexity gate sends hard
+  tasks (many imports, many files, module boundaries, open-ended architecture
+  words) straight to the `escalate` role, and a Scout keeps well-defined
+  single-file work local. It needs `roles.escalate` set to a stronger model and
+  is off by default.
+- **Sparse MoE models** (detected as `is_sparse_moe`) get a direct execution
+  prompt. `interleaved` runs also pass a bounded, deterministic verifier before
+  they accept `finish`.
 
 ## Compare models with the diagnostic benchmarks
 

@@ -177,6 +177,7 @@ commands. Run `pedacito <command> --help` for every flag.
 |---|---|
 | `pedacito gui [PROJECT]` | Open the browser control panel |
 | `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
+| `pedacito models [--profile NAME] [--model ID]` | Print the active (or a named) profile's tuned numbers; `--model` names the model id for that view |
 | `pedacito models refresh` | Refresh the cached models.dev catalog (hosted context windows and prices) now; a failed fetch keeps the old cache |
 | `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
 | `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
@@ -188,7 +189,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito new DIR -t "..."` | Start a project from scratch |
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
-| `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time |
+| `pedacito rpc [PROJ]` | JSONL-RPC over stdin/stdout for editors and other agents: one request per line, streamed events, steering, permission prompts, cancel -- index, profiles and session warm the whole time. `--events off` keeps only terminal frames; `--describe` prints the protocol and exits |
 | `pedacito acp [PROJ]` | Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout: `initialize`, `session/new`, `session/prompt` with text/`@file`/image blocks, streamed `session/update` notifications and `session/request_permission` round-trips; the same warm engine as `rpc` |
 | `pedacito how "..."` | Built-in help for the CLI, the GUI, and settings |
 | `pedacito undo PROJ` | Restore the workspace to the state immediately before the last run; `--list` shows the checkpoint tree |
@@ -201,6 +202,8 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
 | `pedacito image PROMPT` | Generate one image with a configured image-model profile (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Saved under `.pedacito/images/` |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
+| `pedacito diag [PATH]` | Alias of `pedacito diagnose`: run the project's detected linter or typechecker |
+| `pedacito parsers prefetch [--languages ...]` | Pre-warm the tree-sitter grammars for offline or air-gapped use and report ok or failed per language |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
@@ -611,6 +614,16 @@ run line by line. Plain `Enter` submits.
 prompt) stages PNG/JPEG/WebP/GIF images for the next task; `list` shows what is
 staged and `clear` drops it. See [Multimodal input](#multimodal-chat-input).
 
+**Rich view (v0.3.3).** Still zero-dependency. Edits render as inline
+syntax-highlighted unified diffs, and every tool call is a collapsible one-line
+card: `Ctrl+O` toggles the latest card, and `/expand [N|all]` and
+`/collapse [N|all]` work on any card. Type `@` in the prompt to open an
+interactive six-row fuzzy picker over project files, symbols and images: Up and
+Down move through it, Tab or Enter inserts the path, and Esc dismisses it. SGR
+mouse zones are clickable too: `[EN|es]` switches language, the sidebar tabs
+switch panels, a tool card expands or collapses, and the scrollbar jumps. Mouse
+capture stays opt-in (`/mouse on`, or `F2`).
+
 The footer updates after every model call and event: a green/amber/red
 **Context Meter** (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), turn and
 session **Burn Rate** (token burn rate), `Speed: 44.2 tok/s (avg 41.8 tok/s)`,
@@ -625,7 +638,7 @@ Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`
 `/effort [low|medium|high]`, `/creative [on|off|auto]`, `/servers`,
 `/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
-`/hybrid`, `/arena`, `/diff`, `/git [status|stage PATH|unstage PATH|commit
+`/hybrid`, `/arena`, `/diff`, `/expand [N|all]`, `/collapse [N|all]`, `/git [status|stage PATH|unstage PATH|commit
 [MSG]|branch NAME]`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
 `/fix`, `/image PROMPT`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
 `/mouse [on|off]`, `/clear`, `/quit` (`/exit`). A plain line is a
@@ -661,13 +674,42 @@ whole point. Human-facing diagnostics go to stderr; stdout stays pure JSONL.
 Protocol details in `pedacito/rpc.py`, rationale in
 [Techniques §31](../TECHNIQUES.md#31-bidirectional-stdio-jsonl-rpc-a-warm-engine-an-editor-can-drive).
 
+### `acp`: Agent Client Protocol bridge
+
+```bash
+pedacito acp ~/code/anki                                  # editor or agent host over stdio
+pedacito acp ~/code/anki --profile fast --execution-mode interleaved
+```
+
+`pedacito acp` speaks the Agent Client Protocol (JSON-RPC 2.0) on stdin and
+stdout, for editors and agent hosts such as Zed. It wraps the same warm engine
+as `rpc`, so nothing about the harness is duplicated. `initialize` advertises
+the capabilities, and `session/new` binds a project (a foreign working
+directory is refused rather than read) with an optional profile and execution
+mode. `session/prompt` accepts text, `@file` resource and image blocks; `@file`
+paths go through the same containment check as every other read, so traversal
+and symlink escapes are refused. Tasks stream `session/update` notifications
+(`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`,
+`plan`), and gated tools round-trip through `session/request_permission`.
+`session/cancel` maps to the rpc cancel and keeps the process alive. stdout is
+pure JSON-RPC; every human line goes to stderr, and stdin EOF drains the active
+task and exits 0.
+
 ### `new`: start a project from scratch
 
 ```bash
 pedacito new my-app -t "a CLI todo manager with a sqlite backend" --apply
 pedacito new my-api --spec docs/spec.md --review
 pedacito new my-app -t "..." --plan-only --apply     # skeleton only
+pedacito new my-app -t "..." --apply --no-complex    # one pass, no Complex escalation
 ```
+
+`--no-complex` (alias `--single`) turns off the automatic escalation to Complex
+scaffolding for prompts that name several modules. `--complex` now defaults
+`verify_final` on, and a scaffold whose pytest run collects no tests (exit 5)
+is treated as a valid scaffold rather than a failure. The starter
+`pyproject.toml` includes `[tool.pytest.ini_options] pythonpath = ["."]`, so
+`pytest` finds the package from the project root.
 
 The model plans a file tree, the skeleton is written, then each file is filled
 in. Dry run by default. The target directory must be empty or new, or hold
@@ -851,7 +893,32 @@ The TUI exposes the local half as `/git [status|stage PATH|unstage PATH|commit
 [MSG]|branch NAME]`, and the GUI's **Git** button (or **Project → Git: commit &
 pull request…**) offers stage/unstage rows, a message box with **Draft message**
 and **Commit**, and a secret-scan warning banner. Both call the same `gitops`
-functions and refuse on findings.
+functions and refuse on findings. The GUI Git drawer and `/git` never push, and
+`commit` and `pr` refuse to proceed on a secret-scan match.
+
+### Offline parsers: `parsers prefetch` and `diag`
+
+```bash
+pedacito parsers prefetch                          # the common grammar set, while online
+pedacito parsers prefetch --languages python go    # just these grammars
+pedacito diag .                                    # alias of `pedacito diagnose`
+```
+
+Tree-sitter grammars load on first use. `parsers prefetch` warms them ahead of
+time and prints `ok` or `failed` for each language. A grammar that cannot be
+fetched is retried and then falls back to the built-in parser, so an air-gapped
+machine keeps working. `diag` is the short name for `diagnose`, the project's
+detected linter or typechecker, and it takes the same `--file` scope.
+
+### Windows PowerShell 5.1: capturing stderr (`2>&1`)
+
+Pedacito writes its human text to stderr, and under `--jsonl`, `rpc` and `acp`
+stdout must stay pure JSON. On Windows PowerShell 5.1, `2>&1` wraps every
+stderr line as an error record, so a successful run can print red
+`NativeCommandError` text and a piped JSON stream can be corrupted. For clean
+machine output, discard stderr (`pedacito ask . -t "..." --json 2>$null`), or
+run the command under PowerShell 7 or `cmd.exe`, which merge stderr as plain
+text.
 
 ### `gui`: browser control panel
 

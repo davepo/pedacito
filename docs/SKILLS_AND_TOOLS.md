@@ -13,6 +13,7 @@ custom skills, named MCP servers, JSON hooks, and prompt overrides. Settings liv
 - [Named MCP servers](#named-mcp-servers)
 - [JSON hooks](#json-hooks)
 - [Image generation action](#image-generation-action)
+- [Gather formats and oversized observations (v0.3.3)](#gather-formats-and-oversized-observations-v033)
 - [Prompt overrides](#prompt-overrides)
 
 ## Bundled skills
@@ -111,6 +112,23 @@ image profile is configured (`image_profile`, or an auto-detected `modality = "i
 `allow_image_gen = true` or a live permission broker (GUI/TUI) can approve each call. With no image profile the tool
 schema is unchanged. The write uses the same workspace containment and atomic write as every other file write.
 See [Local image generation](CONFIG.md#local-image-generation-image_profile-allow_image_gen).
+
+## Gather formats and oversized observations (v0.3.3)
+
+The gather loop can ask for each lookup step in one of three formats, set by
+`tool_mode`:
+
+- `grammar` (default): a JSON step, constrained by the server when `enforce_json_schema` is on.
+- `native`: the model's own tool-call channel.
+- `plain`: short plain words, for example `read app.py 1 40` or `grep parse_args`. It suits small
+  models that stumble on JSON. `calibrate` A/B-tests it against `grammar` and keeps the format that
+  scores better.
+
+Any observation over `max_observation_tokens` from `run`, `run_test`, `grep`, `diff`, `git_diff`,
+`fetch`, `web_search`, `diagnose` or `serve` is spilled to `.pedacito/scratch/<id>.log`. The model
+gets the head, the tail, the line count and the file name. It can then `read` or `grep` exact lines
+from that file, and only from direct `*.log` files under `.pedacito/scratch/`. The model can never
+write to that directory. See [Security](SECURITY.md#git-commits-pull-requests-undo-and-scratch-files-v033).
 
 ## Prompt overrides
 

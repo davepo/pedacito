@@ -923,6 +923,34 @@ muestra lo que se iría; los git worktrees activos bajo `.pedacito/worktrees/` h
 rehúse a menos que pases `--force`. `pedacito prune` conserva las N sesiones,
 respaldos y archivos de eventos más recientes y recorta `log.txt`.
 
+## Módulos de v0.3.3 de un vistazo
+
+- **`pedacito/gitops.py`**: git guiado. Cada llamada a git usa solo argv. Ejecuta el escaneo previo de
+  secretos sobre el diff preparado (commit) o el diff de la rama (pr), y nunca hace push ni force-push.
+  `pedacito commit`, `pedacito pr`, `/git` en la TUI y el cajón Git de la GUI llaman a las mismas funciones.
+- **`pedacito/acp.py`**: el puente Agent Client Protocol (`pedacito acp`). Es una capa de encuadre
+  JSON-RPC 2.0 sobre el motor caliente `rpc.py`, así que la lógica de tareas no se duplica. Las
+  notificaciones `session/update` salen del mismo flujo de eventos que emite `rpc`.
+- **`pedacito/rpc.py`**: `params.question` en `explain`, `--events on|off` y `--describe`. El `id` del
+  cliente se conserva junto a `req_id` en los eventos transmitidos.
+- **`pedacito/config.py: _endpoint_is_local`**: el único predicado de localidad (loopback, `.local`,
+  RFC 1918, CGNAT RFC 6598 / Tailscale, link-local, ULA de IPv6, etiquetas de proveedor local).
+  `config`, `llm`, `modelcard`, `servers`, `model_catalog` y `cli` delegan en él.
+- **Volcado a `pedacito/tools.py` (scratch)**: las observaciones grandes de las acciones que producen
+  salida se escriben en `.pedacito/scratch/*.log`. El modelo las lee y busca con `read` y `grep`, y no
+  puede escribirlas.
+- **Formato de herramienta `tool_mode = "plain"`**: un formato de palabras simples junto a los formatos
+  grammar y native. `calibrate` lo compara A/B.
+- **Enrutador (`proactive_escalation`)**: enrutador de dos vías opcional. Una compuerta estructural sin
+  tokens escala las tareas difíciles; un Scout de pocos ejemplos en la frontera mantiene en el worker las
+  tareas simples de un solo archivo. Desactivado por defecto.
+- **`pedacito/tui.py`**: la vista enriquecida sin dependencias: diffs en línea, tarjetas plegables de
+  llamadas a herramientas (`Ctrl+O`, `/expand`, `/collapse`), el selector `@` de seis filas y las zonas de
+  ratón SGR. Sigue siendo una capa de terminal solo con la biblioteca estándar.
+- **`pedacito/i18n.py` + `pedacito/profiles.py`**: los encabezados de `pedacito profiles` y el título de
+  recomendaciones se buscan con `i18n.t`, así que `pedacito --lang es profiles` imprime etiquetas en
+  español. El inglés sigue siendo el predeterminado.
+
 ## Límites conocidos
 
 Estos son los límites reales. Las funciones faltantes del arnés no están en esta lista:

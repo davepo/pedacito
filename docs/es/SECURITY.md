@@ -527,6 +527,32 @@ los git worktrees activos bajo `.pedacito/worktrees/` hacen que el reinicio se r
 
 ---
 
+## Commits, pull requests, undo y archivos scratch (v0.3.3)
+
+- **Escaneo previo de secretos antes de cada commit.** `pedacito commit` (y `/git commit` en la TUI,
+  y el cajón Git de la GUI) escanea el diff preparado con el mismo conjunto de patrones que
+  `security.scan_text_for_secrets` antes de ejecutar `git commit`. Una coincidencia rechaza el commit
+  e indica el archivo y el patrón. Solo `--allow-secrets` lo anula, y esa excepción se escribe de
+  forma explícita en la línea de comandos, nunca se guarda en la configuración.
+- **Escaneo previo de secretos antes de cada pull request.** `pedacito pr` escanea de la misma forma el
+  diff de la rama antes de redactar título y cuerpo, así que una credencial tampoco puede llegar a la
+  descripción del PR. `--dry-run` imprime el borrador y nunca llama a `gh`.
+- **Sin push automático y sin force-push.** Nada en `gitops` ejecuta `git push` ni `--force`. `commit`
+  deja un commit local, y `pr` abre un pull request para una rama que ya publicaste. Las llamadas a git
+  usan solo argv, sin shell.
+- **`undo` comprueba el HEAD de git.** Si el HEAD del repositorio se ha movido desde que se tomó el
+  checkpoint (por ejemplo, hiciste commit entre medias), `pedacito undo` se niega a rebobinar el árbol
+  de trabajo y pide `--force`, para que un commit no se deshaga en silencio. Antes de que una ejecución
+  escriba en un árbol divergente, Pedacito toma primero un checkpoint.
+- **`.pedacito/scratch/` está contenido y es de solo lectura para el modelo.** La salida grande de las
+  herramientas se escribe ahí como archivos `*.log`. El modelo solo puede usar `read` y `grep` sobre esos
+  archivos `*.log` directos, con la misma contención de rutas que cualquier otra lectura. No puede
+  escribir, renombrar ni salir del directorio.
+- **Las rutas de ACP están contenidas.** En `pedacito acp`, una mención `@file` o un bloque de recurso
+  pasa por `security.resolve_safe_path`, así que se rechazan los recorridos de ruta y las escapadas por
+  enlaces simbólicos. El proyecto se vincula en `session/new`, y un directorio de trabajo ajeno se
+  rechaza en lugar de leerse.
+
 ## Exportación de trayectorias
 
 La exportación de trayectorias es una función de conjuntos de datos **opcional**, desactivada por defecto

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from . import modelcard
+from . import i18n, modelcard
 
 # The roles the planner can route to another profile (plus the worker, which
 # is the top-level `default_profile` key).
@@ -89,6 +89,8 @@ def list_profiles(cfg) -> list[dict]:
             rec["age_days"] = None
             rec["status"] = "uncalibrated"
         rec.update(modelcard.card_meta(card if isinstance(card, dict) else None))
+        if rec["status"] == "ok" and rec.get("calibrated_stale"):
+            rec["status"] = "stale"
         vram = body.get("vram_gb", getattr(cfg, "vram_gb", 0))
         local = rec["tier"] != "hosted"
         if rec["size_bytes"] and vram and local:
@@ -247,8 +249,9 @@ def apply_roles(text: str, recs: dict) -> str:
 def render(profiles: list[dict], recommend_rows=None) -> str:
     """The shared table. `recommend_rows` is `recommend(profiles)` when the
     caller wants the per-role suggestions appended."""
-    header = ("name", "model", "tier", "specialties", "harness-fit", "eval",
-              "tok/s", "context", "status")
+    header = tuple(i18n.t(f"profiles.col.{key}") for key in (
+        "name", "model", "tier", "specialties", "harness_fit", "eval",
+        "tok_s", "context", "status"))
     rows = []
     for p in profiles:
         fit = f"{p['fit']:.2f}" if p.get("fit") is not None else "-"
@@ -275,7 +278,7 @@ def render(profiles: list[dict], recommend_rows=None) -> str:
               for r in rows]
     if recommend_rows:
         lines.append("")
-        lines.append("Recommendations (suggestions -- confirm before applying):")
+        lines.append(i18n.t("profiles.recommend_title"))
         for role in ("default_profile", "escalate", "verifier", "planner",
                      "summarizer"):
             rec = recommend_rows.get(role)

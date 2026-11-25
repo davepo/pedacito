@@ -178,6 +178,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 |---|---|
 | `pedacito gui [PROJECT]` | Abre el panel de control en el navegador |
 | `pedacito models scan` | Encuentra servidores locales, elige modelos, escribe perfiles y los mide |
+| `pedacito models [--profile NAME] [--model ID]` | Muestra los números ajustados del perfil activo (o de uno indicado); `--model` nombra el id del modelo para esa vista |
 | `pedacito models refresh` | Actualiza ahora la caché del catálogo models.dev (ventanas de contexto y precios de proveedores alojados); si la descarga falla, se conserva la caché anterior |
 | `pedacito config --check` | Prueba la conexión y la generación. `--doctor` también sondea la salida estructurada. `--setup` ejecuta la configuración inicial; `--upgrade [--dry-run]` agrega a tu archivo las opciones recién documentadas |
 | `pedacito calibrate` | Mide el modelo activo (o los perfiles locales con `--all`) y guarda una tarjeta de modelo que ajusta los valores por defecto. Los modelos alojados se rechazan |
@@ -190,6 +191,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito chat PROJ` | Sesión interactiva que mantiene caliente el índice (`--rpc` convierte la sesión en un protocolo de máquina) |
 | `pedacito tui PROJ` | TUI en pantalla dividida: transcripción, barra lateral de actividad/plan en vivo y un pie de telemetría con Context Meter / consumo de tokens / tok/s. Suite completa de comandos slash; `--headless` es programable |
 | `pedacito rpc [PROJ]` | JSONL-RPC por stdin/stdout para editores y otros agentes: una petición por línea, eventos en streaming, dirección, avisos de permiso, cancelación; el índice, los perfiles y la sesión permanecen calientes todo el tiempo |
+| `pedacito acp [PROJ]` | Protocolo Agent Client Protocol (JSON-RPC 2.0) por stdin/stdout: `initialize`, `session/new`, `session/prompt` con bloques de texto, `@file` e imagen, notificaciones `session/update` y respuestas de `session/request_permission`; el mismo motor caliente que `rpc` |
 | `pedacito how "..."` | Ayuda integrada para la CLI, la GUI y los ajustes |
 | `pedacito undo PROJ` | Restaura el espacio de trabajo al estado inmediatamente anterior a la última ejecución; `--list` muestra el árbol de checkpoints |
 | `pedacito checkpoints` | Lista los checkpoints de viaje en el tiempo y la cabeza activa; `--limit` y `--json` dan forma a la salida |
@@ -198,6 +200,10 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito rename OLD NEW` | Renombrado de símbolos en varios archivos mediante el AST y el tokenizador, sin llamada al modelo. `--file` lo acota, `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba, `--apply` escribe (por defecto: vista previa del diff) |
 | `pedacito image PROMPT` | Genera una imagen con un perfil de modelo de imagen configurado (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Se guarda en `.pedacito/images/` |
+| `pedacito diag [PATH]` | Alias de `pedacito diagnose`: ejecuta el linter o verificador de tipos detectado en el proyecto |
+| `pedacito parsers prefetch [--languages ...]` | Precarga las gramáticas de tree-sitter para uso sin conexión o aislado, e informa ok o failed por lenguaje |
+| `pedacito commit [--all] [-m MSG] [-y]` | Escanea el diff preparado en busca de secretos y luego crea un commit local. Nunca hace push; `--no-model` redacta el mensaje sin conexión y `--allow-secrets` es la excepción explícita |
+| `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Redacta título y cuerpo a partir del diff de la rama, el registro de commits y los checkpoints recientes, y luego abre el pull request con `gh`. Nunca hace push de la rama |
 | `pedacito index`, `map`, `files`, `cost` | Construyen e inspeccionan el índice. No necesitan llamada al modelo, salvo los resúmenes de `index` |
 | `pedacito eval` | Puntúa el arnés sobre repositorios de prueba. Usa `--baseline` como compuerta de regresión |
 | `pedacito bench [BENCHMARK\|all]` | Ejecuta la suite de benchmarks de diagnóstico de seis proyectos y la rúbrica oculta de evaluación. `--list` y `--recent` no necesitan modelo; `--json` y `--strict` encajan en CI |
@@ -607,6 +613,16 @@ línea. `Enter` solo envía.
 imágenes PNG/JPEG/WebP/GIF para la siguiente tarea; `list` muestra lo preparado y `clear` lo
 descarta. Consulta [Entrada multimodal](#entrada-multimodal-en-el-chat).
 
+**Vista enriquecida (v0.3.3).** Sigue sin dependencias. Las ediciones se muestran como diffs
+unificados con resaltado de sintaxis en línea, y cada llamada a una herramienta es una tarjeta
+plegable de una línea: `Ctrl+O` alterna la última tarjeta, y `/expand [N|all]` y
+`/collapse [N|all]` actúan sobre cualquier tarjeta. Escribe `@` en el prompt para abrir un
+selector difuso interactivo de seis filas sobre archivos, símbolos e imágenes del proyecto: con las
+flechas Arriba y Abajo te mueves, Tab o Enter inserta la ruta y Esc lo cierra. Las zonas de ratón SGR
+también son clicables: `[EN|es]` cambia el idioma, las pestañas de la barra lateral cambian de panel,
+una tarjeta de herramienta se expande o contrae, y la barra de desplazamiento salta. La captura del
+ratón sigue siendo opcional (`/mouse on`, o `F2`).
+
 El pie se actualiza después de cada llamada al modelo y evento: un
 **Context Meter** verde/ámbar/rojo (`Ctx: [████████░░░░░░░░] 6,420 / 32,768 (19.6%)`), el
 **Burn Rate** (tasa de consumo de tokens) del turno y de la sesión, `Speed: 44.2 tok/s (avg 41.8 tok/s)`,
@@ -621,7 +637,7 @@ Comandos slash: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`
 `/effort [low|medium|high]`, `/creative [on|off|auto]`, `/servers`,
 `/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
-`/hybrid`, `/arena`, `/diff`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
+`/hybrid`, `/arena`, `/diff`, `/expand [N|all]`, `/collapse [N|all]`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
 `/fix`, `/image PROMPT`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
 `/mouse [on|off]`, `/clear`, `/quit` (`/exit`). Una línea simple es una
 tarea y corre por el ciclo normal de recolección/edición/verificación. `/creative on` fuerza
@@ -656,6 +672,26 @@ el punto. Los diagnósticos para humanos van a stderr; stdout permanece como JSO
 Los detalles del protocolo están en `pedacito/rpc.py`, la justificación en
 [Técnicas §31](../../TECHNIQUES.es.md).
 
+### `acp`: puente de Agent Client Protocol
+
+```bash
+pedacito acp ~/code/anki                                  # editor o host de agente por stdio
+pedacito acp ~/code/anki --profile fast --execution-mode interleaved
+```
+
+`pedacito acp` habla Agent Client Protocol (JSON-RPC 2.0) por stdin y stdout, para editores
+y hosts de agentes como Zed. Envuelve el mismo motor caliente que `rpc`, así que el arnés no
+se duplica. `initialize` anuncia las capacidades, y `session/new` vincula un proyecto (un
+directorio de trabajo ajeno se rechaza en lugar de leerse) con un perfil y un modo de ejecución
+opcionales. `session/prompt` acepta bloques de texto, recursos `@file` e imágenes; las rutas
+`@file` pasan por la misma comprobación de contención que cualquier otra lectura, así que se
+rechazan los recorridos de ruta y las escapadas por enlaces simbólicos. Las tareas transmiten
+notificaciones `session/update` (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
+`tool_call_update`, `plan`), y las herramientas restringidas hacen el viaje de ida y vuelta por
+`session/request_permission`. `session/cancel` equivale a la cancelación de rpc y mantiene vivo el
+proceso. stdout es JSON-RPC puro; cada línea humana va a stderr, y el fin de stdin vacía la tarea
+activa y sale con 0.
+
 ### `new`: inicia un proyecto desde cero
 
 ```bash
@@ -680,6 +716,12 @@ también indica cómo iniciarlo realmente: los módulos ES se rechazan sobre
 de una línea `python main.py` para un archivo que el proyecto no contiene. Para un
 sitio web o un andamiaje con mucha UI, `--creative` ejecuta cada tarea en modo
 creativo/de diseño (consulta [Modo creativo / de diseño](#modo-creativo--de-diseño)).
+
+`--no-complex` (alias `--single`) desactiva la escalada automática a andamiaje Complex para
+prompts que nombran varios módulos. `--complex` ahora activa `verify_final` por defecto, y un
+andamiaje cuya ejecución de pytest no recolecta pruebas (código de salida 5) se trata como
+andamiaje válido y no como fallo. El `pyproject.toml` inicial incluye
+`[tool.pytest.ini_options] pythonpath = ["."]`, así que `pytest` encuentra el paquete desde la raíz.
 
 ### `auto`: ciclo autónomo sobre una lista de tareas
 
@@ -815,6 +857,58 @@ después de cada edición.
 `--worktree NAME` se ejecuta en `.pedacito/worktrees/NAME` en una rama `pedacito/NAME`,
 dejando intacto tu checkout. Administra los worktrees directamente con
 `pedacito worktree create|list|remove NAME`.
+
+### git: commit y pull requests
+
+`pedacito commit` es opcional: nunca prepara ni confirma cambios sin que lo pidas, y se
+niega cuando `security.scan_text_for_secrets` encuentra una credencial en el diff preparado.
+Revisa el mensaje y confirma (o usa `-y`). `--all` prepara antes todos los cambios;
+`--no-model` redacta el mensaje de Conventional Commit de forma determinista, sin llamar al servidor;
+`--allow-secrets` es la excepción explícita para un falso positivo confirmado. El commit es local:
+Pedacito nunca ejecuta `git push`.
+
+```bash
+pedacito commit --all                       # redacta un mensaje a partir del diff preparado
+pedacito commit -m "feat: add login" -y     # confirma; antes escanea igualmente
+```
+
+`pedacito pr` usa el mismo escaneo de secretos sobre el diff de la rama, reúne el registro de
+commits y las etiquetas de checkpoints recientes, y redacta un título y cuerpo fundamentados.
+`--dry-run` los imprime sin llamar a `gh`; `--draft` abre un PR en borrador. Requiere la CLI de
+GitHub (`gh`) y nunca hace push de la rama.
+
+```bash
+pedacito pr --base main --dry-run
+pedacito pr --base main --draft -y
+```
+
+La TUI expone la mitad local como `/git [status|stage PATH|unstage PATH|commit [MSG]|branch NAME]`,
+y el botón **Git** de la GUI (o **Proyecto → Git: commit y pull request…**) ofrece filas para
+preparar y quitar cambios, un cuadro de mensaje con **Draft message** y **Commit**, y un banner de
+advertencia del escaneo de secretos. Ambas usan las mismas funciones de `gitops` y se niegan ante hallazgos.
+El cajón Git de la GUI tampoco hace push nunca.
+
+### Analizadores sin conexión: `parsers prefetch` y `diag`
+
+```bash
+pedacito parsers prefetch                          # el conjunto común de gramáticas, con conexión
+pedacito parsers prefetch --languages python go    # solo estas gramáticas
+pedacito diag .                                    # alias de `pedacito diagnose`
+```
+
+Las gramáticas de tree-sitter se cargan al primer uso. `parsers prefetch` las precarga e imprime
+`ok` o `failed` para cada lenguaje. Una gramática que no puede descargarse se reintenta y luego
+recurre al analizador integrado, así que una máquina aislada sigue funcionando. `diag` es el nombre
+corto de `diagnose`, el linter o verificador de tipos detectado en el proyecto, y acepta el mismo `--file`.
+
+### Windows PowerShell 5.1: capturar stderr (`2>&1`)
+
+Pedacito escribe su texto para humanos en stderr, y con `--jsonl`, `rpc` y `acp` stdout debe
+seguir siendo JSON puro. En Windows PowerShell 5.1, `2>&1` envuelve cada línea de stderr como un
+registro de error, así que una ejecución correcta puede imprimir texto rojo `NativeCommandError`, y un
+flujo JSON encadenado puede corromperse. Para una salida limpia apta para máquinas, descarta stderr
+(`pedacito ask . -t "..." --json 2>$null`), o ejecuta el comando en PowerShell 7 o `cmd.exe`, que
+combinan stderr como texto plano.
 
 ### `gui`: panel de control en el navegador
 

@@ -516,5 +516,15 @@
   "gui.image.done": "Guardada en {path}",
   "gui.image.preview_alt": "Vista previa de la imagen generada",
   "gui.image.copy_path": "Copiar ruta",
-  "gui.image.path_copied": "Copiado: {path}"
+  "gui.image.path_copied": "Copiado: {path}",
+  "profiles.col.name": "nombre",
+  "profiles.col.model": "modelo",
+  "profiles.col.tier": "nivel",
+  "profiles.col.specialties": "especialidades",
+  "profiles.col.harness_fit": "ajuste-al-arnés",
+  "profiles.col.eval": "evaluación",
+  "profiles.col.tok_s": "tok/s",
+  "profiles.col.context": "contexto",
+  "profiles.col.status": "estado",
+  "profiles.recommend_title": "Recomendaciones (sugerencias -- confirma antes de aplicar):"
 }
