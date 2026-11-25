@@ -1706,7 +1706,8 @@ def prose_shadow(agent, task: str, reply: str, edits=None) -> list[Finding]:
     try:
         findings += check_citations(agent, reply)
         findings += check_ungrounded_identifiers(agent, reply, task)
-        findings += check_coverage(task, reply, edits or [])
+        findings += check_coverage(clean_task_for_coverage(task), reply,
+                                   edits or [])
     except Exception:
         pass
     for f in findings:
@@ -2821,6 +2822,47 @@ def _is_test_author_clause(text: str) -> bool:
     return "test" in low and bool(_TEST_AUTHOR_RE.search(low))
 
 
+# Markers that begin harness-injected prose appended to the raw task text by
+# run_loop / run_task. Coverage extraction must stop at the FIRST of these, so
+# backticked tool names in the evidence hint / retry notes and signatures in
+# the contract map never become "required literal" clauses.
+_HARNESS_MARKERS = (
+    "\n\nEVIDENCE:",
+    "\n\nCONTEXT FROM PRIOR INVESTIGATION",
+    "\n\n[PROJECT INTERFACE CONTRACTS",
+    "\n\n### RETRY --",
+)
+
+_CONTRACT_BLOCK_RE = re.compile(
+    r"\[PROJECT INTERFACE CONTRACTS[^\]]*\].*?\[END INTERFACE CONTRACTS\]",
+    re.DOTALL)
+
+
+def clean_task_for_coverage(task: str) -> str:
+    """The user's task text with harness-injected prose removed.
+
+    `run_loop` appends an evidence hint (with backticked `run`/`screenshot`/
+    `browser` tool names), prior-investigation context notes, an interface-
+    contract map, and one-shot retry notes to the raw task before the worker
+    sees it. Those are harness prose, not the user's brief, so they must not
+    be mined for coverage requirements; strip everything from the first
+    harness marker (and the goal block's ``ORIGINAL USER GOAL`` prefix).
+    """
+    text = task or ""
+    marker = "\nCURRENT TASK\n"
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    cut = len(text)
+    for m in _HARNESS_MARKERS:
+        i = text.find(m)
+        if i != -1:
+            cut = min(cut, i)
+    if cut != len(text):
+        text = text[:cut]
+    text = _CONTRACT_BLOCK_RE.sub("", text)
+    return text.strip()
+
+
 def _unaddressed(task: str, reply: str, edits,
                  tracker: RequirementTracker | None = None) -> list[Requirement]:
     """The requirement clauses no edit or sentence addresses: their key terms
@@ -3244,12 +3286,15 @@ def check(agent, task: str, reply: str, results, gathered: str = ""
         findings += check_citations(agent, reply)
         findings += check_doc_grounding(agent, results)
         tracker = getattr(agent, "requirements", None)
-        if tracker is not None and getattr(tracker, "task", "") != task:
+        clean_task = clean_task_for_coverage(task)
+        if tracker is not None and getattr(tracker, "task", "") != clean_task:
             tracker = None
         if not getattr(agent, "_is_repair", False):
             # A repair prompt is harness diagnostic text, not a user brief:
-            # its "clauses" are gate output and instructions (BUG-314).
-            findings += check_coverage(task, reply, edits, tracker=tracker)
+            # its "clauses" are gate output and instructions (BUG-314). The
+            # harness-injected evidence hint / contract map / retry notes are
+            # stripped too, so backticked tool names never read as clauses.
+            findings += check_coverage(clean_task, reply, edits, tracker=tracker)
         findings += check_fuzzy(results)
         findings += check_empty_js_tests(results)
     except Exception as e:                  # a checker bug must not block a task

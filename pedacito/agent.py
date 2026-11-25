@@ -2408,6 +2408,11 @@ class Agent:
                 or 0)
             for c in self._task_clients)
         self._task_budget_hit = ""
+        # Expose the task's wall-clock deadline to the clients so each request
+        # timeout is clamped to the remaining budget (BUG: --max-minutes must
+        # not let one slow request run far past it).
+        cap_t = float(getattr(self.cfg, "max_task_seconds", 0) or 0)
+        self.cfg._task_deadline = (time.monotonic() + cap_t) if cap_t > 0 else 0.0
         if verbose and gclient is not self.client:
             print(f"  [scout: gather runs on profile "
                   f"'{getattr(self.cfg, 'scout_profile', '')}']",
@@ -2587,7 +2592,7 @@ class Agent:
         from . import verify as verify_mod
         self._is_repair = bool(is_repair)
         self.requirements = verify_mod.RequirementTracker(
-            "" if is_repair else task)
+            "" if is_repair else verify_mod.clean_task_for_coverage(task))
         self.active_diagnostics = {}
         # A fresh task never inherits a repair lock from the previous one
         # (chat reuses one agent across tasks).
@@ -3886,9 +3891,31 @@ class Agent:
         Samples at `temperature_answer` when set (the reply copies SEARCH text
         character for character from what was read)."""
         self._creative_task = self._creative_for(task)
+        if self._creative_task:
+            self._emit_creative_mode()
         with self._phase_temp("temperature_answer"):
             return self._answer(task, gathered, stream, system, max_tokens,
                                 include_edit_format, images=images)
+
+    def _emit_creative_mode(self) -> None:
+        """Record the effective answer temperature for a Creative/design task
+        (and the delta over the calibrated baseline) as a structured event."""
+        cfg = self.cfg
+        base = float(getattr(cfg, "temperature_answer", None)
+                     if getattr(cfg, "temperature_answer", None) is not None
+                     else getattr(cfg, "temperature", 0.3))
+        try:
+            if _is_local_server(cfg):
+                effective = config_mod.effective_creative_temperature(cfg, base)
+            else:
+                effective = base
+            self._emit(
+                "creative_mode",
+                effective_temperature=round(float(effective), 3),
+                answer_temperature=round(base, 3),
+                creative_temperature_delta=round(float(effective) - base, 3))
+        except Exception:
+            pass
 
     def _answer(self, task: str, gathered: str, stream: bool,
                 system: str | None, max_tokens: int | None,
@@ -4651,21 +4678,29 @@ class Agent:
         Returns (results, reply, findings)."""
         from . import verify as verify_mod
         tracker = getattr(self, "requirements", None)
+        # Coverage mines the user's brief, not the harness-injected evidence
+        # hint / contract map / retry notes the loop appended to `task`.
+        clean_task = verify_mod.clean_task_for_coverage(task)
         self._coverage_edit_targets = [
             r.file for r in results
             if getattr(r, "ok", False) and getattr(r, "file", "")]
         findings.extend(verify_mod.check_coverage(
-            task, reply, results, tracker=tracker))
+            clean_task, reply, results, tracker=tracker))
         # A half-answered multi-clause task used to end with an advisory
         # coverage warning. The requirement state machine seeds one bounded
         # follow-up pass from the clauses no edit addressed.
-        seeds = verify_mod.coverage_seeds(task, reply, results, tracker=tracker)
+        seeds = verify_mod.coverage_seeds(clean_task, reply, results,
+                                          tracker=tracker)
         # A removal whose file was never touched leaves its copy on disk even
         # though no after-text carries it: re-check the real files and merge
         # those clauses in, annotated with the exact line still to delete.
         seeds = verify_mod.merge_unmet(seeds, verify_mod.unmet_requirements(
-            self.index.root, task, results, tracker=tracker))
+            self.index.root, clean_task, results, tracker=tracker))
         if seeds:
+            if self._task_budget_exceeded("coverage follow-up"):
+                # The task is out of wall-clock/token budget: do not spend
+                # another model call on the follow-up pass.
+                return results, reply, verify_mod.dedupe_findings(findings)
             followup = self._coverage_intents(seeds)
             # The receipt fires even when no clause resolves to a target: a
             # silent skip is indistinguishable from "nothing was owed"
@@ -4697,10 +4732,10 @@ class Agent:
                 # is still missing (or a removed one is still present), the
                 # turn ends with a concrete finding instead of silent success.
                 still = verify_mod.coverage_seeds(
-                    task, reply, results, tracker=tracker)
+                    clean_task, reply, results, tracker=tracker)
                 still = verify_mod.merge_unmet(
                     still, verify_mod.unmet_requirements(
-                        self.index.root, task, results, tracker=tracker))
+                        self.index.root, clean_task, results, tracker=tracker))
                 for req in still:
                     hits = getattr(req, "literal_hits", [])
                     where = (" -- still on disk at "

@@ -480,13 +480,18 @@ def _slug(prompt: str) -> str:
 
 def generate_image(cfg, prompt: str, *, output_path=None, size="", steps=0,
                    cfg_scale=None, seed=None, negative_prompt="", profile=None,
-                   root=None, timeout=None) -> dict:
+                   root=None, timeout=None, user_out: bool = False) -> dict:
     """Generate one image and write it into the workspace (or `output_path`).
 
     Returns `{ok, path, rel_path, format, width, height, bytes, elapsed_s,
     model, profile, base_url, prompt}`. Raises `ImageGenError` when no image
     profile is configured or the endpoint returns no image; a path outside
     `root` raises `security.SecurityError`.
+
+    ``user_out=True`` (the CLI's explicit ``--out``) trusts the user's path:
+    an absolute path or a parent directory is written verbatim. The
+    model-called ``generate_image`` tool never sets it, so its output stays
+    inside `root` via ``resolve_safe_path``.
     """
     from .llm import _api_key, _is_local_server
 
@@ -592,13 +597,25 @@ def generate_image(cfg, prompt: str, *, output_path=None, size="", steps=0,
     fmt, width, height = sniff_image_format(image_bytes)
 
     if output_path:
-        dest = security.resolve_safe_path(resolved_root, str(output_path))
+        if user_out:
+            # Explicit CLI --out: honor an absolute path (or one relative to
+            # the current directory / parent dir); the model-called tool never
+            # reaches this branch.
+            out_p = Path(str(output_path)).expanduser()
+            dest = (out_p.resolve() if out_p.is_absolute()
+                    else (resolved_root / out_p).resolve())
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            dest = security.resolve_safe_path(resolved_root, str(output_path))
     else:
         ext = {"png": "png", "jpg": "jpg", "webp": "webp"}.get(fmt, "bin")
         name = f"{time.strftime('%Y%m%d-%H%M%S')}_{_slug(str(prompt or ''))}.{ext}"
         dest = security.resolve_safe_path(
             resolved_root, str(Path(".pedacito") / "images" / name))
-    rel = dest.relative_to(resolved_root).as_posix()
+    try:
+        rel = dest.relative_to(resolved_root).as_posix()
+    except ValueError:
+        rel = str(dest)
 
     fileio.write_bytes(dest, image_bytes)
 

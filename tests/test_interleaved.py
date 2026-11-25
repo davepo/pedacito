@@ -1122,7 +1122,7 @@ def test_real_llmclient_native_tool_calls_over_the_openai_channel(tmp_path):
                           usage={"prompt_tokens": 500, "completion_tokens": 9}),
     ]
 
-    def fake_post(payload, stream=False):
+    def fake_post(payload, stream=False, trip_circuit=True):
         payloads.append(copy.deepcopy(payload))
         return json_response(replies[len(payloads) - 1])
 
@@ -1154,7 +1154,7 @@ def test_real_llmclient_falls_back_to_json_when_tools_are_rejected(tmp_path):
     client = LLMClient(cfg)
     payloads = []
 
-    def fake_post(payload, stream=False):
+    def fake_post(payload, stream=False, trip_circuit=True):
         payloads.append(copy.deepcopy(payload))
         if "tools" in payload:
             raise LLMError("Server returned 400: this model does not support "
@@ -1179,7 +1179,7 @@ def test_real_llmclient_local_grammar_mode_uses_the_json_protocol(tmp_path):
     client = LLMClient(cfg)
     payloads = []
 
-    def fake_post(payload, stream=False):
+    def fake_post(payload, stream=False, trip_circuit=True):
         payloads.append(copy.deepcopy(payload))
         text = '{"tool": "finish", "arguments": {"summary": "local"}}'
         return json_response({"choices": [{"finish_reason": "stop", "message":
@@ -1210,7 +1210,7 @@ def test_real_llmclient_anthropic_native_tool_use(tmp_path):
          "usage": {"input_tokens": 260, "output_tokens": 12}},
     ]
 
-    def fake_anthropic_post(payload, headers, stream=False):
+    def fake_anthropic_post(payload, headers, stream=False, trip_circuit=True):
         payloads.append(copy.deepcopy(payload))
         return json_response(replies[len(payloads) - 1])
 

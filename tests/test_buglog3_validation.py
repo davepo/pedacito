@@ -616,6 +616,11 @@ def test_single_clause_task_has_no_plan():
 
 def test_strict_unclean_finish_is_not_all_tasks_complete(tmp_path,
                                                          monkeypatch, capsys):
+    """A partial application (some blocks applied, some failed) is no longer
+    ticked done at all: it retries once, then fails. A task that landed edits
+    but left its tests red still ticks done and only changes the exit code
+    under --strict. Both finish lines stay honest -- never "All tasks complete."
+    """
     _w(tmp_path, "a.py", "GOOD = 1\n")
     plan_path = tmp_path / "PLAN.md"
     loop.write_plan(plan_path, "goal", ["task A"])
@@ -636,8 +641,35 @@ def test_strict_unclean_finish_is_not_all_tasks_complete(tmp_path,
     err = capsys.readouterr().err
     assert code == 1
     assert "All tasks complete." not in err
+    assert "partial edit" in err          # the honest, specific reason
+    assert "0 task(s) done, 1 failed" in err
+
+
+def test_strict_red_verdict_is_not_all_tasks_complete(tmp_path, monkeypatch,
+                                                       capsys):
+    """A task that landed edits but left its tests red ticks done and, under
+    --strict, the finish line refuses to say "All tasks complete."."""
+    _w(tmp_path, "a.py", "GOOD = 1\n")
+    plan_path = tmp_path / "PLAN.md"
+    loop.write_plan(plan_path, "goal", ["task A"])
+    idx = types.SimpleNamespace(root=tmp_path)
+
+    def fake_run_task(root, cfg_, client, agent, idx_, task, apply=True,
+                      review=False, answer_system=None, is_repair=False):
+        return loop.TaskResult(
+            [Result(True, "a.py", "applied")],
+            "reply", True, ["a.py"], idx_, tests_ok=False)
+
+    monkeypatch.setattr(loop, "run_task", fake_run_task)
+    cfg = _cfg(static_gate=False, frontend_contracts=False,
+               interface_lock=False, use_memory=False, backup=False)
+    code = loop.run_loop(tmp_path, cfg, None, idx, plan_path, apply=True,
+                         strict=True)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "All tasks complete." not in err
     assert "NOT clean under --strict" in err
-    assert "1 task(s) done, 0 failed" in err    # the honest counters stay
+    assert "1 task(s) done, 0 failed" in err
     assert "--strict: task(s) ticked done" in err
 
 

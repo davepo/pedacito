@@ -18,6 +18,7 @@ Usage
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -42,7 +43,7 @@ from . import testsel
 from . import todo as todo_mod
 from . import trajectories
 from .edits import Result, parse_edits
-from .llm import CancelledError, LLMError
+from .llm import CancelledError, CircuitOpenError, LLMError
 
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
@@ -356,6 +357,17 @@ def checkpoint_mode(cfg) -> str:
     return "auto" if getattr(cfg, "_auto_step", 0) else "task"
 
 
+def _transport_outage(e: Exception) -> bool:
+    """True when an LLMError is a model-server reachability problem (a dropped
+    connection, a timeout, a refused connection) rather than a code or content
+    defect. Such failures must never roll back valid applied edits."""
+    low = str(e or "").lower()
+    return any(p in low for p in (
+        "could not connect", "connection", "did not answer", "timed out",
+        "unreachable", "connection refused", "connect", "failed to connect",
+    ))
+
+
 def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
     """Record the pre-run baseline or the post-run checkpoint for one task.
 
@@ -368,7 +380,7 @@ def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
         mode = checkpoint_mode(cfg)
         title = _task_title(task).strip()[:200] or "task"
         if phase == "pre":
-            return checkpoints_mod.ensure_baseline(
+            return checkpoints_mod.ensure_pre_run_checkpoint(
                 root, f"baseline before {title}", mode=mode)
         return checkpoints_mod.create_checkpoint(
             root, title, mode=mode)
@@ -1363,7 +1375,49 @@ def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
             memory.observe_command(root, command, rc == 0, cfg, kind="test")
         except Exception:
             pass
+    if rc == 5 and _pytest_no_tests_ran(out) and not _project_has_tests(root):
+        # pytest exit code 5 means "no tests collected". During early scaffold
+        # tasks the test files do not exist yet, so this is not a product
+        # failure and must not trigger a green-ratchet rollback of valid code.
+        return True, "(pytest collected no tests yet -- nothing to verify)"
     return rc == 0, out.strip()
+
+
+def _pytest_no_tests_ran(output: str) -> bool:
+    """True when pytest's exit-code-5 output says it collected no tests."""
+    text = (output or "").lower()
+    return ("no tests ran" in text or "collected 0 items" in text
+            or "collected no tests" in text)
+
+
+def _project_has_tests(root: Path) -> bool:
+    """True when any .py file under `root` defines a `def test_` function
+    (bounded walk, so a large tree cannot stall verification)."""
+    try:
+        root = Path(root)
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in {".git", ".venv", "venv", "node_modules",
+                             "__pycache__", ".pedacito", ".tox", ".nox"}
+                and not d.startswith("."))
+            for name in filenames:
+                if not name.endswith(".py"):
+                    continue
+                count += 1
+                if count > 200:
+                    return False
+                p = Path(dirpath) / name
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if re.search(r"^\s*def\s+test_", text, re.MULTILINE):
+                    return True
+        return False
+    except OSError:
+        return False
 
 
 def _failure_score(output: str, diag: bool = False) -> int:
@@ -4577,6 +4631,13 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         _finish_capture(tr)
         return tr
     finally:
+        # The task's wall-clock budget is over: clear the deadline so the next
+        # task's (or a post-task summary refresh's) requests are not clamped
+        # by a stale deadline.
+        try:
+            cfg._task_deadline = 0.0
+        except Exception:
+            pass
         if pinned is not None:
             if has_saved_pinned:
                 cfg._pinned_refs = saved_pinned
@@ -5772,6 +5833,19 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         except LLMError as e:
             print(f"  task failed: {e}", file=sys.stderr)
             workspace.log_event(root, f"task failed: {e}", "ERROR")
+            if isinstance(e, CircuitOpenError) \
+                    or _transport_outage(e):
+                # A model-server outage (circuit breaker open, connection
+                # dropped) is not a code defect: whatever edits the task
+                # applied are valid, and the run simply could not verify
+                # them. Rolling the green ratchet back here would discard
+                # real work over a broken wire, so leave the tree as-is and
+                # fail the step without an undo.
+                failed += 1
+                if stop_on_fail:
+                    break
+                mark_failed(plan_path, task, notify=plan_changed)
+                continue
             undo_step(attempted, task, f"task failed: {e}", None)
             failed += 1
             if stop_on_fail:
@@ -6339,18 +6413,46 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
 
         bad_blocks = [r for r in tr.results if not r.ok]
         if bad_blocks and (ok_edits or tr.changed):
-            # A partial application: the task stays ticked (by design), but
-            # the unapplied half is named here, in the run log, and again in
-            # the finish line -- never silently.
+            # A partial application: the unapplied half is named here, in the
+            # run log, and again in the finish line -- never silently. The
+            # task is NOT ticked done over a half-applied batch: it gets ONE
+            # retry to land the missing targets, and a second miss counts as
+            # a failure (the plan marks it [!] instead of [x]).
             where = ", ".join(sorted({r.file for r in bad_blocks}))
             total = len(ok_edits) + len(bad_blocks)
             partial_tasks.append((task, len(ok_edits), len(bad_blocks)))
             print(f"  [partial edit: {len(bad_blocks)} of {total} block(s) "
-                  f"did not apply ({where}) -- the task is still ticked "
-                  f"done]", file=sys.stderr)
+                  f"did not apply ({where})]", file=sys.stderr)
             workspace.log_event(
                 root, f"partial edit on task '{task[:60]}': {len(bad_blocks)}"
                       f" of {total} block(s) did not apply ({where})", "WARN")
+            tries = retried.get(task, 0)
+            if task != _REMEDIATION_TITLE and tries < _MAX_TASK_RETRIES:
+                retried[task] = tries + 1
+                retry_note[:] = [
+                    "### RETRY -- PART OF YOUR PREVIOUS EDIT DID NOT APPLY\n"
+                    f"Your previous attempt applied {len(ok_edits)} block(s) "
+                    f"but {len(bad_blocks)} did NOT land ({where}). The files "
+                    "already written stay written; re-read their current "
+                    f"state and emit ONLY the missing blocks for: {where}."]
+                print("  [partial edit -- retrying once to land the missing "
+                      "block(s)]", file=sys.stderr)
+                workspace.log_event(
+                    root, "partial edit: retrying once to land the missing "
+                          "targets", "WARN")
+                continue
+            # The retry (or a repair) still left blocks unapplied: fail it
+            # instead of ticking it done.
+            print("  [partial edit persisted after a retry -- marking the "
+                  "task failed]", file=sys.stderr)
+            workspace.log_event(
+                root, f"partial edit persisted after a retry on "
+                      f"'{task[:60]}': marking failed", "ERROR")
+            failed += 1
+            if stop_on_fail:
+                break
+            mark_failed(plan_path, task, notify=plan_changed)
+            continue
 
         if strict and ((tr.tests_ok is False and not tr.tests_preexisting_only)
                        or any(not r.ok for r in tr.results)):
@@ -6436,8 +6538,8 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         "ERROR" if failed or strict_bad else "INFO")
     if partial_tasks:
         # The reported defect was silence: say it plainly at the end too.
-        print(f"  [{len(partial_tasks)} task(s) ticked done with blocks that "
-              f"did not apply -- see the 'partial edit' lines above and in "
+        print(f"  [{len(partial_tasks)} task(s) left edit blocks that did not "
+              f"apply -- see the 'partial edit' lines above and in "
               f"{workspace.run_log_path(root).name} (run log)]",
               file=sys.stderr)
         workspace.log_event(root, f"auto loop finished with "

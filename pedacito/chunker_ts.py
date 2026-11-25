@@ -25,6 +25,7 @@ import functools
 import gc
 import re
 import threading
+import time
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version as _dist_version
 
@@ -94,6 +95,10 @@ def ts_guarded(fn):
 _TS_DISABLED_REASON = ""
 try:
     from tree_sitter_language_pack import get_parser
+    try:
+        from tree_sitter_language_pack import DownloadError as _DownloadError
+    except ImportError:                                   # pragma: no cover
+        _DownloadError = OSError
     _ts_version = ""
     try:
         _ts_version = _dist_version("tree-sitter")
@@ -165,6 +170,13 @@ _parser_tls = threading.local()
 _PARSER_INIT_LOCK = threading.Lock()
 
 
+class TreeSitterUnavailableError(RuntimeError):
+    """A tree-sitter grammar could not be loaded (missing language pack, a
+    failed grammar download, or an unsafe tree-sitter version). Callers catch
+    this (or the underlying parser failure) and degrade to whole-file /
+    text-unit chunking instead of crashing `pedacito new` / `pedacito index`."""
+
+
 def _thread_parsers() -> dict[str, object]:
     parsers = getattr(_parser_tls, "parsers", None)
     if parsers is None:
@@ -182,13 +194,37 @@ def _clear_parsers() -> None:
 
 def _get_parser(language: str):
     """Return a thread-local cached tree-sitter Parser for `language`,
-    building it once per thread so two threads never share a mutable Parser."""
+    building it once per thread so two threads never share a mutable Parser.
+
+    The grammar download can fail transiently (a dropped connection while the
+    language pack fetches the grammar), so it retries twice with a short
+    backoff before raising :class:`TreeSitterUnavailableError` -- which the
+    callers catch and degrade gracefully to whole-file chunking."""
     parsers = _thread_parsers()
     p = parsers.get(language)
     if p is None:
+        if get_parser is None:
+            raise TreeSitterUnavailableError(
+                "tree-sitter is unavailable"
+                + (f" ({_TS_DISABLED_REASON})" if _TS_DISABLED_REASON else ""))
         with _PARSER_INIT_LOCK:
-            p = get_parser(language)
-        parsers[language] = p
+            # Another thread may have built the parser while we waited.
+            p = parsers.get(language)
+            if p is None:
+                last: BaseException | None = None
+                for attempt, wait in enumerate((0.0, 0.5, 1.0), 1):
+                    try:
+                        p = get_parser(language)
+                        break
+                    except (OSError, _DownloadError) as e:
+                        last = e
+                        if wait:
+                            time.sleep(wait)
+                if p is None:
+                    raise TreeSitterUnavailableError(
+                        f"could not load a tree-sitter parser for "
+                        f"{language!r}: {last}")
+                parsers[language] = p
     return p
 
 

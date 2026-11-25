@@ -702,7 +702,7 @@ def _cmd_config(args, cfg) -> int:
     from . import providers
     mode = providers.cache_mode_for(cfg)
     cap = client.doctor_prompt_cache()
-    print(f"\nPrompt cache: {mode} -- observed {cap}.")
+    print(f"\nPrompt cache: {mode} -- {cap}.")
     print("\nNext: `pedacito calibrate` measures tool choice, edit format, "
           "honesty and long-context retrieval, and saves a model card.")
     return 0
@@ -1153,10 +1153,17 @@ def _ask_json_report(cfg, summary, *, ok: bool, files_changed, diff: str,
     provider = (summary.get("provider")
                 or getattr(cfg, "active_profile", "")
                 or str(getattr(cfg, "provider", "") or ""))
+    sandbox_effective = False
+    try:
+        from . import sandbox
+        sandbox_effective = sandbox.status(cfg)[0] == "active"
+    except Exception:
+        pass
     return {
         "ok": bool(ok),
         "model": clean(summary.get("model") or getattr(cfg, "model", "")),
         "provider": clean(provider),
+        "sandbox_effective": bool(sandbox_effective),
         # Turns = model calls, exactly `events.RunTelemetry.summary()["calls"]`:
         # every gather step, answer, planning and repair request counts once.
         "turns": int(summary.get("calls") or 0),
@@ -1560,6 +1567,36 @@ def _cmd_diagnose(args) -> int:
     return 0 if ok else 1
 
 
+# The default grammar set `pedacito parsers prefetch` warms: the languages the
+# scaffold/index path actually dispatches to tree-sitter for.
+_PREFETCH_LANGUAGES = (
+    "python", "javascript", "typescript", "tsx", "html", "css",
+    "go", "rust", "json", "yaml",
+)
+
+
+def _cmd_parsers(args) -> int:
+    """`pedacito parsers prefetch [--languages ...]`: pre-warm tree-sitter
+    grammars and report ok/failed per language (for offline use)."""
+    from . import chunker_ts
+    if getattr(args, "parsers_action", "prefetch") != "prefetch":
+        return 2
+    languages = list(getattr(args, "languages", None) or _PREFETCH_LANGUAGES)
+    if not languages:
+        languages = list(_PREFETCH_LANGUAGES)
+    failed = 0
+    for lang in languages:
+        try:
+            chunker_ts._get_parser(lang)
+            print(f"  ok     {lang}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAILED {lang}: {str(e)[:160]}")
+    print(f"\nparsers prefetch: {len(languages) - failed}/{len(languages)} "
+          f"language(s) ready")
+    return 1 if failed else 0
+
+
 def _cmd_profile(args) -> int:
     """`pedacito profile [--show | --run | --reset]`.
 
@@ -1660,6 +1697,8 @@ def _cmd_models_show(args) -> int:
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
+    if getattr(args, "model", None):
+        cfg.model = str(args.model)
     report = profiler.build_report(cfg, fetch_metadata=True)
     if getattr(args, "json", False):
         print(json.dumps(report, indent=1, default=str))
@@ -1747,6 +1786,7 @@ def _cmd_image(args) -> int:
             negative_prompt=getattr(args, "negative", "") or "",
             profile=getattr(args, "profile", None),
             root=root,
+            user_out=True,
         )
     except (imagegen.ImageGenError, security.SecurityError) as exc:
         if getattr(args, "json", False):
@@ -2563,6 +2603,8 @@ def _cmd_checkout(args) -> int:
         print(f"  deleted  {rel}", file=sys.stderr)
     for rel in result["skipped"]:
         print(f"  skipped  {rel}", file=sys.stderr)
+    for rel in result.get("identical") or []:
+        print(f"  unchanged {rel} (already byte-identical on disk)", file=sys.stderr)
     print(f"checkout: {result['files']} file(s) restored from "
           f"{checkpoint_id}; head is now {checkpoint_id}", file=sys.stderr)
     if result.get("safety_id"):
@@ -2583,8 +2625,14 @@ def _cmd_undo(args) -> int:
         return 2
     if getattr(args, "list", False):
         return _cmd_checkpoints(args)
-    result = checkpoints_mod.undo_last_run(root)
+    result = checkpoints_mod.undo_last_run(root,
+                                           force=bool(getattr(args, "force",
+                                                              False)))
     if not result.get("ok"):
+        if result.get("clobber"):
+            print(f"undo refused: {result.get('detail')}", file=sys.stderr)
+            print(f"  {result.get('hint')}", file=sys.stderr)
+            return 1
         # Old workspaces only have .pedacito/backups/<stamp>/ snapshots.
         snapshots = workspace.list_backups(root)
         if not snapshots:
@@ -2602,6 +2650,8 @@ def _cmd_undo(args) -> int:
         print(f"  restored {rel}", file=sys.stderr)
     for rel in result["deleted"]:
         print(f"  deleted  {rel}", file=sys.stderr)
+    for rel in result.get("identical") or []:
+        print(f"  unchanged {rel} (already byte-identical on disk)", file=sys.stderr)
     print(f"undo: back to {result['undone_to']} "
           f"({result['files']} file(s) restored)", file=sys.stderr)
     if result.get("safety_id"):
@@ -3119,6 +3169,17 @@ def _cmd_rename(args) -> int:
         fileio.backup_copy(path, state["dir"] / rel)
         return None
 
+    if args.apply:
+        # Record the exact pre-rename workspace so `pedacito undo` restores it
+        # (a stale head would otherwise make Undo revert to before an earlier
+        # task, losing the rename's own baseline).
+        try:
+            checkpoints_mod.ensure_pre_run_checkpoint(
+                root, f"baseline before rename {args.old} -> {args.new}",
+                mode="manual")
+        except Exception as e:
+            print(f"rename: pre-run checkpoint skipped: {e}", file=sys.stderr)
+
     res = refactor.rename_symbol_across_project(
         root, args.old, args.new, scope_file=args.file or None,
         dry_run=not args.apply,
@@ -3204,7 +3265,53 @@ def _cmd_rename(args) -> int:
         if state["dir"] is not None:
             print(f"\noriginals snapshotted under {state['dir']}; "
                   "`pedacito restore` undoes the rename.")
+        try:
+            checkpoints_mod.create_checkpoint(
+                root, f"rename {args.old} -> {args.new}", mode="manual")
+        except Exception as e:
+            print(f"rename: post-run checkpoint skipped: {e}", file=sys.stderr)
+        _rename_docs_advisory(root, args.old)
     return 0
+
+
+def _rename_docs_advisory(root: Path, old: str) -> None:
+    """One-line advisory when unindexed Markdown docs still name `old`.
+
+    The deterministic rename covers indexed source; docs (.md) outside the
+    index are not rewritten, so a leftover reference there is a silent break
+    in the README/plan until someone reads it. Best-effort: never fatal."""
+    if not old:
+        return
+    try:
+        root = Path(root)
+        if not root.is_dir():
+            return
+        hits: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in {".git", ".pedacito", ".venv", "venv",
+                             "node_modules", "__pycache__"}
+                and not d.startswith("."))
+            for name in sorted(filenames):
+                if not name.lower().endswith((".md", ".mdx")):
+                    continue
+                p = Path(dirpath) / name
+                try:
+                    if p.stat().st_size > 2_000_000:
+                        continue
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if old in text:
+                    hits.append(p.relative_to(root).as_posix())
+        if hits:
+            listed = ", ".join(hits[:4])
+            more = f" (+{len(hits) - 4} more)" if len(hits) > 4 else ""
+            print(f"note: unindexed docs still mention `{old}`: {listed}{more}",
+                  file=sys.stderr)
+    except Exception:
+        pass
 
 
 def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
@@ -3512,6 +3619,9 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         help="the project (default: current directory)")
     p_rest.add_argument("--snapshot", metavar="NAME",
                         help="which snapshot; default is the newest")
+    p_rest.add_argument("--checkpoint", metavar="CP_ID",
+                        help="restore from a time-travel checkpoint id (cp_...) "
+                             "instead of a backup timestamp")
     p_rest.add_argument("--root", default=None)
     p_rest.add_argument("--list", action="store_true", help="list snapshots and exit")
     p_rest.add_argument("--dry-run", action="store_true")
@@ -3528,6 +3638,9 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_undo.add_argument("--root", default=None)
     p_undo.add_argument("--list", action="store_true",
                         help="show the checkpoint tree instead")
+    p_undo.add_argument("--force", action="store_true",
+                        help="revert anyway even when the working tree changed "
+                             "outside the run's own edits")
 
     p_cps = sub.add_parser(
         "checkpoints", help="list time-travel checkpoints (and the active head)")
@@ -3562,7 +3675,8 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                       help="with remove: discard modified/untracked files")
 
     p_diag = sub.add_parser(
-        "diagnose", help="run the project's detected linter/typechecker")
+        "diagnose", aliases=["diag"],
+        help="run the project's detected linter/typechecker")
     p_diag.add_argument("path", nargs="?", default=None,
                         help="the project (default: current directory)")
     p_diag.add_argument("--root", default=None,
@@ -3576,6 +3690,19 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_cost = sub.add_parser("cost", help="estimate indexing cost without spending it")
     _add_common(p_cost)
     p_cost.add_argument("--tps", type=float, default=25.0, help="your tokens/sec")
+
+    p_parsers = sub.add_parser(
+        "parsers", help="tree-sitter parser tools (prefetch grammars for "
+                        "offline/air-gapped use)")
+    p_parsers_sub = p_parsers.add_subparsers(dest="parsers_action",
+                                             required=True)
+    p_prefetch = p_parsers_sub.add_parser(
+        "prefetch", help="pre-warm the tree-sitter grammars and report "
+                         "ok/failed per language")
+    p_prefetch.add_argument("--languages", nargs="*", default=None,
+                            metavar="LANG",
+                            help="grammar names to fetch (default: the common "
+                                 "set)")
 
     p_ask = sub.add_parser("ask", help=t("cli.cmd.ask"),
                            description=t("cli.cmd.ask_desc"))
@@ -3664,6 +3791,10 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                        help="with --apply: after planning and scaffolding, hand "
                             "implementation to the autonomous loop (one task per "
                             "file, fresh context each, resumable PLAN.md)")
+    p_new.add_argument("--no-complex", "--single", dest="no_complex",
+                       action="store_true",
+                       help="disable the silent auto-escalation to Complex "
+                            "scaffolding for multi-module prompts")
     p_new.add_argument("--verify", default=None,
                        help="(with --complex) shell command run after each task, "
                             "e.g. 'pytest -q'; failures feed back for repair")
@@ -3874,6 +4005,10 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_models.add_argument("--config", metavar="FILE",
                           help="write profiles to this config file "
                                "(default: the user config)")
+    p_models.add_argument("--profile", metavar="NAME",
+                          help="show this profile's snapshot (with show)")
+    p_models.add_argument("--model", metavar="ID",
+                          help="model id override (with show)")
 
     p_profiles = sub.add_parser(
         "profiles", help=t("cli.cmd.profiles"))
@@ -4272,7 +4407,7 @@ def _main(argv=None) -> int:
 
     if args.cmd == "worktree":
         return _cmd_worktree(args)
-    if args.cmd == "diagnose":
+    if args.cmd in ("diagnose", "diag"):
         return _cmd_diagnose(args)
     # `update` needs no model, index or vram budget -- and must work on a
     # machine with no config at all (the opt-out then comes from env/user cfg).
@@ -4302,6 +4437,7 @@ def _main(argv=None) -> int:
              "rename": _cmd_rename,
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,
+             "parsers": _cmd_parsers,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
              "mcp": _cmd_mcp, "image": _cmd_image}
     if args.cmd in light:
@@ -4435,6 +4571,32 @@ def _main(argv=None) -> int:
 
         if args.cmd == "restore":
             root = _root(args)
+            cp_target = getattr(args, "checkpoint", None) \
+                or (getattr(args, "snapshot", None)
+                    if str(getattr(args, "snapshot", None) or "").startswith("cp_")
+                    else None)
+            if cp_target:
+                # A checkpoint id (cp_...) is accepted in addition to a backup
+                # timestamp name.
+                try:
+                    cid = checkpoints_mod.resolve_id(root, cp_target)
+                except checkpoints_mod.CheckpointError as e:
+                    print(f"restore: {e}", file=sys.stderr)
+                    return 2
+                result = checkpoints_mod.restore_checkpoint(root, cid)
+                for rel in result["restored"]:
+                    print(f"  restored {rel}", file=sys.stderr)
+                for rel in result["deleted"]:
+                    print(f"  deleted  {rel}", file=sys.stderr)
+                for rel in result.get("identical") or []:
+                    print(f"  unchanged {rel} (already byte-identical on disk)",
+                          file=sys.stderr)
+                print(f"restored {result['files']} file(s) from checkpoint "
+                      f"{cid}; head is now {cid}", file=sys.stderr)
+                if result.get("safety_id"):
+                    print(f"  safety snapshot: {result['safety_id']}",
+                          file=sys.stderr)
+                return 0
             snaps = workspace.list_backups(root)
             if not snaps:
                 print(f"No backups under {root}/.pedacito/backups/", file=sys.stderr)
@@ -4603,6 +4765,7 @@ def _main(argv=None) -> int:
                     else cfg.auto_max_minutes,
                     keep_going=args.keep_going,
                     design=bool(getattr(args, "design", False)),
+                    no_complex=bool(getattr(args, "no_complex", False)),
                     auto_install=bool(getattr(args, "auto_install", False)
                                       or cfg.auto_install_deps),
                     log_command="command: " + " ".join(sys.argv))
@@ -4935,16 +5098,15 @@ def _main(argv=None) -> int:
                           "edits/tests)", file=sys.stderr)
                     elog.emit("exit", code=1)
                     return _finish(1, ok=False)
-                if getattr(args, "apply", False) and getattr(
-                        tr, "budget_hit", False):
-                    bad = [r for r in (getattr(tr, "results", []) or [])
-                           if not getattr(r, "ok", True)]
-                    if bad or not getattr(tr, "applied", False):
-                        print(f"ERROR: task budget exhausted with "
-                              f"{len(bad)} failed edit block(s); run did not "
-                              "finish cleanly", file=sys.stderr)
-                        elog.emit("exit", code=1)
-                        return _finish(1, ok=False)
+                if getattr(tr, "budget_hit", False):
+                    # The task stopped because it exhausted its wall-clock or
+                    # output-token budget (--max-minutes / max_task_seconds):
+                    # say so plainly and exit non-zero -- a run that was cut
+                    # short is not a clean finish even when some edits landed.
+                    print("stopped: max-minutes (task budget exhausted)",
+                          file=sys.stderr)
+                    elog.emit("exit", code=1)
+                    return _finish(1, ok=False)
                 if (getattr(args, "apply", False)
                         and not getattr(tr, "applied", False)
                         and not loop._is_noop(getattr(tr, "reply", "") or "")):

@@ -90,9 +90,28 @@ def list_profiles(cfg) -> list[dict]:
             rec["status"] = "uncalibrated"
         rec.update(modelcard.card_meta(card if isinstance(card, dict) else None))
         vram = body.get("vram_gb", getattr(cfg, "vram_gb", 0))
-        if rec["size_bytes"] and vram and rec["tier"] != "hosted":
+        local = rec["tier"] != "hosted"
+        if rec["size_bytes"] and vram and local:
             rec["context_fits"] = hardware_context_tokens(
                 int(vram), int(rec["size_bytes"]))
+        elif local:
+            # VRAM is 0 / unset: fall back to the profile's declared context
+            # (or the card's measured/choice window) so a local/LAN profile
+            # still shows a context that fits instead of a blank cell.
+            ctx = None
+            if isinstance(card, dict):
+                measured = card.get("measured") or {}
+                choices = card.get("choices") or {}
+                ctx = (body.get("context_tokens")
+                       or choices.get("context_tokens")
+                       or measured.get("context_length"))
+            else:
+                ctx = body.get("context_tokens")
+            try:
+                ctx = int(ctx) if ctx is not None else None
+            except (TypeError, ValueError):
+                ctx = None
+            rec["context_fits"] = ctx
         else:
             rec["context_fits"] = None
         out.append(rec)

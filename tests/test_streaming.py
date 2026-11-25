@@ -211,7 +211,7 @@ def test_cancel_before_response_registration_stops_before_any_read(
     client = LLMClient(_cfg())
     client.echo_stream = False
 
-    def cancelling_post(payload, stream=False):
+    def cancelling_post(payload, stream=False, trip_circuit=True):
         cancel.set()
         return response
 
