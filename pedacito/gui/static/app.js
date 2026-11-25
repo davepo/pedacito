@@ -1859,6 +1859,206 @@ function branchFromCheckpoint(cp) {
       });
     });
 }
+function openGitDialog() {
+  const body = h('div', { class: 'git-dialog' });
+  const msg = h('textarea', {
+    class: 'grow cp-name',
+    rows: 3,
+    placeholder: 'Commit message (a Conventional Commit subject is a good fit)',
+    style: 'width:100%;min-height:64px;font-family:var(--mono,monospace)',
+  });
+  const branchName = h('input', {
+    type: 'text', class: 'grow cp-name',
+    placeholder: 'new branch name (letters, digits, . _ / -)',
+  });
+  const stageAll = h('input', { type: 'checkbox' });
+  const banner = h('div', { class: 'note-box err', style: 'display:none' });
+  let status = null;
+  let busy = false;
+
+  const showBanner = (findings) => {
+    const list = Array.isArray(findings) ? findings : [];
+    if (!list.length) {
+      banner.style.display = 'none';
+      banner.textContent = '';
+      return;
+    }
+    banner.style.display = '';
+    banner.textContent = '\u26A0 Secret pre-flight: ' + list.length
+      + ' possible credential(s) in the staged diff ('
+      + list.slice(0, 3).map((f) => f.kind + ' ' + f.file + ':' + f.line).join(', ')
+      + '). Remove them before committing \u2014 commit anyway only if you are sure.';
+  };
+
+  const apply = (j) => {
+    if (!j || !j.ok) {
+      PDC.toast((j && j.detail) || 'Git command failed.', true);
+      return false;
+    }
+    status = j;
+    showBanner(j.findings);
+    render();
+    return true;
+  };
+
+  const reload = () => PDC.api('/api/git/status').then(apply,
+    () => {
+      clear(body);
+      body.appendChild(h('div', { class: 'note-box err',
+        text: 'Could not read git status for this project.' }));
+    });
+
+  const post = (path, payload, clearMessage) => {
+    if (busy) return;
+    busy = true;
+    PDC.api(path, payload).then((j) => {
+      busy = false;
+      if (clearMessage && j && j.ok) msg.value = '';
+      apply(j);
+    }, () => {
+      busy = false;
+      PDC.toast('Git command failed.', true);
+    });
+  };
+
+  const doCommit = (allowSecrets) => {
+    if (busy) return;
+    const message = String(msg.value || '').trim();
+    busy = true;
+    PDC.api('/api/git/commit', {
+      message: message,
+      allow_secrets: !!allowSecrets,
+      stage_all: !!stageAll.checked,
+    }).then((j) => {
+      busy = false;
+      if (j && j.ok) {
+        msg.value = '';
+        PDC.toast('Committed ' + String(j.commit || '').slice(0, 12) + ' \u2014 nothing was pushed.');
+        apply(j);
+        return;
+      }
+      const detail = String((j && j.detail) || 'Commit failed.');
+      if (!allowSecrets && /secret/i.test(detail)) {
+        PDC.confirm(detail + '\n\nCommit anyway? This records the finding in '
+          + 'git history.', 'Commit anyway', true).then((ok) => {
+          if (ok) doCommit(true);
+        });
+        return;
+      }
+      PDC.toast(detail, true);
+    }, () => {
+      busy = false;
+      PDC.toast('Commit failed.', true);
+    });
+  };
+
+  const draft = () => {
+    if (busy) return;
+    busy = true;
+    PDC.api('/api/git/commit', { draft_only: true }).then((j) => {
+      busy = false;
+      if (!j || !j.ok) {
+        PDC.toast((j && j.detail) || 'Could not draft a commit message.', true);
+        return;
+      }
+      msg.value = j.message || '';
+      showBanner(j.findings);
+      PDC.toast('Draft message ready \u2014 review it before committing.');
+    }, () => {
+      busy = false;
+      PDC.toast('Could not draft a commit message.', true);
+    });
+  };
+
+  const fileRow = (kind, path, action, label) => {
+    const row = h('div', { class: 'cp-file', title: path },
+      h('span', { class: 'cp-status ' + kind, text: kind }),
+      h('span', { class: 'cp-path mono ellip', text: path }));
+    if (action) {
+      row.appendChild(h('button', {
+        class: 'small', text: label,
+        onclick: () => post(action, { paths: [path] }, false),
+      }));
+    }
+    return row;
+  };
+
+  function render() {
+    clear(body);
+    if (!status) {
+      body.appendChild(h('div', { class: 'tip', text: 'Loading git status\u2026' }));
+      return;
+    }
+    body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' },
+      h('b', { text: 'Branch: ' + (status.branch || '(detached)') }),
+      h('span', { class: 'muted small-text',
+        text: status.dirty ? 'uncommitted changes' : 'clean' }),
+      h('button', { class: 'small', text: '\u21BB', title: 'reload git status',
+        onclick: reload })));
+    body.appendChild(banner);
+    showBanner(status.findings);
+
+    const staged = status.staged || [];
+    const unstaged = status.unstaged || [];
+    const untracked = status.untracked || [];
+    const conflicts = status.conflicts || [];
+    const groups = [
+      ['staged', staged, '/api/git/unstage', 'Unstage'],
+      ['unstaged', unstaged, '/api/git/stage', 'Stage'],
+      ['untracked', untracked, '/api/git/stage', 'Stage'],
+    ];
+    let shown = 0;
+    groups.forEach(([kind, paths, path, label]) => {
+      if (!paths.length) return;
+      shown += 1;
+      body.appendChild(h('div', { class: 'small-text muted',
+        style: 'margin:8px 0 3px', text: kind + ' (' + paths.length + ')' }));
+      const list = h('div', { class: 'cp-list' });
+      paths.forEach((p) => list.appendChild(fileRow(kind, p, path, label)));
+      body.appendChild(list);
+    });
+    if (conflicts.length) {
+      shown += 1;
+      body.appendChild(h('div', { class: 'note-box err',
+        text: 'Merge conflicts: ' + conflicts.join(', ') }));
+    }
+    if (!shown) {
+      body.appendChild(h('div', { class: 'tip',
+        text: 'No staged, unstaged or untracked changes.' }));
+    }
+
+    const commitBox = h('div', { style: 'margin-top:12px' });
+    commitBox.appendChild(h('div', { class: 'small-text muted',
+      text: 'Commit message (scan runs again before the commit)' }));
+    commitBox.appendChild(msg);
+    const tools = h('div', { class: 'row', style: 'margin-top:6px' },
+      h('label', { class: 'chk' }, stageAll, 'stage all'),
+      h('button', { class: 'small', text: 'Draft message', onclick: draft }),
+      h('button', { class: 'small primary', text: 'Commit',
+        onclick: () => doCommit(false) }));
+    commitBox.appendChild(tools);
+    body.appendChild(commitBox);
+
+    const branchBox = h('div', { class: 'cp-tools', style: 'margin-top:10px' },
+      branchName,
+      h('button', { class: 'small', text: '+ Branch', onclick: () => {
+        const name = String(branchName.value || '').trim();
+        if (!name) { PDC.toast('Name the branch first.', true); return; }
+        post('/api/git/branch', { name: name, checkout: true }, false);
+        branchName.value = '';
+      } }));
+    body.appendChild(branchBox);
+    body.appendChild(h('div', { class: 'tip', style: 'margin-top:10px',
+      text: 'Pull requests: `pedacito pr` drafts from the branch diff and opens '
+        + 'it with gh. Pedacito never pushes for you.' }));
+  }
+
+  render();
+  reload();
+  PDC.modal('Git \u2014 commit & pull request', body,
+    [{ label: 'Close' }], { wide: true });
+}
+
 function openCheckpointsDialog() {
   const body = h('div', { class: 'cp-dialog' });
   let selected = S.cp.head_id || '';
@@ -4327,6 +4527,8 @@ function TopBar() {
             <${MenuItem} label=${PDC.t('gui.menu.quick_index', null, 'Quick index (no summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label=${PDC.t('gui.menu.restore_backup', null, 'Restore from a backup\u2026')} disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
             <${MenuItem} label=${PDC.t('gui.menu.checkpoints', null, 'Checkpoints / Undo\u2026')} disabled=${!s.root} action=${openCheckpointsDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.git', null, 'Git: commit & pull request\u2026')} disabled=${!s.root} action=${openGitDialog}
+                       title=${PDC.t('gui.menu.git_title', null, 'stage files, scan the staged diff for secrets and commit locally (no push)')} />
             <${MenuItem} label=${PDC.t('gui.menu.rename_symbol', null, 'Rename symbol\u2026')} disabled=${!!j || !s.root} action=${renameSymbolDialog} />
             <${MenuItem} label=${PDC.t('gui.menu.memory', null, 'Memory & repo lessons\u2026')} action=${memoryDialog}
                        title=${PDC.t('gui.menu.memory_title', null, 'scratchpad memory while no project is open')} />
@@ -4347,6 +4549,8 @@ function TopBar() {
           <//>
         </div>
         <div id="topRight">
+          <button id="gitBtn" title=${PDC.t('gui.git_title', null, 'guided git: stage, secret-scan and commit locally; draft a pull request (Pedacito never pushes)')}
+                  disabled=${!s.root} onClick=${openGitDialog}>\u2387 ${PDC.t('gui.git', null, 'Git')}</button>
           <button id="checkpointsBtn" title=${PDC.t('gui.checkpoints_title', null, 'time-travel: inspect, diff, restore or branch from any checkpoint')}
                   disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 ${PDC.t('gui.checkpoints', null, 'Checkpoints / Undo')}</button>
           <button id="rulesBtn" title=${PDC.t('gui.rules_title', null, 'edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call')}

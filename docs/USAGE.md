@@ -196,6 +196,8 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito checkout ID` | Restore the whole workspace or one `--file` from a checkpoint id (a unique prefix works) |
 | `pedacito update [--run]` | Check PyPI for a newer Pedacito and optionally upgrade this install |
 | `pedacito restore PROJ` | Undo the last write |
+| `pedacito commit [--all] [-m MSG] [-y]` | Scan the staged diff for secrets, then create a local commit. Never pushes; `--no-model` drafts the message offline and `--allow-secrets` is the explicit override |
+| `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Draft a grounded title/body from the branch diff, commit log and recent checkpoints, then open the pull request with `gh`. Never pushes the branch |
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
 | `pedacito image PROMPT` | Generate one image with a configured image-model profile (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Saved under `.pedacito/images/` |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
@@ -623,7 +625,8 @@ Slash commands: `/help`, `/keys`, `/status` (`/telemetry`), `/new`, `/auto GOAL`
 `/effort [low|medium|high]`, `/creative [on|off|auto]`, `/servers`,
 `/unload [NAME]`, `/apply [on|off]`, `/verify on|off|status`, `/skills`,
 `/skill NAME`, `/memory`, `/procs`, `/security`, `/theme`, `/pin`, `/rules`,
-`/hybrid`, `/arena`, `/diff`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
+`/hybrid`, `/arena`, `/diff`, `/git [status|stage PATH|unstage PATH|commit
+[MSG]|branch NAME]`, `/checkpoints`, `/undo`, `/checkout ID`, `/run`,
 `/fix`, `/image PROMPT`, `/update`, `/reset`, `/sidebar`, `/scroll up|down|top|bottom|N`,
 `/mouse [on|off]`, `/clear`, `/quit` (`/exit`). A plain line is a
 task and runs through the normal gather/edit/verify loop. `/creative on` forces
@@ -818,6 +821,37 @@ and call arity after every edit.
 `--worktree NAME` runs in `.pedacito/worktrees/NAME` on a `pedacito/NAME`
 branch, leaving your checkout untouched. Manage worktrees directly with
 `pedacito worktree create|list|remove NAME`.
+
+### git: commit and pull requests
+
+`pedacito commit` is opt-in: it never stages or commits without you asking, and
+it refuses when `security.scan_text_for_secrets` finds a credential in the
+staged diff. Review the message, then confirm (or pass `-y`). `--all` stages
+every change first; `--no-model` drafts the Conventional Commit message
+deterministically, with no server call; `--allow-secrets` is the explicit
+override for a confirmed false positive. The commit is local — Pedacito never
+runs `git push`.
+
+```bash
+pedacito commit --all                       # draft a message from the staged diff
+pedacito commit -m "feat: add login" -y     # commit; still scans first
+```
+
+`pedacito pr` uses the same secret scan on the branch diff, gathers the commit
+log and recent checkpoint labels, and drafts a grounded title and body.
+`--dry-run` prints them without calling `gh`; `--draft` opens a draft PR.
+It requires the GitHub CLI (`gh`) and never pushes the branch itself.
+
+```bash
+pedacito pr --base main --dry-run
+pedacito pr --base main --draft -y
+```
+
+The TUI exposes the local half as `/git [status|stage PATH|unstage PATH|commit
+[MSG]|branch NAME]`, and the GUI's **Git** button (or **Project → Git: commit &
+pull request…**) offers stage/unstage rows, a message box with **Draft message**
+and **Commit**, and a secret-scan warning banner. Both call the same `gitops`
+functions and refuse on findings.
 
 ### `gui`: browser control panel
 

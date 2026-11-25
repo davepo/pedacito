@@ -1556,6 +1556,124 @@ def _cmd_worktree(args) -> int:
         return 1
 
 
+def _gitops_client(args):
+    """(client, cfg) for drafting commit/PR text; (None, None) for --no-model.
+
+    Constructing the client is local and makes no network call. Any config or
+    client problem falls back to the deterministic offline draft instead of
+    blocking the commit."""
+    if getattr(args, "no_model", False):
+        return None, None
+    try:
+        cfg = _light_config(args)
+    except ConfigError:
+        return None, None
+    if not str(getattr(cfg, "model", "") or ""):
+        return None, cfg
+    try:
+        return LLMClient(cfg), cfg
+    except Exception:
+        return None, cfg
+
+
+def _confirm_git_action(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        print("Refusing to continue without -y/--yes in a non-interactive "
+              "shell.", file=sys.stderr)
+        return False
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return False
+    return answer in ("y", "yes")
+
+
+def _cmd_commit(args) -> int:
+    """`pedacito commit`: stage/review, scan and commit locally (no push)."""
+    from . import gitops
+    root = _root(args)
+    client, cfg = _gitops_client(args)
+    try:
+        if getattr(args, "all", False):
+            gitops.stage_all_files(root)
+        status = gitops.status_hunks(root)
+        if not status["staged"]:
+            print("Nothing is staged. Stage files first or pass --all.",
+                  file=sys.stderr)
+            return 1
+        findings = gitops.scan_staged_secrets(root)
+        if findings:
+            print("Secret pre-flight found possible credentials in the "
+                  "staged diff:", file=sys.stderr)
+            for finding in findings[:8]:
+                print(f"  - {finding.kind} at {finding.file}:{finding.line} "
+                      f"({finding.masked_preview})", file=sys.stderr)
+            if not getattr(args, "allow_secrets", False):
+                print("Refusing to commit. Remove the secret, or pass "
+                      "--allow-secrets only if it is not a real credential.",
+                      file=sys.stderr)
+                return 1
+            print("Continuing because --allow-secrets was given.",
+                  file=sys.stderr)
+        message = str(getattr(args, "message", None) or "").strip()
+        if not message:
+            message = gitops.draft_commit_message(root, client=client, cfg=cfg)
+        print(f"Branch: {status['branch'] or '(detached)'}")
+        for path in status["staged"]:
+            print(f"  staged {path}")
+        print(f"Message: {message}")
+        if not getattr(args, "yes", False) \
+                and not _confirm_git_action("Create this commit? [y/N] "):
+            print("Commit cancelled.", file=sys.stderr)
+            return 1
+        result = gitops.create_commit(
+            root, message, allow_secrets=getattr(args, "allow_secrets", False))
+    except gitops.GitOpsError as e:
+        print(f"commit: {e}", file=sys.stderr)
+        return 1
+    sha = str(result.get("commit") or "")
+    print(f"Committed {sha[:12]}: {result['message']}")
+    print("Nothing was pushed; push the branch yourself when ready.",
+          file=sys.stderr)
+    return 0
+
+
+def _cmd_pr(args) -> int:
+    """`pedacito pr`: draft (and with gh, open) a pull request; never pushes."""
+    from . import gitops
+    root = _root(args)
+    client, cfg = _gitops_client(args)
+    title = str(getattr(args, "title", None) or "").strip()
+    body = str(getattr(args, "body", None) or "").strip()
+    try:
+        if not title or not body:
+            draft = gitops.draft_pr(root, client=client, cfg=cfg,
+                                    base=args.base)
+            title = title or draft["title"]
+            body = body or draft["body"]
+        print(f"Base: {args.base}")
+        print(f"Title: {title}")
+        print("Body:")
+        print(body)
+        if getattr(args, "dry_run", False):
+            print("Dry run only: no pull request was created.", file=sys.stderr)
+            return 0
+        if not getattr(args, "yes", False) \
+                and not _confirm_git_action("Open this pull request? [y/N] "):
+            print("Pull request cancelled.", file=sys.stderr)
+            return 1
+        result = gitops.create_pr(root, title, body, base=args.base,
+                                  draft=getattr(args, "draft", False))
+    except gitops.GitOpsError as e:
+        print(f"pr: {e}", file=sys.stderr)
+        return 1
+    print(result.get("url") or result.get("output") or "Pull request created.")
+    print("Pedacito did not push the branch; gh opened the PR from the "
+          "branch as published.", file=sys.stderr)
+    return 0
+
+
 def _cmd_diagnose(args) -> int:
     """`pedacito diagnose`."""
     from . import diagnostics
@@ -3721,6 +3839,54 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_wt.add_argument("--force", action="store_true",
                       help="with remove: discard modified/untracked files")
 
+    p_commit = sub.add_parser(
+        "commit", help="review the staged diff and create a local git commit")
+    p_commit.add_argument("paths", nargs="*", default=["."],
+                          help="the project (default: current directory)")
+    p_commit.add_argument("--root", default=None)
+    p_commit.add_argument("--all", action="store_true",
+                          help="stage every change first (git add -A)")
+    p_commit.add_argument("-m", "--message", default=None,
+                          help="use this commit message instead of drafting one")
+    p_commit.add_argument("--no-model", dest="no_model", action="store_true",
+                          help="draft the message deterministically, with no "
+                               "model server call")
+    p_commit.add_argument("-y", "--yes", action="store_true",
+                          help="commit without asking for confirmation")
+    p_commit.add_argument("--allow-secrets", dest="allow_secrets",
+                          action="store_true",
+                          help="commit even when the staged diff matches a "
+                               "secret pattern (explicit override)")
+    p_commit.add_argument("--config", metavar="FILE",
+                          help="use this config file as well")
+    p_commit.add_argument("--profile", metavar="NAME",
+                          help="apply a [profiles.NAME] block from your config")
+
+    p_pr = sub.add_parser(
+        "pr", help="draft and open a pull request with the GitHub CLI")
+    p_pr.add_argument("paths", nargs="*", default=["."],
+                      help="the project (default: current directory)")
+    p_pr.add_argument("--root", default=None)
+    p_pr.add_argument("--base", default="main",
+                      help="base branch for the pull request (default: main)")
+    p_pr.add_argument("--draft", action="store_true",
+                      help="open the pull request as a draft")
+    p_pr.add_argument("--title", default=None,
+                      help="use this title instead of drafting one")
+    p_pr.add_argument("--body", default=None,
+                      help="use this body instead of drafting one")
+    p_pr.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="print the drafted title/body; never call gh")
+    p_pr.add_argument("-y", "--yes", action="store_true",
+                      help="open the pull request without confirming")
+    p_pr.add_argument("--no-model", dest="no_model", action="store_true",
+                      help="draft the title/body deterministically, with no "
+                           "model server call")
+    p_pr.add_argument("--config", metavar="FILE",
+                      help="use this config file as well")
+    p_pr.add_argument("--profile", metavar="NAME",
+                      help="apply a [profiles.NAME] block from your config")
+
     p_diag = sub.add_parser(
         "diagnose", aliases=["diag"],
         help="run the project's detected linter/typechecker")
@@ -4521,7 +4687,8 @@ def _main(argv=None) -> int:
              "checkout": _cmd_checkout,
              "parsers": _cmd_parsers,
              "serve": _cmd_serve, "procs": _cmd_procs, "lsp": _cmd_lsp,
-             "mcp": _cmd_mcp, "image": _cmd_image}
+             "mcp": _cmd_mcp, "image": _cmd_image, "commit": _cmd_commit,
+             "pr": _cmd_pr}
     if args.cmd in light:
         try:
             return light[args.cmd](args)

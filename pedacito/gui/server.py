@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
+from .. import gitops
 from .. import i18n
 from .. import review as review_mod
 from .. import prompts as prompts_mod
@@ -618,6 +619,119 @@ def _rules_post(q, body):
 def _backups(q, body=None):
     """Backup snapshots for the WORKSPACE panel's BACKUPS tab."""
     return 200, {"backups": backup_snapshots()}
+
+
+# --- guided git ----------------------------------------------------------------
+
+def _git_status_payload(root: Path) -> dict:
+    status = gitops.status_hunks(root)
+    findings = gitops.scan_staged_secrets(root)
+    return {
+        **status,
+        "findings": [finding.to_dict() for finding in findings],
+        "has_secrets": bool(findings),
+    }
+
+
+def _git_draft_client():
+    """(client, cfg) for drafting; (None, cfg) when no model is configured."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    if cfg is None or not str(getattr(cfg, "model", "") or ""):
+        return None, cfg
+    try:
+        from ..llm import LLMClient
+        return LLMClient(cfg), cfg
+    except Exception:
+        return None, cfg
+
+
+@get("/api/git/status")
+def _git_status(q, body=None):
+    """Branch, dirty state, per-file diffs and the staged secret scan."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        return 200, _git_status_payload(root)
+    except (gitops.GitOpsError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/stage")
+def _git_stage(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    paths = body.get("paths", body.get("path"))
+    try:
+        result = gitops.stage_files(root, paths)
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/unstage")
+def _git_unstage(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    paths = body.get("paths", body.get("path"))
+    try:
+        result = gitops.unstage_files(root, paths)
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/commit")
+def _git_commit(q, body):
+    """Draft a message (`draft_only`) or commit the staged change."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    if body.get("draft_only"):
+        client, cfg = _git_draft_client()
+        try:
+            message = gitops.draft_commit_message(root, client=client, cfg=cfg)
+            findings = gitops.scan_staged_secrets(root)
+        except (gitops.GitOpsError, OSError) as e:
+            return 400, {"ok": False, "detail": str(e)}
+        return 200, {
+            "ok": True,
+            "message": message,
+            "findings": [finding.to_dict() for finding in findings],
+            "has_secrets": bool(findings),
+        }
+    message = str(body.get("message") or "").strip()
+    try:
+        if not message:
+            client, cfg = _git_draft_client()
+            message = gitops.draft_commit_message(root, client=client, cfg=cfg)
+        result = gitops.create_commit(
+            root, message,
+            stage_all=bool(body.get("stage_all")),
+            allow_secrets=bool(body.get("allow_secrets")))
+        status = _git_status_payload(root)
+        return 200, {**status, **result,
+                     "findings": status["findings"],
+                     "has_secrets": status["has_secrets"]}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/branch")
+def _git_branch(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        result = gitops.create_branch(
+            root, str(body.get("name") or ""),
+            checkout=bool(body.get("checkout", True)))
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
 
 
 # --- time-travel checkpoints --------------------------------------------------
