@@ -3654,7 +3654,8 @@ def _review(root: Path, results, task: str, cfg, backup_dir, stamp: str,
     finally stand (the page writes on Apply, so this re-stamps each result).
     `clauses` (file -> clause ids) and `clause_texts` come from the requirement
     tracker so each file shows the task clause it serves (R8)."""
-    diffs = review_mod.diffs_from_results(results, root, clauses=clauses)
+    diffs = review_mod.diffs_from_results(results, root, clauses=clauses,
+                                          clause_texts=clause_texts)
     if not diffs:
         print("\n  No review page: no edit block applied cleanly.", file=sys.stderr)
         _report(results, dry_run=True)

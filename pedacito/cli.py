@@ -3147,6 +3147,9 @@ def _cmd_domcheck(args) -> int:
     if args.snapshot:
         domcheck.save_snapshot(args.snapshot, res.snapshot or {})
         print(f"snapshot saved: {args.snapshot}")
+    if baseline is not None and not any(
+            f.kind == "mount_regression" for f in res.findings):
+        print("domcheck: ok (unchanged vs baseline)")
     if not res.findings:
         print("no DOM problems found (page loaded, module graph mounted, "
               "controls bound)")

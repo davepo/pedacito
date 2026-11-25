@@ -492,13 +492,17 @@ function Term(el) {
   this.max = 4000; this.raf = 0; this.follow = true; this.newLine();
 }
 Term.prototype.newLine = function () {
+  if (!this.el) return;
   const div = h('div', { class: 'tl' });
   this.el.appendChild(div);
+  this.cur = div;
   this.lines.push(div);
   if (this.lines.length > this.max) { const old = this.lines.shift(); old.remove(); }
 };
 Term.prototype.span = function (text) {
-  if (!text) return;
+  if (!text || !this.el) return;
+  if (!this.cur) this.newLine();
+  if (!this.cur) return;
   if (this.fresh) { clear(this.cur); this.fresh = false; }
   if (this.style) this.cur.appendChild(h('span', { class: this.style, text: text }));
   else this.cur.appendChild(document.createTextNode(text));
@@ -517,13 +521,15 @@ Term.prototype.sgr = function (codes) {
   this.style = cls.join(' ');
 };
 Term.prototype.write = function (text) {
+  if (!this.el || !text) return;
+  if (!this.cur) this.newLine();
   const re = /\x1b\[([0-9;?]*)([A-Za-z])|\r\n|\n|\r|\x1b[^[]/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     this.span(text.slice(last, m.index));
     last = m.index + m[0].length;
     if (m[2] === 'm') this.sgr(m[1] ? m[1].split(';') : []);
-    else if (m[2] === 'K' || m[2] === 'J') clear(this.cur);
+    else if (m[2] === 'K' || m[2] === 'J') { if (this.cur) clear(this.cur); }
     else if (m[0] === '\n' || m[0] === '\r\n') { this.newLine(); this.fresh = false; }
     else if (m[0] === '\r') this.fresh = true;
   }
@@ -534,11 +540,12 @@ Term.prototype.schedule = function () {
   if (this.raf) return;
   this.raf = requestAnimationFrame(() => {
     this.raf = 0;
-    if (this.follow) this.el.scrollTop = this.el.scrollHeight;
+    if (this.follow && this.el) this.el.scrollTop = this.el.scrollHeight;
   });
 };
 Term.prototype.reset = function (text) {
-  clear(this.el); this.lines = []; this.style = ''; this.fresh = false; this.newLine();
+  if (!this.el) return;
+  clear(this.el); this.lines = []; this.cur = null; this.style = ''; this.fresh = false; this.newLine();
   if (text) this.write(text);
 };
 let term = null;
@@ -4928,12 +4935,36 @@ function QuestionCard(props) {
 
 function ReviewCard(props) {
   const m = props.m;
-  const pending = !m.outcome;
-  const title = pending ? 'Review ready \u2014 ' + m.files + ' file' + (m.files === 1 ? '' : 's')
-    : m.outcome === 'applied' ? 'Changes accepted'
-    : m.outcome === 'timeout' ? 'Review timed out' : 'Changes rejected';
+  const activeRev = S.review || (S.status && S.status.review) || null;
+  const liveMatch = !!(activeRev && activeRev.pending
+    && (m.review_id == null || activeRev.id === m.review_id));
+  const outcome = m.outcome || (!liveMatch && activeRev && m.review_id != null
+    && activeRev.id === m.review_id && activeRev.outcome ? activeRev.outcome : '');
+  const pending = !outcome && liveMatch;
+  const fileCount = typeof m.files === 'number' && !isNaN(m.files)
+    ? m.files
+    : (Array.isArray(m.files) ? m.files.length
+       : (liveMatch && Array.isArray(activeRev.files)
+          ? activeRev.files.filter((f) => !f.source).length : null));
+  const hunkNote = (typeof m.hunks_accepted === 'number'
+    && typeof m.hunks_total === 'number'
+    && m.hunks_total > 0 && m.hunks_accepted < m.hunks_total)
+    ? ' (accepted ' + m.hunks_accepted + ' of ' + m.hunks_total + ' hunks)'
+    : '';
+  const title = pending
+    ? (fileCount != null
+       ? 'Review ready \u2014 ' + fileCount + ' file' + (fileCount === 1 ? '' : 's')
+       : 'Review ready')
+    : outcome === 'applied' ? 'Changes accepted' + hunkNote
+    : outcome === 'timeout' ? 'Review timed out'
+    : outcome === 'cancelled' || outcome === 'rejected' ? 'Changes rejected'
+    : (fileCount != null
+       ? 'Review (' + fileCount + ' file' + (fileCount === 1 ? '' : 's') + ')'
+       : 'Review');
+  const cardCls = pending ? ''
+    : (outcome === 'applied' ? 'applied' : 'rejected');
   return html`
-    <div class=${'card ' + (pending ? '' : (m.outcome === 'applied' ? 'applied' : 'rejected'))}>
+    <div class=${'card ' + cardCls}>
       <div class="title">${title}</div>
       <div class="muted small-text">${m.detail || m.text}</div>
       ${pending ? html`<div class="row">
@@ -5518,13 +5549,19 @@ function DiffPane() {
     return () => document.removeEventListener('keydown', onKey);
   }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
   const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
-  const canSelect = !!(R && R.pending && R.partial_ok);
-  const hselSig = JSON.stringify(hselOf(S.diffRel));
+  const pending = !!(R && R.pending);
+  const canSelect = !!(pending && R.partial_ok);
+  const hselSig = JSON.stringify(pending ? hselOf(S.diffRel) : (R && R.accepted_hunks && R.accepted_hunks[S.diffRel]));
   const { oldRows, newRows, uniRows } = useMemo(() => {
     const oldR = [], newR = [], uniR = [];
     const rows = (D && D.rows) || [];
     const hunks = (D && D.hunks) || [];
-    const hsel = hselOf(S.diffRel);
+    const hsel = pending ? hselOf(S.diffRel) : (() => {
+      const f = (R && R.files || []).find((x) => x.rel === S.diffRel);
+      if (f && Array.isArray(f.accepted_hunks)) return f.accepted_hunks;
+      const ah = (R && R.accepted_hunks) || {};
+      return Array.isArray(ah[S.diffRel]) ? ah[S.diffRel] : null;
+    })();
     let lastHunk = -1;
     rows.forEach((r, i) => {
       const key = 'r' + i;
@@ -5545,7 +5582,7 @@ function DiffPane() {
         const h = hunks[hi];
         const hOn = hsel === null || hsel.indexOf(h.index) >= 0;
         const range = '@@ -' + h.a_start + ',' + h.a_count + ' +' + h.b_start + ',' + h.b_count + ' @@';
-        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (canSelect && !hOn ? ' off' : '')}>
+        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (!hOn ? ' off' : '')}>
           ${canSelect ? html`<input type="checkbox" checked=${hOn}
             title=${PDC.t('gui.diff.hunk_title', null, 'accept this hunk only')}
             onChange=${(e) => toggleHunk(S.diffRel, h.index, e.target.checked)} />` : null}
@@ -5586,7 +5623,6 @@ function DiffPane() {
         here, old code beside updated code, for you to accept or reject.
       </div>`;
   }
-  const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => {
     if (S.sel[f.rel] === false) return false;
@@ -5596,12 +5632,29 @@ function DiffPane() {
   const acceptLabel = !R.partial_ok || nSel === editable.length
     ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
     : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
+  const partialHunkSummary = (() => {
+    let acc = 0, tot = 0, anyPartial = false;
+    const ah = R.accepted_hunks || {};
+    editable.forEach((f) => {
+      const hs = f.hunks || [];
+      if (!hs.length) return;
+      const sel = pending ? hselOf(f.rel) : (Array.isArray(f.accepted_hunks) ? f.accepted_hunks : (Array.isArray(ah[f.rel]) ? ah[f.rel] : null));
+      tot += hs.length;
+      if (sel !== null) {
+        acc += sel.length;
+        if (sel.length < hs.length) anyPartial = true;
+      } else if (!pending || S.sel[f.rel] !== false) {
+        acc += hs.length;
+      }
+    });
+    return (anyPartial && tot > 0) ? ('accepted ' + acc + ' of ' + tot + ' hunks') : '';
+  })();
   return html`
     <div class="diffwrap">
       <div id="reviewBar">
         <b id="reviewTitle" title=${R.task || ''}>${R.task || PDC.t('gui.diff.proposed_changes', null, 'Proposed changes')}</b>
         ${!pending ? html`<span class=${'badge-out ' + R.outcome}>
-            ${R.outcome === 'applied' ? PDC.t('gui.diff.accepted', null, 'accepted') : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
+            ${R.outcome === 'applied' ? (partialHunkSummary || PDC.t('gui.diff.accepted', null, 'accepted')) : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
         ${!pending && (R.unaccepted || []).length ? html`
           <span class="badge-out unaccepted"
                 title=${R.unaccepted.map((c) => c + ': ' + ((R.clause_texts || {})[c] || '')).join('\n')}>
@@ -5635,6 +5688,16 @@ function DiffPane() {
             ${(f.clauses || []).map((c) => html`
               <span key=${c} class="clause" title=${(R.clause_texts || {})[c] || c}>${c}</span>`)}
             ${f.edited ? html`<span class="muted">(edited)</span>` : null}
+            ${(() => {
+              const hs = f.hunks || [];
+              if (!hs.length) return null;
+              const ah = R.accepted_hunks || {};
+              const sel = pending ? hselOf(f.rel) : (Array.isArray(f.accepted_hunks) ? f.accepted_hunks : (Array.isArray(ah[f.rel]) ? ah[f.rel] : null));
+              if (sel !== null && sel.length > 0 && sel.length < hs.length) {
+                return html`<span class="muted small-text">(accepted ${sel.length} of ${hs.length} hunks)</span>`;
+              }
+              return null;
+            })()}
             <span class="a">+${f.added}</span><span class="r">\u2212${f.removed}</span>
             ${pending && !f.source && R.partial_ok ? html`
               <button class="fedit" title="edit this file's proposed code"
