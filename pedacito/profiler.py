@@ -1339,8 +1339,13 @@ def probe_model_speed(base_url: str, model: str, config,
     generation_tps = _float(timings.get("predicted_per_second")
                             or timings.get("predicted_tokens_per_second"))
     prefill_s = max(0.0, float(timing.prefill_s or 0.0))
-    if not prefill_tps and prefill_s > 0:
-        prefill_tps = prompt_tokens / prefill_s
+    if not prefill_tps:
+        if prefill_s > 0:
+            prefill_tps = prompt_tokens / prefill_s
+        elif elapsed > 0 and timing.first_token_at is not None:
+            # Coarse OS monotonic clocks (Windows 15.6 ms tick) can record
+            # first_token_at == request_started_at on very fast prefills.
+            prefill_tps = prompt_tokens / max(0.001, elapsed)
     if not generation_tps:
         gen_s = max(0.001, elapsed - prefill_s) if elapsed > 0 else 0.0
         if gen_s > 0 and completion_tokens > 0:

@@ -658,7 +658,7 @@ def test_probe_uses_sse_server_timings(monkeypatch):
 def test_probe_measures_stream_timings_without_server_timings(monkeypatch):
     def fake_post(url, **kw):
         return _SSE(_sse_frames(timings=None, prompt_tokens=1800,
-                                completion_tokens=2), delay=0.01)
+                                completion_tokens=2), delay=0.025)
 
     monkeypatch.setattr(llm.requests, "post", fake_post)
     out = profiler.probe_model_speed(
