@@ -743,6 +743,11 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Pedacito
+.pedacito/
+.pedacitoignore
+PLAN.md
 """
 
 STARTER_PYPROJECT = """\
@@ -2052,9 +2057,10 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     # the same ceiling so agent-driven tasks inside the run see it too.
     minutes = (max_minutes if max_minutes is not None
                else int(getattr(cfg, "auto_max_minutes", 0) or 0))
+    run_started = time.monotonic()
     deadline = None
     if minutes > 0:
-        deadline = time.monotonic() + minutes * 60
+        deadline = run_started + minutes * 60
         cfg.max_task_seconds = minutes * 60
 
     design_doc = None
@@ -2092,6 +2098,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                                 design=design_doc, deadline=deadline)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
                              verbose=verbose, stubs=stubs)
+    if wants_skeleton:
+        # R4-BUG-02: a .gitignore the skeleton just wrote must carry Pedacito's
+        # entries now, not at the first index -- and even before `git init`.
+        workspace.ensure(root, getattr(cfg, "manage_gitignore", True),
+                         getattr(cfg, "create_ignore_file", True))
     if not wants_skeleton:
         if created:
             preview = ", ".join(created[:12])
@@ -2130,7 +2141,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             max_tasks=max_tasks, max_minutes=max_minutes,
                             keep_going=keep_going,
                             verbose=verbose, auto_install=auto_install,
-                            design=design_doc is not None)
+                            design=design_doc is not None,
+                            started=run_started)
         _new_checkpoint(f"new: {plan.project_name}")
         return code
 
@@ -2265,14 +2277,17 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  max_minutes: int | None = None,
                  keep_going: bool = False,
                  verbose: bool = True, auto_install: bool = False,
-                 design: bool = False) -> int:
+                 design: bool = False, started: float | None = None) -> int:
     """Complex mode: with skeleton, stubs and index in place, hand
     implementation to the autonomous loop. The plan becomes a resumable
     checklist (cfg.auto_plan_file, default PLAN.md), one task per source file,
     each run in a fresh context with optional `verify` repair. Returns the
-    loop's exit code."""
+    loop's exit code. `started` is the monotonic start of the whole run, so
+    the --max-minutes budget also bounds the optional README pass at the end."""
     from . import loop
 
+    if started is None:
+        started = time.monotonic()
     rr = cfg.auto_repair_rounds if repair_rounds is None else repair_rounds
     mt = cfg.auto_max_tasks if max_tasks is None else max_tasks
     mm = (getattr(cfg, "auto_max_minutes", 0) if max_minutes is None
@@ -2430,10 +2445,16 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     if not plan.no_extras and (root / "README.md").is_file() \
             and not any(f.path.lower() in ("readme.md", "docs/readme.md")
                         for f in plan.files):
-        doc_plan = Plan(plan.project_name, plan.summary,
-                        [*plan.files,
-                         PlannedFile("README.md", "project README")],
-                        spec=plan.spec, no_extras=plan.no_extras)
+        if mm > 0 and time.monotonic() - started >= mm * 60:
+            # R4-BUG-06: the optional extra README is not worth another LLM
+            # call once the --max-minutes budget is spent.
+            print("[max-minutes reached; skipping optional README "
+                  "documentation pass]", file=sys.stderr)
+        else:
+            doc_plan = Plan(plan.project_name, plan.summary,
+                            [*plan.files,
+                             PlannedFile("README.md", "project README")],
+                            spec=plan.spec, no_extras=plan.no_extras)
     docs_backup = (workspace.new_backup_dir(root, workspace.stamp())
                    if cfg.backup else None)
     docs_summary = build_docs(client, cfg, idx, doc_plan, verbose=verbose,
