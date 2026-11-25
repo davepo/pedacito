@@ -615,6 +615,52 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "acp",
+        "usage": "pedacito acp [PROJECT] [--profile NAME] "
+                 "[--execution-mode MODE] [--permission-timeout SECONDS]",
+        "summary": "Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout "
+                   "for editors and agent hosts. The bridge wraps the same "
+                   "warm rpc engine: initialize advertises the agent "
+                   "capabilities, session/new binds a project and optional "
+                   "profile/execution mode, and session/prompt accepts text, "
+                   "`@file` resource and image blocks. Tasks stream "
+                   "session/update notifications (agent_message_chunk, "
+                   "agent_thought_chunk, tool_call, tool_call_update, plan) "
+                   "and permission prompts round-trip through "
+                   "session/request_permission. session/cancel maps to the "
+                   "rpc cancel and never kills the process.",
+        "keywords": ["acp", "agent client protocol", "json-rpc", "jsonrpc",
+                     "stdio", "editor", "zed", "agent host", "protocol",
+                     "session", "prompt", "image", "resource", "permission"],
+        "examples": [
+            "pedacito acp ~/code/app",
+            "pedacito acp ~/code/app --profile fast --execution-mode interleaved",
+            "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+            "\"params\":{}}' | pedacito acp ~/code/app",
+        ],
+        "flags": [
+            {"flag": "--profile NAME",
+             "help": "apply a [profiles.NAME] block for the session"},
+            {"flag": "--execution-mode MODE",
+             "help": "two_phase, interleaved or auto"},
+            {"flag": "--permission-timeout SECONDS",
+             "help": "how long a gated tool waits for a "
+                     "session/request_permission answer before it is denied "
+                     "(default 120)"},
+        ],
+        "notes": [
+            "stdout is 100% JSON-RPC 2.0; every human line goes to stderr",
+            "the project directory is bound at session/new; a foreign cwd is "
+            "refused instead of being read from",
+            "`@file` mentions and resource blocks go through "
+            "security.resolve_safe_path, so traversal and symlink escapes are "
+            "refused",
+            "stdin EOF drains the active task and exits 0, with no pipe wait",
+            "zero duplicated engine logic: it is pedacito/rpc.py underneath",
+        ],
+        "common": True,
+    },
+    {
         "name": "config",
         "usage": "pedacito config [--init | --setup | --check | --doctor | "
                  "--upgrade [--dry-run] | --reference]",
