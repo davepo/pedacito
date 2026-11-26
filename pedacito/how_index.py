@@ -533,7 +533,7 @@ CLI_COMMANDS = [
             "suggestion), /plan, /consolidate (/compact), /profile, /model ID, "
             "/auto-route, /think, /creative, /apply, /verify on|off|status, "
             "/skills, /memory, /procs, /diff, /undo, /image, /attach, "
-            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /clear, /quit",
+            "/update, /reset, /sidebar, /scroll, /mouse, /lang, /picard, /clear, /quit",
             "/attach [PATH | list | clear] (or @image.png) stages "
             "PNG/JPEG/WebP/GIF images for the next task (max 4, 10 MB each)",
             "Multi-line input: Shift+Enter, Alt+Enter, Ctrl+J or a trailing "
@@ -566,6 +566,16 @@ CLI_COMMANDS = [
             "swaps and modified files",
             "Permission prompts appear in the prompt bar: y = once, "
             "a = session, n = deny",
+            "Rich zero-dependency view: edits show as inline syntax-highlighted "
+            "unified diffs, and each tool call is a collapsible one-line card; "
+            "Ctrl+O toggles the latest card, /expand [N|all] and /collapse [N|all] "
+            "work on any card",
+            "@ opens an interactive fuzzy picker (six rows) over project files, "
+            "symbols and images; Up/Down choose, Tab or Enter inserts the path, "
+            "and Esc dismisses it",
+            "SGR mouse zones: click [EN|es] to switch language, the sidebar tabs, "
+            "a tool card to expand it, or the scrollbar to jump; /mouse on or F2 "
+            "enables capture and /mouse off restores native selection",
             "--headless is deterministic for CI: no PTY, no model server and "
             "explicit UTF-8 streams",
         ],
@@ -611,6 +621,52 @@ CLI_COMMANDS = [
             "stdin EOF flushes the active task's reply before the process "
             "exits; cancel keeps the session warm",
             "protocol details: pedacito/rpc.py; rationale: TECHNIQUES.md §31",
+        ],
+        "common": True,
+    },
+    {
+        "name": "acp",
+        "usage": "pedacito acp [PROJECT] [--profile NAME] "
+                 "[--execution-mode MODE] [--permission-timeout SECONDS]",
+        "summary": "Agent Client Protocol (JSON-RPC 2.0) over stdin/stdout "
+                   "for editors and agent hosts. The bridge wraps the same "
+                   "warm rpc engine: initialize advertises the agent "
+                   "capabilities, session/new binds a project and optional "
+                   "profile/execution mode, and session/prompt accepts text, "
+                   "`@file` resource and image blocks. Tasks stream "
+                   "session/update notifications (agent_message_chunk, "
+                   "agent_thought_chunk, tool_call, tool_call_update, plan) "
+                   "and permission prompts round-trip through "
+                   "session/request_permission. session/cancel maps to the "
+                   "rpc cancel and never kills the process.",
+        "keywords": ["acp", "agent client protocol", "json-rpc", "jsonrpc",
+                     "stdio", "editor", "zed", "agent host", "protocol",
+                     "session", "prompt", "image", "resource", "permission"],
+        "examples": [
+            "pedacito acp ~/code/app",
+            "pedacito acp ~/code/app --profile fast --execution-mode interleaved",
+            "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+            "\"params\":{}}' | pedacito acp ~/code/app",
+        ],
+        "flags": [
+            {"flag": "--profile NAME",
+             "help": "apply a [profiles.NAME] block for the session"},
+            {"flag": "--execution-mode MODE",
+             "help": "two_phase, interleaved or auto"},
+            {"flag": "--permission-timeout SECONDS",
+             "help": "how long a gated tool waits for a "
+                     "session/request_permission answer before it is denied "
+                     "(default 120)"},
+        ],
+        "notes": [
+            "stdout is 100% JSON-RPC 2.0; every human line goes to stderr",
+            "the project directory is bound at session/new; a foreign cwd is "
+            "refused instead of being read from",
+            "`@file` mentions and resource blocks go through "
+            "security.resolve_safe_path, so traversal and symlink escapes are "
+            "refused",
+            "stdin EOF drains the active task and exits 0, with no pipe wait",
+            "zero duplicated engine logic: it is pedacito/rpc.py underneath",
         ],
         "common": True,
     },
@@ -1219,6 +1275,115 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "diag",
+        "usage": "pedacito diag [PATH] [--root DIR] [--file FILE]",
+        "summary": "Alias for `pedacito diagnose`: run the project's detected "
+                   "linter/typechecker.",
+        "keywords": ["diag", "lint", "typecheck", "static analysis", "alias"],
+        "examples": ["pedacito diag .", "pedacito diag . --file app.py"],
+        "flags": [
+            {"flag": "--root DIR", "help": "the project"},
+            {"flag": "--file FILE", "help": "restrict to one project file"},
+        ],
+    },
+    {
+        "name": "commit",
+        "usage": "pedacito commit [PATH] [--all] [-m MSG] [--no-model] [-y] "
+                 "[--allow-secrets]",
+        "summary": "Review the staged diff and create a local git commit. The "
+                   "message is drafted by the active model (or deterministically "
+                   "with --no-model). A secret pre-flight scan runs on the "
+                   "staged diff before every commit and refuses a match unless "
+                   "--allow-secrets is given. It never pushes and never "
+                   "force-pushes.",
+        "keywords": ["commit", "git commit", "commit message", "stage", "staged",
+                     "secret scan", "secrets", "gitops", "guided git", "local commit"],
+        "examples": [
+            "pedacito commit . --all -m \"fix retry backoff\"",
+            "pedacito commit . --no-model -y",
+            "pedacito commit . --all --profile fast",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--all", "help": "stage every change first (git add -A)"},
+            {"flag": "-m, --message MSG",
+             "help": "use this message instead of drafting one"},
+            {"flag": "--no-model",
+             "help": "draft the message deterministically, with no model call"},
+            {"flag": "-y, --yes", "help": "commit without asking for confirmation"},
+            {"flag": "--allow-secrets",
+             "help": "commit even when the staged diff matches a secret pattern "
+                     "(explicit override)"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "nothing here pushes: the commit stays local until you push it yourself",
+            "argv-only git calls; no shell is involved",
+            "the TUI twin is /git; the GUI twin is the Git drawer",
+        ],
+    },
+    {
+        "name": "pr",
+        "usage": "pedacito pr [PATH] [--base BRANCH] [--draft] [--title T] "
+                 "[--body B] [--dry-run] [-y] [--no-model]",
+        "summary": "Draft a pull request title and body from the branch's commits "
+                   "and open it with the GitHub CLI (gh). It never pushes the "
+                   "branch itself and never force-pushes; --dry-run prints the "
+                   "draft and never calls gh.",
+        "keywords": ["pr", "pull request", "gh", "github", "draft pr", "open pr",
+                     "merge request", "review request", "guided git"],
+        "examples": [
+            "pedacito pr . --base main --draft",
+            "pedacito pr . --dry-run",
+            "pedacito pr . --title \"Retry backoff\" --body \"Adds jitter\" -y",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--base BRANCH", "help": "base branch (default: main)"},
+            {"flag": "--draft", "help": "open the pull request as a draft"},
+            {"flag": "--title TEXT", "help": "use this title instead of drafting one"},
+            {"flag": "--body TEXT", "help": "use this body instead of drafting one"},
+            {"flag": "--dry-run",
+             "help": "print the drafted title and body; never call gh"},
+            {"flag": "-y, --yes", "help": "open the pull request without confirming"},
+            {"flag": "--no-model",
+             "help": "draft the title and body deterministically, no model call"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "push the branch first yourself: pr opens the pull request, it does "
+            "not publish your commits",
+            "the TUI twin is /git; the GUI twin is the Git drawer",
+        ],
+    },
+    {
+        "name": "parsers",
+        "usage": "pedacito parsers prefetch [--languages LANG...]",
+        "summary": "Tree-sitter grammar tools for offline and air-gapped machines. "
+                   "`prefetch` warms the common grammars and reports ok or failed "
+                   "per language. Without a grammar, the tree-sitter path falls "
+                   "back to the built-in parsers and the run goes on.",
+        "keywords": ["parsers", "tree-sitter", "tree sitter", "grammar", "grammars",
+                     "offline", "air-gapped", "prefetch", "retry", "fallback"],
+        "examples": [
+            "pedacito parsers prefetch",
+            "pedacito parsers prefetch --languages python javascript go",
+        ],
+        "flags": [
+            {"flag": "prefetch", "help": "the only action: pre-warm the grammars"},
+            {"flag": "--languages LANG...",
+             "help": "grammar names to fetch (default: the common set)"},
+        ],
+        "notes": [
+            "run it once while online, then work offline: a missing grammar "
+            "retries and then falls back instead of failing the whole run",
+        ],
+    },
+    {
         "name": "update",
         "usage": "pedacito update [--run] [--config FILE]",
         "summary": "Check PyPI for a newer Pedacito release and upgrade this "
@@ -1664,13 +1829,15 @@ GUI_TOPICS = [
             "output plus the manual command instead",
             "Dismiss hides the banner until an even newer release appears",
             "Opt out entirely: ⚙ Settings → Updates → check_for_updates → "
-            "off (zero network calls; the banner never appears)",
+            "off (zero network calls; the banner never appears); "
+            "show_update_reminder = false hides the active-development update "
+            "reminder on interactive exit and in the GUI",
         ],
         "keywords": ["update", "upgrade", "new version", "new release",
                      "update pedacito", "upgrade pedacito", "check for "
-                     "updates", "check_for_updates", "update banner",
-                     "pipx upgrade", "restart"],
-        "settings": ["check_for_updates"],
+                     "updates", "check_for_updates", "show_update_reminder",
+                     "update banner", "pipx upgrade", "restart"],
+        "settings": ["check_for_updates", "show_update_reminder"],
         "cli": ["update"],
     },
     {
@@ -2978,6 +3145,197 @@ GUI_TOPICS = [
                      "temperature", "temperature_answer", "sampler"],
         "cli": ["config", "profiles"],
     },
+    {
+        "id": "git-commit-pr",
+        "title": "Commit and open a pull request with guided git (commit, pr)",
+        "summary": "pedacito commit reviews the staged diff, drafts the message and "
+                   "commits locally; pedacito pr drafts the title and body and opens "
+                   "the pull request with gh. A secret pre-flight scan runs before "
+                   "every commit, and nothing here pushes or force-pushes.",
+        "steps": [
+            "CLI: pedacito commit . --all (add -m MSG to write the message yourself, "
+            "--no-model for a deterministic draft)",
+            "The scan refuses a staged diff that matches a secret pattern; remove the "
+            "secret, or pass --allow-secrets only if you have checked it is safe",
+            "Push the branch yourself, then pedacito pr . --base main --draft "
+            "(--dry-run prints the title and body without calling gh)",
+            "TUI: /git offers commit (never pushes) or creating a branch",
+            "GUI: the Git drawer offers the same staged diff, secret scan and draft; "
+            "it never pushes",
+        ],
+        "keywords": ["git", "commit", "commit message", "pull request", "pr", "gh",
+                     "github", "stage", "secret scan", "guided git", "gitops",
+                     "draft pr", "git drawer"],
+        "settings": ["allow_git", "git_context"],
+        "cli": ["commit", "pr"],
+    },
+    {
+        "id": "acp-bridge",
+        "title": "Use Pedacito from an editor over ACP (pedacito acp)",
+        "summary": "pedacito acp speaks the Agent Client Protocol (JSON-RPC 2.0) on "
+                   "stdin and stdout. It wraps the same warm engine as pedacito rpc, "
+                   "so an editor or agent host can bind a project, send prompts with "
+                   "@file and image blocks, and answer permission prompts.",
+        "steps": [
+            "Point the agent host at the command: pedacito acp /path/to/project",
+            "Optional: --profile NAME and --execution-mode interleaved for the session",
+            "The host sends initialize, then session/new (binds the project), then "
+            "session/prompt; updates stream back as session/update notifications",
+            "session/request_permission carries gated tool calls; session/cancel stops "
+            "the running task without killing the process",
+            "Need a simpler protocol? pedacito rpc --describe prints the JSONL method list",
+        ],
+        "keywords": ["acp", "agent client protocol", "json-rpc", "jsonrpc", "editor",
+                     "zed", "agent host", "stdio", "session", "protocol", "bridge"],
+        "settings": ["execution_mode", "allow_shell", "allow_write"],
+        "cli": ["acp", "rpc"],
+    },
+    {
+        "id": "parsers-prefetch",
+        "title": "Prepare tree-sitter grammars for offline use (parsers prefetch)",
+        "summary": "Tree-sitter grammars are fetched on first use. Run pedacito "
+                   "parsers prefetch while online to warm them for air-gapped work; "
+                   "when a grammar is missing the fetch is retried and the run falls "
+                   "back to the built-in parser instead of failing.",
+        "steps": [
+            "Online: pedacito parsers prefetch (or --languages python javascript go)",
+            "The output lists ok or failed for each language",
+            "Offline: the same commands keep working; a missing grammar falls back "
+            "quietly and is reported once",
+        ],
+        "keywords": ["parsers", "parser prefetch", "tree-sitter", "tree sitter",
+                     "grammar", "offline", "air-gapped", "no internet", "retry"],
+        "settings": [],
+        "cli": ["parsers", "index"],
+    },
+    {
+        "id": "tool-mode-plain",
+        "title": "Plain-word gather format for small models (tool_mode = \"plain\")",
+        "summary": "tool_mode = \"plain\" asks for each gather step as short plain "
+                   "words (for example: read app.py 1 40) instead of JSON or native "
+                   "tool calls. It suits small models that stumble on JSON. "
+                   "calibrate A/B-tests it against the grammar format before a card "
+                   "recommends it.",
+        "steps": [
+            "⚙ Settings → Profiles → [Select Profile] → Reasoning & Execution "
+            "Overrides → tool_mode → plain",
+            "Or in config.toml, per profile: tool_mode = \"plain\"",
+            "Run pedacito calibrate on that profile to A/B the plain format; the "
+            "card keeps the choice that scores better",
+            "Valid values are grammar (default), native and plain",
+        ],
+        "keywords": ["tool mode", "plain", "plain words", "gather format",
+                     "small model", "json", "tool_mode", "gather dsl",
+                     "format", "calibrate"],
+        "settings": ["tool_mode", "enforce_json_schema", "execution_mode"],
+        "cli": ["calibrate", "config"],
+    },
+    {
+        "id": "proactive-escalation",
+        "title": "Escalate hard tasks before they fail (proactive_escalation)",
+        "summary": "proactive_escalation = true adds a two-path router that runs once "
+                   "per task. A zero-token structural gate (import fan-out, files "
+                   "touched, module boundaries, open-ended architecture words) sends "
+                   "a hard task straight to the escalate role; a Scout classifier "
+                   "keeps well-defined single-file tasks local. It is off by default "
+                   "and needs roles.escalate.",
+        "steps": [
+            "Configure a stronger model for the escalate role in [roles]",
+            "Set proactive_escalation = true (⚙ Settings → All settings → search "
+            "proactive_escalation)",
+            "Leave it false and the reactive auto_escalate behaviour stays unchanged",
+            "A task that escalates shows the escalate role in the Activity panel",
+        ],
+        "keywords": ["escalate", "escalation", "proactive", "router", "complexity",
+                     "hard task", "stronger model", "roles", "architect",
+                     "scout classifier"],
+        "settings": ["proactive_escalation", "auto_escalate", "roles"],
+        "cli": ["ask", "auto", "config"],
+    },
+    {
+        "id": "scratch-offload",
+        "title": "Oversized tool output is offloaded to .pedacito/scratch/",
+        "summary": "A tool observation that is too large for the context window is "
+                   "written to .pedacito/scratch/ and replaced by a short pointer. "
+                   "The model reads it back with the normal read and grep actions, "
+                   "and the scratch area stays inside the project.",
+        "steps": [
+            "Nothing to click: offloading happens when an observation exceeds "
+            "max_observation_tokens",
+            "Find a file the model offloaded: look under .pedacito/scratch/",
+            "The model can read and grep these logs but never writes to them; only "
+            "direct *.log files under .pedacito/scratch/ are readable this way",
+            "Delete .pedacito/scratch/ at any time; it is rebuilt when needed",
+        ],
+        "keywords": ["scratch", "scratchpad", "offload", "observation", "large output",
+                     "truncated output", "context", "tool output", "scratch files"],
+        "settings": ["max_observation_tokens", "wrap_observations"],
+        "cli": ["ask", "chat"],
+    },
+    {
+        "id": "tui-rich-view",
+        "title": "Rich terminal view: diffs, tool cards and the @ picker (tui)",
+        "summary": "The TUI renders edits as inline syntax-highlighted unified diffs, "
+                   "shows each tool call as a one-line card you can expand, and opens "
+                   "a fuzzy file picker on @. It needs no extra dependency.",
+        "steps": [
+            "Tool calls appear as collapsible one-line cards: Ctrl+O toggles the "
+            "latest one; /expand [N|all] and /collapse [N|all] work on any card",
+            "Type @ in the prompt to open the six-row fuzzy picker over files, symbols "
+            "and images; Up/Down move, Tab or Enter inserts, Esc dismisses",
+            "Mouse: click [EN|es] to switch language, a sidebar tab, a tool card or the "
+            "scrollbar; /mouse on enables SGR capture and /mouse off restores selection",
+            "/status is localized under /lang es, and a skipped test run reads "
+            "tests: skipped (needs allow_shell)",
+        ],
+        "keywords": ["tui", "diff", "highlight", "tool card", "collapse", "expand",
+                     "ctrl+o", "/expand", "/collapse", "picker", "fuzzy", "@",
+                     "mouse", "click", "sgr", "scrollbar", "terminal"],
+        "settings": ["show_telemetry", "allow_shell"],
+        "cli": ["tui"],
+    },
+    {
+        "id": "local-network-endpoints",
+        "title": "Local, LAN and Tailscale endpoints (CGNAT 100.64.0.0/10)",
+        "summary": "Pedacito treats loopback, .local names, RFC 1918 LAN, Tailscale "
+                   "(RFC 6598 CGNAT 100.64.0.0/10), link-local, IPv6 ULA and explicit "
+                   "local provider labels as local. Local models get the local "
+                   "sampling, cache and calibration rules, and a local card that "
+                   "lacks calibrated temperatures is marked stale.",
+        "steps": [
+            "Point base_url at a Tailscale address, for example "
+            "http://100.101.102.103:1234/v1 or http://box.tail1234.ts.net:11434/v1",
+            "The endpoint counts as local, so cache_prompt and the local sampler apply",
+            "A local model card without a calibrated temperature is marked stale: run "
+            "pedacito calibrate --recalibrate once to refresh it",
+        ],
+        "keywords": ["tailscale", "cgnat", "100.64", "lan", "local network",
+                     "private network", "rfc 6598", "ipv6", "ula", "link local",
+                     "stale card", "recalibrate", "base_url", "remote server",
+                     "connect", "connect tailscale", "over tailscale"],
+        "settings": ["base_url", "use_model_card", "prompt_cache"],
+        "cli": ["calibrate", "config", "models scan"],
+    },
+    {
+        "id": "windows-stderr",
+        "title": "Capture stderr on Windows PowerShell 5.1 (2>&1)",
+        "summary": "Pedacito writes human text to stderr, and under --jsonl, rpc and "
+                   "acp stdout must stay pure JSON. On Windows PowerShell 5.1, "
+                   "2>&1 wraps each stderr line as an error record, which looks like "
+                   "a failure and can corrupt piped JSON.",
+        "steps": [
+            "Windows PowerShell 5.1: pedacito ask . -t \"...\" 2>&1 shows stderr as "
+            "red ErrorRecord lines, even when the run succeeds",
+            "For clean JSON on stdout, discard stderr: pedacito ask . -t \"...\" --json "
+            "2>$null",
+            "PowerShell 7+ and cmd.exe merge stderr as plain text",
+        ],
+        "keywords": ["powershell", "powershell 5.1", "windows", "2>&1", "stderr",
+                     "redirect", "error record", "nativecommanderror", "stdout json",
+                     "pipe", "windows terminal"],
+        "settings": [],
+        "cli": ["ask", "rpc"],
+    },
 ]
 
 TOPICS = [
@@ -3051,9 +3409,15 @@ _SETTING_GUI = {
                                "routing)",
     "gui_theme": "Topbar → theme dropdown, or ⚙ Settings → All settings → "
                  "Graphical interface → gui_theme",
+    "picard_mode": "⚙ Settings → Captain Picard Mode checkbox, or TUI /picard "
+                   "on|off, or ⚙ Settings → All settings → Graphical interface "
+                   "→ picard_mode",
     "check_for_updates": "⚙ Settings → All settings → Updates → "
                          "check_for_updates (off = fully offline: no release "
                          "check, no update banner)",
+    "show_update_reminder": "⚙ Settings → All settings → Updates → "
+                            "show_update_reminder (off = hide the "
+                            "active-development update reminder)",
     "disable_thinking": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
                         "& Execution Overrides → disable_thinking (Thinking)",
     "thinking_suffix": "⚙ Settings → Profiles → [Select Profile] → Reasoning "
@@ -3127,6 +3491,10 @@ _SETTING_KEYWORDS = {
     "check_for_updates": ["update", "upgrade", "new version", "new release",
                           "check for updates", "update check", "phone home",
                           "offline", "opt out", "update banner"],
+    "show_update_reminder": ["update reminder", "active development",
+                             "reminder", "exit reminder", "update tip"],
+    "picard_mode": ["picard", "make it so", "captain picard", "star trek",
+                    "button labels"],
     "review": ["review page", "diff review", "approve changes"],
     "backup": ["backup", "snapshot", "undo", "restore"],
     "allow_shell": ["run commands", "shell", "tool permission", "allow run"],

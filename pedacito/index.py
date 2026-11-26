@@ -990,15 +990,18 @@ class _Breaker:
 
 
 def _ask(client, cfg, system: str, prompt: str, label: str,
-         breaker: _Breaker, max_tokens: int | None = None) -> str:
+         breaker: _Breaker, max_tokens: int | None = None,
+         trip_circuit: bool = True) -> str:
     """Request one summary from the model, truncated to 400 chars (a batched
     reply, `max_tokens` given, keeps its lines and is parsed by the caller).
     Failures go to `breaker` (which may raise SystemExit); returns "" on
-    failure."""
+    failure. ``trip_circuit=False`` makes the call best-effort for the shared
+    circuit breaker, so a summary-refresh drop does not open it."""
     try:
         s = client.chat(
             [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             max_tokens=max_tokens or cfg.max_tokens_summary,
+            trip_circuit=trip_circuit,
         ).strip()
     except LLMError as e:
         breaker.fail(label, e)
@@ -1065,13 +1068,37 @@ def _chunk_with_imports(rel: str, path: Path, cfg, raw: bytes | None = None
             raw_imports(rel, src, tree=tree))
     if suffix in LANG_BY_EXT and TS_AVAILABLE:
         src = _decode_bytes(raw) if raw is not None else fileio.read_text(path)
-        return (_unique_qualnames(chunk_file_ts(
-            rel, src, suffix, cfg.class_split_lines,
-            cfg.max_unit_lines, cfg.max_unit_chars,
-            cfg.max_unit_tokens, cfg.unit_overlap_lines)),
-            raw_imports(rel, src))
+        try:
+            return (_unique_qualnames(chunk_file_ts(
+                rel, src, suffix, cfg.class_split_lines,
+                cfg.max_unit_lines, cfg.max_unit_chars,
+                cfg.max_unit_tokens, cfg.unit_overlap_lines)),
+                raw_imports(rel, src))
+        except Exception:
+            # A missing grammar / failed download / unsafe tree-sitter version
+            # must not crash `pedacito index` or `pedacito new`: degrade to
+            # whole-file reference chunking (one concise warning per language).
+            _ts_fallback_warn(suffix)
     return _unique_qualnames(chunk_reference(rel, path,
                                              cfg.max_reference_bytes)), []
+
+
+_TS_FALLBACK_WARNED: set[str] = set()
+
+
+def _ts_fallback_warn(suffix: str) -> None:
+    """One concise stderr warning per language when tree-sitter chunking
+    falls back to whole-file reference chunking (never per file)."""
+    if suffix in _TS_FALLBACK_WARNED:
+        return
+    _TS_FALLBACK_WARNED.add(suffix)
+    try:
+        print(f"[warn] tree-sitter is unavailable for {suffix} files; "
+              f"chunking them as whole-file references (install "
+              f"tree-sitter-language-pack to restore structural chunking)",
+              file=sys.stderr)
+    except Exception:
+        pass
 
 
 def _unit_prompt(c: Chunk, cfg) -> str:
@@ -1117,7 +1144,7 @@ def _parse_batch(text: str, n: int) -> list[str]:
 
 def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
                      breaker: "_Breaker", verbose: bool,
-                     save: bool = True) -> int:
+                     save: bool = True, trip_circuit: bool = True) -> int:
     """Summarise `todo` through a bounded worker pool (sequential for one
     worker), storing results in the content-hash cache. With
     `summary_batch` > 1, short units share one request (fewer round-trips and
@@ -1140,17 +1167,18 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
         if len(group) == 1:
             c = group[0]
             return [_ask(client, cfg, SUMMARY_SYSTEM, _unit_prompt(c, cfg),
-                         c.key, breaker)]
+                         c.key, breaker, trip_circuit=trip_circuit)]
         body = "\n\n".join(
             f"### {k}. {c.file} :: {c.qualname}\n{c.source[:600]}"
             for k, c in enumerate(group, 1))
         text = _ask(client, cfg, _BATCH_SYSTEM, f"N = {len(group)}\n\n{body}",
                     group[0].key + f" (+{len(group) - 1})", breaker,
-                    max_tokens=cfg.max_tokens_summary * len(group))
+                    max_tokens=cfg.max_tokens_summary * len(group),
+                    trip_circuit=trip_circuit)
         got = _parse_batch(text, len(group))
         # whatever the batch did not return is asked for singly
         return [g or _ask(client, cfg, SUMMARY_SYSTEM, _unit_prompt(c, cfg),
-                          c.key, breaker)
+                          c.key, breaker, trip_circuit=trip_circuit)
                 for g, c in zip(got, group)]
 
     def land(i: int, group: list[Chunk], texts: list[str]) -> None:
@@ -1408,7 +1436,8 @@ def refresh_summaries(index: Index, client, cfg, limit: int = 12,
               f"{'y' if len(todo) == 1 else 'ies'} for changed code...",
               file=sys.stderr)
     try:
-        n = _summarise_units(index, todo, client, cfg, cache, breaker, False)
+        n = _summarise_units(index, todo, client, cfg, cache, breaker, False,
+                             trip_circuit=False)
     except SystemExit:
         return 0
     if n:

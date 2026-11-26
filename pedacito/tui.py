@@ -47,6 +47,7 @@ from pathlib import Path
 from . import checkpoints as checkpoints_mod
 from . import events as events_mod
 from . import gitinfo
+from . import gitops
 from . import i18n
 from . import index as index_mod
 from . import llm as llm_mod
@@ -71,7 +72,9 @@ from .config import Config
 from .llm import LLMClient, LLMError
 
 __all__ = ["TuiSession", "enable_vt_mode", "parse_escape_sequence",
-           "run_tui", "HELP_TEXT", "KEYS_TEXT"]
+           "run_tui", "HELP_TEXT", "KEYS_TEXT",
+           "style_unified_diff_line", "format_unified_diff",
+           "fuzzy_rank_picker_candidates", "extract_at_query"]
 
 # ANSI sequences. They are emitted only for a real interactive TTY; headless
 # frames stay plain text so CI logs and StringIO assertions are deterministic.
@@ -121,7 +124,8 @@ _SWAP_ARROW = "\u2192"
 _TAB_PREFIX = {
     "/con": "/consolidate ",
     "/pro": "/profile ",
-    "/pi": "/pin ",
+    "/pin": "/pin ",
+    "/pic": "/picard ",
     "/ru": "/rules ",
     "/aut": "/auto-route ",
     "/cre": "/creative ",
@@ -134,6 +138,8 @@ _TAB_PREFIX = {
     "/la": "/lang ",
     "/im": "/image ",
     "/at": "/attach ",
+    "/ex": "/expand ",
+    "/col": "/collapse ",
 }
 _SLASH_COMMANDS = [
     "/help", "/keys", "/status", "/telemetry", "/new", "/auto", "/auto!", "/plan",
@@ -141,10 +147,12 @@ _SLASH_COMMANDS = [
     "/auto-route", "/think", "/effort", "/mode", "/exec-mode",
     "/creative", "/servers", "/unload",
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
-    "/theme", "/lang", "/image", "/attach",
+    "/theme", "/lang", "/picard", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
     "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/git",
     "/update",
+    "/expand", "/collapse",
     "/reset", "/sidebar", "/scroll", "/mouse", "/clear",
     "/quit", "/exit",
 ]
@@ -155,8 +163,9 @@ _KNOWN_KEYS = {
     "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END",
     "PAGE_UP", "PAGE_DOWN", "SHIFT_UP", "SHIFT_DOWN",
     "SHIFT_LEFT", "SHIFT_RIGHT", "ALT_PAGE_UP", "ALT_PAGE_DOWN",
-    "WHEEL_UP", "WHEEL_DOWN", "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_L",
-    "CTRL_U", "CTRL_W", "F2", "F3", "SHIFT_TAB",
+    "WHEEL_UP", "WHEEL_DOWN", "MOUSE_CLICK",
+    "CTRL_C", "CTRL_D", "CTRL_K", "CTRL_L",
+    "CTRL_O", "CTRL_U", "CTRL_W", "F2", "F3", "SHIFT_TAB",
 }
 
 # Commands shown by /help and in the prompt bar's hint line.
@@ -177,7 +186,9 @@ Pedacito TUI keybindings
   Esc                   jump to the live bottom
   Backspace / Delete    edit the prompt; Ctrl+W deletes a word
   Ctrl+K / Ctrl+L       kill to end of line / force a full repaint
-  Tab                   complete slash commands and profile names
+  Ctrl+O                toggle expand/collapse on the latest tool-call card
+  @                     open interactive fuzzy picker for files, symbols, images
+  Tab                   complete slash commands, profiles, or @ fuzzy match
   F2                    toggle SGR mouse mode (native selection default)
   F3                    toggle interface language (EN <-> ES)
   Ctrl+C                cancel the running task
@@ -227,6 +238,7 @@ Pedacito TUI commands
   /theme [NAME]             list color themes, or switch to NAME and save it
                             (shared with the GUI Theme Manager)
   /lang [en|es]             switch interface language (F3 toggles EN/ES)
+  /picard [on|off]          toggle Captain Picard Mode ('Make it so.')
   /image PROMPT [--out FILE] [--size WxH]
                             generate an image with the configured image profile
   /attach [PATH|list|clear] attach an image (PNG/JPEG/WebP/GIF, <=10 MB, max 4)
@@ -251,6 +263,9 @@ Pedacito TUI commands
   /security ack             acknowledge every current secret finding
   /security gitignore       add .env patterns to .gitignore
   /diff                     git status and working-tree diff
+  /git [status|stage PATH|unstage PATH|commit [MSG]|branch NAME]
+                            guided local git: stage, scan for secrets and
+                            commit (never pushes), or create a branch
   /checkpoints [N]          show the time-travel checkpoint tree
   /undo                     restore the state before the last run (or the
                             newest .pedacito/backups snapshot on old projects)
@@ -266,6 +281,8 @@ Pedacito TUI commands
   /sidebar                  toggle the activity / plan pane
   /scroll up|down|top|bottom|N
                             scroll the transcript (also works in --headless)
+  /expand [N|all]           expand collapsible tool-call card N (or all)
+  /collapse [N|all]         collapse tool-call card N (or all)
   /mouse [on|off]           SGR mouse wheel capture (F2); off keeps native
                             text selection and OS copy/paste
   /clear                    clear the transcript pane
@@ -294,7 +311,9 @@ Atajos de teclado de Pedacito TUI
   Esc                   ir al final en vivo
   Backspace / Delete    editar el prompt; Ctrl+W borra una palabra
   Ctrl+K / Ctrl+L       borrar hasta el final de línea / forzar repintado
-  Tab                   completar comandos con barra y nombres de perfiles
+  Ctrl+O                alternar expandir/contraer la última tarjeta de herramienta
+  @                     abrir selector difuso de archivos, símbolos e imágenes
+  Tab                   completar comandos con barra, perfiles o selección @
   F2                    alternar modo ratón SGR (selección nativa por defecto)
   F3                    alternar idioma de la interfaz (EN <-> ES)
   Ctrl+C                cancelar la tarea en ejecución
@@ -328,6 +347,7 @@ Comandos de Pedacito TUI
   /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
   /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
   /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
+  /picard [on|off]          activar o desactivar el Modo Capitán Picard ('Make it so.')
   /image PROMPT [--out ARCHIVO] [--size WxH]
                             generar una imagen con el perfil de imagen configurado
   /attach [RUTA|list|clear] adjuntar una imagen (PNG/JPEG/WebP/GIF, <=10 MB, máx 4)
@@ -343,6 +363,9 @@ Comandos de Pedacito TUI
   /rules [list|set|clear]   ver o editar .pedacito/rules.md
   /security [ack|gitignore] escanear secretos o archivos .env expuestos
   /diff                     estado de git y diff del árbol de trabajo
+  /git [status|stage RUTA|unstage RUTA|commit [MSG]|branch NOMBRE]
+                            git local guiado: preparar, escanear secretos y
+                            confirmar (nunca hace push) o crear una rama
   /checkpoints [N]          mostrar el árbol de checkpoints
   /undo                     restaurar el estado anterior a la última ejecución
   /checkout ID              restaurar el espacio de trabajo desde un checkpoint
@@ -352,6 +375,8 @@ Comandos de Pedacito TUI
   /reset                    limpiar el estado de .pedacito (conserva memoria)
   /sidebar                  mostrar u ocultar el panel de actividad / plan
   /scroll up|down|top|bottom|N  desplazar la transcripción
+  /expand [N|all]           expandir tarjeta de herramienta N (o todas)
+  /collapse [N|all]         contraer tarjeta de herramienta N (o todas)
   /mouse [on|off]           captura de rueda del ratón SGR (F2)
   /clear                    limpiar el panel de transcripción
   /quit  /exit              salir y restaurar la terminal
@@ -396,12 +421,17 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
     if not buf:
         return "", 0
 
-    # SGR mouse wheel, before the generic CSI checks.
+    # SGR mouse wheel and click events, before the generic CSI checks.
     match = _SGR_MOUSE_RE.match(buf)
     if match:
         button = int(match.group(1))
+        press = match.group(4) == "M"
         key = {64: "WHEEL_UP", 65: "WHEEL_DOWN"}.get(button)
-        return (key, match.end()) if key else ("UNKNOWN", match.end())
+        if key:
+            return key, match.end()
+        if (button & 0x43) == 0 and press:
+            return "MOUSE_CLICK", match.end()
+        return "UNKNOWN", match.end()
 
     # Alternate-scroll bursts. Count repeated sequences so one drain returns
     # WHEEL rather than leaking N history events into the prompt.
@@ -484,6 +514,7 @@ def parse_escape_sequence(buf: str) -> tuple[str, int]:
         "\x01": "HOME", "\x05": "END",
         "\x03": "CTRL_C", "\x04": "CTRL_D",
         "\x0b": "CTRL_K", "\x0c": "CTRL_L",
+        "\x0f": "CTRL_O",
         "\x15": "CTRL_U", "\x17": "CTRL_W",
     }
     if char in controls:
@@ -625,6 +656,138 @@ def _screen_size(default=(100, 30)) -> tuple[int, int]:
     return max(40, int(size.columns)), max(12, int(size.lines))
 
 
+_PICKER_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_AT_TOKEN_RE = re.compile(r"(?:^|(?<=[\s(\"'\[{]))@([^\s\"'()\]{}]*)$")
+_TOOL_CARD_ID_RE = re.compile(r"^\s*\[(\d+)\]\s+[\u2713\u2717]")
+
+
+def style_unified_diff_line(line: str, *, color: bool = True) -> str:
+    """Syntax-highlight one unified diff line using clean ANSI codes.
+
+    + added lines -> green (\\x1b[32m)
+    - removed lines -> red (\\x1b[31m)
+    @@ ... @@ hunk headers -> cyan (\\x1b[36m)
+    --- / +++ / diff --git / index file headers -> bold (\\x1b[1m)
+    When `color=False` or `NO_COLOR` is set, returns plain text with zero ANSI bytes.
+    """
+    raw = _untrusted_text(line)
+    if not color or os.environ.get("NO_COLOR"):
+        return raw
+    stripped = raw.lstrip()
+    if (stripped.startswith("diff --git")
+            or stripped.startswith("index ")
+            or stripped.startswith("--- ")
+            or stripped.startswith("+++ ")
+            or stripped in ("---", "+++")):
+        return f"\x1b[1m{raw}\x1b[0m"
+    if stripped.startswith("@@"):
+        return f"\x1b[36m{raw}\x1b[0m"
+    if stripped.startswith("+"):
+        return f"\x1b[32m{raw}\x1b[0m"
+    if stripped.startswith("-"):
+        return f"\x1b[31m{raw}\x1b[0m"
+    return raw
+
+
+def format_unified_diff(diff_text: str, *, color: bool = True) -> list[str]:
+    """Format a multi-line unified diff block into syntax-highlighted lines."""
+    lines = _untrusted_text(diff_text).splitlines()
+    return [style_unified_diff_line(ln, color=color) for ln in lines]
+
+
+def extract_at_query(buf: str, cursor_pos: int | None = None
+                     ) -> tuple[int, int, str] | None:
+    """Extract an active `@query` mention ending at `cursor_pos`.
+
+    Returns `(at_start_index, cursor_end_index, query)` when the cursor is
+    positioned right after `@` or `@<query>` (preceded by start-of-input or
+    whitespace/opening delimiter), or `None` when no `@` mention is active.
+    """
+    text = str(buf or "")
+    pos = len(text) if cursor_pos is None else max(0, min(int(cursor_pos), len(text)))
+    before = text[:pos]
+    line_start = before.rfind("\n") + 1
+    line_before = before[line_start:]
+    match = _AT_TOKEN_RE.search(line_before)
+    if not match:
+        return None
+    query = match.group(1)
+    at_start = line_start + match.start()
+    return at_start, pos, query
+
+
+def _fuzzy_subsequence_score(query: str, target: str) -> int | None:
+    """Return a positive fuzzy match score if `query` matches `target`, else None."""
+    if not query:
+        return 1
+    q = query.lower()
+    t = target.lower()
+    if q == t:
+        return 1000
+    base = t.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    if base == q:
+        return 950 - min(40, len(t))
+    if base.startswith(q):
+        return 850 - min(60, len(t))
+    if t.startswith(q):
+        return 800 - min(60, len(t))
+    idx = t.find(q)
+    if idx != -1:
+        boundary_bonus = 60 if (idx == 0 or t[idx - 1] in "/._-:") else 0
+        return 650 + boundary_bonus - min(80, idx) - min(60, len(t))
+    # Subsequence match with consecutive/boundary bonuses
+    q_idx = 0
+    score = 300
+    last_match = -2
+    for t_idx, ch in enumerate(t):
+        if q_idx < len(q) and ch == q[q_idx]:
+            if t_idx == last_match + 1:
+                score += 15
+            elif t_idx == 0 or t[t_idx - 1] in "/._-:":
+                score += 12
+            else:
+                score -= min(8, t_idx - last_match)
+            last_match = t_idx
+            q_idx += 1
+            if q_idx == len(q):
+                break
+    if q_idx < len(q):
+        return None
+    return max(1, score - min(60, len(t)))
+
+
+def fuzzy_rank_picker_candidates(query: str, candidates: list[dict],
+                                 limit: int = 6) -> list[dict]:
+    """Pure deterministic fuzzy ranking over file, symbol, and image candidates.
+
+    Each candidate dict has `{"kind": "file"|"symbol"|"image", "value": str,
+    "label": str, "detail": str}`. Returns up to `limit` highest-scoring items.
+    """
+    q = str(query or "").strip()
+    kind_priority = {"file": 0, "image": 1, "symbol": 2}
+    scored: list[tuple[int, int, str, dict]] = []
+    for item in candidates or ():
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "")
+        label = str(item.get("label") or value)
+        kind = str(item.get("kind") or "file")
+        if not value:
+            continue
+        s_val = _fuzzy_subsequence_score(q, value)
+        s_lbl = _fuzzy_subsequence_score(q, label)
+        best = max(
+            s_val if s_val is not None else -1,
+            s_lbl if s_lbl is not None else -1,
+        )
+        if best < 0:
+            continue
+        scored.append((-best, kind_priority.get(kind, 9), value.lower(), item))
+    scored.sort(key=lambda row: (row[0], row[1], row[2]))
+    max_items = max(1, int(limit)) if limit else 6
+    return [row[3] for row in scored[:max_items]]
+
+
 class TuiSession:
     """One split-screen session.
 
@@ -684,8 +847,22 @@ class TuiSession:
         self._history_draft = ""
         self.scroll_offset = 0
         self.sidebar_scroll_offset = 0
+        self.sidebar_tab = "all"
         self.mouse_sgr = False
         self._last_mouse_col = 0
+        self._last_mouse_row = 0
+        self.tool_cards: list[dict] = []
+        self._tool_call_starts: dict[str, tuple[float, int]] = {}
+        self._last_step_t = time.monotonic()
+        self.picker_open = False
+        self.picker_query = ""
+        self.picker_items: list[dict] = []
+        self.picker_index = 0
+        self._picker_dismissed_at: int | None = None
+        self._picker_candidates_cache: tuple[float, list[dict]] | None = None
+        self._current_task_text = ""
+        self._tests_not_run_flag = False
+        self._tests_ran_flag = False
         self._prompt_view_start = 0
         self._prompt_line_offset = 0
         self._preferred_col: int | None = None
@@ -1059,6 +1236,9 @@ class TuiSession:
                                lang=self.lang,
                                n=len(self.pending_images))
             img_badge = f" {sep} {self._style(img_label, 'accent')}"
+        picard_badge = ""
+        if bool(getattr(self.cfg, "picard_mode", False)):
+            picard_badge = f" {sep} {self._style('[Picard]', 'accent', bold=True)}"
         line2 = (f" {self._style(line2_auto_route + ':', 'muted')} "
                  f"{self._style(routing, 'success' if routing == 'ON' else 'muted')} "
                  f"{sep} {self._style(line2_scout + ':', 'muted')} "
@@ -1069,7 +1249,7 @@ class TuiSession:
                  f"{self._style(sidebar, 'text')} "
                  f"{sep} {self._style(lang_label + ':', 'muted')} "
                  f"{self._style(lang_pill, 'accent')}"
-                 f"{img_badge}")
+                 f"{img_badge}{picard_badge}")
         return [line1, line2]
 
     # -------------------------------------------------------------- sidebar
@@ -1095,29 +1275,39 @@ class TuiSession:
 
     def _all_sidebar_rows(self, width: int) -> list[str]:
         width = max(20, width)
-        rows: list[str] = [i18n.t("tui.sidebar.title", lang=self.lang)]
+        tab = str(getattr(self, "sidebar_tab", "all") or "all").lower()
+        title = i18n.t("tui.sidebar.title", lang=self.lang)
+        rows: list[str] = [title]
         items = self.plan_items()
-        rows.append(f"PLAN: {self._plan_path().name}")
-        if items:
-            for checked, text in items:
-                mark = "x" if checked else " "
-                rows.append(f"[{mark}] {text}")
-        else:
-            rows.append(i18n.t("tui.sidebar.no_plan", lang=self.lang))
-        rows.append("")
-        rows.append(i18n.t("tui.sidebar.activity", lang=self.lang))
-        if self.activity:
-            for row in self.activity:
-                rows.append(row if row.startswith("\u00b7 ") else f"\u00b7 {row}")
-        else:
-            rows.append(i18n.t("tui.sidebar.waiting", lang=self.lang))
-        rows.append("")
-        rows.append(i18n.t("tui.sidebar.modified", lang=self.lang))
-        if self.modified:
-            for rel in self.modified:
-                rows.append(f"~ {rel}")
-        else:
-            rows.append(i18n.t("tui.sidebar.none_yet", lang=self.lang))
+        show_plan = tab in ("all", "plan")
+        show_activity = tab in ("all", "activity")
+        show_files = tab in ("all", "files", "modified")
+        if show_plan:
+            rows.append(f"PLAN: {self._plan_path().name}")
+            if items:
+                for checked, text in items:
+                    mark = "x" if checked else " "
+                    rows.append(f"[{mark}] {text}")
+            else:
+                rows.append(i18n.t("tui.sidebar.no_plan", lang=self.lang))
+        if show_activity:
+            if len(rows) > 1:
+                rows.append("")
+            rows.append(i18n.t("tui.sidebar.activity", lang=self.lang))
+            if self.activity:
+                for row in self.activity:
+                    rows.append(row if row.startswith("\u00b7 ") else f"\u00b7 {row}")
+            else:
+                rows.append(i18n.t("tui.sidebar.waiting", lang=self.lang))
+        if show_files:
+            if len(rows) > 1:
+                rows.append("")
+            rows.append(i18n.t("tui.sidebar.modified", lang=self.lang))
+            if self.modified:
+                for rel in self.modified:
+                    rows.append(f"~ {rel}")
+            else:
+                rows.append(i18n.t("tui.sidebar.none_yet", lang=self.lang))
         return rows
 
     def _sidebar_lines(self, width: int, height: int) -> list[str]:
@@ -1169,8 +1359,146 @@ class TuiSession:
     def _transcript_viewport_height(self, height: int | None = None) -> int:
         return max(1, self._body_height(height) - 1)
 
+    def _format_tool_card_summary(self, card: dict) -> str:
+        cid = int(card.get("id", 0))
+        mark = "\u2713" if card.get("ok", True) else "\u2717"
+        action = str(card.get("action") or "tool")
+        detail = str(card.get("detail") or "").strip()
+        dur = int(card.get("duration_ms", 0) or 0)
+        head = f"[{cid}] {mark} {action}"
+        if detail:
+            head += f" {detail}"
+        head += f" \u00b7 {dur}ms"
+        return head
+
+    def _render_tool_card_text(self, card: dict) -> str:
+        summary = self._format_tool_card_summary(card)
+        output = str(card.get("output") or "").strip()
+        if not card.get("expanded", False) or not output:
+            return summary
+        body_lines = [f"    \u2502 {ln}" for ln in output.splitlines()]
+        return "\n".join([summary] + body_lines)
+
+    def add_tool_card(self, action: str, detail: str = "", *,
+                      ok: bool = True, duration_ms: int = 0,
+                      output: str = "", expanded: bool = False) -> dict:
+        """Record a collapsible tool-call card in the transcript and return it."""
+        with self._write_lock:
+            cid = len(self.tool_cards) + 1
+            card = {
+                "id": cid,
+                "action": _untrusted_text(action).strip() or "tool",
+                "detail": _untrusted_text(detail).strip(),
+                "ok": bool(ok),
+                "duration_ms": max(0, int(duration_ms or 0)),
+                "output": _untrusted_text(output),
+                "expanded": bool(expanded),
+            }
+            self.tool_cards.append(card)
+            self._append(f"__TOOL_CARD__:{cid}", "tool_card")
+            return card
+
+    def get_tool_card(self, card_id: int) -> dict | None:
+        for card in self.tool_cards:
+            if int(card.get("id", 0)) == int(card_id):
+                return card
+        return None
+
+    def toggle_tool_card(self, target: int | str | None = None,
+                         *, expand: bool | None = None) -> list[dict]:
+        """Toggle, expand, or collapse tool card(s).
+
+        `target` may be None (the latest tool card), an integer ID (1-based),
+        or `"all"`. `expand=True` forces expand, `expand=False` forces
+        collapse, and `expand=None` toggles.
+        """
+        with self._write_lock:
+            if not self.tool_cards:
+                return []
+            if target is None or str(target).strip() == "":
+                cards = [self.tool_cards[-1]]
+            elif str(target).strip().lower() == "all":
+                cards = list(self.tool_cards)
+            else:
+                try:
+                    cid = int(str(target).strip())
+                except ValueError:
+                    return []
+                found = self.get_tool_card(cid)
+                cards = [found] if found is not None else []
+            for card in cards:
+                if expand is None:
+                    card["expanded"] = not bool(card.get("expanded", False))
+                else:
+                    card["expanded"] = bool(expand)
+            if cards:
+                self._dirty = True
+            return cards
+
+    def _expand_command(self, arg: str, *, expand: bool) -> None:
+        raw = str(arg or "").strip()
+        if not self.tool_cards:
+            self._append("No tool-call cards in this session yet.", "system")
+            return
+        if raw and raw.lower() != "all":
+            try:
+                int(raw)
+            except ValueError:
+                cmd = "expand" if expand else "collapse"
+                self._append(f"Usage: /{cmd} [N|all]", "error")
+                return
+        changed = self.toggle_tool_card(raw or None, expand=expand)
+        if not changed:
+            self._append(f"No tool-call card matching '{raw}'.", "error")
+            return
+        state = "expanded" if expand else "collapsed"
+        ids = ", ".join(f"[{c['id']}]" for c in changed)
+        self._append(f"Tool card(s) {ids} {state}.", "system")
+        if expand and self.headless:
+            for card in changed:
+                output = str(card.get("output") or "").strip()
+                if not output:
+                    continue
+                for ln in output.splitlines():
+                    self._append(f"    \u2502 {ln}", "system")
+
     def _wrap_transcript_line(self, kind: str, text: str,
                              width: int) -> list[str]:
+        if kind == "tool_card":
+            m = re.match(r"^__TOOL_CARD__:(\d+)$", str(text).strip())
+            card = self.get_tool_card(int(m.group(1))) if m else None
+            if card is not None:
+                rendered = self._render_tool_card_text(card)
+                tone = "success" if card.get("ok", True) else "danger"
+                lines = rendered.splitlines() or [rendered]
+                chunks: list[str] = []
+                for idx_l, raw_ln in enumerate(lines):
+                    wrapped = textwrap.wrap(
+                        "  " + raw_ln, width=max(1, width),
+                        replace_whitespace=False, drop_whitespace=False,
+                        break_long_words=True, break_on_hyphens=False) or ["  "]
+                    if idx_l == 0:
+                        chunks.extend(self._style(w, tone) for w in wrapped)
+                    else:
+                        chunks.extend(self._style(w, "muted") for w in wrapped)
+                return chunks
+        if kind == "diff":
+            body = str(text)
+            chunks = []
+            in_fence = False
+            for raw in body.splitlines() or [""]:
+                if raw.strip().startswith("```"):
+                    in_fence = not in_fence
+                    continue
+                wrapped = textwrap.wrap(
+                    "  " + raw, width=max(1, width),
+                    replace_whitespace=False, drop_whitespace=False,
+                    break_long_words=True, break_on_hyphens=False) or ["  "]
+                for w in wrapped:
+                    chunks.append(
+                        style_unified_diff_line(w, color=self._colors_on()))
+            return chunks
+
         prefixes = {
             "banner": "\u25c6 ",
             "user": "\u00bb ",
@@ -1193,8 +1521,33 @@ class TuiSession:
             if kind in tokens else prefix
         whole_line = kind in ("receipt", "success", "warn", "error")
         body = str(text)
-        chunks: list[str] = []
+        chunks = []
+        in_diff_fence = False
         for raw in body.splitlines() or [""]:
+            stripped_raw = raw.strip()
+            if stripped_raw.startswith("```diff") or stripped_raw.startswith("```patch"):
+                in_diff_fence = True
+                continue
+            if in_diff_fence and stripped_raw.startswith("```"):
+                in_diff_fence = False
+                continue
+            is_inline_diff = in_diff_fence or (
+                kind in ("assistant", "system")
+                and (raw.startswith("diff --git ")
+                     or raw.startswith("--- a/")
+                     or raw.startswith("+++ b/")
+                     or (raw.startswith("@@ ") and " @@" in raw))
+            )
+            if is_inline_diff:
+                wrapped = textwrap.wrap(
+                    "  " + raw, width=max(1, width),
+                    replace_whitespace=False, drop_whitespace=False,
+                    break_long_words=True, break_on_hyphens=False) or ["  "]
+                for w in wrapped:
+                    chunks.append(
+                        style_unified_diff_line(w, color=self._colors_on()))
+                prefix = "  "
+                continue
             start = len(chunks)
             chunks.extend(textwrap.wrap(
                 prefix + raw, width=max(1, width),
@@ -1469,7 +1822,10 @@ class TuiSession:
 
         header = self.header_lines(width)
         footer = self.telemetry_lines(width)
-        hint = i18n.t("tui.hint_bar", lang=self.lang)
+        hint_key = ("tui.hint_bar_picard"
+                    if bool(getattr(self.cfg, "picard_mode", False))
+                    else "tui.hint_bar")
+        hint = i18n.t(hint_key, lang=self.lang)
         transcript_heading = i18n.t("tui.transcript", lang=self.lang)
         max_prompt_rows = max(
             1, min(MAX_PROMPT_ROWS, height - len(header) - len(footer) - 3))
@@ -1484,6 +1840,15 @@ class TuiSession:
             left = [transcript_heading] + self._transcript_rows(
                 left_width - 1, body_height - 1)
             right = self._sidebar_lines(side_width - 1, body_height)
+            if self.picker_open and self.picker_items:
+                popup = self._picker_popup_lines(left_width - 1)
+                avail_t = max(1, body_height - 1)
+                while len(left) < avail_t + 1:
+                    left.append("")
+                for p_i, p_line in enumerate(popup):
+                    row_slot = max(1, avail_t + 1 - len(popup) + p_i)
+                    if row_slot < len(left):
+                        left[row_slot] = p_line
             body: list[str] = []
             for row in range(body_height):
                 lt = left[row] if row < len(left) else ""
@@ -1496,6 +1861,12 @@ class TuiSession:
             body = [_fit(row, width) for row in body[:body_height]]
             while len(body) < body_height:
                 body.append(_fit("", width))
+            if self.picker_open and self.picker_items:
+                popup = self._picker_popup_lines(width - 1)
+                for p_i, p_line in enumerate(popup):
+                    row_slot = max(1, body_height - len(popup) + p_i)
+                    if row_slot < len(body):
+                        body[row_slot] = _fit(p_line, width)
 
         lines = [_fit(row, width) for row in header]
         lines.extend(body)
@@ -1543,7 +1914,14 @@ class TuiSession:
             self._headless_activity_sent = len(self.activity)
             chunks: list[str] = []
             if new_rows:
-                chunks.append("\n".join(f"{kind}: {text}"
+                def _fmt_headless(kind: str, text: str) -> str:
+                    if kind == "tool_card":
+                        m = re.match(r"^__TOOL_CARD__:(\d+)$", str(text).strip())
+                        card = self.get_tool_card(int(m.group(1))) if m else None
+                        if card is not None:
+                            return f"tool_card: {self._render_tool_card_text(card)}"
+                    return f"{kind}: {text}"
+                chunks.append("\n".join(_fmt_headless(kind, text)
                                         for kind, text in new_rows))
             if new_activity:
                 chunks.append("\n".join(f"activity: {row}"
@@ -1685,6 +2063,49 @@ class TuiSession:
             if fields.get("file") and fields.get("file") not in detail:
                 detail = f"{fields['file']} {detail}".strip()
             self.activity.append(f"{action} {detail}".rstrip())
+            now_t = time.monotonic()
+            dur_ms = _as_int(fields.get("duration_ms"),
+                             max(1, int((now_t - self._last_step_t) * 1000)))
+            self._last_step_t = now_t
+            ok = not bool(fields.get("error", False))
+            output = str(fields.get("output") or fields.get("preview")
+                         or fields.get("obs") or "")
+            if not output and fields.get("obs_chars"):
+                output = f"({int(fields['obs_chars'])} chars observed)"
+            self.add_tool_card(action, detail, ok=ok, duration_ms=dur_ms,
+                               output=output)
+        elif kind == "tool_call":
+            name = str(fields.get("name") or fields.get("action") or "tool")
+            args = str(fields.get("args") or fields.get("detail") or "")
+            call_id = str(fields.get("id") or f"tc-{len(self.tool_cards) + 1}")
+            self.activity.append(f"{name} {args}".rstrip())
+            card = self.add_tool_card(name, args, ok=True, duration_ms=0,
+                                      output="")
+            self._tool_call_starts[call_id] = (time.monotonic(), card["id"])
+        elif kind == "tool_result":
+            call_id = str(fields.get("id") or "")
+            name = str(fields.get("name") or "tool")
+            ok = bool(fields.get("ok", True))
+            preview = str(fields.get("preview") or fields.get("output") or "")
+            dur_ms = _as_int(fields.get("duration_ms"), 0)
+            started = self._tool_call_starts.pop(call_id, None)
+            if started is not None:
+                t0, cid = started
+                if not dur_ms:
+                    dur_ms = max(1, int((time.monotonic() - t0) * 1000))
+                card = self.get_tool_card(cid)
+                if card is not None:
+                    card["ok"] = ok
+                    card["duration_ms"] = dur_ms
+                    if preview:
+                        card["output"] = _untrusted_text(preview)
+            else:
+                self.add_tool_card(name, str(fields.get("args") or ""),
+                                   ok=ok, duration_ms=dur_ms, output=preview)
+        elif kind == "tests":
+            self._tests_ran_flag = True
+        elif kind == "tests_not_run":
+            self._tests_not_run_flag = True
         elif kind == "call":
             self._stream_status = ""
             self._stream_phase = ""
@@ -1740,17 +2161,30 @@ class TuiSession:
             errors = _as_int(fields.get("errors"))
             warnings = _as_int(fields.get("warnings"))
             mark = "\u2713" if not errors else "\u2717"
+            task_check = str(fields.get("task") or self._current_task_text or "")
+            skipped_shell = bool(fields.get("tests_skipped")) or (
+                not bool(getattr(self.cfg, "allow_shell", False))
+                and not self._tests_ran_flag
+                and (bool(loop._task_named_tests(task_check))
+                     or self._tests_not_run_flag)
+            )
+            skipped_note = (
+                " \u2014 " + i18n.t("tui.verify.tests_skipped_shell",
+                                   lang=self.lang)
+                if skipped_shell else ""
+            )
             text = (f"{mark} verify: {errors} error(s), "
-                    f"{warnings} warning(s)")
+                    f"{warnings} warning(s){skipped_note}")
             self.activity.append(text)
             self._append(f"verification: {errors} error(s), "
-                         f"{warnings} warning(s)", "receipt")
+                         f"{warnings} warning(s){skipped_note}", "receipt")
         elif kind == "fold":
             n = _as_int(fields.get("n"), self.folds + 1)
             self.folds = max(self.folds + 1, n)
             self.activity.append(f"fold {self.folds} (context compacted)")
         elif kind == "task":
             title = str(fields.get("task") or fields.get("title") or "task")
+            self._current_task_text = title
             self.activity.append(f"task: {title}")
         elif kind == "command":
             cmd = str(fields.get("cmd") or fields.get("command") or "")
@@ -1862,8 +2296,11 @@ class TuiSession:
         if pattern:
             opts += " / " + i18n.t("tui.perm.allow_project", lang=self.lang,
                                    pattern=pattern)
+        allow_cue = ("Make it so?"
+                     if bool(getattr(self.cfg, "picard_mode", False))
+                     else "Allow?")
         banner = (f"[Permission Required: {category} ({label}) "
-                  f"\u2014 {detail[:160]}] Allow? ({opts}):")
+                  f"\u2014 {detail[:160]}] {allow_cue} ({opts}):")
         self._set_banner(banner)
         self._append(banner, "activity")
         self._redraw(force=True)
@@ -2080,12 +2517,14 @@ class TuiSession:
                 if key == "ESC" and len(self._raw_buf) == 1:
                     if self._read_raw_chunk(0.012):
                         continue
-                if key in ("WHEEL_UP", "WHEEL_DOWN"):
+                if key in ("WHEEL_UP", "WHEEL_DOWN", "MOUSE_CLICK"):
                     match = _SGR_MOUSE_RE.match(self._raw_buf)
                     if match:
                         self._last_mouse_col = int(match.group(2))
+                        self._last_mouse_row = int(match.group(3))
                     else:
                         self._last_mouse_col = 0
+                        self._last_mouse_row = 0
                 self._raw_buf = self._raw_buf[used:]
                 return key
             remaining = deadline - time.monotonic()
@@ -2154,6 +2593,7 @@ class TuiSession:
         self.input_buf = (self.input_buf[:pos] + text
                           + self.input_buf[pos:])
         self.cursor_pos = pos + len(text)
+        self._sync_picker()
         self._dirty = True
 
     def _history_prev(self) -> None:
@@ -2188,6 +2628,10 @@ class TuiSession:
         line = self.input_buf.strip()
         self.input_buf = ""
         self.cursor_pos = 0
+        self.picker_open = False
+        self.picker_items = []
+        self.picker_index = 0
+        self._picker_dismissed_at = None
         self.scroll_offset = 0
         self.sidebar_scroll_offset = 0
         self._history_pos = len(self.command_history)
@@ -2244,6 +2688,302 @@ class TuiSession:
         self.cursor_pos = len(self.input_buf)
         self._dirty = True
 
+    def _collect_picker_candidates(self) -> list[dict]:
+        """Collect project files, symbols, and local images for the `@` picker."""
+        now = time.monotonic()
+        cached = self._picker_candidates_cache
+        if cached is not None and now - cached[0] < 1.5:
+            return cached[1]
+
+        candidates: list[dict] = []
+        seen_values: set[str] = set()
+        files = select_mod._workspace_files(self.root, self.idx)
+        for rel in files:
+            norm = str(rel).replace("\\", "/")
+            if not norm or norm in seen_values:
+                continue
+            seen_values.add(norm)
+            ext = Path(norm).suffix.lower()
+            if ext in _PICKER_IMAGE_EXTS:
+                candidates.append({
+                    "kind": "image",
+                    "value": norm,
+                    "label": f"[img] {norm}",
+                    "detail": "image",
+                })
+            else:
+                candidates.append({
+                    "kind": "file",
+                    "value": norm,
+                    "label": norm,
+                    "detail": "file",
+                })
+
+        # Also check any top-level/workspace image files that might not be in index.files
+        try:
+            matcher = select_mod.Matcher.from_files(self.root)
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                d = Path(dirpath)
+                base = "" if d == self.root else d.relative_to(self.root).as_posix()
+                dirnames[:] = [
+                    name for name in dirnames
+                    if not select_mod.is_venv_dir(d / name)
+                    and not matcher.prunable_dir(f"{base}/{name}" if base else name)
+                ]
+                for fname in sorted(filenames):
+                    if Path(fname).suffix.lower() not in _PICKER_IMAGE_EXTS:
+                        continue
+                    rel_img = f"{base}/{fname}" if base else fname
+                    if rel_img in seen_values or matcher.excluded(rel_img):
+                        continue
+                    seen_values.add(rel_img)
+                    candidates.append({
+                        "kind": "image",
+                        "value": rel_img,
+                        "label": f"[img] {rel_img}",
+                        "detail": "image",
+                    })
+        except OSError:
+            pass
+
+        # Symbols from index or workspace AST scan
+        try:
+            records = select_mod._symbol_records(self.root, self.idx)
+        except Exception:
+            records = []
+        for chunk in records[:800]:
+            c_file = str(getattr(chunk, "file", "") or "").replace("\\", "/")
+            qual = str(getattr(chunk, "qualname", "") or "").strip()
+            c_kind = str(getattr(chunk, "kind", "symbol") or "symbol")
+            if not c_file or not qual or c_kind == "module":
+                continue
+            val = f"{c_file}:{qual}"
+            if val in seen_values:
+                continue
+            seen_values.add(val)
+            candidates.append({
+                "kind": "symbol",
+                "value": val,
+                "label": f"{c_file}:{qual}",
+                "detail": c_kind,
+            })
+
+        self._picker_candidates_cache = (now, candidates)
+        return candidates
+
+    def _sync_picker(self) -> None:
+        """Update the `@` fuzzy picker popup state from `input_buf` and `cursor_pos`."""
+        extracted = extract_at_query(self.input_buf, self.cursor_pos)
+        if extracted is None:
+            self.picker_open = False
+            self.picker_query = ""
+            self.picker_items = []
+            self.picker_index = 0
+            self._picker_dismissed_at = None
+            return
+        at_start, _end, query = extracted
+        if self._picker_dismissed_at == at_start:
+            self.picker_open = False
+            return
+        self._picker_dismissed_at = None
+        candidates = self._collect_picker_candidates()
+        ranked = fuzzy_rank_picker_candidates(query, candidates, limit=6)
+        if not ranked:
+            self.picker_open = False
+            self.picker_query = query
+            self.picker_items = []
+            self.picker_index = 0
+            return
+        if not self.picker_open or query != self.picker_query:
+            self.picker_index = 0
+        self.picker_query = query
+        self.picker_items = ranked
+        self.picker_index = max(0, min(self.picker_index, len(ranked) - 1))
+        self.picker_open = True
+
+    def picker_state(self) -> dict:
+        """Pure snapshot of the `@` fuzzy picker popup state for deterministic tests."""
+        return {
+            "open": bool(self.picker_open),
+            "query": str(self.picker_query),
+            "index": int(self.picker_index),
+            "items": list(self.picker_items),
+            "selected": (self.picker_items[self.picker_index]
+                         if self.picker_open and 0 <= self.picker_index < len(self.picker_items)
+                         else None),
+        }
+
+    def picker_move(self, delta: int) -> int:
+        """Move the `@` fuzzy picker selection up (-1) or down (+1)."""
+        if not self.picker_open or not self.picker_items:
+            return 0
+        n = len(self.picker_items)
+        self.picker_index = (self.picker_index + int(delta)) % n
+        self._dirty = True
+        return self.picker_index
+
+    def picker_dismiss(self) -> None:
+        """Dismiss the `@` fuzzy picker cleanly (Esc)."""
+        extracted = extract_at_query(self.input_buf, self.cursor_pos)
+        if extracted is not None:
+            self._picker_dismissed_at = extracted[0]
+        self.picker_open = False
+        self.picker_items = []
+        self.picker_index = 0
+        self._dirty = True
+
+    def picker_accept(self) -> str | None:
+        """Insert the selected `@<path>` or `@<file>:<symbol>` into `input_buf`."""
+        if not self.picker_open or not self.picker_items:
+            return None
+        idx = max(0, min(self.picker_index, len(self.picker_items) - 1))
+        chosen = self.picker_items[idx]
+        value = str(chosen.get("value") or "").strip()
+        if not value:
+            self.picker_dismiss()
+            return None
+        extracted = extract_at_query(self.input_buf, self.cursor_pos)
+        if extracted is None:
+            self.picker_dismiss()
+            return None
+        at_start, cur_end, _query = extracted
+        replacement = f"@{value} "
+        post = self.input_buf[cur_end:]
+        if post.startswith(" "):
+            replacement = f"@{value}"
+        self.input_buf = self.input_buf[:at_start] + replacement + post
+        self.cursor_pos = at_start + len(replacement)
+        self.picker_open = False
+        self.picker_items = []
+        self.picker_index = 0
+        self._picker_dismissed_at = None
+        self._dirty = True
+        return value
+
+    def _picker_popup_lines(self, width: int) -> list[str]:
+        """Render the 6-row inline `@` fuzzy dropdown overlay."""
+        items = self.picker_items[:6]
+        lines: list[str] = []
+        for idx, item in enumerate(items):
+            selected = idx == self.picker_index
+            marker = "\u25b8 " if selected else "  "
+            kind = str(item.get("kind") or "file")
+            badge = {"file": "[file]", "symbol": "[sym]", "image": "[img]"}.get(
+                kind, f"[{kind}]")
+            val = str(item.get("value") or "")
+            raw_row = f"  {marker}{badge:<6} @{val}"
+            cut = _truncate_visible(raw_row, max(10, width - 1))
+            if selected:
+                lines.append(self._style(cut, "accent", bold=True))
+            else:
+                lines.append(self._style(cut, "muted"))
+        return lines
+
+    def handle_mouse_click(self, col: int, row: int) -> str | None:
+        """Map 1-based SGR mouse `(col, row)` coordinates to clickable UI zones.
+
+        Zones:
+          - `"lang_badge"`: toggles EN <-> ES on header line 2 `[EN|es]` / `[en|ES]`
+          - `"sidebar_toggle"`: toggles sidebar on header line 2 `sidebar: on|off`
+          - `"sidebar_tab:<tab>"`: switches/scrolls sidebar section when clicking
+            sidebar headers (`ACTIVITY & PLAN`, `PLAN:`, `LIVE ACTIVITY`, `MODIFIED FILES`)
+          - `"tool_card:<id>"`: toggles expand/collapse on a tool-call card row
+          - `"scrollbar_up"` / `"scrollbar_down"`: clicks near the transcript right edge
+        """
+        width, height = self._size()
+        col = max(1, int(col))
+        row = max(1, int(row))
+        show_sidebar = self._show_sidebar(width)
+        side_width = min(46, max(32, width // 3)) if show_sidebar else 0
+        left_width = (width - side_width - 1) if show_sidebar else width
+
+        # Header line 2 (1-based row 2): [EN|es] language badge & sidebar toggle
+        if row == 2:
+            raw_h2 = _ANSI_RE.sub("", self.header_lines(width)[1])
+            for pill in ("[EN|es]", "[en|ES]"):
+                idx = raw_h2.find(pill)
+                if idx != -1:
+                    lang_label = i18n.t("tui.header.lang", lang=self.lang)
+                    lbl_idx = raw_h2.find(lang_label + ":")
+                    start_c = (lbl_idx + 1) if lbl_idx != -1 else (idx + 1)
+                    end_c = idx + len(pill) + 1
+                    if start_c <= col <= end_c:
+                        self._toggle_lang()
+                        return "lang_badge"
+            sb_label = i18n.t("tui.header.sidebar", lang=self.lang) + ":"
+            sb_idx = raw_h2.find(sb_label)
+            if sb_idx != -1 and (sb_idx + 1) <= col <= (sb_idx + len(sb_label) + 5):
+                self.sidebar = not self.sidebar
+                self._dirty = True
+                return "sidebar_toggle"
+
+        body_top = 3
+        body_h = self._body_height(height)
+        body_bottom = body_top + body_h - 1
+        if not (body_top <= row <= body_bottom):
+            return None
+
+        # Sidebar click zones
+        if show_sidebar and col >= left_width + 2:
+            vis_side = self._sidebar_lines(side_width - 1, body_h)
+            s_idx = row - body_top
+            clicked_line = _ANSI_RE.sub("", vis_side[s_idx]).strip() \
+                if 0 <= s_idx < len(vis_side) else ""
+            title_lbl = i18n.t("tui.sidebar.title", lang=self.lang)
+            act_lbl = i18n.t("tui.sidebar.activity", lang=self.lang)
+            mod_lbl = i18n.t("tui.sidebar.modified", lang=self.lang)
+            if clicked_line.startswith(title_lbl):
+                order = ("all", "plan", "activity", "files")
+                cur = str(getattr(self, "sidebar_tab", "all") or "all")
+                nxt = order[(order.index(cur) + 1) % len(order)] \
+                    if cur in order else "all"
+                self.sidebar_tab = nxt
+                self.sidebar_scroll_offset = 0
+                self._dirty = True
+                return f"sidebar_tab:{nxt}"
+            if clicked_line.startswith("PLAN:"):
+                self.sidebar_tab = "plan" if self.sidebar_tab != "plan" else "all"
+                self.sidebar_scroll_offset = 0
+                self._dirty = True
+                return f"sidebar_tab:{self.sidebar_tab}"
+            if clicked_line.startswith(act_lbl):
+                self.sidebar_tab = "activity" if self.sidebar_tab != "activity" else "all"
+                self.sidebar_scroll_offset = 0
+                self._dirty = True
+                return f"sidebar_tab:{self.sidebar_tab}"
+            if clicked_line.startswith(mod_lbl):
+                self.sidebar_tab = "files" if self.sidebar_tab != "files" else "all"
+                self.sidebar_scroll_offset = 0
+                self._dirty = True
+                return f"sidebar_tab:{self.sidebar_tab}"
+            return "sidebar"
+
+        # Transcript pane (rows body_top + 1 .. body_bottom)
+        if row == body_top:
+            return "transcript_header"
+        t_row_idx = row - (body_top + 1)
+        t_height = max(1, body_h - 1)
+        t_width = left_width - 1
+
+        # Rightmost column of transcript pane acts as a clickable scrollbar
+        if col in (left_width, left_width + 1):
+            half = max(1, t_height // 2)
+            if t_row_idx < t_height // 2:
+                self.scroll_transcript(half)
+                return "scrollbar_up"
+            self.scroll_transcript(-half)
+            return "scrollbar_down"
+
+        vis_rows = self._transcript_rows(t_width, t_height)
+        if 0 <= t_row_idx < len(vis_rows):
+            plain = _ANSI_RE.sub("", vis_rows[t_row_idx])
+            m = _TOOL_CARD_ID_RE.match(plain)
+            if m:
+                cid = int(m.group(1))
+                if self.toggle_tool_card(cid):
+                    return f"tool_card:{cid}"
+        return None
+
     def _sidebar_column(self, col: int) -> bool:
         width, _height = self._size()
         if not self._show_sidebar(width):
@@ -2263,7 +3003,8 @@ class TuiSession:
         self._dirty = True
         return self.mouse_sgr
 
-    def handle_key(self, key: str, *, col: int | None = None) -> bool:
+    def handle_key(self, key: str, *, col: int | None = None,
+                   row: int | None = None) -> bool:
         """Apply one parsed key event to the prompt or viewport."""
         key = str(key)
         width, height = self._size()
@@ -2277,6 +3018,13 @@ class TuiSession:
             self._toggle_mouse()
         elif key == "F3":
             self._toggle_lang()
+        elif key == "CTRL_O":
+            self.toggle_tool_card()
+        elif key == "MOUSE_CLICK":
+            use_col = self._last_mouse_col if col is None else int(col)
+            use_row = self._last_mouse_row if row is None else int(row)
+            if use_col and use_row:
+                self.handle_mouse_click(use_col, use_row)
         elif key == "PAGE_UP":
             self.scroll_transcript(half)
         elif key == "PAGE_DOWN":
@@ -2303,6 +3051,7 @@ class TuiSession:
                     self.input_buf = (self.input_buf[:start]
                                       + self.input_buf[self.cursor_pos:])
                     self.cursor_pos = start
+                self._sync_picker()
                 self._dirty = True
             else:
                 self.scroll_transcript(half)
@@ -2310,6 +3059,7 @@ class TuiSession:
             if self.input_buf:
                 pos = self.cursor_pos
                 self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
+                self._sync_picker()
                 self._dirty = True
             else:
                 self.scroll_transcript(-half)
@@ -2321,6 +3071,7 @@ class TuiSession:
             elif pos < len(self.input_buf):
                 # At end of a logical line: join with the following line.
                 self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
+            self._sync_picker()
             self._dirty = True
         elif key == "CTRL_L":
             self._dirty = True
@@ -2334,30 +3085,42 @@ class TuiSession:
                 start -= 1
             self.input_buf = self.input_buf[:start] + self.input_buf[pos:]
             self.cursor_pos = start
+            self._sync_picker()
             self._dirty = True
         elif key in ("SHIFT_ENTER", "ALT_ENTER", "CTRL_J"):
             self._insert_text("\n")
         elif key == "ENTER":
-            cont_idx = self._has_line_continuation()
-            if cont_idx is not None:
-                self.input_buf = (self.input_buf[:cont_idx] + "\n"
-                                  + self.input_buf[cont_idx + 1:])
-                self.cursor_pos = cont_idx + 1
-                self._dirty = True
+            if self.picker_open and self.picker_items:
+                self.picker_accept()
             else:
-                self._submit_input()
+                cont_idx = self._has_line_continuation()
+                if cont_idx is not None:
+                    self.input_buf = (self.input_buf[:cont_idx] + "\n"
+                                      + self.input_buf[cont_idx + 1:])
+                    self.cursor_pos = cont_idx + 1
+                    self._sync_picker()
+                    self._dirty = True
+                else:
+                    self._submit_input()
         elif key in ("PASTE_START", "PASTE_END"):
             pass
         elif key == "TAB":
-            self._complete()
+            if self.picker_open and self.picker_items:
+                self.picker_accept()
+            else:
+                self._complete()
         elif key == "ESC":
-            if self.input_buf:
+            if self.picker_open:
+                self.picker_dismiss()
+            elif self.input_buf:
                 self._dirty = True
             else:
                 self.scroll_to_bottom()
                 self.sidebar_scroll_offset = 0
         elif key == "UP":
-            if "\n" in self.input_buf:
+            if self.picker_open and self.picker_items:
+                self.picker_move(-1)
+            elif "\n" in self.input_buf:
                 line_idx, line_col, lines = self._cursor_line_col()
                 if line_idx > 0:
                     target_col = (self._preferred_col
@@ -2366,6 +3129,7 @@ class TuiSession:
                     self._preferred_col = target_col
                     self.cursor_pos = self._offset_for_line_col(
                         lines, line_idx - 1, target_col)
+                    self._sync_picker()
                     self._dirty = True
                 else:
                     self._preferred_col = None
@@ -2375,7 +3139,9 @@ class TuiSession:
             else:
                 self._history_prev()
         elif key == "DOWN":
-            if "\n" in self.input_buf:
+            if self.picker_open and self.picker_items:
+                self.picker_move(1)
+            elif "\n" in self.input_buf:
                 line_idx, line_col, lines = self._cursor_line_col()
                 if line_idx < len(lines) - 1:
                     target_col = (self._preferred_col
@@ -2384,6 +3150,7 @@ class TuiSession:
                     self._preferred_col = target_col
                     self.cursor_pos = self._offset_for_line_col(
                         lines, line_idx + 1, target_col)
+                    self._sync_picker()
                     self._dirty = True
                 else:
                     self._preferred_col = None
@@ -2394,35 +3161,42 @@ class TuiSession:
                 self._history_next()
         elif key == "LEFT":
             self.cursor_pos = max(0, self.cursor_pos - 1)
+            self._sync_picker()
             self._dirty = True
         elif key == "RIGHT":
             self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
+            self._sync_picker()
             self._dirty = True
         elif key == "HOME":
             start, _end = self._line_bounds()
             self.cursor_pos = start
+            self._sync_picker()
             self._dirty = True
         elif key == "END":
             _start, end = self._line_bounds()
             self.cursor_pos = end
             self.scroll_offset = 0
             self.sidebar_scroll_offset = 0
+            self._sync_picker()
             self._dirty = True
         elif key == "BACKSPACE":
             if self.cursor_pos > 0:
                 pos = self.cursor_pos
                 self.input_buf = self.input_buf[:pos - 1] + self.input_buf[pos:]
                 self.cursor_pos = pos - 1
+                self._sync_picker()
                 self._dirty = True
         elif key == "DELETE":
             pos = self.cursor_pos
             if pos < len(self.input_buf):
                 self.input_buf = self.input_buf[:pos] + self.input_buf[pos + 1:]
+                self._sync_picker()
                 self._dirty = True
         elif key == "CTRL_C":
             if self.input_buf:
                 self.input_buf = ""
                 self.cursor_pos = 0
+                self._sync_picker()
                 self._dirty = True
         elif len(key) == 1 and key >= " ":
             self._insert_text(key)
@@ -2432,17 +3206,21 @@ class TuiSession:
             self._dirty = True
         return handled
 
-    def feed_key_event(self, key: str, *, col: int | None = None) -> bool:
-        return self.handle_key(key, col=col)
+    def feed_key_event(self, key: str, *, col: int | None = None,
+                       row: int | None = None) -> bool:
+        return self.handle_key(key, col=col, row=row)
 
-    def feed_key(self, key: str, *, col: int | None = None) -> bool:
-        return self.handle_key(key, col=col)
+    def feed_key(self, key: str, *, col: int | None = None,
+                 row: int | None = None) -> bool:
+        return self.handle_key(key, col=col, row=row)
 
-    def handle_key_event(self, key: str, *, col: int | None = None) -> bool:
+    def handle_key_event(self, key: str, *, col: int | None = None,
+                         row: int | None = None) -> bool:
         """Alias used by programmatic drivers and tests."""
-        return self.handle_key(key, col=col)
+        return self.handle_key(key, col=col, row=row)
 
-    def feed_keys(self, keys, *, col: int | None = None) -> str:
+    def feed_keys(self, keys, *, col: int | None = None,
+                  row: int | None = None) -> str:
         """Apply key names, raw escape sequences or literal text in order."""
         if isinstance(keys, str):
             if keys in _KNOWN_KEYS or keys.startswith("ALT_"):
@@ -2452,7 +3230,7 @@ class TuiSession:
         for item in keys:
             item = str(item)
             if item in _KNOWN_KEYS or item.startswith("ALT_") or len(item) <= 1:
-                self.handle_key(item, col=col)
+                self.handle_key(item, col=col, row=row)
             elif item.startswith("\x1b") or item.startswith("\x00") \
                     or item.startswith("\xe0"):
                 raw = item
@@ -2472,7 +3250,9 @@ class TuiSession:
                             raw = ""
                         continue
                     self.handle_key(
-                        key, col=(int(mouse.group(2)) if mouse else col))
+                        key,
+                        col=(int(mouse.group(2)) if mouse else col),
+                        row=(int(mouse.group(3)) if mouse else row))
                     raw = raw[used:]
             else:
                 for char in item:
@@ -2702,6 +3482,14 @@ class TuiSession:
             self._append("tests: GREEN", "receipt")
         elif tests_ok is False:
             self._append("tests: RED", "error")
+        elif (not bool(getattr(self.cfg, "allow_shell", False))
+              and not self._tests_ran_flag
+              and (bool(loop._task_named_tests(task))
+                   or self._tests_not_run_flag)):
+            skipped_lbl = i18n.t("tui.verify.tests_skipped_shell",
+                                 lang=self.lang)
+            if not any(skipped_lbl in line for _k, line in self.transcript[-6:]):
+                self._append(skipped_lbl, "receipt")
         for finding in field(tr, "findings", []) or []:
             if field(finding, "severity", "error") == "error":
                 render = field(finding, "render")
@@ -3008,6 +3796,9 @@ class TuiSession:
         """Run one plain-text coding task, keeping the UI live while it runs."""
         self._context_override = None
         self._event_active = ""
+        self._current_task_text = str(task or "")
+        self._tests_not_run_flag = False
+        self._tests_ran_flag = False
         run_images = self._collect_task_images(task)
         if run_images:
             names = ", ".join(img.get("name", "image") for img in run_images)
@@ -3087,7 +3878,11 @@ class TuiSession:
                          "for one pass)", "system")
             self.run_auto(goal)
             return
-        question = "Run as a single-pass Task instead? [Y/n]:"
+        question = (
+            "Run as a single-pass Task instead? \u2014 Make it so? [Y/n]:"
+            if bool(getattr(self.cfg, "picard_mode", False))
+            else "Run as a single-pass Task instead? [Y/n]:"
+        )
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)
@@ -3341,6 +4136,9 @@ class TuiSession:
         if cmd == "lang":
             self._lang_command(arg)
             return
+        if cmd == "picard":
+            self._picard_command(arg)
+            return
         if cmd == "image":
             self._image_command(arg)
             return
@@ -3455,6 +4253,9 @@ class TuiSession:
         if cmd == "diff":
             self._diff()
             return
+        if cmd == "git":
+            self._git(arg)
+            return
         if cmd == "checkpoints":
             self._checkpoints(arg)
             return
@@ -3473,6 +4274,12 @@ class TuiSession:
         if cmd == "update":
             self._update(arg)
             return
+        if cmd == "expand":
+            self._expand_command(arg, expand=True)
+            return
+        if cmd == "collapse":
+            self._expand_command(arg, expand=False)
+            return
         if cmd == "reset":
             self._reset()
             return
@@ -3487,6 +4294,8 @@ class TuiSession:
             return
         if cmd == "clear":
             self.transcript = []
+            self.tool_cards = []
+            self._tool_call_starts.clear()
             self._headless_sent = 0
             self.scroll_offset = 0
             self._scroll_seen_total = 0
@@ -3499,31 +4308,44 @@ class TuiSession:
     def status_report(self) -> str:
         t = self.telemetry()
         bar, _color, state = _meter(t["context_utilization_pct"], 16)
+        lang = self.lang
+        tr = lambda key, **kw: i18n.t(f"tui.status.{key}", lang=lang, **kw)  # noqa: E731
+        writes_val = tr("writes_on") if self.apply else tr("writes_off")
+        creative_val = (
+            "ON" if getattr(self.cfg, "creative_mode", False)
+            else ("auto" if getattr(self.cfg, "creative_auto", True) else "off")
+        )
+        route_val = "ON" if getattr(self.cfg, "auto_route_specialties", False) else "OFF"
+        think_val = "off" if getattr(self.cfg, "disable_thinking", False) else "on"
+        effort_val = getattr(self.cfg, "reasoning_effort", "default") or "default"
+        streams_val = getattr(self.cfg, "max_concurrency", 0) or "auto"
         lines = [
-            "Pedacito TUI telemetry",
-            f"  profile : {self.profile}",
-            f"  model   : {getattr(self.cfg, 'model', '?')}",
-            f"  writes  : {'ON' if self.apply else 'off (dry run)'}",
-            f"  creative: {'ON' if getattr(self.cfg, 'creative_mode', False) else ('auto' if getattr(self.cfg, 'creative_auto', True) else 'off')}",
-            f"  context : [{bar}] {t['context_utilization_pct']:.1f}% "
+            tr("title"),
+            f"  {tr('profile'):<8}: {self.profile}",
+            f"  {tr('model'):<8}: {getattr(self.cfg, 'model', '?')}",
+            f"  {tr('writes'):<8}: {writes_val}",
+            f"  {tr('creative'):<8}: {creative_val}",
+            f"  {tr('context'):<8}: [{bar}] {t['context_utilization_pct']:.1f}% "
             f"({t['last_prompt_tokens']:,} / {t['context_tokens']:,})"
             + ("  HIGH" if state == "high" else ""),
-            f"  turn    : +{t['last_prompt_tokens']:,} in / "
+            f"  {tr('turn'):<8}: +{t['last_prompt_tokens']:,} in / "
             f"+{t['last_completion_tokens']:,} out",
-            f"  session : {t['session_prompt_tokens']:,} in / "
+            f"  {tr('session'):<8}: {t['session_prompt_tokens']:,} in / "
             f"{t['session_completion_tokens']:,} out",
-            f"  speed   : {t['last_tok_per_s']:.1f} tok/s last turn, "
-            f"{t['avg_tok_per_s']:.1f} tok/s session average",
-            f"  cache   : {t['cache_hit_pct']:.1f}% KV cache hit",
-            f"  folds   : {t['folds']}",
-            f"  active  : {_active_label(t['active_model_role'])}",
-            f"  routing : Auto-Route "
-            f"{'ON' if getattr(self.cfg, 'auto_route_specialties', False) else 'OFF'}"
-            f", thinking {'off' if getattr(self.cfg, 'disable_thinking', False) else 'on'}",
-            f"  class   : {self._model_class()}"
-            f", effort {getattr(self.cfg, 'reasoning_effort', 'default') or 'default'}"
-            f", streams {getattr(self.cfg, 'max_concurrency', 0) or 'auto'}",
-            f"  mode    : {getattr(self.cfg, 'execution_mode', 'two_phase') or 'two_phase'}"
+            f"  {tr('speed'):<8}: "
+            + tr("speed_value",
+                 last=f"{t['last_tok_per_s']:.1f}",
+                 avg=f"{t['avg_tok_per_s']:.1f}"),
+            f"  {tr('cache'):<8}: "
+            + tr("cache_value", pct=f"{t['cache_hit_pct']:.1f}"),
+            f"  {tr('folds'):<8}: {t['folds']}",
+            f"  {tr('active'):<8}: {_active_label(t['active_model_role'])}",
+            f"  {tr('routing'):<8}: "
+            + tr("routing_value", route=route_val, think=think_val),
+            f"  {tr('class'):<8}: "
+            + tr("class_value", klass=self._model_class(),
+                 effort=effort_val, streams=streams_val),
+            f"  {tr('mode'):<8}: {getattr(self.cfg, 'execution_mode', 'two_phase') or 'two_phase'}"
             f" \u2192 {self._resolved_execution_mode()}",
         ]
         card = getattr(self.cfg, "_card", None)
@@ -3534,19 +4356,23 @@ class TuiSession:
                 card = None
         if isinstance(card, dict):
             score = (card.get("measured") or {}).get("overall")
-            lines.append(f"  model card: {score if score is not None else '?'}"
-                         " / 10 (calibrated)")
+            score_txt = score if score is not None else "?"
+            lines.append(
+                f"  {tr('model_card')}: "
+                + tr("model_card_calibrated", score=score_txt))
         else:
-            lines.append("  model card: none (run `pedacito calibrate`)")
+            lines.append(f"  {tr('model_card')}: {tr('model_card_none')}")
         try:
             specs = roles_mod.specialties_for(
                 self.cfg, getattr(self.cfg, "active_profile", "") or "")
         except Exception:
             specs = ()
-        lines.append("  specialties: " + (", ".join(specs) if specs else "(none)"))
+        lines.append(
+            f"  {tr('specialties')}: "
+            + (", ".join(specs) if specs else tr("none")))
         stats = t.get("stats") if isinstance(t.get("stats"), dict) else {}
         by_site = stats.get("by_site") if isinstance(stats, dict) else {}
-        lines.append("  per-call-site tokens:")
+        lines.append(f"  {tr('by_site')}")
         if isinstance(by_site, dict) and by_site:
             for site, row in sorted(by_site.items()):
                 row = row if isinstance(row, dict) else {}
@@ -3556,7 +4382,7 @@ class TuiSession:
                     f"{_as_int(row.get('completion_tokens')):>7,} out  "
                     f"{_as_int(row.get('cached_tokens')):>8,} cached")
         else:
-            lines.append("    (no model calls yet)")
+            lines.append(f"    {tr('no_calls')}")
         return "\n".join(lines)
 
     def _model_class(self) -> str:
@@ -4539,6 +5365,69 @@ class TuiSession:
             return
         self._append("No git changes or backup snapshots to show.", "system")
 
+    def _git(self, arg: str = "") -> None:
+        """`/git [status|stage PATH|unstage PATH|commit [MSG]|branch NAME]`."""
+        text = str(arg or "").strip()
+        sub, _, rest = text.partition(" ")
+        sub = sub.lower() or "status"
+        rest = rest.strip()
+        try:
+            if sub == "status":
+                st = gitops.status_hunks(self.root)
+                if not st["dirty"]:
+                    self._append(f"git: branch {st['branch'] or '?'} is clean "
+                                 "(nothing to commit)", "system")
+                    return
+                self._append(f"git: branch {st['branch'] or '?'}", "system")
+                for label in ("staged", "unstaged", "untracked", "conflicts"):
+                    for path in st[label]:
+                        self._append(f"  {label:<9} {path}", "diff")
+                return
+            if sub in ("stage", "add", "unstage", "reset"):
+                if not rest:
+                    self._append(f"Usage: /git {sub} PATH", "error")
+                    return
+                if sub in ("stage", "add"):
+                    result = gitops.stage_files(self.root, [rest])
+                    self._append("git: staged " + ", ".join(result["staged"]),
+                                 "system")
+                else:
+                    result = gitops.unstage_files(self.root, [rest])
+                    self._append("git: unstaged "
+                                 + ", ".join(result["unstaged"]), "system")
+                return
+            if sub == "commit":
+                findings = gitops.scan_staged_secrets(self.root)
+                if findings:
+                    self._append("git: refusing to commit; the staged diff "
+                                 "contains possible secrets. Run /security to "
+                                 "review them.", "error")
+                    for finding in findings[:5]:
+                        self._append(
+                            f"  {finding.kind} {finding.file}:{finding.line} "
+                            f"{finding.masked_preview}", "error")
+                    return
+                message = rest or gitops.draft_commit_message(self.root)
+                result = gitops.create_commit(self.root, message)
+                sha = str(result.get("commit") or "")[:12]
+                self._append(f"git: committed {sha} {result['message']}",
+                             "system")
+                self._append("Nothing was pushed; push when ready.",
+                             "system")
+                return
+            if sub == "branch":
+                if not rest:
+                    self._append("Usage: /git branch NAME", "error")
+                    return
+                result = gitops.create_branch(self.root, rest)
+                self._append("git: created and switched to branch "
+                             + result["branch"], "system")
+                return
+            self._append("Usage: /git [status|stage PATH|unstage PATH|"
+                         "commit [MSG]|branch NAME]", "error")
+        except (gitops.GitOpsError, OSError) as exc:
+            self._append(f"git: {exc}", "error")
+
     def _checkpoints(self, arg: str = "") -> None:
         limit = 0
         text = str(arg or "").strip()
@@ -4723,6 +5612,15 @@ class TuiSession:
                          "system")
 
     def _confirm(self, question: str) -> bool:
+        if bool(getattr(self.cfg, "picard_mode", False)):
+            if re.search(r"[\(\[]y/N[\)\]]", question):
+                question = re.sub(
+                    r"\s*[\(\[]y/N[\)\]]\s*:?\s*$",
+                    " Make it so? [y/N]:",
+                    question,
+                )
+            elif "Make it so?" not in question:
+                question = question.rstrip(" :") + " \u2014 Make it so? [y/N]:"
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)
@@ -4908,7 +5806,44 @@ class TuiSession:
                     pass
         finally:
             self.close()
+            if not self.headless and bool(
+                getattr(self.cfg, "show_update_reminder", True)
+            ):
+                reminder = update_mod.active_dev_reminder(
+                    self.cfg, lang=self.lang)
+                if reminder:
+                    self._write(reminder + "\n")
         return 0
+
+    def _picard_command(self, arg: str) -> None:
+        """`/picard [on|off]`: toggle Captain Picard Mode live."""
+        raw = str(arg or "").strip().lower()
+        cur = bool(getattr(self.cfg, "picard_mode", False))
+        if raw in ("", "toggle"):
+            nxt = not cur
+        elif raw in ("on", "true", "yes", "1", "engage"):
+            nxt = True
+        elif raw in ("off", "false", "no", "0"):
+            nxt = False
+        else:
+            self._append(i18n.t("tui.picard.usage", lang=self.lang), "error")
+            return
+        self.cfg.picard_mode = nxt
+        try:
+            self.cfg.sources["picard_mode"] = "tui /picard"
+        except Exception:
+            pass
+        if nxt:
+            self._append(
+                i18n.t("tui.picard.on", lang=self.lang),
+                "system",
+            )
+        else:
+            self._append(
+                i18n.t("tui.picard.off", lang=self.lang),
+                "system",
+            )
+        self._dirty = True
 
     def _set_lang(self, new_lang: str, *, persist: bool = True) -> str:
         """Switch the TUI's active interface language, persist it, and log a notice."""

@@ -20,7 +20,8 @@ from pedacito import cli, events, index as index_mod  # noqa: E402
 from pedacito.config import Config  # noqa: E402
 
 KEYS = {"ok", "model", "provider", "turns", "elapsed_sec", "tokens",
-        "files_changed", "verify_passed", "diff", "diff_truncated"}
+        "files_changed", "verify_passed", "diff", "diff_truncated",
+        "sandbox_effective"}
 TOKEN_KEYS = {"prompt", "completion", "tok_per_sec"}
 
 REPLY = ("Raised the limit.\n\n--- FILE: app.py\n<<<<<<< SEARCH\n"

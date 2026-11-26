@@ -44,7 +44,8 @@ def _save_card(model, url, overall, tok, size, repeats=3, sd=0.0, ts=None):
             "model": model, "url": url,
             "measured": {"overall": overall, "overall_sd": sd,
                          "tok_per_s": tok, "size_bytes": size},
-            "choices": {}, "notes": [], "repeats": repeats, "seconds": 1.0}
+            "choices": {"temperature": 0.3, "temperature_answer": 0.3},
+            "notes": [], "repeats": repeats, "seconds": 1.0}
     modelcard.save_card(card)
 
 

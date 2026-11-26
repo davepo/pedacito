@@ -925,6 +925,37 @@ shows what would go; live git worktrees under `.pedacito/worktrees/` make it
 refuse unless you pass `--force`. `pedacito prune` keeps the newest N sessions,
 backups and event files and trims `log.txt`.
 
+## v0.3.3 modules at a glance
+
+- **`pedacito/gitops.py`** — guided git. Every git call is argv-only. It runs the
+  secret pre-flight scan on the staged diff (commit) or the branch diff (pr) and
+  never pushes or force-pushes. `pedacito commit`, `pedacito pr`, the TUI `/git`
+  and the GUI Git drawer all call the same functions.
+- **`pedacito/acp.py`** — the Agent Client Protocol bridge (`pedacito acp`). It
+  is a JSON-RPC 2.0 framing layer over the warm `rpc.py` engine, so the task
+  logic is not duplicated. `session/update` notifications come from the same
+  event stream that `rpc` emits.
+- **`pedacito/rpc.py`** — `params.question` on `explain`, `--events on|off` and
+  `--describe`. The caller's `id` is kept next to `req_id` on streamed events.
+- **`pedacito/config.py: _endpoint_is_local`** — the single locality predicate
+  (loopback, `.local`, RFC 1918, RFC 6598 CGNAT / Tailscale, link-local, IPv6
+  ULA, local provider labels). `config`, `llm`, `modelcard`, `servers`,
+  `model_catalog` and `cli` all delegate to it.
+- **`pedacito/tools.py` scratch spill** — oversized observations from the
+  observation-producing actions are written to `.pedacito/scratch/*.log`. The
+  model reads and greps them through `read` and `grep`, and cannot write them.
+- **Tool format `tool_mode = "plain"`** — a plain-word gather format next to the
+  grammar and native formats. `calibrate` A/B-tests it.
+- **Router (`proactive_escalation`)** — an opt-in two-path router. A zero-token
+  structural gate escalates hard tasks; a boundary-fewshot Scout keeps simple
+  single-file tasks on the worker. Off by default.
+- **`pedacito/tui.py`** — the zero-dependency rich view: inline diffs, collapsible
+  tool-call cards (`Ctrl+O`, `/expand`, `/collapse`), the six-row `@` picker and
+  SGR mouse zones. It is still a stdlib-only terminal layer.
+- **`pedacito/i18n.py` + `pedacito/profiles.py`** — `pedacito profiles` headers
+  and the recommendations title are looked up through `i18n.t`, so
+  `pedacito --lang es profiles` prints Spanish labels. English stays the default.
+
 ## Known limits
 
 These are the real boundaries. Missing harness features are not on this list:

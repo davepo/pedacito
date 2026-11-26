@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from . import modelcard
+from . import i18n, modelcard
 
 # The roles the planner can route to another profile (plus the worker, which
 # is the top-level `default_profile` key).
@@ -89,10 +89,31 @@ def list_profiles(cfg) -> list[dict]:
             rec["age_days"] = None
             rec["status"] = "uncalibrated"
         rec.update(modelcard.card_meta(card if isinstance(card, dict) else None))
+        if rec["status"] == "ok" and rec.get("calibrated_stale"):
+            rec["status"] = "stale"
         vram = body.get("vram_gb", getattr(cfg, "vram_gb", 0))
-        if rec["size_bytes"] and vram and rec["tier"] != "hosted":
+        local = rec["tier"] != "hosted"
+        if rec["size_bytes"] and vram and local:
             rec["context_fits"] = hardware_context_tokens(
                 int(vram), int(rec["size_bytes"]))
+        elif local:
+            # VRAM is 0 / unset: fall back to the profile's declared context
+            # (or the card's measured/choice window) so a local/LAN profile
+            # still shows a context that fits instead of a blank cell.
+            ctx = None
+            if isinstance(card, dict):
+                measured = card.get("measured") or {}
+                choices = card.get("choices") or {}
+                ctx = (body.get("context_tokens")
+                       or choices.get("context_tokens")
+                       or measured.get("context_length"))
+            else:
+                ctx = body.get("context_tokens")
+            try:
+                ctx = int(ctx) if ctx is not None else None
+            except (TypeError, ValueError):
+                ctx = None
+            rec["context_fits"] = ctx
         else:
             rec["context_fits"] = None
         out.append(rec)
@@ -115,6 +136,11 @@ def _confidence(rec: dict) -> str:
     if (rec.get("repeats") or 0) <= 1 or (rec.get("spread") or 0.0) > 0.1:
         return _LOW_CONFIDENCE
     return ""
+
+
+def _arch_family(rec: dict) -> str:
+    """The model card's `choices.arch_family` for a profile record, or ''."""
+    return str((rec.get("card_choices") or {}).get("arch_family") or "")
 
 
 def recommend(profiles: list[dict]) -> dict:
@@ -146,19 +172,37 @@ def recommend(profiles: list[dict]) -> dict:
 
     # Specialists: highest score overall (local or hosted), different from the
     # worker, only when it beats the worker by the gain floor; speed breaks
-    # ties. The same profile is picked for escalate/verifier/planner.
+    # ties. For the second-opinion / recovery roles (escalate/verifier/
+    # planner) a candidate whose model card names a DIFFERENT `arch_family`
+    # (Qwen worker + Gemma/Mistral verifier) is preferred over a same-family
+    # one, reducing correlated failure modes. The same profile is picked for
+    # escalate/verifier/planner.
     scored = [p for p in profiles if _score(p) is not None
               and (worker is None or p["name"] != worker["name"])]
-    specialist = max(
-        scored, key=lambda p: (_score(p), p.get("tok_per_s") or 0.0)) \
-        if scored else None
-    if worker is not None and specialist is not None \
-            and _score(specialist) + 1e-9 >= _score(worker) + _ESCALATE_MIN_GAIN:
+    eligible = ([p for p in scored
+                 if _score(p) + 1e-9 >= _score(worker) + _ESCALATE_MIN_GAIN]
+                if worker is not None else scored)
+    specialist = None
+    family_note = ""
+    if eligible:
+        worker_family = _arch_family(worker) if worker is not None else ""
+        diff = [p for p in eligible
+                if worker_family and _arch_family(p)
+                and _arch_family(p) != worker_family]
+        pick = max(diff, key=lambda p: (_score(p), p.get("tok_per_s") or 0.0)) \
+            if diff else max(eligible, key=lambda p: (_score(p),
+                                                      p.get("tok_per_s") or 0.0))
+        specialist = pick
+        if diff and pick in diff:
+            family_note = (f" (different architecture family "
+                           f"'{_arch_family(pick)}' vs the worker's "
+                           f"'{worker_family}', to de-correlate failures)")
+    if worker is not None and specialist is not None:
         for role in ("escalate", "verifier", "planner"):
             recs[role] = {
                 "name": specialist["name"],
                 "reason": f"highest score ({_score(specialist):.2f}) "
-                          f"that beats the worker by >= 0.1"}
+                          f"that beats the worker by >= 0.1{family_note}"}
     else:
         for role in ("escalate", "verifier", "planner"):
             recs[role] = {
@@ -205,8 +249,9 @@ def apply_roles(text: str, recs: dict) -> str:
 def render(profiles: list[dict], recommend_rows=None) -> str:
     """The shared table. `recommend_rows` is `recommend(profiles)` when the
     caller wants the per-role suggestions appended."""
-    header = ("name", "model", "tier", "specialties", "harness-fit", "eval",
-              "tok/s", "context", "status")
+    header = tuple(i18n.t(f"profiles.col.{key}") for key in (
+        "name", "model", "tier", "specialties", "harness_fit", "eval",
+        "tok_s", "context", "status"))
     rows = []
     for p in profiles:
         fit = f"{p['fit']:.2f}" if p.get("fit") is not None else "-"
@@ -233,7 +278,7 @@ def render(profiles: list[dict], recommend_rows=None) -> str:
               for r in rows]
     if recommend_rows:
         lines.append("")
-        lines.append("Recommendations (suggestions -- confirm before applying):")
+        lines.append(i18n.t("profiles.recommend_title"))
         for role in ("default_profile", "escalate", "verifier", "planner",
                      "summarizer"):
             rec = recommend_rows.get(role)

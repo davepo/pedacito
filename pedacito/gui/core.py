@@ -116,6 +116,14 @@ def thread_title_from(text) -> str:
     return collapse[:THREAD_TITLE_CHARS].rstrip() + "…"
 
 
+_THREAD_MSG_EXTRA_KEYS = (
+    "files", "outcome", "review_id", "detail", "qid", "answered", "answer",
+    "kind", "hunks_accepted", "hunks_total", "clauses", "mode", "attachments",
+    "level", "head", "results", "stats", "needs_index", "consolidated",
+    "benchmark",
+)
+
+
 def read_thread_file(path):
     """One thread JSON -> a normalized record, or None (with a warning) when
     the file is not a thread. A corrupt thread must never stop the GUI from
@@ -144,10 +152,16 @@ def read_thread_file(path):
             ts = float(m.get("ts") or 0)
         except (TypeError, ValueError):
             ts = 0.0
-        # the file stores {role, content, ts}; the runtime transcript is
+        # the file stores {role, content, ts, ...}; the runtime transcript is
         # {id, role, text, time, ...}
-        messages.append({"id": i + 1, "role": str(m.get("role") or "user"),
-                         "text": str(m.get("content") or ""), "time": ts})
+        msg = {"id": i + 1, "role": str(m.get("role") or "user"),
+               "text": str(m.get("content") if "content" in m
+                           else m.get("text") or ""),
+               "time": ts}
+        for k in _THREAD_MSG_EXTRA_KEYS:
+            if k in m and m[k] is not None:
+                msg[k] = m[k]
+        messages.append(msg)
     try:
         created = float(data.get("created_at") or 0)
         updated = float(data.get("updated_at") or created or 0)
@@ -360,6 +374,7 @@ class Review:
         # a partial accept left unaccepted (filled by decide_review).
         self.clause_texts: dict[str, str] = dict(clause_texts or {})
         self.unaccepted: list[str] = []
+        self.accepted_hunks: dict[str, list[int]] = {}
 
 
 def before_text(fd) -> str:
@@ -390,7 +405,8 @@ def pack_hunks(hunks) -> list:
     checkboxes (empty for legacy diffs and display-only rename sources)."""
     return [{"index": h.index, "a_start": h.a_start, "a_count": h.a_count,
              "b_start": h.b_start, "b_count": h.b_count,
-             "added": h.added, "removed": h.removed, "rows": list(h.rows)}
+             "added": h.added, "removed": h.removed, "rows": list(h.rows),
+             "clauses": list(getattr(h, "clauses", ()))}
             for h in (hunks or [])]
 
 
@@ -1024,6 +1040,15 @@ class State:
     def _thread_payload_locked(self, rec: dict) -> dict:
         """The JSON file content for one thread record. Caller holds `lock`
         (the active record's `messages` IS the live transcript list)."""
+        msgs = []
+        for m in rec["messages"]:
+            row = {"role": m.get("role"),
+                   "content": str(m.get("text") or ""),
+                   "ts": m.get("time")}
+            for k in _THREAD_MSG_EXTRA_KEYS:
+                if k in m and m[k] is not None:
+                    row[k] = m[k]
+            msgs.append(row)
         return {
             "id": rec["id"],
             "title": rec["title"],
@@ -1031,10 +1056,7 @@ class State:
             "updated_at": rec["updated_at"],
             "profile": rec.get("profile", ""),
             "title_custom": bool(rec.get("title_custom")),
-            "messages": [{"role": m.get("role"),
-                          "content": str(m.get("text") or ""),
-                          "ts": m.get("time")}
-                         for m in rec["messages"]],
+            "messages": msgs,
         }
 
     def _write_thread_file(self, payload: dict, root: Path | None = None,
@@ -1787,8 +1809,10 @@ class State:
             self._rid += 1
             rv = Review(self._rid, **rv_args)
         n = len([d for d in rv.diffs if not d.removed_source])
+        total_h = sum(len(getattr(d, "hunks", ()) or ())
+                      for d in rv.diffs if not d.removed_source)
         msg = self.add_message("review", rv.task, review_id=rv.id, files=n,
-                               outcome="")
+                               outcome="", hunks_total=total_h)
         rv.mid = msg["id"]
         # A plain transcript line next to the card, so the chat history of a
         # run reads: prompt -> ... -> "Staged changes across N file(s)".
@@ -1811,6 +1835,7 @@ class State:
                 "pending": not rv.outcome,
                 "clause_texts": rv.clause_texts,
                 "unaccepted": rv.unaccepted,
+                "accepted_hunks": dict(getattr(rv, "accepted_hunks", {}) or {}),
                 "files": [{
                     "rel": d.rel, "added": d.added, "removed": d.removed,
                     "message": d.message, "source": d.removed_source,
@@ -1818,6 +1843,10 @@ class State:
                     "edited": d.rel in rv.edits,
                     "clauses": list(getattr(d, "clauses", ())),
                     "hunks": pack_hunks(getattr(d, "hunks", ())),
+                    "accepted_hunks": (
+                        list(d.hunk_selection)
+                        if getattr(d, "hunk_selection", None) is not None
+                        else None),
                 } for d in rv.diffs],
             }
 
@@ -1886,13 +1915,16 @@ class State:
                                  kind="review_rejected", review_id=rv.id)
                 return True, rv.detail
             hmap = accepted_hunks if isinstance(accepted_hunks, dict) else {}
-            if rv.partial_ok and files is not None:
-                keep = set(files) | set(hmap)
+            if rv.partial_ok and (files is not None or hmap):
+                keep = (set(files) if files is not None
+                        else {d.rel for d in rv.diffs if not d.removed_source}) | set(hmap)
                 with self.lock:
                     all_clauses = {c for d in rv.diffs if not d.removed_source
                                    for c in getattr(d, "clauses", ())}
                     snapshot = list(rv.diffs)
                     fd_snap = [(d, d.after_text,
+                                getattr(d, "added", None),
+                                getattr(d, "removed", None),
                                 getattr(d, "hunk_selection", None))
                                for d in rv.diffs]
                     kept = [d for d in rv.diffs
@@ -1901,11 +1933,6 @@ class State:
                         return False, ("Select at least one file or hunk to accept."
                                        if hmap else
                                        "Select at least one file to accept.")
-                    kept_clauses = {c for d in kept if not d.removed_source
-                                    for c in getattr(d, "clauses", ())}
-                    # R8: a clause none of whose files was accepted stays
-                    # flagged, so the sign-off records what is still open.
-                    rv.unaccepted = sorted(all_clauses - kept_clauses)
                     rv.diffs[:] = kept
                     for d in rv.diffs:
                         if d.rel in rv.edits:
@@ -1915,12 +1942,42 @@ class State:
                             rv.diffs, hmap)
                         if not ok:
                             rv.diffs[:] = snapshot
-                            for d, after, sel in fd_snap:
+                            for d, after, added, removed, sel in fd_snap:
                                 d.after_text = after
+                                if added is not None:
+                                    d.added = added
+                                if removed is not None:
+                                    d.removed = removed
                                 if hasattr(d, "hunk_selection"):
                                     d.hunk_selection = sel
                             rv.unaccepted = []
+                            rv.accepted_hunks = {}
                             return False, detail
+                    kept_clauses: set[str] = set()
+                    for d in rv.diffs:
+                        if d.removed_source:
+                            continue
+                        d_hunks = getattr(d, "hunks", None) or []
+                        d_sel = getattr(d, "hunk_selection", None)
+                        if d_sel is not None and d_hunks and len(d_sel) < len(d_hunks):
+                            hc = review_mod.hunk_clauses_for_file(
+                                d, rv.clause_texts)
+                            for hi in d_sel:
+                                kept_clauses.update(hc.get(hi, ()))
+                        else:
+                            kept_clauses.update(getattr(d, "clauses", ()))
+                    # R8: a clause none of whose files/hunks was accepted stays
+                    # flagged, so the sign-off records what is still open.
+                    rv.unaccepted = sorted(all_clauses - kept_clauses)
+                    rv.accepted_hunks = {}
+                    for d in rv.diffs:
+                        if d.removed_source:
+                            continue
+                        d_sel = getattr(d, "hunk_selection", None)
+                        if d_sel is not None:
+                            rv.accepted_hunks[d.rel] = list(d_sel)
+                        elif d.rel in hmap:
+                            rv.accepted_hunks[d.rel] = sorted(set(hmap[d.rel]))
             elif rv.edits:
                 for d in rv.diffs:
                     if d.rel in rv.edits:
@@ -1980,7 +2037,28 @@ class State:
                 detail = f"Discard failed: {e}"
         with self.lock:
             rv.outcome, rv.detail = outcome, detail
-        self.set_message(rv.mid, outcome=outcome, detail=detail)
+            extra: dict = {"outcome": outcome, "detail": detail}
+            if outcome == "applied":
+                total_h = 0
+                acc_h = 0
+                partial_any = False
+                for d in rv.diffs:
+                    if d.removed_source:
+                        continue
+                    hs = getattr(d, "hunks", None) or []
+                    sel = getattr(d, "hunk_selection", None)
+                    if hs:
+                        total_h += len(hs)
+                        if sel is not None:
+                            acc_h += len(sel)
+                            if len(sel) < len(hs):
+                                partial_any = True
+                        else:
+                            acc_h += len(hs)
+                if total_h and (partial_any or getattr(rv, "accepted_hunks", None)):
+                    extra["hunks_accepted"] = acc_h
+                    extra["hunks_total"] = total_h
+        self.set_message(rv.mid, **extra)
         rv.done.set()
         self.bus.publish("review_done", id=rv.id, outcome=outcome)
 
@@ -2233,6 +2311,12 @@ class State:
                 "update": dict(self.update) if self.update else None,
                 "update_run": dict(self.update_run),
                 "check_for_updates": update_mod.updates_enabled(cfg),
+                "show_update_reminder": (
+                    bool(getattr(cfg, "show_update_reminder", True))
+                    if cfg else True),
+                "picard_mode": (
+                    bool(getattr(cfg, "picard_mode", False))
+                    if cfg else False),
                 # specialist routing (#50): the topbar toggle's state
                 "auto_route_specialties": (bool(cfg.auto_route_specialties)
                                            if cfg else False),
@@ -2275,11 +2359,16 @@ class State:
         return {"id": rv.id, "pending": not rv.outcome, "outcome": rv.outcome,
                 "task": rv.task, "partial_ok": rv.partial_ok,
                 "clause_texts": rv.clause_texts, "unaccepted": rv.unaccepted,
+                "accepted_hunks": dict(getattr(rv, "accepted_hunks", {}) or {}),
                 "files": [{"rel": d.rel, "added": d.added, "removed": d.removed,
                            "source": d.removed_source,
                            "edited": d.rel in rv.edits,
                            "clauses": list(getattr(d, "clauses", ())),
-                           "hunks": pack_hunks(getattr(d, "hunks", ()))}
+                           "hunks": pack_hunks(getattr(d, "hunks", ())),
+                           "accepted_hunks": (
+                               list(d.hunk_selection)
+                               if getattr(d, "hunk_selection", None) is not None
+                               else None)}
                           for d in rv.diffs]}
 
 

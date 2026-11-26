@@ -38,6 +38,151 @@ import time
 ROLES = ("worker", "planner", "verifier", "summarizer", "repair",
          "escalate", "fallback")
 
+# Second-opinion and recovery roles: a different model ARCHITECTURE family
+# (from the model card's `choices.arch_family`) is preferred for these so a
+# Qwen worker is verified/repaired/escalated by a Gemma or Mistral rather than
+# a same-family model that shares its failure modes (arXiv:2611.17610).
+SECOND_OPINION_ROLES = ("verifier", "repair", "escalate")
+
+
+def arch_family_of(cfg, name: str) -> str:
+    """The model card's `choices.arch_family` for profile `name` ('' when the
+    profile is unknown or its card has no architecture library match)."""
+    card = _profile_card(cfg, name) or {}
+    return str((card.get("choices") or {}).get("arch_family") or "")
+
+
+def prefer_second_opinion_profile(cfg, role: str, name: str) -> str:
+    """For a second-opinion/recovery role, prefer a configured profile whose
+    `arch_family` differs from the worker's when `name` shares it. Returns
+    `name` unchanged when there is no worker family, the named profile is a
+    different family already, or no different-family profile is configured."""
+    if role not in SECOND_OPINION_ROLES or not name:
+        return name
+    active = str(getattr(cfg, "active_profile", "") or "").strip()
+    worker_family = arch_family_of(cfg, active)
+    if not worker_family:
+        return name
+    named_family = arch_family_of(cfg, name)
+    if not named_family or named_family != worker_family:
+        return name
+    for candidate in (getattr(cfg, "profiles", None) or {}):
+        if candidate == name or candidate == active:
+            continue
+        fam = arch_family_of(cfg, candidate)
+        if fam and fam != worker_family:
+            return candidate
+    return name
+
+
+# Proactive two-path capability escalation (arXiv:2611.16414): before a task
+# runs, a zero-token structural-complexity gate and (optionally) a
+# boundary-fewshot Scout classifier decide whether it should go straight to
+# the `escalate` role instead of starting on the worker.
+_ARCHITECTURAL_RE = re.compile(
+    r"\b(architect|architecture|refactor|restructure|reorgani[sz]e|"
+    r"modulari[sz]e|decouple|redesign|rework|overhaul|migrate|port|"
+    r"platform|framework|subsystem|pipeline|layer|boundary|"
+    r"cross[- ]cutting|across the (?:codebase|project|app|repo))\b", re.I)
+# A task that names this many files is a multi-file touch, whatever the words.
+_COMPLEX_FILE_FLOOR = 4
+# Total distinct files importing (or imported by) the task's files above which
+# the change crosses enough module boundaries to warrant escalation.
+_FAN_OUT_FLOOR = 8
+
+
+def _structural_complexity(cfg, task: str, idx) -> bool:
+    """Zero-token structural gate: architectural keywords, a multi-file touch,
+    or a large import fan-out / cross-module boundary across the task's files."""
+    text = (task or "").lower()
+    if _ARCHITECTURAL_RE.search(text):
+        return True
+    try:
+        from . import rank
+        files = rank.task_files(idx, task)
+    except Exception:
+        files = []
+    if len(files) >= _COMPLEX_FILE_FLOOR:
+        return True
+    if files:
+        try:
+            g = idx.graph
+        except Exception:
+            g = None
+        if g is not None:
+            fan: set = set()
+            for f in files:
+                try:
+                    fan |= set(g.dependents(f))
+                    fan |= set(g.imports.get(f, ()))
+                except Exception:
+                    continue
+            if len(fan) >= _FAN_OUT_FLOOR:
+                return True
+    return False
+
+
+def _single_file_execution(task: str, idx) -> bool:
+    """True when the task is a well-defined single-file execution task (one
+    clear edit verb and one task-named file) -- the Scout classifier keeps
+    exactly these local."""
+    text = (task or "").lower()
+    if not re.search(r"\b(fix|change|add|modify|update|rename|remove|delete|"
+                     r"correct|repair|adjust|tweak|implement|rewrite)\b", text):
+        return False
+    try:
+        from . import rank
+        files = rank.task_files(idx, task)
+    except Exception:
+        files = []
+    return len(files) == 1
+
+
+def proactive_escalation_reason(cfg, task: str, idx) -> str:
+    """Why `task` should go straight to the `roles.escalate` role, or "" to
+    keep it on the worker. Requires `proactive_escalation` on.
+
+    Path 1 (zero tokens): a structural-complexity gate -- open-ended
+    architectural keywords, a multi-file touch, or a large import fan-out /
+    cross-module boundary -- escalates immediately.
+    Path 2 (boundary few-shot): when a scout_profile is configured and the
+    task is ambiguous (neither clearly structural nor a well-defined
+    single-file edit), the Scout classifies it; a well-defined single-file
+    execution task stays local."""
+    if not getattr(cfg, "proactive_escalation", False):
+        return ""
+    if _structural_complexity(cfg, task, idx):
+        return ("structurally complex task (architectural keywords, "
+                "multi-file touch, or a large import fan-out)")
+    if _single_file_execution(task, idx):
+        return ""
+    # Ambiguous task: a configured scout classifies it (keeps well-defined
+    # single-file execution tasks local); with no scout it stays local.
+    return ""
+
+
+def scout_escalation_verdict(cfg, task: str, idx, scout_client) -> bool:
+    """Boundary-fewshot Scout classifier for an ambiguous task: True when the
+    task should escalate, False to keep it local. Uses the scout profile's
+    client when it is reachable and distinct from the worker; a failed or
+    absent scout never escalates (reactive escalation still covers it)."""
+    if scout_client is None:
+        return False
+    system = (
+        "Classify this coding task in ONE word: LOCAL if it is a well-defined "
+        "single-file execution task a local model can do, or ESCALATE if it "
+        "is architecturally complex, cross-module, or open-ended enough to "
+        "need a stronger model. Reply with just LOCAL or ESCALATE.")
+    try:
+        raw = scout_client.chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": str(task or "")[:2000]}],
+            max_tokens=8, stream=False, disable_thinking=True)
+    except Exception:
+        return False
+    return bool(re.search(r"\bescalate\b", (raw or ""), re.I))
+
+
 def derive_config(cfg, profile: str):
     """A copy of `cfg` with profile `profile`'s settings (and tier preset)
     applied on top; None when the profile does not exist."""
@@ -78,6 +223,15 @@ def client_for(cfg, role: str, default):
     """The client for `role`: a dedicated one when `cfg.roles[role]` names a
     profile, else `default`. Clients are cached on the config."""
     name = (getattr(cfg, "roles", None) or {}).get(role)
+    if role in SECOND_OPINION_ROLES and name:
+        # Cross-family ensembling: a verifier/repair/escalate role prefers a
+        # profile whose architecture family differs from the worker's, so the
+        # second opinion is not a same-family model sharing its failure modes.
+        preferred = prefer_second_opinion_profile(cfg, role, str(name))
+        if preferred and preferred != name:
+            print(f"[roles] '{role}' prefers a different architecture family: "
+                  f"using '{preferred}' instead of '{name}'", file=sys.stderr)
+            name = preferred
     if not name or default is None:
         return default
     cache = cfg.__dict__.setdefault("_role_clients", {})

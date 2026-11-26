@@ -60,6 +60,19 @@ PDC.fmtTokens = (n) => {
   return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n);
 };
 
+// Captain Picard Mode: relabels primary action buttons to 'Make it so.' while
+// preserving the original semantic label in the button's title tooltip.
+PDC.isPicardMode = () => !!(S && S.status && S.status.picard_mode);
+PDC.picardText = (normalText) => PDC.isPicardMode() ? 'Make it so.' : normalText;
+PDC.picardTitle = (normalText, baseTitle) => {
+  if (!PDC.isPicardMode()) return baseTitle || '';
+  const sem = String(normalText || '').trim();
+  const base = String(baseTitle || '').trim();
+  if (!sem) return base;
+  if (!base) return sem;
+  return base.toLowerCase().indexOf(sem.toLowerCase()) >= 0 ? base : (sem + ' \u2014 ' + base);
+};
+
 // ------------------------------------------------------------------- i18n ----
 PDC.lang = (document.documentElement.lang === 'es') ? 'es' : 'en';
 PDC.i18n = { en: {}, es: {} };
@@ -165,8 +178,12 @@ PDC.modal = (title, body, buttons, opts) => {
   const onKey = (e) => { if (e.key === 'Escape' && !opts.locked) close(); };
   const foot = h('div', { class: 'modal-foot' });
   (buttons || []).forEach((b) => {
+    const usePicard = !!(b.primary && !b.danger && !b.noPicard);
+    const shownLabel = usePicard ? PDC.picardText(b.label) : b.label;
+    const shownTitle = usePicard ? PDC.picardTitle(b.label, b.title) : (b.title || '');
     foot.appendChild(h('button', {
-      class: b.primary ? 'primary' : (b.danger ? 'danger' : ''), text: b.label,
+      class: b.primary ? 'primary' : (b.danger ? 'danger' : ''), text: shownLabel,
+      title: shownTitle || null,
       onclick: () => { const keep = b.onclick && b.onclick(close); if (keep !== false && !b.stay) close(); }
     }));
   });
@@ -192,10 +209,25 @@ PDC.modal = (title, body, buttons, opts) => {
 
 PDC.confirm = (text, okLabel, danger) => new Promise((resolve) => {
   let done = false;
+  const semLabel = okLabel || 'OK';
   PDC.modal('Please confirm', h('p', { text: text, style: 'white-space:pre-wrap;margin:0' }), [
     { label: 'Cancel', onclick: () => { done = true; resolve(false); } },
-    { label: okLabel || 'OK', primary: !danger, danger: !!danger, onclick: () => { done = true; resolve(true); } }
+    { label: PDC.picardText(semLabel), title: PDC.picardTitle(semLabel), primary: !danger, danger: !!danger, onclick: () => { done = true; resolve(true); } }
   ], { narrow: true, onClose: () => { if (!done) resolve(false); } });
+});
+
+PDC.prompt = (title, initial, okLabel, placeholder) => new Promise((resolve) => {
+  let done = false;
+  const semLabel = okLabel || 'OK';
+  const inp = h('input', { type: 'text', value: initial || '', class: 'grow', placeholder: placeholder || '' });
+  const m = PDC.modal(title || 'Prompt', h('div', { class: 'row' }, inp), [
+    { label: 'Cancel', onclick: () => { done = true; resolve(null); } },
+    { label: PDC.picardText(semLabel), title: PDC.picardTitle(semLabel), primary: true, onclick: () => { done = true; resolve(inp.value.trim()); } }
+  ], { narrow: true, onClose: () => { if (!done) resolve(null); } });
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); done = true; m.close(); resolve(inp.value.trim()); }
+  });
+  setTimeout(() => { inp.focus(); }, 30);
 });
 
 // Folder browser (used by the header, settings and the New-project option).
@@ -282,7 +314,7 @@ function showPermissionModal(pp) {
       onclick: () => { PDC.decidePermission(pp.id, decision); return false; } },
     extra || {});
   const buttons = [
-    btn('Allow Once', 'allow_once', { primary: true }),
+    btn(PDC.picardText('Allow Once'), 'allow_once', { primary: true, title: PDC.picardTitle('Allow Once') }),
     btn('Allow for This Run', 'allow_run', {}),
     btn('Always Allow', 'allow_always', {}),
   ];
@@ -387,6 +419,24 @@ function writeUpdateDismissed(version) {
     else localStorage.removeItem(UPDATE_DISMISSED_KEY);
   } catch (e) {}
 }
+const REMINDER_DISMISSED_KEY = 'pedacito_update_reminder_dismissed_at';
+const REMINDER_TTL_MS = 7 * 24 * 3600 * 1000;
+function readReminderDismissedAt() {
+  try { return Number(localStorage.getItem(REMINDER_DISMISSED_KEY) || 0) || 0; }
+  catch (e) { return 0; }
+}
+function isReminderDismissed(ts) {
+  const t = Number(ts || 0);
+  return t > 0 && (Date.now() - t) < REMINDER_TTL_MS;
+}
+function dismissUpdateReminder() {
+  const now = Date.now();
+  try { localStorage.setItem(REMINDER_DISMISSED_KEY, String(now)); } catch (e) {}
+  if (S && S.ui) S.ui.reminderDismissedAt = now;
+  emit();
+}
+PDC.isReminderDismissed = isReminderDismissed;
+PDC.dismissUpdateReminder = dismissUpdateReminder;
 const UPDATE_STAGE_RANK = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2,
                             c: 3, rc: 3, pre: 3, preview: 3,
                             post: 5, rev: 5, r: 5 };
@@ -457,6 +507,8 @@ const S = {
         // (a newer release re-shows the banner), the upgrade output drawer,
         // and manual instructions when no upgrade command can be run.
         updateDismissed: savedUpdateDismissed,
+        reminderDismissedAt: readReminderDismissedAt(),
+        reminderChecking: false,
         updateDrawerOpen: false, updateManual: '', updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
@@ -492,13 +544,17 @@ function Term(el) {
   this.max = 4000; this.raf = 0; this.follow = true; this.newLine();
 }
 Term.prototype.newLine = function () {
+  if (!this.el) return;
   const div = h('div', { class: 'tl' });
   this.el.appendChild(div);
+  this.cur = div;
   this.lines.push(div);
   if (this.lines.length > this.max) { const old = this.lines.shift(); old.remove(); }
 };
 Term.prototype.span = function (text) {
-  if (!text) return;
+  if (!text || !this.el) return;
+  if (!this.cur) this.newLine();
+  if (!this.cur) return;
   if (this.fresh) { clear(this.cur); this.fresh = false; }
   if (this.style) this.cur.appendChild(h('span', { class: this.style, text: text }));
   else this.cur.appendChild(document.createTextNode(text));
@@ -517,13 +573,15 @@ Term.prototype.sgr = function (codes) {
   this.style = cls.join(' ');
 };
 Term.prototype.write = function (text) {
+  if (!this.el || !text) return;
+  if (!this.cur) this.newLine();
   const re = /\x1b\[([0-9;?]*)([A-Za-z])|\r\n|\n|\r|\x1b[^[]/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     this.span(text.slice(last, m.index));
     last = m.index + m[0].length;
     if (m[2] === 'm') this.sgr(m[1] ? m[1].split(';') : []);
-    else if (m[2] === 'K' || m[2] === 'J') clear(this.cur);
+    else if (m[2] === 'K' || m[2] === 'J') { if (this.cur) clear(this.cur); }
     else if (m[0] === '\n' || m[0] === '\r\n') { this.newLine(); this.fresh = false; }
     else if (m[0] === '\r') this.fresh = true;
   }
@@ -534,11 +592,12 @@ Term.prototype.schedule = function () {
   if (this.raf) return;
   this.raf = requestAnimationFrame(() => {
     this.raf = 0;
-    if (this.follow) this.el.scrollTop = this.el.scrollHeight;
+    if (this.follow && this.el) this.el.scrollTop = this.el.scrollHeight;
   });
 };
 Term.prototype.reset = function (text) {
-  clear(this.el); this.lines = []; this.style = ''; this.fresh = false; this.newLine();
+  if (!this.el) return;
+  clear(this.el); this.lines = []; this.cur = null; this.style = ''; this.fresh = false; this.newLine();
   if (text) this.write(text);
 };
 let term = null;
@@ -1859,6 +1918,207 @@ function branchFromCheckpoint(cp) {
       });
     });
 }
+function openGitDialog() {
+  const body = h('div', { class: 'git-dialog' });
+  const msg = h('textarea', {
+    class: 'grow cp-name',
+    rows: 3,
+    placeholder: 'Commit message (a Conventional Commit subject is a good fit)',
+    style: 'width:100%;min-height:64px;font-family:var(--mono,monospace)',
+  });
+  const branchName = h('input', {
+    type: 'text', class: 'grow cp-name',
+    placeholder: 'new branch name (letters, digits, . _ / -)',
+  });
+  const stageAll = h('input', { type: 'checkbox' });
+  const banner = h('div', { class: 'note-box err', style: 'display:none' });
+  let status = null;
+  let busy = false;
+
+  const showBanner = (findings) => {
+    const list = Array.isArray(findings) ? findings : [];
+    if (!list.length) {
+      banner.style.display = 'none';
+      banner.textContent = '';
+      return;
+    }
+    banner.style.display = '';
+    banner.textContent = '\u26A0 Secret pre-flight: ' + list.length
+      + ' possible credential(s) in the staged diff ('
+      + list.slice(0, 3).map((f) => f.kind + ' ' + f.file + ':' + f.line).join(', ')
+      + '). Remove them before committing \u2014 commit anyway only if you are sure.';
+  };
+
+  const apply = (j) => {
+    if (!j || !j.ok) {
+      PDC.toast((j && j.detail) || 'Git command failed.', true);
+      return false;
+    }
+    status = j;
+    showBanner(j.findings);
+    render();
+    return true;
+  };
+
+  const reload = () => PDC.api('/api/git/status').then(apply,
+    () => {
+      clear(body);
+      body.appendChild(h('div', { class: 'note-box err',
+        text: 'Could not read git status for this project.' }));
+    });
+
+  const post = (path, payload, clearMessage) => {
+    if (busy) return;
+    busy = true;
+    PDC.api(path, payload).then((j) => {
+      busy = false;
+      if (clearMessage && j && j.ok) msg.value = '';
+      apply(j);
+    }, () => {
+      busy = false;
+      PDC.toast('Git command failed.', true);
+    });
+  };
+
+  const doCommit = (allowSecrets) => {
+    if (busy) return;
+    const message = String(msg.value || '').trim();
+    busy = true;
+    PDC.api('/api/git/commit', {
+      message: message,
+      allow_secrets: !!allowSecrets,
+      stage_all: !!stageAll.checked,
+    }).then((j) => {
+      busy = false;
+      if (j && j.ok) {
+        msg.value = '';
+        PDC.toast('Committed ' + String(j.commit || '').slice(0, 12) + ' \u2014 nothing was pushed.');
+        apply(j);
+        return;
+      }
+      const detail = String((j && j.detail) || 'Commit failed.');
+      if (!allowSecrets && /secret/i.test(detail)) {
+        PDC.confirm(detail + '\n\nCommit anyway? This records the finding in '
+          + 'git history.', 'Commit anyway', true).then((ok) => {
+          if (ok) doCommit(true);
+        });
+        return;
+      }
+      PDC.toast(detail, true);
+    }, () => {
+      busy = false;
+      PDC.toast('Commit failed.', true);
+    });
+  };
+
+  const draft = () => {
+    if (busy) return;
+    busy = true;
+    PDC.api('/api/git/commit', { draft_only: true }).then((j) => {
+      busy = false;
+      if (!j || !j.ok) {
+        PDC.toast((j && j.detail) || 'Could not draft a commit message.', true);
+        return;
+      }
+      msg.value = j.message || '';
+      showBanner(j.findings);
+      PDC.toast('Draft message ready \u2014 review it before committing.');
+    }, () => {
+      busy = false;
+      PDC.toast('Could not draft a commit message.', true);
+    });
+  };
+
+  const fileRow = (kind, path, action, label) => {
+    const row = h('div', { class: 'cp-file', title: path },
+      h('span', { class: 'cp-status ' + kind, text: kind }),
+      h('span', { class: 'cp-path mono ellip', text: path }));
+    if (action) {
+      row.appendChild(h('button', {
+        class: 'small', text: label,
+        onclick: () => post(action, { paths: [path] }, false),
+      }));
+    }
+    return row;
+  };
+
+  function render() {
+    clear(body);
+    if (!status) {
+      body.appendChild(h('div', { class: 'tip', text: 'Loading git status\u2026' }));
+      return;
+    }
+    body.appendChild(h('div', { class: 'row', style: 'margin-bottom:8px' },
+      h('b', { text: 'Branch: ' + (status.branch || '(detached)') }),
+      h('span', { class: 'muted small-text',
+        text: status.dirty ? 'uncommitted changes' : 'clean' }),
+      h('button', { class: 'small', text: '\u21BB', title: 'reload git status',
+        onclick: reload })));
+    body.appendChild(banner);
+    showBanner(status.findings);
+
+    const staged = status.staged || [];
+    const unstaged = status.unstaged || [];
+    const untracked = status.untracked || [];
+    const conflicts = status.conflicts || [];
+    const groups = [
+      ['staged', staged, '/api/git/unstage', 'Unstage'],
+      ['unstaged', unstaged, '/api/git/stage', 'Stage'],
+      ['untracked', untracked, '/api/git/stage', 'Stage'],
+    ];
+    let shown = 0;
+    groups.forEach(([kind, paths, path, label]) => {
+      if (!paths.length) return;
+      shown += 1;
+      body.appendChild(h('div', { class: 'small-text muted',
+        style: 'margin:8px 0 3px', text: kind + ' (' + paths.length + ')' }));
+      const list = h('div', { class: 'cp-list' });
+      paths.forEach((p) => list.appendChild(fileRow(kind, p, path, label)));
+      body.appendChild(list);
+    });
+    if (conflicts.length) {
+      shown += 1;
+      body.appendChild(h('div', { class: 'note-box err',
+        text: 'Merge conflicts: ' + conflicts.join(', ') }));
+    }
+    if (!shown) {
+      body.appendChild(h('div', { class: 'tip',
+        text: 'No staged, unstaged or untracked changes.' }));
+    }
+
+    const commitBox = h('div', { style: 'margin-top:12px' });
+    commitBox.appendChild(h('div', { class: 'small-text muted',
+      text: 'Commit message (scan runs again before the commit)' }));
+    commitBox.appendChild(msg);
+    const tools = h('div', { class: 'row', style: 'margin-top:6px' },
+      h('label', { class: 'chk' }, stageAll, 'stage all'),
+      h('button', { class: 'small', text: 'Draft message', onclick: draft }),
+      h('button', { class: 'small primary', text: PDC.picardText('Commit'),
+        title: PDC.picardTitle('Commit') || null,
+        onclick: () => doCommit(false) }));
+    commitBox.appendChild(tools);
+    body.appendChild(commitBox);
+
+    const branchBox = h('div', { class: 'cp-tools', style: 'margin-top:10px' },
+      branchName,
+      h('button', { class: 'small', text: '+ Branch', onclick: () => {
+        const name = String(branchName.value || '').trim();
+        if (!name) { PDC.toast('Name the branch first.', true); return; }
+        post('/api/git/branch', { name: name, checkout: true }, false);
+        branchName.value = '';
+      } }));
+    body.appendChild(branchBox);
+    body.appendChild(h('div', { class: 'tip', style: 'margin-top:10px',
+      text: 'Pull requests: `pedacito pr` drafts from the branch diff and opens '
+        + 'it with gh. Pedacito never pushes for you.' }));
+  }
+
+  render();
+  reload();
+  PDC.modal('Git \u2014 commit & pull request', body,
+    [{ label: 'Close' }], { wide: true });
+}
+
 function openCheckpointsDialog() {
   const body = h('div', { class: 'cp-dialog' });
   let selected = S.cp.head_id || '';
@@ -4327,6 +4587,8 @@ function TopBar() {
             <${MenuItem} label=${PDC.t('gui.menu.quick_index', null, 'Quick index (no summaries)')} disabled=${!!j || !s.root} action=${() => buildIndex(false)} />
             <${MenuItem} label=${PDC.t('gui.menu.restore_backup', null, 'Restore from a backup\u2026')} disabled=${!!j || !(s.snapshots || []).length} action=${restoreDialog} />
             <${MenuItem} label=${PDC.t('gui.menu.checkpoints', null, 'Checkpoints / Undo\u2026')} disabled=${!s.root} action=${openCheckpointsDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.git', null, 'Git: commit & pull request\u2026')} disabled=${!s.root} action=${openGitDialog}
+                       title=${PDC.t('gui.menu.git_title', null, 'stage files, scan the staged diff for secrets and commit locally (no push)')} />
             <${MenuItem} label=${PDC.t('gui.menu.rename_symbol', null, 'Rename symbol\u2026')} disabled=${!!j || !s.root} action=${renameSymbolDialog} />
             <${MenuItem} label=${PDC.t('gui.menu.memory', null, 'Memory & repo lessons\u2026')} action=${memoryDialog}
                        title=${PDC.t('gui.menu.memory_title', null, 'scratchpad memory while no project is open')} />
@@ -4347,6 +4609,8 @@ function TopBar() {
           <//>
         </div>
         <div id="topRight">
+          <button id="gitBtn" title=${PDC.t('gui.git_title', null, 'guided git: stage, secret-scan and commit locally; draft a pull request (Pedacito never pushes)')}
+                  disabled=${!s.root} onClick=${openGitDialog}>\u2387 ${PDC.t('gui.git', null, 'Git')}</button>
           <button id="checkpointsBtn" title=${PDC.t('gui.checkpoints_title', null, 'time-travel: inspect, diff, restore or branch from any checkpoint')}
                   disabled=${!s.root} onClick=${openCheckpointsDialog}>\u23F1 ${PDC.t('gui.checkpoints', null, 'Checkpoints / Undo')}</button>
           <button id="rulesBtn" title=${PDC.t('gui.rules_title', null, 'edit persistent project rules (.pedacito/rules.md) applied to every Task, Auto and Refine call')}
@@ -4590,6 +4854,35 @@ function MessageList() {
 
 function Hello() {
   const s = S.status;
+  const info = s.update;
+  const dismissedVer = S.ui.updateDismissed;
+  const updateBannerShowing = !!(info && info.update_available
+    && (!dismissedVer || isNewerVersion(info.latest, dismissedVer)));
+  const showDevReminder = s.show_update_reminder !== false
+    && !updateBannerShowing
+    && !isReminderDismissed(S.ui.reminderDismissedAt);
+  const checkFromWelcome = () => {
+    if (S.ui.reminderChecking) return;
+    S.ui.reminderChecking = true;
+    emit();
+    PDC.api('/api/update/check', {}).then((j) => {
+      S.ui.reminderChecking = false;
+      const u = j && j.update;
+      if (u && u.detail === 'disabled') {
+        PDC.toast(PDC.t('gui.update.disabled_toast', null, 'Update checks are disabled (check_for_updates = false).'));
+      } else if (u && u.ok && u.update_available) {
+        PDC.toast(PDC.t('gui.update.available', { version: u.latest }, 'Pedacito v' + u.latest + ' is available'));
+      } else if (u && u.ok) {
+        PDC.toast(PDC.t('gui.update.up_to_date_toast', null, 'Pedacito is up to date.'));
+      } else {
+        PDC.toast(PDC.t('gui.update.offline_toast', null, 'Could not reach PyPI right now.'));
+      }
+      refreshState();
+    }, () => {
+      S.ui.reminderChecking = false;
+      emit();
+    });
+  };
   return html`
     <div class="hello">
       <h3>Welcome to pedacito</h3>
@@ -4604,6 +4897,17 @@ function Hello() {
       ${s.needs_setup
         ? html`<button class="primary" onClick=${() => callSettings()}>Set up your model server</button>`
         : 'Open a project above (Browse\u2026 helps).'}
+      ${showDevReminder ? html`
+        <div class="note-box small-text" id="activeDevReminder" style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="grow">${PDC.t('gui.update.active_dev_tip', null,
+            'Tip: Pedacito is in active development with frequent bug fixes and updates \u2014 run `pedacito update` regularly to stay current.')}</span>
+          <button class="small" disabled=${!!S.ui.reminderChecking} onClick=${checkFromWelcome}>
+            ${S.ui.reminderChecking
+              ? PDC.t('gui.update.checking', null, 'Checking\u2026')
+              : PDC.t('gui.update.check_btn', null, 'Check for updates')}</button>
+          <button class="ghost small" title=${PDC.t('gui.update.dismiss_reminder_title', null, 'hide this reminder for 7 days')}
+                  onClick=${dismissUpdateReminder}>\u2715</button>
+        </div>` : null}
     </div>`;
 }
 
@@ -4724,12 +5028,36 @@ function QuestionCard(props) {
 
 function ReviewCard(props) {
   const m = props.m;
-  const pending = !m.outcome;
-  const title = pending ? 'Review ready \u2014 ' + m.files + ' file' + (m.files === 1 ? '' : 's')
-    : m.outcome === 'applied' ? 'Changes accepted'
-    : m.outcome === 'timeout' ? 'Review timed out' : 'Changes rejected';
+  const activeRev = S.review || (S.status && S.status.review) || null;
+  const liveMatch = !!(activeRev && activeRev.pending
+    && (m.review_id == null || activeRev.id === m.review_id));
+  const outcome = m.outcome || (!liveMatch && activeRev && m.review_id != null
+    && activeRev.id === m.review_id && activeRev.outcome ? activeRev.outcome : '');
+  const pending = !outcome && liveMatch;
+  const fileCount = typeof m.files === 'number' && !isNaN(m.files)
+    ? m.files
+    : (Array.isArray(m.files) ? m.files.length
+       : (liveMatch && Array.isArray(activeRev.files)
+          ? activeRev.files.filter((f) => !f.source).length : null));
+  const hunkNote = (typeof m.hunks_accepted === 'number'
+    && typeof m.hunks_total === 'number'
+    && m.hunks_total > 0 && m.hunks_accepted < m.hunks_total)
+    ? ' (accepted ' + m.hunks_accepted + ' of ' + m.hunks_total + ' hunks)'
+    : '';
+  const title = pending
+    ? (fileCount != null
+       ? 'Review ready \u2014 ' + fileCount + ' file' + (fileCount === 1 ? '' : 's')
+       : 'Review ready')
+    : outcome === 'applied' ? 'Changes accepted' + hunkNote
+    : outcome === 'timeout' ? 'Review timed out'
+    : outcome === 'cancelled' || outcome === 'rejected' ? 'Changes rejected'
+    : (fileCount != null
+       ? 'Review (' + fileCount + ' file' + (fileCount === 1 ? '' : 's') + ')'
+       : 'Review');
+  const cardCls = pending ? ''
+    : (outcome === 'applied' ? 'applied' : 'rejected');
   return html`
-    <div class=${'card ' + (pending ? '' : (m.outcome === 'applied' ? 'applied' : 'rejected'))}>
+    <div class=${'card ' + cardCls}>
       <div class="title">${title}</div>
       <div class="muted small-text">${m.detail || m.text}</div>
       ${pending ? html`<div class="row">
@@ -5126,13 +5454,20 @@ function Composer() {
           <b>${PDC.t('gui.post_edit_verify', null, 'Post-edit verify')}</b>
         </label>
         <span class="grow muted small-text" id="sendHint">${isHow ? PDC.t('gui.composer.how_hint', null, 'answers stay out of this chat thread') : (steerable ? PDC.t('gui.composer.steer_hint', null, 'delivered at the next lookup step') : '')}</span>
-        <button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
-                disabled=${!!(j && j.cancelled && !isHow)}
-                onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
-          ${isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
-              : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
-              : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)))}
-        </button>
+        ${(() => {
+          const sendSem = isHow ? (S.how.loading ? PDC.t('gui.composer.asking', null, 'Asking\u2026') : PDC.t('gui.mode.explain.send', null, 'Ask'))
+            : (j ? (j.cancelled ? PDC.t('gui.stopping', null, 'Stopping\u2026') : PDC.t('gui.stop', null, 'Stop'))
+            : (S.mode === 'auto' ? (opt('auto', 'plan_only') ? PDC.t('gui.composer.plan_only', null, 'Plan only') : PDC.t('gui.mode.auto.send', null, 'Apply & run')) : PDC.t('gui.mode.' + S.mode + '.send', null, m.send)));
+          const usePicard = !j && !(isHow && S.how.loading);
+          const sendLabel = usePicard ? PDC.picardText(sendSem) : sendSem;
+          const sendTitle = usePicard ? PDC.picardTitle(sendSem) : '';
+          return html`<button id="sendBtn" class=${isHow ? 'primary' : (j ? 'danger' : 'primary')}
+                  title=${sendTitle || null}
+                  disabled=${!!(j && j.cancelled && !isHow)}
+                  onClick=${() => { if (isHow) send(); else if (j) stop(); else send(); }}>
+            ${sendLabel}
+          </button>`;
+        })()}
         <input type="file" id="filePick" multiple hidden
                onchange=${(e) => { attachFiles(e.target.files); e.target.value = ''; }} />
       </div>
@@ -5314,13 +5649,19 @@ function DiffPane() {
     return () => document.removeEventListener('keydown', onKey);
   }, [R, S.diffRel, S.ui.diffOpen, switchDiffFile]);
   const foldSig = Object.keys(S.ui.folds).filter((k) => k.startsWith(S.diffRel + '#')).join('|');
-  const canSelect = !!(R && R.pending && R.partial_ok);
-  const hselSig = JSON.stringify(hselOf(S.diffRel));
+  const pending = !!(R && R.pending);
+  const canSelect = !!(pending && R.partial_ok);
+  const hselSig = JSON.stringify(pending ? hselOf(S.diffRel) : (R && R.accepted_hunks && R.accepted_hunks[S.diffRel]));
   const { oldRows, newRows, uniRows } = useMemo(() => {
     const oldR = [], newR = [], uniR = [];
     const rows = (D && D.rows) || [];
     const hunks = (D && D.hunks) || [];
-    const hsel = hselOf(S.diffRel);
+    const hsel = pending ? hselOf(S.diffRel) : (() => {
+      const f = (R && R.files || []).find((x) => x.rel === S.diffRel);
+      if (f && Array.isArray(f.accepted_hunks)) return f.accepted_hunks;
+      const ah = (R && R.accepted_hunks) || {};
+      return Array.isArray(ah[S.diffRel]) ? ah[S.diffRel] : null;
+    })();
     let lastHunk = -1;
     rows.forEach((r, i) => {
       const key = 'r' + i;
@@ -5341,7 +5682,7 @@ function DiffPane() {
         const h = hunks[hi];
         const hOn = hsel === null || hsel.indexOf(h.index) >= 0;
         const range = '@@ -' + h.a_start + ',' + h.a_count + ' +' + h.b_start + ',' + h.b_count + ' @@';
-        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (canSelect && !hOn ? ' off' : '')}>
+        const mkH = (off) => html`<div key=${key + off} class=${'hunk-head' + (!hOn ? ' off' : '')}>
           ${canSelect ? html`<input type="checkbox" checked=${hOn}
             title=${PDC.t('gui.diff.hunk_title', null, 'accept this hunk only')}
             onChange=${(e) => toggleHunk(S.diffRel, h.index, e.target.checked)} />` : null}
@@ -5382,7 +5723,6 @@ function DiffPane() {
         here, old code beside updated code, for you to accept or reject.
       </div>`;
   }
-  const pending = R.pending;
   const editable = R.files.filter((f) => !f.source);
   const nSel = R.partial_ok ? editable.filter((f) => {
     if (S.sel[f.rel] === false) return false;
@@ -5392,12 +5732,29 @@ function DiffPane() {
   const acceptLabel = !R.partial_ok || nSel === editable.length
     ? (editable.length > 1 ? PDC.t('gui.diff.accept_all', null, 'Accept all') : PDC.t('gui.diff.accept', null, 'Accept'))
     : PDC.t('gui.diff.accept_n_of_m', { n: nSel, m: editable.length }, 'Accept ' + nSel + ' of ' + editable.length);
+  const partialHunkSummary = (() => {
+    let acc = 0, tot = 0, anyPartial = false;
+    const ah = R.accepted_hunks || {};
+    editable.forEach((f) => {
+      const hs = f.hunks || [];
+      if (!hs.length) return;
+      const sel = pending ? hselOf(f.rel) : (Array.isArray(f.accepted_hunks) ? f.accepted_hunks : (Array.isArray(ah[f.rel]) ? ah[f.rel] : null));
+      tot += hs.length;
+      if (sel !== null) {
+        acc += sel.length;
+        if (sel.length < hs.length) anyPartial = true;
+      } else if (!pending || S.sel[f.rel] !== false) {
+        acc += hs.length;
+      }
+    });
+    return (anyPartial && tot > 0) ? ('accepted ' + acc + ' of ' + tot + ' hunks') : '';
+  })();
   return html`
     <div class="diffwrap">
       <div id="reviewBar">
         <b id="reviewTitle" title=${R.task || ''}>${R.task || PDC.t('gui.diff.proposed_changes', null, 'Proposed changes')}</b>
         ${!pending ? html`<span class=${'badge-out ' + R.outcome}>
-            ${R.outcome === 'applied' ? PDC.t('gui.diff.accepted', null, 'accepted') : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
+            ${R.outcome === 'applied' ? (partialHunkSummary || PDC.t('gui.diff.accepted', null, 'accepted')) : R.outcome === 'cancelled' ? PDC.t('gui.diff.rejected', null, 'rejected') : R.outcome}</span>` : null}
         ${!pending && (R.unaccepted || []).length ? html`
           <span class="badge-out unaccepted"
                 title=${R.unaccepted.map((c) => c + ': ' + ((R.clause_texts || {})[c] || '')).join('\n')}>
@@ -5415,7 +5772,8 @@ function DiffPane() {
                     onClick=${toggleEdit}>${S.editing ? '\u2716 ' + PDC.t('gui.diff.show_diff', null, 'Show diff') : '\u270E ' + PDC.t('gui.diff.edit_proposed', null, 'Edit proposed')}</button>
             <button class="small danger" onClick=${() => decide('reject')}>${R.files.length > 1 ? PDC.t('gui.diff.reject_all', null, 'Reject all') : PDC.t('gui.diff.reject', null, 'Reject')}</button>
             <button class="small primary" disabled=${nSel === 0}
-                    onClick=${() => decide('apply')}>${acceptLabel}</button>` : null}
+                    title=${PDC.picardTitle(acceptLabel) || null}
+                    onClick=${() => decide('apply')}>${PDC.picardText(acceptLabel)}</button>` : null}
         </div>
       </div>
       <div id="fileStrip">
@@ -5431,6 +5789,16 @@ function DiffPane() {
             ${(f.clauses || []).map((c) => html`
               <span key=${c} class="clause" title=${(R.clause_texts || {})[c] || c}>${c}</span>`)}
             ${f.edited ? html`<span class="muted">(edited)</span>` : null}
+            ${(() => {
+              const hs = f.hunks || [];
+              if (!hs.length) return null;
+              const ah = R.accepted_hunks || {};
+              const sel = pending ? hselOf(f.rel) : (Array.isArray(f.accepted_hunks) ? f.accepted_hunks : (Array.isArray(ah[f.rel]) ? ah[f.rel] : null));
+              if (sel !== null && sel.length > 0 && sel.length < hs.length) {
+                return html`<span class="muted small-text">(accepted ${sel.length} of ${hs.length} hunks)</span>`;
+              }
+              return null;
+            })()}
             <span class="a">+${f.added}</span><span class="r">\u2212${f.removed}</span>
             ${pending && !f.source && R.partial_ok ? html`
               <button class="fedit" title="edit this file's proposed code"

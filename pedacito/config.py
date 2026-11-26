@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import difflib
 import inspect
+import ipaddress
 import json
 import os
 import re
@@ -202,9 +203,12 @@ class Config:
     # Also accepted: "json_object", "json" (-> "object"), "json_schema" (-> "schema").
     json_mode: str = "schema"
     # How lookup steps are produced: "grammar" (a JSON schema constrains the
-    # sampler) or "native" (the model's own tool-call channel: better for models
-    # trained on tool calling). `pedacito calibrate` measures both on your model
-    # and the card picks; set it here to force one.
+    # sampler), "native" (the model's own tool-call channel: better for models
+    # trained on tool calling), or "plain" (a deterministic plain-word gather
+    # format -- `action read / file x.py / lines 10 to 40` or `key: value`
+    # lines -- for models that emit words more reliably than JSON). `pedacito
+    # calibrate` measures all of them on your model and the card picks; set it
+    # here to force one.
     tool_mode: str = "grammar"
     # Which execution engine runs a task:
     #   "two_phase" -- the classic gather-then-answer ladder. The default,
@@ -1042,6 +1046,14 @@ class Config:
     # Zero-edit runs recorded for one profile before escalation is suggested
     # (the per-profile failure statistic). 0 = off.
     escalation_zero_edit_runs: int = 3
+    # Proactive two-path escalation routing (arXiv:2611.16414): BEFORE the
+    # task runs, a zero-token structural-complexity gate (import fan-out,
+    # multi-file touch count, cross-module boundaries, open-ended
+    # architectural keywords) escalates the task straight to the `escalate`
+    # role, and a boundary-fewshot Scout classifier keeps well-defined
+    # single-file execution tasks local. Needs `roles.escalate` configured;
+    # off by default so existing reactive-only escalation is unchanged.
+    proactive_escalation: bool = False
     # Hook commands per event, e.g. hooks = { post_edit = ["ruff format {file}"] }
     # -- run without a shell, JSON event on stdin.
     hooks: dict = field(default_factory=dict)
@@ -1082,6 +1094,9 @@ class Config:
     # `benchmarks/` folder beside the currently open project (or ./benchmarks
     # when no project is open). Each run gets its own generated subfolder.
     benchmarks_dir: str = ""
+    # Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save, Apply,
+    # Run, and Commit buttons to 'Make it so.'
+    picard_mode: bool = False
 
     # --- Telemetry and retention (local only) --------------------------------
     # One-line telemetry ribbon on stderr after each task (context bar,
@@ -1105,6 +1120,10 @@ class Config:
     # alpha/beta tags, "any" also considers them. PEDACITO_UPDATE_CHANNEL
     # overrides it like any other setting.
     update_channel: str = "stable"
+    # Active-development update reminder: show a concise 1-line reminder on
+    # interactive TUI/chat exit and a subtle dismissible notice in the GUI
+    # reminding users to run `pedacito update` regularly. false opts out.
+    show_update_reminder: bool = True
 
     # Bookkeeping for `pedacito config`; not settings.
     sources: dict = None
@@ -1410,9 +1429,9 @@ def _coerce(name: str, value, path: Path | None = None):
         return norm
     if name == "tool_mode":
         norm = str(value).strip().lower()
-        if norm not in ("grammar", "native"):
-            raise ConfigError(f"{where}{name} must be 'grammar' or 'native', "
-                              f"got {value!r}")
+        if norm not in ("grammar", "native", "plain"):
+            raise ConfigError(f"{where}{name} must be 'grammar', 'native' or "
+                              f"'plain', got {value!r}")
         return norm
     if name == "edit_style":
         norm = str(value).strip().lower()
@@ -1874,7 +1893,7 @@ def load(root: Path | None = None, explicit: Path | None = None,
     # Hosted APIs (DeepSeek in particular) reject response_format json_schema,
     # so switch to "object" unless the user spelled json_mode somewhere.
     host = _hostname(cfg.base_url)
-    remote = host not in _LOCAL_HOSTS
+    remote = not _endpoint_is_local(cfg.base_url, cfg.provider)
     deepseek = "deepseek" in cfg.model.lower() or "deepseek" in host
 
     # Provider compatibility quirks (C4) from the C0 table, applied before the
@@ -1971,7 +1990,7 @@ def fill_default_prices(cfg: Config) -> None:
     is remote; any explicit price wins, and local servers stay at 0."""
     if any(cfg.sources.get(k, "default") != "default" for k in _PRICE_FIELDS):
         return
-    if _hostname(cfg.base_url) in _LOCAL_HOSTS:
+    if _endpoint_is_local(cfg.base_url, getattr(cfg, "provider", "")):
         return
     try:
         from . import providers as providers_mod
@@ -2052,15 +2071,31 @@ def is_hosted(cfg: Config) -> bool:
         return True
     if cfg.json_mode == "object":
         return True
-    return _hostname(cfg.base_url) not in _LOCAL_HOSTS
+    return not _endpoint_is_local(cfg.base_url, getattr(cfg, "provider", ""))
 
 
 _GIB = 1024 ** 3
 
 
 def missing_hardware(cfg: Config) -> list[str]:
-    """Mandatory hardware settings still unset; always empty for hosted APIs."""
+    """Mandatory hardware settings still unset; always empty for hosted APIs.
+
+    A non-loopback LAN/Tailscale server runs on another machine, so the
+    client's `vram_gb` does not describe the GPU serving the model: auto_fit
+    already ignores it for those endpoints, and requiring it here would block
+    every command on a profile that legitimately has none. An explicitly
+    configured `context_tokens` likewise supplies the window auto_fit would
+    otherwise derive from VRAM, so VRAM is not mandatory then either.
+    """
     if is_hosted(cfg):
+        return []
+    host = _hostname(cfg.base_url)
+    is_loopback = host in _LOCAL_HOSTS
+    is_lan = (not is_loopback) and _endpoint_is_local(
+        cfg.base_url, getattr(cfg, "provider", ""))
+    if is_lan:
+        return []
+    if _is_explicit_limit(cfg.sources.get("context_tokens", "default")):
         return []
     return ["vram_gb"] if int(cfg.vram_gb or 0) <= 0 else []
 
@@ -2202,7 +2237,8 @@ def auto_fit(cfg: Config, verbose: bool = True) -> list[str]:
         detected = info.get("context_length")
         host = _hostname(cfg.base_url)
         is_loopback = host in _LOCAL_HOSTS
-        is_lan = (not is_loopback) and _endpoint_is_local(cfg.base_url)
+        is_lan = (not is_loopback) and _endpoint_is_local(
+            cfg.base_url, cfg.provider)
         vram_src = cfg.sources.get("vram_gb", "default")
         vram_on_profile = (
             ("profile " in vram_src and "explicit" in vram_src)
@@ -2780,19 +2816,52 @@ def _guess_tier(name: str, body: dict) -> str | None:
     return None
 
 
-def _endpoint_is_local(base_url: str) -> bool:
-    """True for a loopback/private-LAN/mDNS endpoint (the places a user
-    self-hosts a model server). Used to keep the tier heuristic from calling
-    a local model 'hosted' because of its name."""
+# Real self-host ranges: RFC 1918 plus RFC 6598 carrier-grade NAT (a homelab
+# behind a CGNAT gateway -- or a Tailscale 100.x address -- is still the user's
+# box), and IPv6 unique-local addresses. Deliberately NOT `addr.is_private`:
+# Python 3.11.4+ reports `is_private == False` for 100.64.0.0/10, yet still
+# flags the IANA documentation carve-outs (192.0.2.0/24, 198.51.100.0/24,
+# 203.0.113.0/24) that route nowhere a user self-hosts.
+_LAN_V4_NETS = tuple(ipaddress.ip_network(n) for n in
+                     ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                      "100.64.0.0/10"))
+_LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
+
+# Runtime/provider labels that name a self-hosted server, whatever the URL says
+# (a tunneled box still runs on the user's hardware). Matched case-insensitively
+# after underscores are stripped, so "llama_cpp" folds to "llamacpp".
+_LOCAL_PROVIDER_LABELS = ("local", "llamacpp", "llama.cpp", "lemonade",
+                          "lemond", "vllm", "lmstudio", "ollama",
+                          "strata", "avalon")
+
+
+def _endpoint_is_local(base_url: str, provider: str = "") -> bool:
+    """True for a loopback/private-LAN/CGNAT/mDNS endpoint (the places a user
+    self-hosts a model server), or for an explicit local provider label. The
+    ONE canonical predicate every call site delegates to, so the tier
+    heuristic, the acceleration/sampling keys, and hosted detection all agree.
+
+    IPv4 recognises loopback, link-local, RFC 1918 (10/8, 172.16/12,
+    192.168/16) and RFC 6598 CGNAT/Tailscale (100.64.0.0/10). It does NOT rely
+    on `addr.is_private`, which in Python 3.11.4+ drops 100.64.0.0/10
+    (`is_private == False`) yet still flags the IANA documentation carve-outs.
+    IPv6 recognises loopback, link-local and ULA (fc00::/7).
+    """
     host = _hostname(base_url)
     if host in _LOCAL_HOSTS or host.endswith(".local"):
         return True
     try:
-        import ipaddress
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return False
-    return addr.is_loopback or addr.is_link_local or addr.is_private
+        addr = None
+    if addr is not None:
+        if addr.is_loopback or addr.is_link_local:
+            return True
+        nets = _LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS
+        if any(addr in net for net in nets):
+            return True
+    name = str(provider or "").lower().replace("_", "")
+    return any(label in name for label in _LOCAL_PROVIDER_LABELS)
 
 
 # --- model capability profiles ------------------------------------------------
@@ -2892,6 +2961,33 @@ def is_local_moe(cfg=None, model=None, provider=None, base_url=None,
     if not local:
         return False
     return any(p.search(model_s) for p in _LOCAL_MOE_PATTERNS)
+
+
+# Sparse-MoE model-id markers beyond the tiered local-moe server patterns:
+# the A3B/A4B/A2B "active params" spellings (qwen3-30b-a3b), Mixtral's
+# `mixtral`/`8x7b`, and the generic `moe` token. Used by the execution-direct
+# prompting helper (`is_sparse_moe`) so a sparse expert model gets strictly
+# direct, execution-focused prompts instead of verbose planning boilerplate.
+_SPARSE_MOE_PATTERNS = (
+    re.compile(r"a\d+b", re.IGNORECASE),           # a3b, a4b, a2b
+    re.compile(r"\bmixtral\b", re.IGNORECASE),
+    re.compile(r"\d+x\d+b", re.IGNORECASE),        # 8x7b, 8x22b
+    re.compile(r"(?:^|[\s/_.-])moe(?:$|[\s/_.-])", re.IGNORECASE),
+)
+
+
+def is_sparse_moe(cfg=None, model=None, provider=None, base_url=None,
+                  profile=None) -> bool:
+    """True for a sparse Mixture-of-Experts model: a tiered local-moe server
+    (`is_local_moe`), or a model id that names sparse experts (a3b/a4b/a2b,
+    mixtral, NxMb, moe). Sparse-MoE profiles keep prompts strictly direct and
+    execution-focused and skip `plan_threshold` pre-splits unless a task is
+    truly multi-module."""
+    if is_local_moe(cfg, model, provider, base_url, profile):
+        return True
+    model_s, _provider_s, _base_s, _profile_s = _local_moe_texts(
+        cfg, model, provider, base_url, profile)
+    return any(p.search(model_s) for p in _SPARSE_MOE_PATTERNS)
 
 
 def capability_profile(cfg=None, model=None, provider=None, base_url=None,
@@ -3396,7 +3492,9 @@ json_mode = "schema"
 # response_format json_schema so the server constrains sampling to valid
 # tool-call JSON; a 400 downgrades that endpoint automatically.
 enforce_json_schema = true
-# tool_mode = "grammar"     # "native" = the model's tool-call channel
+# tool_mode = "grammar"     # "native" = the model's tool-call channel;
+#                           # "plain" = plain-word gather format (action read /
+#                           # file x.py / lines 10 to 40, or key: value lines)
 # execution_mode = "two_phase"  # "interleaved" = agentic read/edit/test loop;
 #                               # "auto" picks by model class: hosted, local-MoE
 #                               # and calibrated large -> interleaved, else two_phase
@@ -3468,6 +3566,12 @@ check_for_updates = true
 # update_channel: "stable" ignores pre/dev/rc/alpha/beta PyPI releases; "any"
 # includes them (PEDACITO_UPDATE_CHANNEL overrides).
 update_channel = "stable"
+# show_update_reminder: show a 1-line active-development reminder on interactive
+# exit and a subtle dismissible notice in the GUI. false opts out.
+# show_update_reminder = true
+# picard_mode: Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save,
+# Apply, Run, and Commit buttons to 'Make it so.'
+# picard_mode = false
 # Hosted native transports and provider catalog sync:
 # gemini_native = true
 # openai_responses = false

@@ -22,19 +22,24 @@ Wire protocol (stdin, one JSON object per line)::
     {"id": 5, "method": "status"}
 
 Every stdout line is a JSON event. Events streamed while a task runs carry
-``"req_id"`` of the request that produced them; every request gets exactly one
-terminal ``{"kind": "rpc_response", "id": ...}`` frame. ``ask`` additionally
-streams the engine's live events and ends with a compact
-``{"kind": "result", "req_id": ...}`` summary frame (reply, applied files,
-steps, cost, and any `blockers:` gate findings the run ended on) before its
-``rpc_response``.
+``"req_id"`` (the string form of the request id) and ``"id"`` (the caller's
+original id, unchanged) of the request that produced them, so both legacy
+``req_id`` streamers and JSON-RPC 2.0 clients can pair updates with a request.
+Every request gets exactly one terminal ``{"kind": "rpc_response", "id": ...}``
+frame carrying that same original id. ``ask`` additionally streams the
+engine's live events and ends with a compact ``{"kind": "result"}`` summary
+frame (reply, applied files, steps, cost, and any `blockers:` gate findings
+the run ended on) before its ``rpc_response``. ``--events off`` (or
+``params.events = false``) keeps only the terminal frames.
 
 Methods:
 
 * ``ask`` / ``explain`` - run one agent turn with the warm index; ``ask``
   params: ``task`` (required), ``apply`` (default off - the safe default for
   machine clients), ``refine`` (expand the brief into a sectioned spec before
-  planning), ``plan`` (true forces planning, false skips it).
+  planning), ``plan`` (true forces planning, false skips it), ``events``
+  (default true; false = terminal frames only). ``explain`` accepts the
+  question as ``question`` (also ``task``/``symbol``/``message``/``query``).
 * ``steer`` - push a mid-run steering message into the active task's queue;
   drained at a step boundary, which never rewrites already-sent history, so
   the provider's prompt cache is preserved.
@@ -89,6 +94,90 @@ _DECISIONS = ("allow_once", "allow_run", "allow_always", "always_allow", "deny")
 _METHODS = _TASK_METHODS + ("steer", "permission_reply", "cancel",
                             "consolidate", "switch_profile", "status")
 
+#: Per-method documentation for `pedacito rpc --describe`. Kept next to the
+#: dispatcher so a machine client can discover the wire without scraping help.
+_METHOD_DOCS: dict[str, dict] = {
+    "ask": {
+        "params": {"task": "string (required; aliases: message, query)",
+                   "apply": "bool (default false)",
+                   "refine": "bool",
+                   "plan": "bool (null = engine decides)",
+                   "events": "bool (default true; false = terminal frames only)"},
+        "result": "reply, applied, changed, edits, clauses, blockers, steps, "
+                  "tests_ok, cost, session",
+    },
+    "explain": {
+        "params": {"question": "string (required; aliases: task, symbol, "
+                               "message, query)"},
+        "result": "reply",
+    },
+    "steer": {"params": {"text": "string (required)"},
+              "result": "queued"},
+    "permission_reply": {
+        "params": {"request_id": "string from a permission_request event",
+                   "decision": "one of " + ", ".join(_DECISIONS)},
+        "result": "request_id, decision",
+    },
+    "cancel": {"params": {}, "result": "cancelled, active"},
+    "consolidate": {"params": {}, "result": "session handoff summary "
+                                               "(alias: compact)"},
+    "switch_profile": {
+        "params": {"profile": "string (required)", "kind": "main|scout"},
+        "result": "profile, kind",
+    },
+    "status": {"params": {}, "result": "profile, model, tier, scout, steps, "
+                                       "writes, index, session, cache_hit, "
+                                       "context_utilization_pct, busy"},
+}
+
+
+def describe() -> dict:
+    """The machine-readable protocol description printed by `--describe`."""
+    return {
+        "protocol": "pedacito-jsonl-rpc",
+        "transport": {
+            "request": "stdin, one JSON object per line",
+            "event": "stdout, one JSON object per line; diagnostics on stderr",
+            "eof": "stdin EOF flushes the active task's terminal frame, then "
+                   "the process exits 0",
+        },
+        "envelope": {
+            "request": {"id": "int|string (optional)",
+                        "method": "string",
+                        "params": "object (optional)"},
+            "event": {"kind": "string", "req_id": "string",
+                      "id": "original request id (int|string)",
+                      "t": "seconds since the session started"},
+            "response": {"kind": "rpc_response", "id": "int|string",
+                         "method": "string", "ok": "bool",
+                         "result": "object (when ok)", "error": "string"},
+            "result": {"kind": "result", "id": "int|string",
+                       "req_id": "string", "reply": "string|null",
+                       "applied": "bool", "changed": "string[]",
+                       "blockers": "string[]", "cost": "object"},
+            "permission_request": {
+                "kind": "permission_request", "request_id": "string",
+                "req_id": "string", "turn_id": "int|null",
+                "category": "string", "key": "string",
+                "decision_vocabulary": list(_DECISIONS),
+                "timeout_seconds": "float"},
+        },
+        "events": {"flag": "--events on|off (default on)",
+                   "per_request": "params.events = false disables the "
+                                  "incremental engine events for that request"},
+        "methods": _METHOD_DOCS,
+    }
+
+
+def _flag(value: Any, *, default: bool = True) -> bool:
+    """A per-request boolean that also accepts the JSON-ish spellings a
+    shell/CLI client may send ("off", "false", 0, ...)."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "off", "no")
+    return bool(value)
+
 
 def _turn_id(value: Any) -> Optional[int]:
     """The numeric turn id a client's request maps to, when it carries one.
@@ -124,14 +213,24 @@ class RpcOut:
 
     def __init__(self, real_out: TextIO,
                  tag: Callable[[], Optional[str]] = lambda: None,
-                 suppress: tuple = ()):
+                 suppress: tuple = (),
+                 id_tag: Optional[Callable[[], Any]] = None):
         self._out = real_out
         self._tag = tag
+        # Optional companion to `tag`: it returns the caller's ORIGINAL
+        # request id (int or str), which every streamed event frame carries
+        # as `"id"` so a JSON-RPC 2.0 transport can pair updates with the
+        # request that produced them without re-parsing `req_id`.
+        self._id_tag = id_tag
         self._suppress = tuple(suppress)
         self._lock = threading.Lock()
         self._buf_lock = threading.Lock()
         self._buf = ""
         self._closed = False
+        # Live event streaming. ``False`` still writes terminal frames
+        # (rpc_response/result/reply/permission_request) but drops the
+        # engine's incremental events - `pedacito rpc --events off`.
+        self.events = True
         self._results = 0  # `kind:"result"` events let through - see _task_worker
 
     @property
@@ -189,9 +288,14 @@ class RpcOut:
             return
         if event.get("kind") in self._suppress:
             return
+        if not self.events:
+            return
         req = self._tag()
         if req is not None:
             event["req_id"] = req
+            original = self._id_tag() if self._id_tag is not None else None
+            if original is not None:
+                event["id"] = original
         if event.get("kind") == "result":
             with self._lock:
                 self._results += 1
@@ -242,6 +346,7 @@ class RpcServer:
         always_apply: Optional[Callable[[str, str, str], None]] = None,
         consolidate: Optional[Callable[[], dict]] = None,
         permission_timeout: float = PERMISSION_TIMEOUT,
+        events: bool = True,
     ):
         self._run = run
         self._explain = explain
@@ -252,12 +357,16 @@ class RpcServer:
         self._consolidate = consolidate
         self._in = input_stream if input_stream is not None else sys.stdin
         self._perm_timeout = max(1.0, float(permission_timeout))
-        self.out = output or RpcOut(sys.stdout, lambda: self._tag_for(None))
+        self._events = bool(events)
+        self.out = output or RpcOut(sys.stdout, lambda: self._tag_for(None),
+                                    id_tag=lambda: self._id_for(None))
         self._mu = threading.Lock()
         self._active: Optional[str] = None      # req_id of the running task
+        self._active_raw: Any = None            # caller's original id value
         self._seq = 0
         self._busy = threading.Event()
         self._cancel = threading.Event()
+        self._ready = threading.Event()          # serve() has installed its hook
         self._client = None                     # LLMClient, for mid-stream cancel
         self._worker: Optional[threading.Thread] = None
         self._steer_q: "queue.Queue[str]" = queue.Queue()
@@ -280,16 +389,40 @@ class RpcServer:
         with self._mu:
             return self._active
 
+    def _id_for(self, explicit: Any = None) -> Any:
+        """The original request id (int or str), for ACP/JSON-RPC pairing."""
+        if explicit is not None:
+            return explicit
+        with self._mu:
+            return self._active_raw
+
     def _set_active(self, req_id: Optional[str], *,
-                    expected: Optional[str] = None) -> None:
+                    expected: Optional[str] = None,
+                    raw: Any = None) -> None:
         with self._mu:
             if expected is not None and self._active != expected:
                 return
             self._active = req_id
+            self._active_raw = req_id if raw is None else raw
             if req_id is None:
                 self._busy.clear()
             else:
                 self._busy.set()
+
+    def bind_input(self, stream: TextIO) -> None:
+        """Point the request loop at another stream.
+
+        Transports that own stdin themselves (the ACP bridge) feed requests
+        through a queue and let `serve()` do the dispatching, tagging and
+        permission brokerage exactly as it does for a raw JSONL client.
+        """
+        self._in = stream
+
+    def wait_ready(self, timeout: Optional[float] = None) -> bool:
+        """Block until `serve()` has installed the permission broker (or the
+        timeout expires). Transports that dispatch from their own thread use
+        this so a first request cannot race the hook installation."""
+        return self._ready.wait(timeout)
 
     def _frame(self, req_id: Any, method: str, *, result: Any = None,
                error: Any = None) -> dict:
@@ -438,7 +571,7 @@ class RpcServer:
         Returns a frame only when the request is refused before launching."""
         task = params.get("task") or params.get("message") or params.get("query")
         if method == "explain":
-            task = params.get("symbol") or task
+            task = params.get("symbol") or task or params.get("question")
         if not str(task or "").strip():
             return self._frame(req_id, method, error="missing params.task")
         apply_ = bool(params.get("apply", False))
@@ -452,7 +585,12 @@ class RpcServer:
         self._cancel.clear()
         with self._mu:
             self._steer_q = queue.Queue()
-        self._set_active(str(req_id))
+        # Per-request `events` lets a client ask for a quiet turn (only the
+        # terminal frames); the server-wide `--events off` is the floor.
+        if hasattr(self.out, "events"):
+            self.out.events = (self._events
+                               and _flag(params.get("events"), default=True))
+        self._set_active(str(req_id), raw=req_id)
         worker = threading.Thread(
             target=self._task_worker,
             args=(req_id, method, str(task), apply_, refine, plan),
@@ -470,7 +608,8 @@ class RpcServer:
         try:
             if method == "explain":
                 reply = self._explain(task)
-                terminal_frames.append({"kind": "reply", "req_id": str(req_id),
+                terminal_frames.append({"kind": "reply", "id": req_id,
+                                        "req_id": str(req_id),
                                         "reply": reply})
                 terminal_frames.append(
                     self._frame(req_id, method, result={"reply": reply}))
@@ -599,7 +738,9 @@ class RpcServer:
             self._perm[rid] = {"event": ev, "decision": "", "info": info}
         req_id = self._tag_for(None)
         self.out.emit({
-            "kind": "permission_request", "req_id": req_id, "request_id": rid,
+            "kind": "permission_request",
+            "id": self._id_for(None),
+            "req_id": req_id, "request_id": rid,
             "turn_id": _turn_id(req_id), "category": category, "key": key,
             "action_summary": str(info.get("action_summary") or ""),
             "detail": str(info.get("detail") or ""),
@@ -652,10 +793,12 @@ class RpcServer:
     # ------------------------------------------------------------------ #
     def serve(self) -> int:
         """Read stdin until EOF / a broken pipe. Returns the process exit code."""
+        self._ready.clear()
         prev_hook = security.permission_handler()
         my_hook = self._permission_request
         security.install_permission_hook(my_hook)
         self._set_active(None)
+        self._ready.set()
         try:
             while True:
                 try:
@@ -733,4 +876,4 @@ class RpcServer:
 
 
 __all__ = ["RpcOut", "RpcServer", "MAX_LINE", "PERMISSION_TIMEOUT",
-           "EOF_JOIN_GRACE", "EOF_CANCEL_GRACE"]
+           "EOF_JOIN_GRACE", "EOF_CANCEL_GRACE", "describe"]

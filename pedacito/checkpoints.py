@@ -291,10 +291,24 @@ def _changed_paths(old: dict[str, Path], new: dict[str, Path]) -> list[str]:
     return changed
 
 
+# A repair round labels its checkpoint with the fix prompt's first line, which
+# is boilerplate with no identifying detail ("Your last change failed this
+# check:"). Fold that bare prefix to a clean, generic label so the checkpoint
+# list does not show a wall of identical, uninformative titles.
+_BARE_LABEL_PREFIX = "your last change failed this check"
+_BARE_LABELS = {
+    _BARE_LABEL_PREFIX: "repair",
+    _BARE_LABEL_PREFIX + ":": "repair",
+}
+
+
 def _clean_label(label) -> str:
     text = " ".join(str(label or "").split())
     if not text:
         text = "checkpoint"
+    low = text.lower().rstrip(":")
+    if low == _BARE_LABEL_PREFIX or low.startswith(_BARE_LABEL_PREFIX + ":"):
+        text = "repair"
     return text[:MAX_LABEL]
 
 
@@ -396,6 +410,37 @@ def ensure_baseline(root, label: str = "baseline",
                 entry = _find_entry(data, data.get("head_id") or "")
                 return dict(entry) if entry is not None else None
         return create_checkpoint(root, label, mode=mode)
+    except (OSError, CheckpointError):
+        return None
+
+
+def ensure_pre_run_checkpoint(root, label: str = "pre-run",
+                              mode: str = "task") -> dict | None:
+    """Record a pre-run checkpoint that ALWAYS matches the live workspace.
+
+    Unlike :func:`ensure_baseline` (which only snapshots when no checkpoint
+    exists yet), this re-snapshots whenever the tracked files have drifted
+    from the active head since it was recorded -- a manual edit, a
+    ``git commit`` or a ``pedacito rename`` between runs. The returned
+    checkpoint (existing or freshly created) is then the exact ``parent_id``
+    for the task's post-run checkpoint, so Undo restores the true pre-task
+    state instead of an older one.
+
+    Returns None when the workspace cannot be snapshotted.
+    """
+    try:
+        with _LOCK:
+            data = _load_index(root)
+            if data["checkpoints"]:
+                head = _find_entry(data, data.get("head_id") or "")
+                if head is None:
+                    head = data["checkpoints"][-1]
+                head_dir = snapshot_dir(root, str(head.get("id") or ""))
+                if head_dir.is_dir():
+                    live = dict(iter_workspace_files(root))
+                    if not _changed_paths(_snapshot_map(head_dir), live):
+                        return dict(head)
+            return create_checkpoint(root, label, mode=mode)
     except (OSError, CheckpointError):
         return None
 
@@ -665,6 +710,7 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
         restored: list[str] = []
         deleted: list[str] = []
         skipped: list[str] = []
+        identical: list[str] = []
 
         if files is not None:
             # Explicit files: copy when the checkpoint has them, remove when
@@ -672,6 +718,11 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
             for rel in affected:
                 dest = root / rel
                 if rel in target:
+                    if target_hashes.get(rel) == current_hashes.get(rel) \
+                            and current_hashes.get(rel) is not None:
+                        # The bytes on disk already match the checkpoint; the
+                        # copy below would be a no-op, so say so honestly.
+                        identical.append(rel)
                     try:
                         fileio.copy_file_atomic(target[rel], dest)
                         restored.append(rel)
@@ -686,8 +737,12 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
                 except CheckpointError:
                     skipped.append(rel)
                     continue
+                dest = root / rel
+                if target_hashes.get(rel) == current_hashes.get(rel) \
+                        and current_hashes.get(rel) is not None:
+                    identical.append(rel)
                 try:
-                    fileio.copy_file_atomic(src, root / rel)
+                    fileio.copy_file_atomic(src, dest)
                     restored.append(rel)
                 except OSError:
                     skipped.append(rel)
@@ -713,18 +768,47 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
             "deleted": sorted(deleted),
             "deleted_files": sorted(deleted),
             "skipped": sorted(set(skipped)),
+            "identical": sorted(set(identical)),
             "files": len(restored),
             "safety": safety,
             "safety_id": str(safety.get("id")) if safety else "",
         }
 
 
-def undo_last_run(root) -> dict:
+def _undo_clobber_warning(root, head_entry: dict) -> str:
+    """A non-empty warning when reverting to the pre-run state would overwrite
+    workspace changes the last checkpoint's own delta does not cover -- a
+    manual edit, a ``pedacito rename`` or a ``git commit`` made after the run.
+    Returns '' when the live tree still matches the checkpoint (or drifted
+    only in files the run itself changed, which undo is meant to revert)."""
+    head_id = str(head_entry.get("id") or "")
+    own = set(head_entry.get("files_changed") or [])
+    head_dir = snapshot_dir(root, head_id)
+    if not head_dir.is_dir():
+        return ""
+    try:
+        live = dict(iter_workspace_files(root))
+        changed = _changed_paths(_snapshot_map(head_dir), live)
+    except OSError:
+        return ""
+    external = [rel for rel in changed if rel not in own]
+    if not external:
+        return ""
+    listed = ", ".join(sorted(external)[:5])
+    more = f" (+{len(external) - 5} more)" if len(external) > 5 else ""
+    return (f"the working tree changed since that run in file(s) it did not "
+            f"touch ({listed}{more}) -- a manual edit, rename or git commit. "
+            "Undo would overwrite them.")
+
+
+def undo_last_run(root, force: bool = False) -> dict:
     """Restore the state immediately before the active checkpoint's run.
 
     The active checkpoint's parent is the pre-run snapshot.  With a single
     checkpoint the checkpoint itself is restored (there is nothing earlier).
-    Returns ``ok=False`` when no checkpoints exist.
+    Returns ``ok=False`` when no checkpoints exist, and refuses (with a
+    ``clobber`` detail) when reverting would overwrite workspace changes the
+    run did not make, unless ``force`` is set.
     """
     data = _load_index(root)
     if not data["checkpoints"]:
@@ -732,6 +816,15 @@ def undo_last_run(root) -> dict:
     head = _find_entry(data, data.get("head_id") or "")
     if head is None:
         head = data["checkpoints"][-1]
+    warning = _undo_clobber_warning(root, dict(head))
+    if warning and not force:
+        return {
+            "ok": False,
+            "detail": warning,
+            "clobber": True,
+            "hint": "pass --force to revert anyway, or `pedacito checkout` to "
+                    "restore a chosen checkpoint.",
+        }
     target = str(head.get("parent_id") or head.get("id"))
     result = restore_checkpoint(root, target)
     result["undone_to"] = target
@@ -740,6 +833,16 @@ def undo_last_run(root) -> dict:
 
 
 # --- presentation -------------------------------------------------------------
+
+def _render_timestamp(ts) -> str:
+    """A checkpoint's stored UTC ISO timestamp, shown in local time with its
+    offset (the stored JSON keeps the UTC `Z` form for compatibility)."""
+    try:
+        dt = datetime.fromisoformat(str(ts or "").replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (ValueError, TypeError):
+        return str(ts or "")
+
 
 def render_list(root, limit: int = 0) -> str:
     """Human-readable checkpoint tree for the CLI and the TUI."""
@@ -756,7 +859,7 @@ def render_list(root, limit: int = 0) -> str:
         n = len(cp.get("files_changed") or [])
         lines.append(
             f"  {mark} {cp.get('id')}  [{cp.get('mode')}] "
-            f"{cp.get('timestamp')}  {n} file(s){parent}")
+            f"{_render_timestamp(cp.get('timestamp'))}  {n} file(s){parent}")
         lines.append(f"      {cp.get('label')}")
     return "\n".join(lines)
 

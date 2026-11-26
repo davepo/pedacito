@@ -2,6 +2,97 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
+## v0.3.3 — 2026-11-25
+
+### Guided Git, ACP Bridge, Rich TUI, and Hardened Local Networking
+
+- **Guided git and pull requests** — `pedacito commit [--all] [-m MSG]` reviews
+  the staged diff, drafts the message (or `--no-model` deterministically) and
+  commits locally. `pedacito pr [--base] [--draft]` drafts the title and body and
+  opens the pull request with `gh`. Both live in `pedacito/gitops.py`, use
+  argv-only git calls, never push and never force-push. Every commit runs a
+  secret pre-flight scan on the staged diff and refuses a match unless
+  `--allow-secrets` is given. The TUI gets `/git`, and the GUI gets a Git drawer.
+- **Agent Client Protocol bridge** — `pedacito acp [PROJECT]` is a JSON-RPC 2.0
+  stdio bridge over the same warm engine as `pedacito rpc`. `initialize`,
+  `session/new` (binds the project, optional profile and execution mode),
+  `session/prompt` (text, `@file` and image blocks), `session/update` streaming,
+  `session/request_permission` and `session/cancel` are supported. `@file`
+  mentions go through the same path-containment check as every other read.
+- **RPC hardening** — `pedacito rpc` accepts `params.question` on `explain`,
+  keeps the caller's `id` next to `req_id` on streamed events, and adds
+  `--events on|off` and `--describe`.
+- **Core reliability** — pre-run divergent-tree checkpoints
+  (`ensure_pre_run_checkpoint`), an `undo --force` guard, checkpoints for
+  `rename --apply`, local-time checkpoint timestamps, and
+  `restore --checkpoint` / `--snapshot cp_...`. Tree-sitter loads retry and fall
+  back offline, and `pedacito parsers prefetch` warms the grammars for
+  air-gapped work. CSS `/* ... */` stubs are valid.
+- **`new` scaffolding** — `STARTER_PYPROJECT` ships `[tool.pytest.ini_options]
+  pythonpath = ["."]`; `new --complex` defaults `verify_final`, and pytest exit 5
+  (no tests collected) is handled as a scaffold result. `new --no-complex` (alias
+  `--single`) turns off the automatic escalation to Complex scaffolding. The
+  planner accepts fenced JSON and retries once.
+- **Honest run semantics** — `--max-minutes` is a hard per-call timeout clamp;
+  a partial batch is reported as partial; `--apply` with zero edits reports a
+  failure; summary refresh has its own circuit breaker, so one failing summary
+  cannot halt the rest.
+- **CLI polish** — `pedacito diag` (alias of `diagnose`), `pedacito models
+  --profile/--model`, absolute `pedacito image --out`, a Markdown-doc advisory
+  after `rename`, and `"sandbox_effective"` in `ask --json`. `doctor` prompt-cache
+  wording is corrected, and `profiles` reads LAN context with a fallback.
+  `webcheck` flags empty files, CSS-comment problems and unlinked assets, and
+  `map` includes `.css`.
+- **Local, LAN and Tailscale endpoints** — one predicate, `_endpoint_is_local`,
+  now serves config, llm, modelcard, servers, model_catalog and cli. It treats
+  loopback, `.local`, RFC 1918, RFC 6598 CGNAT / Tailscale (`100.64.0.0/10`),
+  link-local, IPv6 ULA (`fc00::/7`) and explicit local provider labels as local.
+  A local model card without a calibrated temperature is marked stale for
+  recalibration.
+- **Small-model and sparse-MoE upgrades** (opt-in where noted):
+  - `tool_mode = "plain"` is a plain-word gather format that calibrate A/B-tests
+    against the grammar format.
+  - `best_of` candidates are shadow-tested through `VirtualWorkspace`, and
+    `profiles.recommend()` and `roles.py` prefer a cross-family `arch_family`.
+  - `proactive_escalation = false` (opt-in) adds a two-path router: a zero-token
+    structural complexity gate escalates hard tasks, and a boundary-fewshot Scout
+    keeps well-defined single-file tasks local.
+  - Sparse-MoE models get execution-direct prompting (`is_sparse_moe`).
+  - The `interleaved` engine runs a bounded, deterministic verifier before it
+    accepts `finish`.
+  - Oversized tool observations are offloaded to `.pedacito/scratch/`. The model
+    can read and grep those `*.log` files but cannot write to them.
+- **GUI hardening** — the `Term.newLine()` null dereference on reload is fixed.
+  Partial-hunk review (`accepted_hunks`) records hunk-level
+  `added`/`removed`/`unaccepted` provenance. Thread cards keep their metadata,
+  and `ReviewCard` is defensive. `/compact` produces a deterministic handoff.
+  The layout is responsive on narrow viewports, client disconnects are quiet in
+  `gui/server.py`, the Settings → Profiles rows truncate with an ellipsis and show
+  score chips, and `domcheck` reports `ok (unchanged vs baseline)`.
+- **Rich zero-dependency TUI** — edits render as inline syntax-highlighted
+  unified diffs. Tool calls are collapsible one-line cards (`Ctrl+O`, `/expand`,
+  `/collapse`). `@` opens a six-row fuzzy picker popup. SGR mouse zones cover
+  `[EN|es]`, the sidebar tabs, tool cards and the scrollbar. `/status` is localized
+  under `/lang es`, and a skipped test run reads
+  `tests: skipped (needs allow_shell)`.
+- **Localization** — `pedacito profiles` headers and the recommendations title are
+  translated through `i18n` (`profiles.col.*`), and `en.json` and `es.json` keep
+  identical key sets.
+- **Captain Picard Mode & Active-Development Update Reminder** — `picard_mode`
+  (default `false`, TUI `/picard [on|off]`, GUI Settings toggle) relabels primary
+  submit, OK, Save, Apply, Run and Commit buttons to `"Make it so."` while keeping
+  the semantic label in tooltips. `show_update_reminder` (default `true`) shows a
+  concise 1-line active-development reminder on interactive TUI/chat exit (never in
+  `--headless`, `--json`, `rpc`, `acp`, or non-TTY pipes) and a subtle dismissible
+  notice in the GUI.
+- **Telemetry** — a `creative_mode` telemetry event records creative runs.
+- **`pedacito how` covers v0.3.3** — cards for `commit`, `pr`, `diag` and
+  `parsers`, and topics for guided git, ACP, `parsers prefetch`, `tool_mode =
+  "plain"`, `proactive_escalation`, the `.pedacito/scratch/` offload, the rich TUI
+  (`Ctrl+O`, `/expand`, the `@` picker), Tailscale/CGNAT endpoints, and the
+  PowerShell 5.1 `2>&1` stderr note.
+- Version is `0.3.3` in `pyproject.toml` and `pedacito/__init__.py`.
+
 ## v0.3.2 — 2026-11-23
 
 ### Interleaved Execution, Native Providers, and Strata Onboarding

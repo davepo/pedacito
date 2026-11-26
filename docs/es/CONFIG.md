@@ -254,6 +254,25 @@ locales débiles; y las tareas creativas/de diseño se ejecutan a ≥ 0.6 (consu
 se repite, el reintento recibe un suave empujón de `presence_penalty = 0.15`
 en lugar de una temperatura fría o una penalización de repetición pesada.
 
+## Endpoints locales, LAN y Tailscale
+
+Toda decisión que depende de "¿es este un servidor local?" pasa por un único predicado, así que la
+heurística de nivel, las reglas de muestreo, las claves de aceleración y la comprobación de tarjetas
+obsoletas coinciden. Un endpoint cuenta como local cuando su host es loopback, un nombre `.local`, una
+dirección RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), una dirección de Tailscale u otra CGNAT RFC 6598
+(`100.64.0.0/10`), una dirección link-local, una dirección IPv6 unique-local (`fc00::/7`), o una etiqueta
+de proveedor que nombra un runtime local:
+
+```toml
+[profiles.homebox]
+base_url = "http://100.101.102.103:1234/v1"   # una dirección de Tailscale cuenta como local
+model = "qwen3.5-27b"
+```
+
+Los endpoints locales conservan el muestreador local, `cache_prompt` y las reglas de MoE local.
+Una tarjeta de modelo local que no tenga temperatura calibrada se marca como **obsoleta**, así que ejecuta
+`pedacito calibrate --recalibrate` una vez después de actualizar a v0.3.3.
+
 ## Aceleración de inferencia local
 
 La caché alojada reutiliza un prefijo del lado del proveedor; un servidor autoalojado puede hacer
@@ -856,6 +875,7 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `allow_subagents` | false | La acción `task` (auxiliar de solo lectura con una ventana nueva). |
 | `allow_fetch` / `fetch_allowed_hosts` | false / `[]` | La acción `fetch` y los hosts que puede leer. |
 | `roles` | `{}` | Perfiles por trabajo: `planner`, `verifier`, `summarizer`, `repair`, `escalate`, `fallback`. |
+| `proactive_escalation` | false | Opción (v0.3.3) de enrutado de dos vías que se ejecuta una vez por tarea. Una compuerta estructural sin tokens (fan-out de importaciones, archivos tocados, límites de módulo, palabras de arquitectura abiertas) envía una tarea difícil directamente al rol `escalate`; un clasificador Scout de pocos ejemplos en la frontera mantiene las tareas bien definidas de un solo archivo en local. Necesita `roles.escalate`; `false` deja la escalada reactiva sin cambios. |
 | `auto_escalate` / `escalation_zero_edit_runs` | true / 3 | Amplía el reintento de `escalate` más allá de "no aterrizó ninguna edición": un fallo semántico de reparación, dos arrendamientos sin progreso, o esta cantidad de ejecuciones consecutivas sin ediciones en un perfil ganan un reintento incluso cuando se aplicaron ediciones. Cada razón emite un evento `escalation_suggested` incluso sin un rol configurado; 0 desactiva la estadística de ejecuciones sin ediciones. |
 | `hooks` / `hook_timeout` | `{}` / 10 | Tus comandos en eventos, cada uno limitado a esta cantidad de segundos (consulta [Hooks](#hooks); los hooks a nivel de proyecto necesitan `pedacito trust`). |
 | `scrub_env` / `env_passthrough` | true / `[]` | Entorno mínimo para los comandos elegidos por el modelo. |
@@ -871,13 +891,15 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `show_telemetry` | true | Cinta de telemetría de una línea en stderr tras cada tarea (barra de contexto, tokens del turno, velocidad, aciertos de caché); nunca se muestra en los modos `--jsonl` / rpc. Consulta [Telemetría en vivo](USAGE.md#telemetría-en-vivo). |
 | `check_for_updates` | true | Verificación discreta de versiones en PyPI al iniciar: una petición GET anónima (tiempo límite de 2 s, en caché 24 h junto a la configuración de usuario), un banner descartable en la GUI con actualización en streaming + Restart, `pedacito update [--run]`, `/update` de la TUI. `false` = cero llamadas de red y cero subprocesos de actualización en todas partes. Consulta [Actualización](INSTALLATION.md#actualización). |
 | `update_channel` | `"stable"` | Qué versiones de PyPI cuentan como "la más reciente": `"stable"` ignora las etiquetas pre/dev/rc/alpha/beta; `"any"` las incluye. `PEDACITO_UPDATE_CHANNEL` la anula como cualquier otro ajuste. Consulta [Actualización](INSTALLATION.md#actualización). |
+| `show_update_reminder` | true | Muestra un recordatorio de desarrollo activo de una línea al salir de sesiones interactivas de TUI/chat (nunca en `--headless`, `--json`, `rpc`, `acp` o tuberías sin TTY) y un aviso sutil y descartable en la GUI que recuerda ejecutar `pedacito update` con regularidad. `false` lo desactiva. |
+| `picard_mode` | false | Modo cosmético Capitán Picard: cambia las etiquetas de los botones de enviar, Aceptar, Guardar, Aplicar, Ejecutar y Confirmar en la GUI/TUI a `'Make it so.'` (conservando la etiqueta original en el tooltip del botón); `/picard [on\|off]` en la TUI lo alterna en vivo. |
 | `log_events` / `keep_events` | true / 20 | Telemetría JSONL local bajo `.pedacito/events/`. |
 | `summary_workers` / `refresh_summaries` | 0 / 12 | Resúmenes concurrentes (0 = automático: alojado 4, local 1); unidades vueltas a resumir tras una tarea. |
 | `summary_batch` | 1 | Unidades cortas resumidas N por petición durante la indexación (menos viajes de ida y vuelta; las líneas sin analizar recurren a peticiones individuales). |
-| `max_observation_tokens` | 0 | Techo de una observación que no es de lectura, en tokens (0 = automático: un cuarto de la ventana, 300-2200). |
+| `max_observation_tokens` | 0 | Techo de una observación que no es de lectura, en tokens (0 = automático: un cuarto de la ventana, 300-2200). Una observación por encima del techo (run, run_test, grep, diff, fetch, diagnose, serve) se vuelca a `.pedacito/scratch/*.log` (v0.3.3) y el modelo recibe el inicio, el final y el nombre del archivo para usar `read` o `grep` bajo demanda. |
 | `plan_threshold` / `max_replans` | 0 / 1 | Planifica automáticamente las tareas que nombran esta cantidad de archivos o requisitos; las tareas que nombran 5+ archivos se planifican automáticamente incluso con 0 a menos que esto se defina explícitamente (`--plan` fuerza una tarea, `--no-plan` la excluye); revisiones del planificador tras un paso fallido. |
 | `allow_steering` | true | Entrega al modelo en `chat` las líneas escritas a mitad de una tarea. |
-| `tool_mode` | `grammar` | `native` envía los pasos de búsqueda por el canal de llamadas a herramientas del modelo; `calibrate` elige. |
+| `tool_mode` | `grammar` | `native` envía los pasos de búsqueda por el canal de llamadas a herramientas del modelo; `plain` (v0.3.3) los envía como palabras simples y breves (`read app.py 1 40`), lo que conviene a modelos pequeños que tropiezan con JSON; `calibrate` compara A/B los formatos y conserva el que puntúa mejor. Valores válidos: `grammar`, `native`, `plain`. |
 | `execution_mode` | `two_phase` | El motor de tareas: `two_phase` (recopilar y luego responder), `interleaved` (una conversación agéntica de leer/editar/probar) o `auto` (interleaved para APIs alojadas, servidores local-MoE y modelos locales grandes calibrados cuya tarjeta eligió llamadas nativas a herramientas; `two_phase` para modelos locales tiny/small/medium y sin calibrar). `--execution-mode` lo sobrescribe por ejecución; `/mode` en la TUI lo cambia en vivo. |
 | `step_reasoning_first` | true | `true` coloca `reasoning` antes de la acción en cada paso de búsqueda (el modelo dice qué necesita y luego elige); sin definir deja que decida la tarjeta del modelo. `calibrate` mide ambos órdenes con la misma regla de adoptar-solo-si-es-0.1-mejor que `tool_mode`. |
 | `fewshot_steps` | unset | `true` muestra tres pasos resueltos de tu proyecto (grep de un símbolo, leerlo, done) una vez en el primer turno del usuario, incluso con gramática o llamadas nativas a herramientas; sin definir deja que decida la tarjeta del modelo. Unos 70 tokens de prompt extra en cada llamada de búsqueda (el servidor los guarda en caché tras la primera, pero un conteo de tokens de prompt como el de `eval` aún los incluye en cada llamada). `calibrate` lo adopta solo si elige la acción correcta 0.1 más a menudo sin pérdida de pasos bien formados. |

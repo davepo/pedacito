@@ -244,10 +244,14 @@ _PROTECTED_PREFIXES = (".git/", ".pedacito/")
 _PROTECTED_NAMES = (".pedacitoignore", ".pedacito.toml", "pedacito.toml")
 
 
-def is_protected(rel: str, cfg=None) -> str:
+def is_protected(rel: str, cfg=None, write: bool = True) -> str:
     """Why the model may not write `rel`, or "" when it may. Covers VCS and
     Pedacito state, the autonomous loop's plan file (the model must not tick
-    its own checkboxes), and `protected_paths` from config."""
+    its own checkboxes), and `protected_paths` from config.
+
+    With `write=False` (a read), the one `.pedacito/` subtree the model may
+    look at -- `.pedacito/scratch/*.log`, the harness's own spilled tool
+    output -- is allowed; everything else under `.pedacito/` stays refused."""
     p = (rel or "").replace("\\", "/").strip()
     while p.startswith("./"):
         p = p[2:]
@@ -255,6 +259,13 @@ def is_protected(rel: str, cfg=None) -> str:
     low = p.lower()
     if not low:
         return ""
+    if not write:
+        from .tools import is_scratch_log
+        try:
+            if is_scratch_log(p):
+                return ""
+        except Exception:
+            pass
     if low == ".git" or low.startswith(_PROTECTED_PREFIXES) \
             or "/.git/" in "/" + low:
         return f"`{p}` is VCS/Pedacito state (.git/ and .pedacito/ are never written by the model)"

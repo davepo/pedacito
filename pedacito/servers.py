@@ -64,7 +64,6 @@ ACTION_TIMEOUT = 30.0
 COMMAND_TIMEOUT = 120.0
 DEFAULT_EVICT_WAIT = 10.0
 
-_LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
 _LEMONADE_ENV_KEYS = ("LEMONADE_API_KEY", "LEMONADE_KEY")
 # Strata and Avalon read their key from these variables; accepting them means
 # a GUI started from the same shell can drive an already-running server
@@ -109,17 +108,11 @@ def _host(base_url: str) -> str:
         return ""
 
 
-def is_local_url(base_url: str) -> bool:
-    """True for a loopback/private-LAN/mDNS endpoint (a self-hosted server)."""
-    host = _host(base_url)
-    if host in _LOCAL_HOSTS or host.endswith(".local"):
-        return True
-    try:
-        import ipaddress
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return addr.is_loopback or addr.is_link_local or addr.is_private
+def is_local_url(base_url: str, provider: str = "") -> bool:
+    """True for a loopback/private-LAN/CGNAT/mDNS endpoint (a self-hosted
+    server). Delegates to the one canonical predicate in config.py."""
+    from .config import _endpoint_is_local
+    return _endpoint_is_local(base_url, provider)
 
 
 def normalize_url(base_url: str) -> str:

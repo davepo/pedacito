@@ -2965,11 +2965,11 @@ def test_run_loop_accepts_gather_only_progress(tmp_path, monkeypatch):
 
 
 def test_run_loop_strict_flags_unclean_tasks(tmp_path, monkeypatch):
-    """O6: with --strict the run's exit code reports a task that landed
-    edits but is not clean -- it left a failed edit block (a partial
-    application) or impacted tests still red after the repair rounds -- as
-    1, even though the task itself is ticked done. Without it both exit 0
-    and only the run log notes the problem."""
+    """O6: a task that landed edits but left impacted tests red still ticks
+    done and only changes the exit code under --strict. A PARTIAL application
+    (some edit blocks failed) is now a hard failure: it retries once to land
+    the missing targets, then marks the task [!] and exits 1 regardless of
+    --strict."""
     idx = types.SimpleNamespace(root=tmp_path)
     ok_block = types.SimpleNamespace(ok=True, file="a.py",
                                      message="applied 1 block(s)")
@@ -2981,25 +2981,39 @@ def test_run_loop_strict_flags_unclean_tasks(tmp_path, monkeypatch):
         n[0] += 1
         plan = tmp_path / f"PLAN-{n[0]}.md"
         loop.write_plan(plan, "goal", ["Fix the discount"])
-        monkeypatch.setattr(loop, "run_task", lambda *a, **k: tr)
+        calls = []
+
+        def fake(root, cfg_, client, agent, idx_, task, **k):
+            calls.append(task)
+            return tr
+
+        monkeypatch.setattr(loop, "run_task", fake)
         code = loop.run_loop(tmp_path, _cfg(), None, idx, plan, apply=True,
                              strict=strict)
-        # the task is still ticked done: strict changes the exit code, not
-        # the plan's bookkeeping
-        assert "- [x] Fix the discount" in plan.read_text(encoding="utf-8")
-        return code
+        return code, plan.read_text(encoding="utf-8"), calls
 
     partial = loop.TaskResult([ok_block, bad_block], "done", True,
                               ["a.py"], idx)
-    assert run_once(partial, strict=True) == 1
-    assert run_once(partial, strict=False) == 0
+    code, text, calls = run_once(partial, strict=False)
+    assert code == 1                        # failed after the retry
+    assert "- [x] Fix the discount" not in text
+    assert len(calls) == 2                  # one attempt + one retry
+    code, text, _calls = run_once(partial, strict=True)
+    assert code == 1
+    assert "- [x] Fix the discount" not in text
+
     red = loop.TaskResult([ok_block], "done", True, ["a.py"], idx,
                           tests_ok=False)
-    assert run_once(red, strict=True) == 1
-    assert run_once(red, strict=False) == 0
+    code, text, _calls = run_once(red, strict=True)
+    assert code == 1
+    assert "- [x] Fix the discount" in text   # red is exit-code-only under strict
+    code, text, _calls = run_once(red, strict=False)
+    assert code == 0
+    assert "- [x] Fix the discount" in text
+
     clean = loop.TaskResult([ok_block], "done", True, ["a.py"], idx,
                             tests_ok=True)
-    assert run_once(clean, strict=True) == 0
+    assert run_once(clean, strict=True)[0] == 0
 
 
 def test_is_noop_matches_the_refusal_phrasing_models_actually_use():

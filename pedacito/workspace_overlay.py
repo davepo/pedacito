@@ -138,7 +138,7 @@ class VirtualWorkspace:
             raise PathRefused(f"path escapes the project root: {raw}") from exc
         if canon in ("", "."):
             raise PathRefused("that path is the project root, not a file")
-        why = safety.is_protected(canon, self.cfg if write else None)
+        why = safety.is_protected(canon, self.cfg if write else None, write=write)
         if why:
             raise PathRefused(why)
         if not allow_sensitive and security.is_sensitive_path(canon):

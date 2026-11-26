@@ -20,7 +20,7 @@ Pedacito needs **Python 3.11 or newer**. It does not need Node.js for the harnes
 
 Requires Python 3.11+.
 
-Quick install from PyPI (0.3.2):
+Quick install from PyPI (0.3.3):
 
 ```bash
 pip install pedacito                     # Windows: py -m pip install pedacito

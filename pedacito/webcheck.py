@@ -1720,6 +1720,107 @@ def _sibling_spec(from_rel: str, target_rel: str) -> str:
     return spec if spec.startswith((".", "/")) else "./" + spec
 
 
+def _comment_only(text: str, html: bool = False) -> bool:
+    """True when `text` holds nothing but comments and whitespace."""
+    s = text
+    if html:
+        s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
+        s = re.sub(r"<!doctype[^>]*>", "", s, flags=re.I)
+    else:
+        s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+        s = re.sub(r"//[^\n]*", "", s)
+    return not s.strip()
+
+
+def _empty_file_findings(htmls, jss, csss) -> list[Finding]:
+    """Effectively empty or comment-only HTML/JS/CSS files: a page, script or
+    stylesheet that ships nothing is a silent, broken deliverable."""
+    out: list[Finding] = []
+    for rel, text in htmls:
+        if _comment_only(text, html=True):
+            out.append(Finding(rel, 1, "empty or comment-only HTML file -- the "
+                               "page renders nothing"))
+    for rel, text in jss:
+        if _comment_only(text):
+            out.append(Finding(rel, 1, "empty or comment-only JS file -- no "
+                               "code runs when it loads"))
+    for rel, text in csss:
+        if _comment_only(text):
+            out.append(Finding(rel, 1, "empty or comment-only CSS file -- the "
+                               "stylesheet styles nothing"))
+    return out
+
+
+def _css_slash_comment_findings(csss) -> list[Finding]:
+    """`//` is not a CSS comment (CSS uses /* */): a line starting with `//`
+    is invalid CSS and the browser skips the rule that follows."""
+    out: list[Finding] = []
+    for rel, text in csss:
+        for m in re.finditer(r"^[ \t]*//[^\n]*", text, re.M):
+            out.append(Finding(
+                rel, _line_of(text, m.start()),
+                "`//` is not a CSS comment (CSS uses /* */); the browser "
+                "treats this line as invalid and skips the rule"))
+    return out
+
+
+def _unreferenced_sibling_findings(root: Path, htmls, jss, csss
+                                   ) -> list[Finding]:
+    """Sibling .js/.css files no .html references (directly or through another
+    JS file's import): they never load, so their content never runs."""
+    if not htmls:
+        return []
+    referenced: set[str] = set()
+    for rel, text in htmls:
+        for m in _SCRIPT_TAG_RE.finditer(text):
+            sm = _SRC_ATTR_RE.search(m.group(1))
+            if sm:
+                src = _first_group(sm).strip().split("?")[0].split("#")[0]
+                js_rel, external = _resolve_src(root, rel, src)
+                if not external and js_rel:
+                    referenced.add(js_rel)
+        for m in _LINK_TAG_RE.finditer(text):
+            rm = _REL_ATTR_RE.search(m.group(1))
+            if not rm or "stylesheet" not in _first_group(rm).lower():
+                continue
+            hm = _HREF_ATTR_RE.search(m.group(1))
+            if not hm:
+                continue
+            href = _first_group(hm).strip().split("?")[0].split("#")[0]
+            css_rel, external = _resolve_src(root, rel, href)
+            if not external and css_rel:
+                referenced.add(css_rel)
+    # A JS file another JS file imports is part of the module graph even when
+    # no <script src> names it directly.
+    for rel, text in jss:
+        for m in _ESM_IMPORT_RE.finditer(text):
+            spec = m.group("spec")
+            for cand in (spec, spec + ".js", spec + ".mjs"):
+                target, external = _resolve_src(root, rel, cand)
+                if not external and target:
+                    referenced.add(target)
+                    break
+    html_dirs = {Path(rel).parent.as_posix() for rel, _ in htmls}
+    out: list[Finding] = []
+    for rel, text in [*jss, *csss]:
+        if rel in referenced:
+            continue
+        # Only flag true siblings of an HTML page (same folder); a file under
+        # `src/input.css` may legitimately feed a PostCSS/Tailwind/bundler build.
+        if Path(rel).parent.as_posix() not in html_dirs:
+            continue
+        is_js = rel.endswith((".js", ".mjs", ".cjs"))
+        if not is_js and re.search(
+                r"@(?:tailwind|apply|plugin|source|theme)\b", text or ""):
+            continue
+        kind = "JS" if is_js else "CSS"
+        out.append(Finding(
+            rel, 1,
+            f"this {kind} file is not referenced by any .html file (and no "
+            "sibling imports it) -- it never loads"))
+    return out
+
+
 def run(root, files: list[str] | None = None) -> list[Finding]:
     """Every contract finding for the project under `root`, sorted by file
     and line. With `files`, only findings whose own file OR whose contract
@@ -1925,6 +2026,11 @@ def run(root, files: list[str] | None = None) -> list[Finding]:
     #  _js_instance_method_errors -- runtime-fatal, parse-cleans JS)
     findings.extend(_const_reassign_findings(scopes))
     findings.extend(_instance_method_findings(scopes))
+
+    # --- check 14: empty/comment-only files, `//` CSS comments, orphans -----
+    findings.extend(_empty_file_findings(htmls, jss, csss))
+    findings.extend(_css_slash_comment_findings(csss))
+    findings.extend(_unreferenced_sibling_findings(root, htmls, jss, csss))
 
     # --- dedupe, filter, sort ----------------------------------------------
     uniq: list[Finding] = []

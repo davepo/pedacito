@@ -22,6 +22,7 @@ answer system prompt and the tool schema.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -379,7 +380,13 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
     entries that escape the root or have no extension, cap at cfg.max_new_files.
     Raises LLMError if nothing usable comes back. `design`, when given, is a
     compact architecture contract the file list must follow. `deadline`
-    carries the run's time budget into the call's retry loop (BUG-010)."""
+    carries the run's time budget into the call's retry loop (BUG-010).
+
+    The planner reply is parsed even when it arrives wrapped in markdown
+    fences or padded with prose (`_extract_plan_json`), and a reply that
+    yields no usable files gets ONE bounded repair retry before the plan
+    fails -- with a redacted 200-char snippet of the raw reply on stderr.
+    """
     limit = getattr(cfg, "max_new_files", 24)
     budget = getattr(cfg, "max_spec_chars", MAX_SPEC_CHARS)
     body = spec.text[:budget]
@@ -397,12 +404,125 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
             f"Plan at most {limit} files for this project.")
     messages = [{"role": "system", "content": PLAN_SYSTEM},
                 {"role": "user", "content": user}]
-    raw = client.chat_json(messages, PLAN_SCHEMA,
-                           max_tokens=getattr(cfg, "max_tokens_plan", 2000),
-                           disable_thinking=True, deadline=deadline)
-    if not isinstance(raw, dict):
-        raise LLMError("The planning call did not return an object.")
 
+    def _attempt() -> dict | None:
+        """One planning call, parsed (fences/prose tolerated)."""
+        try:
+            raw = client.chat_json(
+                messages, PLAN_SCHEMA,
+                max_tokens=getattr(cfg, "max_tokens_plan", 2000),
+                disable_thinking=True, deadline=deadline)
+        except LLMError as e:
+            # chat_json could not produce JSON at all; try the plain reply so
+            # a fenced object can still be extracted before we give up.
+            try:
+                text = client.chat(
+                    messages,
+                    max_tokens=getattr(cfg, "max_tokens_plan", 2000),
+                    schema=PLAN_SCHEMA, stream=False, disable_thinking=True)
+                return _extract_plan_json(text)
+            except Exception:
+                raise e
+        if isinstance(raw, dict):
+            return raw
+        return _extract_plan_json(raw)
+
+    raw = _attempt()
+    files, dropped = _plan_files(raw or {}, root, limit)
+    if not files:
+        # ONE bounded repair retry: name what was wrong, ask for the object.
+        messages = messages + [
+            {"role": "assistant",
+             "content": json.dumps(raw or {}, ensure_ascii=False)[:4000]},
+            {"role": "user",
+             "content":
+                 "That plan listed no usable files. Reply again with ONE "
+                 "valid JSON object: {\"project_name\": ..., \"summary\": ..., "
+                 "\"files\": [{\"path\": \"relative/path.ext\", \"purpose\": "
+                 "\"...\"}, ...]}. Every file path must include an extension "
+                 "and stay inside the project."},
+        ]
+        try:
+            raw2 = _attempt()
+        except LLMError:
+            raw2 = None
+        if isinstance(raw2, dict):
+            files2, dropped2 = _plan_files(raw2, root, limit)
+            if files2:
+                raw, files, dropped = raw2, files2, dropped2
+
+    if not files:
+        print(f"[planning failed: no usable files; raw reply: "
+              f"{_redact_snippet(raw)}]", file=sys.stderr)
+        raise LLMError(
+            "The model proposed no usable files.\n"
+            "  Try a more concrete spec, or a stronger profile: planning a file\n"
+            "  tree is the easiest task in this tool and a model that fails it\n"
+            "  will not implement one either.")
+    files.sort(key=lambda f: f.path)
+
+    plan = Plan(project_name=str(raw.get("project_name") or spec.title)[:80],
+                summary=str(raw.get("summary") or "").strip(),
+                files=files, spec=spec, no_extras=no_extras)
+    if verbose:
+        print(f"  plan: {len(files)} file(s)"
+              + (f", {dropped} unusable entr{'y' if dropped == 1 else 'ies'} dropped"
+                 if dropped else ""), file=sys.stderr)
+    return plan
+
+
+def _extract_plan_json(text) -> dict | None:
+    """Parse a planner reply into an object, tolerating markdown fences and
+    surrounding prose. Returns the first JSON object that carries a ``files``
+    key (the plan's shape), or None."""
+    if isinstance(text, dict):
+        return text if "files" in text else None
+    s = str(text or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if "\n" in s:
+            s = s.split("\n", 1)[1]
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, TypeError):
+        pass
+    dec = json.JSONDecoder()
+    i = 0
+    while True:
+        i = s.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, _end = dec.raw_decode(s[i:])
+        except (ValueError, TypeError):
+            i += 1
+            continue
+        if isinstance(obj, dict) and "files" in obj:
+            return obj
+        i += 1
+    return None
+
+
+def _redact_snippet(raw, n: int = 200) -> str:
+    """A secret-scrubbed 200-char preview of a planner reply, for error logs."""
+    try:
+        s = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    except Exception:
+        s = str(raw)
+    s = str(s or "")
+    s = re.sub(r"(?i)\b(sk-[A-Za-z0-9_\-]{6,})\b", "[redacted]", s)
+    s = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"'])[^\"']+([\"'])",
+               r"\1[redacted]\2", s)
+    s = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1[redacted]", s)
+    s = " ".join(s.split())
+    return s[:n]
+
+
+def _plan_files(raw: dict, root: Path, limit: int) -> tuple[list[PlannedFile], int]:
+    """Sanitise a plan object into PlannedFiles: dedupe paths, drop entries
+    that escape the root or have no extension, cap at `limit`."""
     seen: set[str] = set()
     files: list[PlannedFile] = []
     dropped = 0
@@ -419,26 +539,10 @@ def build_plan(spec: Spec, client, cfg, root: Path, verbose: bool = True,
             continue
         seen.add(rel)
         files.append(PlannedFile(rel, str(entry.get("purpose", "")).strip()))
-
     if len(files) > limit:
         dropped += len(files) - limit
         files = files[:limit]
-    if not files:
-        raise LLMError(
-            "The model proposed no usable files.\n"
-            "  Try a more concrete spec, or a stronger profile: planning a file\n"
-            "  tree is the easiest task in this tool and a model that fails it\n"
-            "  will not implement one either.")
-    files.sort(key=lambda f: f.path)
-
-    plan = Plan(project_name=str(raw.get("project_name") or spec.title)[:80],
-                summary=str(raw.get("summary") or "").strip(),
-                files=files, spec=spec, no_extras=no_extras)
-    if verbose:
-        print(f"  plan: {len(files)} file(s)"
-              + (f", {dropped} unusable entr{'y' if dropped == 1 else 'ies'} dropped"
-                 if dropped else ""), file=sys.stderr)
-    return plan
+    return files, dropped
 
 
 def _stub_language_error(rel: str, code: str) -> str | None:
@@ -639,6 +743,11 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Pedacito
+.pedacito/
+.pedacitoignore
+PLAN.md
 """
 
 STARTER_PYPROJECT = """\
@@ -654,6 +763,9 @@ requires-python = ">=3.11"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 """
 
 
@@ -665,8 +777,10 @@ def _header(rel: str, purpose: str) -> str:
     ext = Path(rel).suffix.lower()
     if ext == ".py":
         return f'"""{rel} -- {safe}"""\n'
-    if ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".css"):
+    if ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
         return f"// {rel} -- {safe}\n"
+    if ext == ".css":
+        return f"/* {rel} -- {safe} */\n"
     if ext in (".rb", ".sh", ".yaml", ".yml", ".toml", ".ini", ".cfg"):
         return f"# {rel} -- {safe}\n"
     if ext in (".md", ".rst", ".txt"):
@@ -709,8 +823,19 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
     stubs = stubs or {}
     created: list[str] = []
     wanted: dict[str, str] = {}
+    name = "".join(c for c in plan.project_name.lower().replace(" ", "-")
+                   if c.isalnum() or c == "-").strip("-") or "project"
     for f in plan.files:
-        wanted[f.path] = stubs.get(f.path, _header(f.path, f.purpose))
+        if f.path in stubs:
+            wanted[f.path] = stubs[f.path]
+        elif f.path.lower() == "pyproject.toml":
+            # A planned pyproject gets a real starter file, never a bare
+            # 1-line `# ...` header: a broken pyproject silently breaks
+            # `pytest -q` / `pip install -e .` for a fresh scaffold.
+            wanted[f.path] = STARTER_PYPROJECT.format(
+                name=name, summary=(plan.summary or name)[:120])
+        else:
+            wanted[f.path] = _header(f.path, f.purpose)
 
     readme = next((f.path for f in plan.files
                    if f.path.lower() in ("readme.md", "docs/readme.md")), None)
@@ -722,8 +847,6 @@ def apply_skeleton(root: Path, plan: Plan, dry_run: bool = False,
         # A starter pyproject belongs in a Python plan only: in a JS/HTML project
         # it would mislead the repo brief, the diagnostics, and the model about
         # what stack and test command the project has.
-        name = "".join(c for c in plan.project_name.lower().replace(" ", "-")
-                       if c.isalnum() or c == "-").strip("-") or "project"
         wanted.setdefault("pyproject.toml",
                           STARTER_PYPROJECT.format(name=name,
                                                    summary=(plan.summary or name)[:120]))
@@ -767,6 +890,14 @@ def skeleton_index(root: Path, plan: Plan, cfg) -> Index:
             # Rust/Java/... via tree-sitter -- not the Python chunker for all
             got, imps = _chunk_with_imports(f.path, path, cfg)
         except (SyntaxError, OSError):
+            continue
+        except Exception as e:
+            # A missing grammar / failed parser download must not crash
+            # `pedacito new`: skip the file's structural chunks with a single
+            # concise warning (the reference chunker already handles the
+            # tree-sitter fallback inside _chunk_with_imports).
+            print(f"[warn] {f.path} could not be chunked "
+                  f"({type(e).__name__}); skipped", file=sys.stderr)
             continue
         chunks.extend(got)
         imports[f.path] = imps
@@ -1836,7 +1967,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             repair_rounds: int | None = None, max_tasks: int | None = None,
             max_minutes: int | None = None,
             keep_going: bool = False, auto_install: bool = False,
-            design: bool = False, log_command: str = "") -> int:
+            design: bool = False, log_command: str = "",
+            no_complex: bool = False) -> int:
     """Plan a new project from `spec`, lay down its skeleton, and (unless asked
     to stop earlier) implement every source file. Returns a process exit code;
     progress goes to stderr.
@@ -1870,9 +2002,10 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
 
     # A prompt that names a multi-module architecture (>=3 source files,
     # "across four files", "multi-module", ...) upgrades to Complex on its
-    # own; an explicit user check is never overridden or downgraded.
+    # own; an explicit user check is never overridden or downgraded, and
+    # --no-complex/--single disables the silent auto-escalation outright.
     auto_complex = False
-    if not complex:
+    if not complex and not no_complex:
         from . import loop as loop_mod
         if loop_mod.detect_complex_scaffold(spec.text):
             complex = True
@@ -1924,9 +2057,10 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     # the same ceiling so agent-driven tasks inside the run see it too.
     minutes = (max_minutes if max_minutes is not None
                else int(getattr(cfg, "auto_max_minutes", 0) or 0))
+    run_started = time.monotonic()
     deadline = None
     if minutes > 0:
-        deadline = time.monotonic() + minutes * 60
+        deadline = run_started + minutes * 60
         cfg.max_task_seconds = minutes * 60
 
     design_doc = None
@@ -1964,6 +2098,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                                 design=design_doc, deadline=deadline)
     created = apply_skeleton(root, plan, dry_run=not wants_skeleton,
                              verbose=verbose, stubs=stubs)
+    if wants_skeleton:
+        # R4-BUG-02: a .gitignore the skeleton just wrote must carry Pedacito's
+        # entries now, not at the first index -- and even before `git init`.
+        workspace.ensure(root, getattr(cfg, "manage_gitignore", True),
+                         getattr(cfg, "create_ignore_file", True))
     if not wants_skeleton:
         if created:
             preview = ", ".join(created[:12])
@@ -2002,7 +2141,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             max_tasks=max_tasks, max_minutes=max_minutes,
                             keep_going=keep_going,
                             verbose=verbose, auto_install=auto_install,
-                            design=design_doc is not None)
+                            design=design_doc is not None,
+                            started=run_started)
         _new_checkpoint(f"new: {plan.project_name}")
         return code
 
@@ -2137,14 +2277,17 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                  max_minutes: int | None = None,
                  keep_going: bool = False,
                  verbose: bool = True, auto_install: bool = False,
-                 design: bool = False) -> int:
+                 design: bool = False, started: float | None = None) -> int:
     """Complex mode: with skeleton, stubs and index in place, hand
     implementation to the autonomous loop. The plan becomes a resumable
     checklist (cfg.auto_plan_file, default PLAN.md), one task per source file,
     each run in a fresh context with optional `verify` repair. Returns the
-    loop's exit code."""
+    loop's exit code. `started` is the monotonic start of the whole run, so
+    the --max-minutes budget also bounds the optional README pass at the end."""
     from . import loop
 
+    if started is None:
+        started = time.monotonic()
     rr = cfg.auto_repair_rounds if repair_rounds is None else repair_rounds
     mt = cfg.auto_max_tasks if max_tasks is None else max_tasks
     mm = (getattr(cfg, "auto_max_minutes", 0) if max_minutes is None
@@ -2165,6 +2308,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         root, cfg, client, idx, plan_file,
         apply=True,
         verify=vf,
+        verify_final=bool(vf) and not design,
         repair_rounds=rr,
         max_tasks=mt,
         max_minutes=mm,
@@ -2301,10 +2445,16 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     if not plan.no_extras and (root / "README.md").is_file() \
             and not any(f.path.lower() in ("readme.md", "docs/readme.md")
                         for f in plan.files):
-        doc_plan = Plan(plan.project_name, plan.summary,
-                        [*plan.files,
-                         PlannedFile("README.md", "project README")],
-                        spec=plan.spec, no_extras=plan.no_extras)
+        if mm > 0 and time.monotonic() - started >= mm * 60:
+            # R4-BUG-06: the optional extra README is not worth another LLM
+            # call once the --max-minutes budget is spent.
+            print("[max-minutes reached; skipping optional README "
+                  "documentation pass]", file=sys.stderr)
+        else:
+            doc_plan = Plan(plan.project_name, plan.summary,
+                            [*plan.files,
+                             PlannedFile("README.md", "project README")],
+                            spec=plan.spec, no_extras=plan.no_extras)
     docs_backup = (workspace.new_backup_dir(root, workspace.stamp())
                    if cfg.backup else None)
     docs_summary = build_docs(client, cfg, idx, doc_plan, verbose=verbose,

@@ -79,6 +79,12 @@ def available() -> tuple[bool, str]:
         with sync_playwright() as p:
             exe = p.chromium.executable_path
         ok = bool(exe) and Path(exe).exists()
+        if ok and os.name == "nt" and "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+            try:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
+                    Path(exe).resolve().parents[2])
+            except Exception:
+                pass
     except Exception:
         ok = False
     _AVAIL_CACHE = (True, "") if ok else (False, _BROWSER_HINT)
@@ -1048,8 +1054,19 @@ def check(root, *, entry: str = "", timeout: int = 45,
     cmd = [sys.executable, "-m", "pedacito.domcheck", "--worker",
            str(root), "--entry", rel, "--timeout", str(timeout)]
     cap = timeout + 10
+    child_env = dict(os.environ)
+    pkg_parent = str(Path(__file__).resolve().parents[1])
+    cur_pp = child_env.get("PYTHONPATH", "")
+    pp_parts = [p for p in cur_pp.split(os.pathsep) if p] if cur_pp else []
+    if pkg_parent not in pp_parts:
+        pp_parts.insert(0, pkg_parent)
+    for sp in sys.path:
+        if sp and "site-packages" in sp and sp not in pp_parts:
+            pp_parts.append(sp)
+    if pp_parts:
+        child_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
     rc, out, stopped, _secs = proc.run(cmd, cwd=root, timeout=cap,
-                                       max_output=400_000)
+                                       max_output=400_000, env=child_env)
     if stopped == "timeout":
         return DomResult(entry=rel, error=(
             f"the headless DOM check did not finish within {cap}s; a page "

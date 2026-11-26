@@ -161,6 +161,15 @@ FIELD_META: dict[str, FieldMeta] = {
                     "tools matching the current task are shown, and a server "
                     "not marked trusted asks the permission broker first. "
                     "Independent of the legacy allow_mcp catalog path."),
+    "picard_mode": FieldMeta(
+        label="Captain Picard Mode (\"Make it so.\")",
+        description="Cosmetic Captain Picard Mode: relabels GUI/TUI submit, "
+                    "OK, Save, Apply, Run, and Commit buttons to 'Make it so.'"),
+    "show_update_reminder": FieldMeta(
+        label="Show Active-Development Update Reminder",
+        description="Show a concise active-development update reminder on "
+                    "interactive TUI/chat exit and a subtle dismissible "
+                    "notice in the GUI."),
 }
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")

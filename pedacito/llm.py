@@ -30,7 +30,6 @@ Only dependency is `requests`.
 from __future__ import annotations
 
 import base64
-import ipaddress
 import json
 import os
 import random
@@ -567,46 +566,19 @@ def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
 
 # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab behind a
 # CGNAT gateway is still the user's box), and IPv6 unique-local addresses.
-_LAN_V4_NETS = tuple(ipaddress.ip_network(n) for n in
-                    ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                     "100.64.0.0/10"))
-_LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
-
+# The canonical predicate lives in config._endpoint_is_local; this module just
+# delegates so every caller agrees on what "local" means.
 
 def _is_local_server(cfg) -> bool:
     """True for endpoints the user self-hosts, where the acceleration keys make
-    sense: loopback or private-LAN addresses (the inverse of `_is_remote`, which
-    only knows the loopback spellings, plus RFC1918/carve-out ranges), or a
-    provider table entry that names a local runtime."""
-    try:
-        host = (urlparse(cfg.base_url).hostname or "").lower()
-    except ValueError:
-        return False
-    if host.endswith(".local"):        # mDNS names, the usual LAN spelling
-        return True
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ""):
-        return True
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab
-        # behind a CGNAT gateway is still the user's box), loopback spellings,
-        # link-local, and IPv6 unique-local. `is_private` alone is too broad:
-        # the IANA carve-outs (203.0.113/24, 198.51.100/24, 192.0.2/24, ...)
-        # read as "private" to the stdlib but route nowhere a user self-hosts.
-        nets = (_LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS)
-        if addr.is_loopback or addr.is_link_local \
-                or any(addr in net for net in nets):
-            return True
-        # A numeric address outside every LAN range is only local if the
-        # user's provider entry says so: choosing "llamacpp" for a tunneled
-        # box is an explicit statement that the endpoint is self-hosted.
-    name = str(getattr(cfg, "provider", "") or "").lower().replace("_", "")
-    return any(w in name for w in ("local", "llamacpp", "llama.cpp", "lemond",
-                                   "vllm", "lmstudio", "ollama",
-                                   "strata", "avalon"))
+    sense: loopback, private-LAN/CGNAT/mDNS addresses, or a provider table
+    entry that names a local runtime. Delegates to the one canonical predicate
+    in config.py so the acceleration/sampling keys, hosted detection, tier
+    heuristics and server discovery never disagree."""
+    from .config import _endpoint_is_local
+    return _endpoint_is_local(
+        str(getattr(cfg, "base_url", "") or ""),
+        str(getattr(cfg, "provider", "") or ""))
 
 
 def is_external_provider(cfg) -> bool:
@@ -2241,17 +2213,44 @@ class LLMClient:
             self._notify_redaction(count, redacted, "warn")
         return payload
 
-    def _post(self, payload: dict, stream: bool = False):
+    def _effective_timeout(self) -> float:
+        """The per-request timeout, clamped to the task's remaining wall-clock
+        budget (floor 5s) when ``max_task_seconds`` is set and a task is
+        active. A single slow request must not run far past ``--max-minutes``."""
+        timeout = float(self.cfg.timeout)
+        deadline = float(getattr(self.cfg, "_task_deadline", 0.0) or 0.0)
+        if deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 5.0
+            return min(timeout, max(5.0, remaining))
+        return timeout
+
+    def _post(self, payload: dict, stream: bool = False, trip_circuit: bool = True):
         """POST to the chat completions endpoint, raising a specific LLMError
         subclass on failure (connection, timeout, load failure, template,
-        transient/rate limit, context overflow, or other server error)."""
+        transient/rate limit, context overflow, or other server error).
+
+        ``trip_circuit=False`` makes the request best-effort for the breaker:
+        it still fails fast while the breaker is open, but a failure here does
+        NOT open (or reset) the shared circuit -- so a summary-refresh drop
+        cannot take down the main task's client."""
         payload = self._apply_outbound_guard(payload)
         self._check_circuit()
+
+        def _fail() -> None:
+            if trip_circuit:
+                self._record_failure()
+
+        def _ok() -> None:
+            if trip_circuit:
+                self._record_success()
+
         try:
             try:
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
-                    timeout=self.cfg.timeout, stream=stream)
+                    timeout=self._effective_timeout(), stream=stream)
             except requests.exceptions.ConnectionError:
                 # A pooled keep-alive connection the server already closed
                 # looks like a refused connection; retry once on a fresh
@@ -2263,21 +2262,21 @@ class LLMClient:
                 self._reset_session()
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
-                    timeout=self.cfg.timeout, stream=stream)
+                    timeout=self._effective_timeout(), stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
-            self._record_failure()
+            _fail()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"The server at {self.cfg.base_url} did not answer within "
                 f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
                 "local model may need a larger timeout; a hosted API may be "
                 "overloaded.") from e
         except requests.exceptions.RequestException as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"Request to {self.cfg.base_url} failed: "
                 f"{type(e).__name__}: {str(e)[:200]}") from e
@@ -2315,10 +2314,10 @@ class LLMClient:
                     "Qwen-VL, Claude, or GPT-4o) and try again.\n"
                     f"Server detail: {body[:300]}")
             if r.status_code >= 500 and not loading:
-                self._record_failure()
+                _fail()
             hint = _oom_hint(body) if r.status_code >= 500 else ""
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}{hint}")
-        self._record_success()
+        _ok()
         return r
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -2400,7 +2399,7 @@ class LLMClient:
     def chat(self, messages: list[dict], max_tokens: int, schema: dict | None = None,
              stream: bool | None = None, disable_thinking: bool | None = None,
              json_schema: dict | None = None, cancel_event=None,
-             on_stream=None) -> str:
+             on_stream=None, trip_circuit: bool = True) -> str:
         """Send a chat completion request and return the response text.
 
         `json_schema` is the strict schema to attach as the
@@ -2458,7 +2457,8 @@ class LLMClient:
                 text = self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
-                                       on_stream=on_stream)
+                                       on_stream=on_stream,
+                                       trip_circuit=trip_circuit)
             except ContextOverflowError as e:
                 # The server's window is smaller than our budgets assumed
                 # (stock LM Studio 8192 / Ollama 4096). Halve the reply budget
@@ -2765,7 +2765,8 @@ class LLMClient:
                    schema: dict | None = None, stream: bool = False,
                    disable_thinking: bool | None = None,
                    json_schema: dict | None = None, cancel_event=None,
-                   on_stream=None, _count_call: bool = True) -> str:
+                   on_stream=None, _count_call: bool = True,
+                   trip_circuit: bool = True) -> str:
         """One HTTP request (no retry logic); returns the response text,
         buffered or streamed (to `stream_callback`, else stdout).
 
@@ -2795,19 +2796,19 @@ class LLMClient:
                 messages, max_tokens, schema=schema, stream=stream,
                 disable_thinking=disable_thinking, json_schema=json_schema,
                 cancel_event=cancel_event, on_stream=on_stream,
-                _count_call=_count_call)
+                _count_call=_count_call, trip_circuit=trip_circuit)
         if transport_anthropic.is_anthropic_native(self.cfg):
             return self._chat_once_anthropic(
                 messages, max_tokens, schema=schema, stream=stream,
                 disable_thinking=disable_thinking, json_schema=json_schema,
                 cancel_event=cancel_event, on_stream=on_stream,
-                _count_call=_count_call)
+                _count_call=_count_call, trip_circuit=trip_circuit)
         if transport_gemini.is_gemini_native(self.cfg):
             return self._chat_once_gemini(
                 messages, max_tokens, schema=schema, stream=stream,
                 disable_thinking=disable_thinking, json_schema=json_schema,
                 cancel_event=cancel_event, on_stream=on_stream,
-                _count_call=_count_call)
+                _count_call=_count_call, trip_circuit=trip_circuit)
         fmt_schema = json_schema if json_schema is not None else schema
         msgs = [dict(m) for m in messages]
         want_off = (disable_thinking if disable_thinking is not None
@@ -3016,7 +3017,7 @@ class LLMClient:
 
         if not stream:
             try:
-                r = self._post(payload)
+                r = self._post(payload, trip_circuit=trip_circuit)
             except LLMError as e:
                 if self._cache_markers_rejected_by(e):
                     self._cache_markers_rejected = True
@@ -3028,7 +3029,8 @@ class LLMClient:
                                            json_schema,
                                            cancel_event=cancel_event,
                                            on_stream=on_stream,
-                                           _count_call=False)
+                                           _count_call=False,
+                                           trip_circuit=trip_circuit)
                 if native and self._tools_rejected(e):
                     self._native_ok = False
                     print("[this server rejected native tool calls; using the "
@@ -3037,19 +3039,22 @@ class LLMClient:
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
                                            on_stream=on_stream,
-                                           _count_call=False)
+                                           _count_call=False,
+                                           trip_circuit=trip_circuit)
                 if self._downgrade_response_format(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
                                            on_stream=on_stream,
-                                           _count_call=False)
+                                           _count_call=False,
+                                           trip_circuit=trip_circuit)
                 if self._deny_accel_caps(payload, e):
                     return self._chat_once(messages, max_tokens, schema, stream,
                                            disable_thinking, json_schema,
                                            cancel_event=cancel_event,
                                            on_stream=on_stream,
-                                           _count_call=False)
+                                           _count_call=False,
+                                           trip_circuit=trip_circuit)
                 raise
             try:
                 with self._active_response_lock:
@@ -3083,7 +3088,7 @@ class LLMClient:
         self.last_finish_reason = ""
         self.last_reasoning_chars = 0
         try:
-            r = self._post(payload, stream=True)
+            r = self._post(payload, stream=True, trip_circuit=trip_circuit)
         except LLMError as e:
             if self._cache_markers_rejected_by(e):
                 self._cache_markers_rejected = True
@@ -3093,19 +3098,22 @@ class LLMClient:
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
                                        on_stream=on_stream,
-                                       _count_call=False)
+                                       _count_call=False,
+                                       trip_circuit=trip_circuit)
             if self._downgrade_response_format(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
                                        on_stream=on_stream,
-                                       _count_call=False)
+                                       _count_call=False,
+                                       trip_circuit=trip_circuit)
             if self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
                                        on_stream=on_stream,
-                                       _count_call=False)
+                                       _count_call=False,
+                                       trip_circuit=trip_circuit)
             low = str(e).lower()
             if "stream_options" in payload and (
                     "stream_options" in low or "include_usage" in low):
@@ -3113,7 +3121,7 @@ class LLMClient:
                 # retry once without it.
                 self._stream_usage_ok = False
                 payload.pop("stream_options", None)
-                r = self._post(payload, stream=True)
+                r = self._post(payload, stream=True, trip_circuit=trip_circuit)
             else:
                 raise
         if self._response_is_json(r):
@@ -3411,7 +3419,8 @@ class LLMClient:
     # secret guard, replay digest, telemetry) runs on the OpenAI-shaped
     # messages; everything after (the HTTP POST) speaks native Anthropic.
 
-    def _anthropic_post(self, payload: dict, headers: dict, stream: bool = False):
+    def _anthropic_post(self, payload: dict, headers: dict, stream: bool = False,
+                        trip_circuit: bool = True):
         """POST to the native /v1/messages endpoint, raising the same LLMError
         subclasses as `_post` (connection, timeout, transient/rate limit --
         including Anthropic's 529 overloaded -- context overflow, and clear
@@ -3419,10 +3428,19 @@ class LLMClient:
         from . import transport_anthropic
         url = transport_anthropic.messages_endpoint(self.cfg.base_url)
         self._check_circuit()
+
+        def _fail() -> None:
+            if trip_circuit:
+                self._record_failure()
+
+        def _ok() -> None:
+            if trip_circuit:
+                self._record_success()
+
         try:
             try:
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self.cfg.timeout, stream=stream)
+                                    timeout=self._effective_timeout(), stream=stream)
             except requests.exceptions.ConnectionError:
                 with self._session_lock:
                     used = self._session_used
@@ -3430,21 +3448,21 @@ class LLMClient:
                     raise
                 self._reset_session()
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self.cfg.timeout, stream=stream)
+                                    timeout=self._effective_timeout(), stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
-            self._record_failure()
+            _fail()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"The server at {self.cfg.base_url} did not answer within "
                 f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
                 "local model may need a larger timeout; a hosted API may be "
                 "overloaded.") from e
         except requests.exceptions.RequestException as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"Request to {self.cfg.base_url} failed: "
                 f"{type(e).__name__}: {str(e)[:200]}") from e
@@ -3479,9 +3497,9 @@ class LLMClient:
                     "Gemma 4, Qwen-VL, or GPT-4o) and try again.\n"
                     f"Server detail: {body[:300]}")
             if r.status_code >= 500:
-                self._record_failure()
+                _fail()
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
-        self._record_success()
+        _ok()
         return r
 
     @staticmethod
@@ -3499,7 +3517,8 @@ class LLMClient:
                              disable_thinking: bool | None = None,
                              json_schema: dict | None = None,
                              cancel_event=None, on_stream=None,
-                             _count_call: bool = True) -> str:
+                             _count_call: bool = True,
+                             trip_circuit: bool = True) -> str:
         """One native /v1/messages request (see `_chat_once` for the contract).
 
         Step schemas become a forced `step` tool (Anthropic has no
@@ -3588,7 +3607,8 @@ class LLMClient:
 
         if not stream:
             try:
-                r = self._anthropic_post(payload, headers, stream=False)
+                r = self._anthropic_post(payload, headers, stream=False,
+                                         trip_circuit=trip_circuit)
             except LLMError as e:
                 if self._cache_markers_rejected_by(e) and cache_enabled:
                     self._cache_markers_rejected = True
@@ -3598,7 +3618,7 @@ class LLMClient:
                         messages, max_tokens, schema=schema, stream=stream,
                         disable_thinking=disable_thinking, json_schema=json_schema,
                         cancel_event=cancel_event, on_stream=on_stream,
-                        _count_call=False)
+                        _count_call=False, trip_circuit=trip_circuit)
                 raise
             try:
                 data = r.json()
@@ -3699,7 +3719,8 @@ class LLMClient:
             return self._cancel_requested(external_cancel)
 
         try:
-            r = self._anthropic_post(payload, headers, stream=True)
+            r = self._anthropic_post(payload, headers, stream=True,
+                                     trip_circuit=trip_circuit)
         except LLMError as e:
             if self._cache_markers_rejected_by(e) and cache_enabled:
                 self._cache_markers_rejected = True
@@ -3796,13 +3817,23 @@ class LLMClient:
     def _native_http_post(self, url: str, payload: dict, headers: dict,
                           *, stream: bool = False,
                           auth_hint: str = "",
-                          transient_statuses: tuple[int, ...] = (429, 503)):
+                          transient_statuses: tuple[int, ...] = (429, 503),
+                          trip_circuit: bool = True):
         """Shared HTTP POST + error taxonomy for native provider transports."""
         self._check_circuit()
+
+        def _fail() -> None:
+            if trip_circuit:
+                self._record_failure()
+
+        def _ok() -> None:
+            if trip_circuit:
+                self._record_success()
+
         try:
             try:
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self.cfg.timeout, stream=stream)
+                                    timeout=self._effective_timeout(), stream=stream)
             except requests.exceptions.ConnectionError:
                 with self._session_lock:
                     used = self._session_used
@@ -3810,21 +3841,21 @@ class LLMClient:
                     raise
                 self._reset_session()
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self.cfg.timeout, stream=stream)
+                                    timeout=self._effective_timeout(), stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
-            self._record_failure()
+            _fail()
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"The server at {self.cfg.base_url} did not answer within "
                 f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
                 "local model may need a larger timeout; a hosted API may be "
                 "overloaded.") from e
         except requests.exceptions.RequestException as e:
-            self._record_failure()
+            _fail()
             raise LLMError(
                 f"Request to {self.cfg.base_url} failed: "
                 f"{type(e).__name__}: {str(e)[:200]}") from e
@@ -3854,9 +3885,9 @@ class LLMClient:
                     "Gemini, Gemma 4, Qwen-VL, or GPT-4o) and try again.\n"
                     f"Server detail: {body[:300]}")
             if r.status_code >= 500:
-                self._record_failure()
+                _fail()
             raise LLMError(f"Server returned {r.status_code}: {body[:500]}")
-        self._record_success()
+        _ok()
         return r
 
     def _run_native_stream(self, r, *, parse_stream_fn, stream_cancelled_cls,
@@ -4039,7 +4070,8 @@ class LLMClient:
                           disable_thinking: bool | None = None,
                           json_schema: dict | None = None,
                           cancel_event=None, on_stream=None,
-                          _count_call: bool = True) -> str:
+                          _count_call: bool = True,
+                          trip_circuit: bool = True) -> str:
         """One native Google Gemini ``/v1beta`` request."""
         from . import transport_gemini
 
@@ -4096,7 +4128,8 @@ class LLMClient:
 
         if not stream:
             r = self._native_http_post(url, payload, headers, stream=False,
-                                       auth_hint=auth_hint)
+                                       auth_hint=auth_hint,
+                                       trip_circuit=trip_circuit)
             try:
                 with self._active_response_lock:
                     self._active_response = r
@@ -4121,7 +4154,8 @@ class LLMClient:
                 data, native=native, prompt_est=prompt_est, t0=t0)
 
         r = self._native_http_post(url, payload, headers, stream=True,
-                                   auth_hint=auth_hint)
+                                   auth_hint=auth_hint,
+                                   trip_circuit=trip_circuit)
         return self._run_native_stream(
             r,
             parse_stream_fn=transport_gemini.parse_sse_stream,
@@ -4186,6 +4220,7 @@ class LLMClient:
         json_schema: dict | None = None,
         cancel_event=None, on_stream=None,
         _count_call: bool = True,
+        trip_circuit: bool = True,
     ) -> str:
         """One OpenAI ``/v1/responses`` request."""
         from . import transport_openai
@@ -4244,7 +4279,8 @@ class LLMClient:
 
         if not stream:
             r = self._native_http_post(url, payload, headers, stream=False,
-                                       auth_hint=auth_hint)
+                                       auth_hint=auth_hint,
+                                       trip_circuit=trip_circuit)
             try:
                 with self._active_response_lock:
                     self._active_response = r
@@ -4270,7 +4306,8 @@ class LLMClient:
                 data, native=native, prompt_est=prompt_est, t0=t0)
 
         r = self._native_http_post(url, payload, headers, stream=True,
-                                   auth_hint=auth_hint)
+                                   auth_hint=auth_hint,
+                                   trip_circuit=trip_circuit)
         return self._run_native_stream(
             r,
             parse_stream_fn=transport_openai.parse_sse_stream,

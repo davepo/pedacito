@@ -44,9 +44,10 @@ def _pw(path, text: str) -> None:
 # ------------------------------------------------- bug 1: silent partial edits
 def test_partial_edit_reported_at_task_and_run_level(tmp_path, monkeypatch,
                                                       capsys):
-    """A task whose reply applies SOME blocks but fails others stays ticked
-    (by design, see test_loop.py's strict test), but the unapplied blocks must
-    surface: at the moment it happens, in the run log, and in the finish line."""
+    """A task whose reply applies SOME blocks but fails others is NOT ticked
+    done over the half-applied batch: it retries once to land the missing
+    targets, and a second miss marks the task failed -- while still naming the
+    unapplied blocks at the moment it happens and in the run log."""
     plan = tmp_path / "PLAN.md"
     loop.write_plan(plan, "goal", ["Patch two files"])
     idx = types.SimpleNamespace(root=tmp_path)
@@ -65,11 +66,13 @@ def test_partial_edit_reported_at_task_and_run_level(tmp_path, monkeypatch,
                         lambda root, cmd, **kw: (True, ""))
     code = loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                          verify="pytest -q")
-    assert code == 0                       # unchanged: still not a failure
+    assert code == 1                       # partial, then failed on retry
     err = capsys.readouterr().err
     assert "partial edit" in err and "b.py" in err
+    assert "retrying once to land the missing block" in err
     log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
     assert "partial edit on task" in log
+    assert "- [x] Patch two files" not in plan.read_text(encoding="utf-8")
 
 
 def test_partial_edit_final_summary_mentions_partial_tasks(tmp_path,
@@ -94,9 +97,9 @@ def test_partial_edit_final_summary_mentions_partial_tasks(tmp_path,
     loop.run_loop(tmp_path, cfg, None, idx, plan, apply=True,
                   verify="pytest -q")
     err = capsys.readouterr().err
-    assert "ticked done with blocks that did not apply" in err
+    assert "partial edit persisted after a retry" in err
     log = workspace.run_log_path(tmp_path).read_text(encoding="utf-8")
-    assert "partially applied task" in log
+    assert "partial edit on task" in log
 
 
 # --------------------------------------- bug 3: verify_final (whole-goal mode)

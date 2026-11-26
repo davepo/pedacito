@@ -527,6 +527,33 @@ live git worktrees under `.pedacito/worktrees/` make the reset refuse unless you
 
 ---
 
+## Git commits, pull requests, undo and scratch files (v0.3.3)
+
+- **Secret pre-flight before every commit.** `pedacito commit` (and the TUI
+  `/git commit`, and the GUI Git drawer) scans the staged diff with the same
+  pattern set as `security.scan_text_for_secrets` before it runs `git commit`.
+  A match refuses the commit and names the file and the pattern. Only
+  `--allow-secrets` overrides it, and that override is explicit on the command
+  line, never saved to config.
+- **Secret pre-flight before every pull request.** `pedacito pr` scans the branch
+  diff the same way before it drafts the title and body, so a credential cannot
+  reach a PR description either. `--dry-run` prints the draft and never calls `gh`.
+- **No automatic push and no force-push.** Nothing in `gitops` runs `git push`
+  or `--force`. `commit` leaves a local commit, and `pr` opens a pull request for
+  a branch you have already published. Git calls are argv-only, with no shell.
+- **`undo` checks git HEAD.** When the repository's HEAD has moved since the
+  checkpoint was taken (for example, you committed in between), `pedacito undo`
+  refuses to rewind the working tree and asks for `--force`, so a commit is not
+  silently undone. Checkpoints created before a divergent edit are taken first.
+- **`.pedacito/scratch/` is contained and read-only to the model.** Large tool
+  output is written there as `*.log` files. The model can `read` and `grep`
+  only those direct `*.log` files, through the same path containment as any
+  other read. It cannot write, rename or traverse out of the directory.
+- **ACP paths are contained.** In `pedacito acp`, a `@file` mention or resource
+  block goes through `security.resolve_safe_path`, so traversal and symlink
+  escapes are refused. The project is bound at `session/new`, and a foreign
+  working directory is refused rather than read from.
+
 ## Trajectory export
 
 Trajectory export is an **opt-in** dataset feature, off by default

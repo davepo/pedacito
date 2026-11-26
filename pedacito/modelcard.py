@@ -99,12 +99,36 @@ def _card_is_image(card) -> bool:
     return imagegen.is_image_model(card.get("model") or "")
 
 
+def _card_missing_temperatures(card) -> bool:
+    """True for a CURRENT-version, non-image, LOCAL text card whose ``choices``
+    record neither calibrated temperature. Cards saved before the calibrated
+    temperature work (WP-3305) fall here and must re-calibrate; hosted cards
+    (never temperature-calibrated) and image cards (no chat surface) do not."""
+    if not isinstance(card, dict):
+        return False
+    if card.get("version") != CARD_VERSION:
+        return False
+    if _card_is_image(card):
+        return False
+    url = str(card.get("url") or "")
+    if not url:
+        return False
+    from .config import _endpoint_is_local
+    if not _endpoint_is_local(url):
+        return False
+    choices = card.get("choices")
+    return (isinstance(choices, dict)
+            and "temperature" not in choices
+            and "temperature_answer" not in choices)
+
+
 def card_meta(card: dict | None) -> dict:
     """Calibration-badge metadata for one saved card (or None): whether it is
     calibrated, when ("YYYY-MM-DD HH:MM"), its age in whole days, whether it
-    is stale (older than the TTL or from an old card version), the overall
-    score, and whether it is an image-generator card. An absent card yields
-    the all-empty/zero form."""
+    is stale (older than the TTL, from an old card version, or a local text
+    card saved before calibrated temperatures), the overall score, and whether
+    it is an image-generator card. An absent card yields the all-empty/zero
+    form."""
     if not isinstance(card, dict):
         return {"calibrated": False, "calibrated_at": "",
                 "calibrated_age_days": 0, "calibrated_stale": False,
@@ -114,7 +138,8 @@ def card_meta(card: dict | None) -> dict:
     ts = float(card.get("ts", 0) or 0)
     age_days = int((time.time() - ts) / 86400) if ts else 0
     at = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
-    stale = age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
+    stale = (age_days > CARD_TTL_DAYS or card.get("version") != CARD_VERSION
+             or _card_missing_temperatures(card))
     measured = card.get("measured") or {}
     score = float(measured.get("overall") or 0.0)
     is_image = _card_is_image(card)
@@ -438,6 +463,56 @@ def _t_tool_choice(client, cfg, reasoning_first: bool = False,
             else:
                 notes.append(f"{task[:34]}...: chose {step['action']}, "
                              f"wanted one of {sorted(ok)}")
+    n = len(scenarios)
+    return right / n, parsed / n, notes
+
+
+def _t_tool_choice_plain(client, cfg) -> tuple[float, float, list[str]]:
+    """(accuracy, parse rate, notes). The same eight scenarios, but the model
+    replies in the plain-word gather format (`action read / file ... / lines
+    10 to 40`, or `key: value` lines) and the harness parses it with
+    `parse_plain_step` -- no JSON grammar, so a model that emits words more
+    reliably than JSON can be measured directly."""
+    from .tools import parse_plain_step, plain_step_instructions
+    system = _gather_system(cfg) + plain_step_instructions()
+    right = parsed = 0
+    notes = []
+    scenarios = list(_SCENARIOS)
+    done_msgs = [
+        {"role": "assistant", "content": "action read / file src/scheduler.py "
+                                         "/ lines 82 to 90"},
+        {"role": "user", "content":
+         "RESULT:\nsrc/scheduler.py lines 82-90:\n 82 | def is_leech(self, n):\n"
+         " 83 |     return n >= 8\n\n[Next action? No lookup limit -- choose "
+         "'done' once the task is covered.]"},
+    ]
+    scenarios.append(("What does is_leech return? One-word answer is enough.",
+                      done_msgs, {"done"}))
+    scenarios.append(("Report the threshold used in is_leech.", done_msgs,
+                      {"done"}))
+    for task, extra, ok in scenarios:
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content":
+                 f"PROJECT MAP\n\n{_MAP}\n\nTASK\n{task}\n\n"
+                 "[Next action? No lookup limit -- choose 'done' once the "
+                 "task is covered.]"}] + extra
+        try:
+            raw = client.chat(msgs, max_tokens=cfg.max_tokens_step,
+                              stream=False, disable_thinking=True)
+            step = parse_plain_step(raw)
+        except LLMError as e:
+            notes.append(f"{task[:30]}...: call failed "
+                         f"({str(e).splitlines()[0][:60]})")
+            continue
+        if isinstance(step, dict) and step.get("action"):
+            parsed += 1
+            if step["action"] in ok:
+                right += 1
+            else:
+                notes.append(f"{task[:34]}...: chose {step['action']}, "
+                             f"wanted one of {sorted(ok)}")
+        else:
+            notes.append(f"{task[:30]}...: no action parsed")
     n = len(scenarios)
     return right / n, parsed / n, notes
 
@@ -1091,6 +1166,20 @@ def _arm_wins(measured: dict, arm: str, tc: float, js: float) -> bool:
             and measured.get(f"json_ok_{arm}", 0.0) >= js)
 
 
+def _plain_wins(measured: dict, tc: float, js: float) -> bool:
+    """Adopt the plain-word gather format only when it MEASURES better than
+    the baseline JSON: a clear gain in choosing the right action with no loss
+    of well-formed steps, OR equal accuracy with meaningfully better
+    adherence (fewer unparseable steps)."""
+    score = measured.get("tool_choice_plain")
+    if score is None:
+        return False
+    adhere = measured.get("json_ok_plain", 0.0)
+    if score + 1e-9 >= tc + _ARM_GAIN and adhere >= js:
+        return True
+    return abs(score - tc) < 1e-9 and adhere + 1e-9 >= js + _ARM_GAIN
+
+
 def choose(measured: dict, hosted: bool) -> dict:
     """Card choices from the measurements."""
     tc = measured.get("tool_choice", 0.0)
@@ -1104,11 +1193,16 @@ def choose(measured: dict, hosted: bool) -> dict:
     measured["overall"] = round(overall, 2)
     pack = "full" if overall >= 0.8 else "small" if overall >= 0.55 else "tiny"
     # Native tool calls only when they MEASURE better: a clear gain in choosing
-    # the right action with no loss of well-formed steps.
+    # the right action with no loss of well-formed steps. The plain-word format
+    # (arXiv:2611.17169) follows the same evidence gate against baseline JSON;
+    # native wins the tie between the two arms.
     native_wins = _arm_wins(measured, "native", tc, js)
+    plain_wins = _plain_wins(measured, tc, js)
+    tool_mode = ("native" if native_wins
+                 else "plain" if plain_wins else "grammar")
     ch: dict = {"prompt_pack": pack,
                 "answer_mode": "auto" if cont >= 1.0 else "rebuild",
-                "tool_mode": "native" if native_wins else "grammar"}
+                "tool_mode": tool_mode}
     # Reason-first steps follow the same rule: only when they measure better.
     if _arm_wins(measured, "rf", tc, js):
         ch["step_reasoning_first"] = True
@@ -1283,7 +1377,8 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     except Exception:
         info = {}
     hosted = is_hosted(cfg) and not _endpoint_is_local(
-        str(getattr(cfg, "base_url", "") or ""))
+        str(getattr(cfg, "base_url", "") or ""),
+        str(getattr(cfg, "provider", "") or ""))
     # The base-architecture recommendation applies to LOCAL models only; a
     # hosted API keeps its provider-table defaults.
     allow_hf = bool(getattr(cfg, "auto_refresh_model_catalog", True))
@@ -1335,6 +1430,13 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     say(f"  tool choice, worked examples    "
         f"{measured['tool_choice_fs']:>4.0%}   "
         f"adherence {measured['json_ok_fs']:.0%}")
+    cols, n = _repeat(_t_tool_choice_plain, repeats, client, cfg)
+    _store(measured, "tool_choice_plain", cols[0])
+    _store(measured, "json_ok_plain", cols[1])
+    notes += [f"plain-word: {x}" for x in n[:3]]
+    say(f"  tool choice, plain-word format  "
+        f"{measured['tool_choice_plain']:>4.0%}   "
+        f"adherence {measured['json_ok_plain']:.0%}")
     cols, n = _repeat(_t_edit_format, repeats, client, cfg)
     _store(measured, "edit_format", cols[0])
     notes += n
@@ -1474,6 +1576,8 @@ def render(card: dict) -> str:
              f"overall {m.get('overall', '?')})"]
     if card.get("_needs_recalibrate"):
         lines.append("  (v1 card: re-calibrate to record per-probe means)")
+    if _card_missing_temperatures(card):
+        lines.append("  (calibrated before temperature recording: re-calibrate)")
     lines.append("  choices: " + ", ".join(f"{k}={v}" for k, v in c.items()))
     tags = m.get("specialties") or c.get("specialties")
     if tags:

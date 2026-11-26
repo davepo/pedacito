@@ -2080,6 +2080,69 @@ thread-snapshot API is `Thread32First`/`Thread32Next` -- there is NO wide varian
 (only the process snapshots have `W`). Covered by
 `tests/test_processes_crucible.py` and `tests/test_windows_portability.py`.
 
+### 52. One locality predicate for every endpoint decision
+
+**Problem.** Four modules each decided whether a `base_url` was a local server, and
+they disagreed. Python 3.11.4+ reports a Tailscale address (RFC 6598, `100.64.0.0/10`)
+as not private, so a self-hosted box on a tailnet was handled as a hosted API: its
+sampling keys were stripped, `cache_prompt` was withheld and its calibration was
+treated as remote.
+
+**Technique.** One predicate, `_endpoint_is_local`, that tests loopback, `.local`,
+RFC 1918, RFC 6598 explicitly and does not rely on `addr.is_private`, plus IPv6
+link-local and unique-local (`fc00::/7`) and explicit local provider labels. Every
+call site (config, llm, modelcard, servers, model_catalog, cli) delegates to it. A
+local model card that has no calibrated temperature is marked stale, so the value
+is measured again rather than guessed.
+
+**Prevention.** The predicate has a table-driven test over each range and each
+call site. Adding a new "local" rule means editing one function.
+
+### 53. Plain-word gather steps, chosen by measurement
+
+**Problem.** Some small models produce a malformed JSON gather step on a large share
+of turns, and each malformed step costs a retry.
+
+**Technique.** `tool_mode = "plain"` asks for each step as a plain-word line
+(`read app.py 1 40`, `grep parse_args`). `calibrate` runs the grammar and plain
+formats on the same probes and keeps the one that scores better, using the same
+adopt-only-if-clearly-better rule as `tool_mode` and `step_reasoning_first`. The
+format is a measured property of the model, not a guess.
+
+### 54. Spill the wall, keep a pointer: scratch offloading
+
+**Problem.** A single `run` or `grep` can return thousands of lines, and carrying
+all of them in the context window crowds out the task.
+
+**Technique.** An observation over `max_observation_tokens` from an observation
+action is written to `.pedacito/scratch/<id>.log`. The model receives the head, the
+tail, the line count and the file name, and it reads exact lines on demand with
+`read` or `grep`. The directory is read-only to the model: it cannot write there,
+and only direct `*.log` files are readable. Spilled output is data, never a place
+where instructions can be planted for later steps.
+
+### 55. Deterministic check before `finish`
+
+**Problem.** An interleaved run can declare the task finished while a verification
+it could have run is still red.
+
+**Technique.** When the model calls `finish` in `interleaved` mode, a bounded,
+deterministic pre-stop verifier runs first (the scoped checks the task already
+depends on). A failure is returned to the model as an observation, and the loop
+continues. The number of rounds is capped, so the verifier can never trap the run
+in a loop.
+
+### 56. Two-path proactive routing (opt-in)
+
+**Problem.** Reactive escalation waits for a small model to fail, which costs a
+failed attempt on tasks that were obviously hard from the start.
+
+**Technique.** With `proactive_escalation = true`, a zero-token structural gate
+(import fan-out, files touched, cross-module boundaries, open-ended architecture
+words) escalates the task straight to the `escalate` role. A boundary-fewshot
+Scout classifier keeps well-defined single-file tasks local. Both paths run once per
+task, and the setting is off by default so existing reactive behaviour is unchanged.
+
 ## Quick reference: techniques 5, 11, 17 to 51
 
 | Technique | Section | How to turn it off | Where you see it |

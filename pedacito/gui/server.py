@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
+from .. import gitops
 from .. import i18n
 from .. import review as review_mod
 from .. import prompts as prompts_mod
@@ -618,6 +619,119 @@ def _rules_post(q, body):
 def _backups(q, body=None):
     """Backup snapshots for the WORKSPACE panel's BACKUPS tab."""
     return 200, {"backups": backup_snapshots()}
+
+
+# --- guided git ----------------------------------------------------------------
+
+def _git_status_payload(root: Path) -> dict:
+    status = gitops.status_hunks(root)
+    findings = gitops.scan_staged_secrets(root)
+    return {
+        **status,
+        "findings": [finding.to_dict() for finding in findings],
+        "has_secrets": bool(findings),
+    }
+
+
+def _git_draft_client():
+    """(client, cfg) for drafting; (None, cfg) when no model is configured."""
+    with STATE.lock:
+        cfg = STATE.cfg
+    if cfg is None or not str(getattr(cfg, "model", "") or ""):
+        return None, cfg
+    try:
+        from ..llm import LLMClient
+        return LLMClient(cfg), cfg
+    except Exception:
+        return None, cfg
+
+
+@get("/api/git/status")
+def _git_status(q, body=None):
+    """Branch, dirty state, per-file diffs and the staged secret scan."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        return 200, _git_status_payload(root)
+    except (gitops.GitOpsError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/stage")
+def _git_stage(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    paths = body.get("paths", body.get("path"))
+    try:
+        result = gitops.stage_files(root, paths)
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/unstage")
+def _git_unstage(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    paths = body.get("paths", body.get("path"))
+    try:
+        result = gitops.unstage_files(root, paths)
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/commit")
+def _git_commit(q, body):
+    """Draft a message (`draft_only`) or commit the staged change."""
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    if body.get("draft_only"):
+        client, cfg = _git_draft_client()
+        try:
+            message = gitops.draft_commit_message(root, client=client, cfg=cfg)
+            findings = gitops.scan_staged_secrets(root)
+        except (gitops.GitOpsError, OSError) as e:
+            return 400, {"ok": False, "detail": str(e)}
+        return 200, {
+            "ok": True,
+            "message": message,
+            "findings": [finding.to_dict() for finding in findings],
+            "has_secrets": bool(findings),
+        }
+    message = str(body.get("message") or "").strip()
+    try:
+        if not message:
+            client, cfg = _git_draft_client()
+            message = gitops.draft_commit_message(root, client=client, cfg=cfg)
+        result = gitops.create_commit(
+            root, message,
+            stage_all=bool(body.get("stage_all")),
+            allow_secrets=bool(body.get("allow_secrets")))
+        status = _git_status_payload(root)
+        return 200, {**status, **result,
+                     "findings": status["findings"],
+                     "has_secrets": status["has_secrets"]}
+    except (gitops.GitOpsError, security.SecurityError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
+
+
+@post("/api/git/branch")
+def _git_branch(q, body):
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": "No project is open."}
+    try:
+        result = gitops.create_branch(
+            root, str(body.get("name") or ""),
+            checkout=bool(body.get("checkout", True)))
+        return 200, {**_git_status_payload(root), **result}
+    except (gitops.GitOpsError, OSError) as e:
+        return 400, {"ok": False, "detail": str(e)}
 
 
 # --- time-travel checkpoints --------------------------------------------------
@@ -1573,9 +1687,10 @@ def _session_consolidate(q, body):
         return 409, {"ok": False,
                      "detail": "A job is running. Stop it before "
                                "consolidating the session."}
-    msgs = [{"role": m.get("role"), "content": str(m.get("text") or "")}
-            for m in STATE.messages_snapshot()
-            if m.get("role") in ("user", "assistant") and m.get("text")]
+    msgs = [m for m in STATE.messages_snapshot()
+            if m.get("role") in ("user", "assistant", "receipt",
+                                 "system", "diff", "activity", "error")
+            and (m.get("text") or m.get("results") or m.get("files"))]
     try:
         res = memory.consolidate_session(root, cfg, msgs or None)
     except OSError as e:
@@ -2867,11 +2982,24 @@ def _benchmarks_run(q, body):
 
 # --- the handler ------------------------------------------------------------------
 
+_CLIENT_DISCONNECT = (
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionResetError,
+)
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "PedacitoGUI"
 
     def log_message(self, *a):
         pass
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except _CLIENT_DISCONNECT:
+            return
 
     def _headers(self, code: int, ctype: str, length: int | None) -> None:
         self.send_response(code)
@@ -2885,8 +3013,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
-        self._headers(code, ctype, len(body))
-        self.wfile.write(body)
+        try:
+            self._headers(code, ctype, len(body))
+            self.wfile.write(body)
+        except _CLIENT_DISCONNECT:
+            return
 
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj, default=str).encode(),
@@ -2968,15 +3099,18 @@ class _Handler(BaseHTTPRequestHandler):
         if len(data) > MAX_PREVIEW_ASSET_BYTES:
             self._send(413, b"file too large", "text/plain")
             return
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "SAMEORIGIN")
-        self.send_header("Content-Security-Policy", PREVIEW_CSP)
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            self.send_header("Content-Security-Policy", PREVIEW_CSP)
+            self.end_headers()
+            self.wfile.write(data)
+        except _CLIENT_DISCONNECT:
+            return
 
     def _discard_request_body(self) -> None:
         """Consume a POST body we refuse before parsing it.
@@ -3005,69 +3139,75 @@ class _Handler(BaseHTTPRequestHandler):
             remaining -= len(chunk)
 
     def do_GET(self):
-        if not review_mod.request_allowed(self, post=False):
-            self._json(403, {"ok": False})
+        try:
+            if not review_mod.request_allowed(self, post=False):
+                self._json(403, {"ok": False})
+                return
+            url = urlparse(self.path)
+            query = parse_qs(url.query)
+            if url.path == "/events":
+                self._events(query)
+                return
+            if url.path.startswith("/api/runner/preview/"):
+                self._runner_preview(url.path[len("/api/runner/preview/"):])
+                return
+            if url.path.startswith("/preview/"):
+                self._preview(url.path[len("/preview/"):])
+                return
+            if url.path == "/favicon.ico":
+                self._send(200, FAVICON_SVG, "image/svg+xml")
+                return
+            route = GET_ROUTES.get(url.path)
+            if route is None:
+                if url.path.startswith("/api/"):
+                    self._json(404, {"ok": False})
+                else:
+                    self._static("index.html" if url.path == "/"
+                                 else url.path.replace("/static/", "", 1))
+                return
+            self._call(route, query, None)
+        except _CLIENT_DISCONNECT:
             return
-        url = urlparse(self.path)
-        query = parse_qs(url.query)
-        if url.path == "/events":
-            self._events(query)
-            return
-        if url.path.startswith("/api/runner/preview/"):
-            self._runner_preview(url.path[len("/api/runner/preview/"):])
-            return
-        if url.path.startswith("/preview/"):
-            self._preview(url.path[len("/preview/"):])
-            return
-        if url.path == "/favicon.ico":
-            self._send(200, FAVICON_SVG, "image/svg+xml")
-            return
-        route = GET_ROUTES.get(url.path)
-        if route is None:
-            if url.path.startswith("/api/"):
-                self._json(404, {"ok": False})
-            else:
-                self._static("index.html" if url.path == "/"
-                             else url.path.replace("/static/", "", 1))
-            return
-        self._call(route, query, None)
 
     def do_POST(self):
-        if not review_mod.request_allowed(self, post=True):
-            self._discard_request_body()
-            self._json(403, {"ok": False})
-            return
-        # CSRF: a browser-driven POST carries Origin/Referer -- both must name
-        # a loopback host (or this server's bound address). Foreign values
-        # mean some website is trying to drive the local agent: refuse.
-        bound = (getattr(self.server, "server_address", ("127.0.0.1", 0)) or
-                 ("127.0.0.1", 0))[0]
-        if not security.post_origin_allowed(self.headers, bound_host=bound):
-            self._discard_request_body()
-            self._json(403, {"ok": False,
-                             "detail": "Origin/Referer is not loopback"})
-            return
-        url = urlparse(self.path)
-        route = POST_ROUTES.get(url.path)
-        if route is None:
-            self._discard_request_body()
-            self._json(404, {"ok": False})
-            return
         try:
-            n = max(0, int(self.headers.get("Content-Length") or 0))
-        except ValueError:
-            n = 0
-        if n > MAX_BODY:
-            self._discard_request_body()
-            self._json(413, {"ok": False, "detail": "Request too large."})
+            if not review_mod.request_allowed(self, post=True):
+                self._discard_request_body()
+                self._json(403, {"ok": False})
+                return
+            # CSRF: a browser-driven POST carries Origin/Referer -- both must name
+            # a loopback host (or this server's bound address). Foreign values
+            # mean some website is trying to drive the local agent: refuse.
+            bound = (getattr(self.server, "server_address", ("127.0.0.1", 0)) or
+                     ("127.0.0.1", 0))[0]
+            if not security.post_origin_allowed(self.headers, bound_host=bound):
+                self._discard_request_body()
+                self._json(403, {"ok": False,
+                                 "detail": "Origin/Referer is not loopback"})
+                return
+            url = urlparse(self.path)
+            route = POST_ROUTES.get(url.path)
+            if route is None:
+                self._discard_request_body()
+                self._json(404, {"ok": False})
+                return
+            try:
+                n = max(0, int(self.headers.get("Content-Length") or 0))
+            except ValueError:
+                n = 0
+            if n > MAX_BODY:
+                self._discard_request_body()
+                self._json(413, {"ok": False, "detail": "Request too large."})
+                return
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            self._call(route, parse_qs(url.query), body)
+        except _CLIENT_DISCONNECT:
             return
-        try:
-            body = json.loads(self.rfile.read(n) or b"{}")
-        except ValueError:
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
-        self._call(route, parse_qs(url.query), body)
 
     def _call(self, route, query, body) -> None:
         try:
@@ -3093,9 +3233,9 @@ class _Handler(BaseHTTPRequestHandler):
                        or query.get("since", ["0"])[0])
         except ValueError:
             last = 0
-        self._headers(200, "text/event-stream", None)
         self.close_connection = True
         try:
+            self._headers(200, "text/event-stream", None)
             self.wfile.write(b"retry: 1500\n\n")
             self.wfile.flush()
             while not STATE.bus.closed:
@@ -3115,7 +3255,7 @@ class _Handler(BaseHTTPRequestHandler):
                                  f"data: {json.dumps(e, default=str)}\n\n")
                 self.wfile.write("".join(chunk).encode())
                 self.wfile.flush()
-        except (OSError, ValueError):
+        except (*_CLIENT_DISCONNECT, OSError, ValueError):
             return
 
 

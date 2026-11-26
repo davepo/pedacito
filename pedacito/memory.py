@@ -256,8 +256,14 @@ HANDOFF_SECTIONS = ("Goal & Context", "Files Modified & Key Decisions",
 _CONSOLIDATE_LOGS = 6
 _PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,8}")
 _TEST_RE = re.compile(
-    r"\b\d+\s+(?:passed|failed|error)\b|\btests?\s+(?:ok|passed|failed)\b"
-    r"|\b(?:pytest|vitest|jest|npm test|cargo test|go test)\b", re.I)
+    r"\b\d+\s+(?:passed|failed|error|errors)\b"
+    r"|\btests?\s*(?::\s*(?:GREEN|RED|passed|failed|ok)\b"
+    r"|(?:ok|passed|failed)\b)"
+    r"|\bRAN\s+\d+\s+TESTS?\b", re.I)
+_SOURCE_LINE_RE = re.compile(
+    r"^\s*(?:>>\s*)?\d+\s*\||^\s*(?:[+-]{3}\s|[+-]\s*\d+\s*\|)"
+    r"|^\s*(?:def |class |import |from \S+ import )"
+    r"|^\s*(?:\"\"\"|''')")
 _DECISION_RE = re.compile(
     r"\b(?:decided to|decision:|we chose|chose .* instead|key decision)\b",
     re.I)
@@ -322,11 +328,16 @@ def _task_from_user_turn(text: str) -> str:
 
 
 def _collect_lines(text: str, rx: re.Pattern, cap: int = 3,
-                   sentence: bool = False) -> list[str]:
+                   sentence: bool = False,
+                   skip_source: bool = False) -> list[str]:
     out: list[str] = []
-    for line in text.splitlines():
-        line = line.strip().lstrip("- ").strip()
+    for raw_line in text.splitlines():
+        if skip_source and _SOURCE_LINE_RE.search(raw_line):
+            continue
+        line = raw_line.strip().lstrip("- ").strip()
         if not line or not rx.search(line):
+            continue
+        if skip_source and _SOURCE_LINE_RE.search(line):
             continue
         if sentence:
             # Keep only the sentence that carries the signal, not the whole
@@ -340,7 +351,37 @@ def _collect_lines(text: str, rx: re.Pattern, cap: int = 3,
     return out[-cap:]
 
 
-def _handoff_material(root, messages):
+_RECEIPT_APPLY_RE = re.compile(
+    r"(?:^\s*(?:[-*\u2713\u2717]\s*)?|\b)"
+    r"(applied|FAILED|failed)\s+`?([^`:\n]+)`?",
+    re.I)
+
+
+def _extract_receipt_files(text: str, applied: list[str],
+                           failed: list[str]) -> None:
+    for line in text.splitlines():
+        if _SOURCE_LINE_RE.search(line):
+            continue
+        mm = re.match(r"^\s*\+{3}\s+b/(\S+)", line)
+        if mm:
+            name = mm.group(1).strip()
+            if _PATH_RE.search(name):
+                applied.append(name)
+            continue
+        mm = _RECEIPT_APPLY_RE.search(line)
+        if mm:
+            verb = mm.group(1).lower()
+            name = mm.group(2).strip()
+            # Keep exact single path token
+            if " " in name:
+                tok = name.split()[0].strip("`'\",;")
+            else:
+                tok = name.strip("`'\",;")
+            if _PATH_RE.fullmatch(tok):
+                (applied if verb == "applied" else failed).append(tok)
+
+
+def _handoff_material(root, messages, files_changed=None):
     """(before_tokens, facts) distilled from the live buffer or, without one,
     the most recent session transcripts. Harness-visible facts only."""
     from .llm import estimate_messages, estimate_tokens
@@ -352,30 +393,57 @@ def _handoff_material(root, messages):
     nexts: list[str] = []
     replies: list[str] = []
 
+    if files_changed:
+        for f in files_changed:
+            rel = str(f or "").strip()
+            if rel and _PATH_RE.search(rel):
+                applied.append(rel)
+
     if messages:
         msgs = [m for m in messages if isinstance(m, dict)]
         before = estimate_messages(msgs)
+        test_sources: list[str] = []
         for m in msgs:
             role = str(m.get("role") or "")
             text = _msg_text(m)
+            # Structured message metadata (GUI results / review_applied / etc.)
+            for r in m.get("results") or ():
+                if isinstance(r, dict) and r.get("file"):
+                    rel = str(r["file"]).strip()
+                    msg_txt = str(r.get("message") or "")
+                    if r.get("ok") and not msg_txt.startswith("not written"):
+                        applied.append(rel)
+                    elif not r.get("ok"):
+                        failed.append(rel)
+            if m.get("kind") == "review_applied" and isinstance(m.get("files"), list):
+                for f in m["files"]:
+                    if isinstance(f, str) and f.strip():
+                        applied.append(f.strip())
+            if isinstance(m.get("files_changed"), (list, tuple)):
+                for f in m["files_changed"]:
+                    if isinstance(f, str) and f.strip():
+                        applied.append(f.strip())
+
             if role == "user":
                 task = _task_from_user_turn(text)
                 if task:
                     tasks.append(task)
-            elif role == "assistant":
-                replies.append(text)
-                for line in text.splitlines():
-                    mm = re.search(r"\b(applied|FAILED)\s+`?([^`:\n]+)`?",
-                                   line)
-                    if mm:
-                        name = mm.group(2).strip()
-                        if _PATH_RE.search(name):
-                            (applied if mm.group(1) == "applied"
-                             else failed).append(name)
+                # User turns that are harness tool observations (e.g. RESULT:
+                # from run_test) may carry test verdicts, but skip numbered source reads.
+                if text.startswith("RESULT:"):
+                    test_sources.append(text)
+            elif role in ("receipt", "system", "diff", "assistant",
+                          "activity", "error"):
+                if role == "assistant":
+                    replies.append(text)
+                if role in ("receipt", "system", "diff", "assistant"):
+                    _extract_receipt_files(text, applied, failed)
+                if role != "diff":
+                    test_sources.append(text)
         body = "\n".join(replies[-4:])
         decisions = _collect_lines(body, _DECISION_RE, sentence=True)
-        tests = _collect_lines("\n".join(_msg_text(m) for m in msgs),
-                               _TEST_RE)
+        tests = _collect_lines("\n".join(test_sources), _TEST_RE,
+                               skip_source=True)
         nexts = _collect_lines(body, _NEXT_RE, sentence=True)
     else:
         from . import sessions
@@ -394,11 +462,24 @@ def _handoff_material(root, messages):
                     (applied if mm.group(1) == "applied"
                      else failed).append(mm.group(2))
             decisions += _collect_lines(text, _DECISION_RE, 2, sentence=True)
-            tests += _collect_lines(text, _TEST_RE, 2)
+            tests += _collect_lines(text, _TEST_RE, 2, skip_source=True)
             nexts += _collect_lines(text, _NEXT_RE, 2, sentence=True)
             reply = text.split("## Response", 1)
             if len(reply) == 2:
                 replies.append(reply[1].split("##", 1)[0].strip())
+
+    if not applied and root is not None:
+        try:
+            from . import checkpoints
+            for cp in reversed(checkpoints.list_checkpoints(root)):
+                for f in cp.get("files_changed") or ():
+                    rel = str(f or "").strip()
+                    if rel:
+                        applied.append(rel)
+                if applied:
+                    break
+        except Exception:
+            pass
 
     def dedup(rows: list[str], cap: int) -> list[str]:
         out: list[str] = []
@@ -481,7 +562,8 @@ def _model_handoff(client, facts: dict, draft: str) -> str:
 
 
 def consolidate_session(root: Path, cfg, messages: list[dict] | None = None,
-                        *, client=None, pin_memory: bool = True) -> dict:
+                        *, client=None, pin_memory: bool = True,
+                        files_changed: list[str] | None = None) -> dict:
     """Compact the recent session history into a structured handoff.
 
     Summarizes the live `messages` buffer when given (chat / GUI transcripts;
@@ -494,7 +576,8 @@ def consolidate_session(root: Path, cfg, messages: list[dict] | None = None,
     let the active model refine the wording (extractive fallback on error).
     """
     from .llm import estimate_tokens
-    before, facts = _handoff_material(root, messages)
+    before, facts = _handoff_material(root, messages,
+                                      files_changed=files_changed)
     summary = _render_handoff(facts)
     if client is not None:
         summary = _model_handoff(client, facts, summary)

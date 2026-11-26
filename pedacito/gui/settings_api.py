@@ -196,6 +196,10 @@ def payload() -> dict:
         "resolved": settings.resolved(cfg if cfg is not None
                                       else config_mod.Config()),
         "active_profile": cfg.active_profile if cfg is not None else "",
+        "picard_mode": (bool(getattr(cfg, "picard_mode", False))
+                        if cfg is not None else False),
+        "show_update_reminder": (bool(getattr(cfg, "show_update_reminder", True))
+                                 if cfg is not None else True),
         "tiers": list(config_mod.PRESET_TIERS),
         "user": file_info("user"),
         "project": file_info("project"),
@@ -225,6 +229,16 @@ def apply_changes(which: str, profile: str | None, changes: dict,
     new = settings.set_values(text, _changes_clean(changes), removes,
                               profile=profile or None)
     write_config(path, new)
+    with STATE.lock:
+        STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
+        STATE._global_cfg_stamp = None
+        if STATE.cfg is not None and not profile:
+            for k in ("picard_mode", "show_update_reminder"):
+                if k in changes:
+                    setattr(STATE.cfg, k, bool(changes[k]))
+                elif k in removes:
+                    setattr(STATE.cfg, k, getattr(config_mod.Config(), k))
     return payload()
 
 
@@ -307,6 +321,10 @@ def save_raw(which: str, text: str) -> dict:
     path = config_path(which)
     text = settings.restore_secrets(text, _read_text(path))
     write_config(path, text)
+    with STATE.lock:
+        STATE._user_cfg_stamp = None
+        STATE._user_raw_prefs = None
+        STATE._global_cfg_stamp = None
     return payload()
 
 

@@ -7,6 +7,12 @@
   var t = function (key, vars, fb) {
     return (PDC.t ? PDC.t(key, vars, fb) : (fb !== undefined ? fb : key));
   };
+  var picardText = function (label) {
+    return PDC.picardText ? PDC.picardText(label) : label;
+  };
+  var picardTitle = function (label, baseTitle) {
+    return PDC.picardTitle ? PDC.picardTitle(label, baseTitle) : (baseTitle || '');
+  };
 
   var COMMON = ['base_url', 'api_key', 'model', 'tier', 'vram_gb', 'json_mode', 'timeout',
     'allow_write', 'allow_shell', 'allow_browser', 'allow_screenshots', 'semantic_search', 'review',
@@ -86,7 +92,14 @@
   function save(payload, url, okMsg) {
     return PDC.api(url, payload).then(function (j) {
       if (!j.ok) { PDC.toast(j.detail || 'could not save', true); return j; }
-      X.data = j; X.pending = {}; pickDefaults(); render();
+      X.data = j; X.pending = {};
+      if (PDC.S && PDC.S.status) {
+        if (typeof j.picard_mode === 'boolean') PDC.S.status.picard_mode = j.picard_mode;
+        else if (j.resolved && j.resolved.picard_mode) PDC.S.status.picard_mode = !!j.resolved.picard_mode.value;
+        if (typeof j.show_update_reminder === 'boolean') PDC.S.status.show_update_reminder = j.show_update_reminder;
+        else if (j.resolved && j.resolved.show_update_reminder) PDC.S.status.show_update_reminder = !!j.resolved.show_update_reminder.value;
+      }
+      pickDefaults(); render();
       PDC.toast(okMsg || 'Saved.' + (j.reload_pending ? ' Applies after the running job.' : ''));
       PDC.refreshState();
       return j;
@@ -283,9 +296,10 @@
     }
     if (f.error) body.appendChild(h('div', { class: 'note-box err', text: f.error }));
     if (X.which === 'project' && f.exists && f.trusted === false) {
+      var trustLbl = t('settings.review_trust', null, 'Review & trust\u2026');
       body.appendChild(h('div', { class: 'note-box' },
         t('settings.untrusted_project', { fields: f.exec_fields.join(', ') }, 'This project config is not trusted yet, so its execution settings (' + f.exec_fields.join(', ') + ') are ignored until you approve it. '),
-        h('button', { class: 'small', text: t('settings.review_trust', null, 'Review & trust\u2026'), onclick: trust })));
+        h('button', { class: 'small', text: picardText(trustLbl), title: picardTitle(trustLbl) || null, onclick: trust })));
     }
     var tabs = h('div', { class: 'stabs' });
     [['discovery', t('settings.tab.discovery', null, 'Model discovery')],
@@ -315,9 +329,19 @@
     replySel.addEventListener('change', function () {
       save({ file: 'user', profile: null, changes: { llm_reply_language: replySel.value }, removes: [] }, '/api/settings/set');
     });
+    var picardVal = !!((d.resolved && d.resolved.picard_mode && d.resolved.picard_mode.value) || d.picard_mode);
+    var picardChk = h('input', { type: 'checkbox', checked: picardVal,
+      onchange: function (e) {
+        var on = !!e.target.checked;
+        if (PDC.S && PDC.S.status) PDC.S.status.picard_mode = on;
+        save({ file: 'user', profile: null, changes: { picard_mode: on }, removes: [] }, '/api/settings/set',
+          on ? t('settings.picard_on', null, 'Captain Picard Mode: Make it so.') : t('settings.picard_off', null, 'Captain Picard Mode: OFF'));
+      } });
     body.appendChild(h('div', { class: 'row small-text', style: 'margin:0 0 10px;gap:8px;flex-wrap:wrap' },
       h('span', { class: 'muted', text: t('settings.language', null, 'Interface language') + ':' }), langSel,
       h('span', { class: 'muted', text: t('settings.llm_reply_language', null, 'Model reply language') + ':' }), replySel,
+      h('label', { class: 'chk', title: t('settings.picard_mode_hint', null, "Cosmetic Captain Picard Mode: relabels GUI/TUI submit, OK, Save, Apply, Run, and Commit buttons to 'Make it so.'") },
+        picardChk, ' ', t('settings.picard_mode', null, 'Captain Picard Mode')),
       h('span', { class: 'muted', style: 'margin-left:auto', text: t('settings.quick_links', null, 'Quick links:') }),
       h('button', { class: 'ghost small', text: t('gui.menu.skills', null, 'Skills library & creator\u2026'),
         title: t('gui.menu.skills_title', null, 'browse built-in, user and project skills; write or auto-draft custom ones'),
@@ -388,7 +412,8 @@
         h('label', { text: 'Model' }), h('div', { class: 'row' }, model, list),
         h('label', { text: 'vram_gb' }), vram),
       status,
-      h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'primary', text: 'Create config', onclick: function () {
+      h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'primary',
+        text: picardText('Create config'), title: picardTitle('Create config') || null, onclick: function () {
         save({ base_url: url.value, model: model.value, vram_gb: vram.value }, '/api/settings/setup', 'Config created.');
       } })));
     return box;
@@ -1300,7 +1325,9 @@
     scoutSel.addEventListener('change', function () { PAIR.scout = scoutSel.value; paintStarter(); });
     paintStarter();
     var msg = h('div', { class: 'muted small-text', text: PAIR.msg || '' });
-    var saveBtn = h('button', { class: 'primary', text: PAIR.busy ? t('settings.pair.saving', null, 'Saving\u2026') : t('settings.pair.save', null, 'Save pairing'),
+    var saveLbl = PAIR.busy ? t('settings.pair.saving', null, 'Saving\u2026') : t('settings.pair.save', null, 'Save pairing');
+    var saveBtn = h('button', { class: 'primary', text: PAIR.busy ? saveLbl : picardText(saveLbl),
+      title: PAIR.busy ? null : (picardTitle(saveLbl) || null),
       disabled: PAIR.busy || !names.length || X.which !== 'user', onclick: function () {
         var scout = scoutSel.value === '__new__' ? PAIR.newName.trim() : scoutSel.value;
         if (!PAIR.architect || !scout) { PDC.toast(t('settings.pair.pick_error', null, 'Pick an architect and a scout.'), true); return; }
@@ -1340,10 +1367,32 @@
   function profilesTab() {
     var f = file(), names = Object.keys(f.profiles || {}).sort();
     var defName = (f.settings || {}).default_profile || '';
+    var calMap = (X.data && X.data.calibration) || {};
     var list = h('div', { class: 'plist' });
     names.forEach(function (n) {
-      list.appendChild(h('div', { class: 'pitem' + (n === X.profile ? ' on' : ''), onclick: function () { X.profile = n; X.pending = {}; render(); } },
-        h('span', { class: 'grow', text: n }),
+      var cal = calMap[n] || {};
+      var p = f.profiles[n] || {};
+      var model = p.model ? ' (' + p.model + ')' : '';
+      var scoreChip = null;
+      if (cal.is_image_model) {
+        scoreChip = h('span', { class: 'tag image', text: '\uD83C\uDFA8', title: calTitle(cal) });
+      } else if (cal.is_hosted) {
+        scoreChip = h('span', { class: 'tag hosted', text: '\u2601', title: calTitle(cal) });
+      } else if (cal.calibrated) {
+        var scoreText = '\u2713 ' + Number(cal.card_score || 0).toFixed(2);
+        scoreChip = h('span', {
+          class: 'tag ' + (cal.calibrated_stale ? 'warn' : 'act'),
+          text: scoreText,
+          title: calTitle(cal)
+        });
+      }
+      list.appendChild(h('div', {
+        class: 'pitem' + (n === X.profile ? ' on' : ''),
+        title: n + model,
+        onclick: function () { X.profile = n; X.pending = {}; render(); }
+      },
+        h('span', { class: 'pname grow ellip', text: n, title: n + model }),
+        scoreChip,
         n === X.data.active_profile ? h('span', { class: 'tag act', text: 'active' }) : null,
         n === defName ? h('span', { class: 'tag', text: 'default' }) : null));
     });
@@ -1391,7 +1440,14 @@
   function setPending(key, v, row) {
     if (v === undefined) delete X.pending[key]; else X.pending[key] = v;
     if (row) row.classList.toggle('mod', key in X.pending);
-    var b = document.getElementById('savePending'); if (b) { var n = Object.keys(X.pending).length; b.disabled = !n; b.textContent = n ? 'Save ' + n + ' change' + (n === 1 ? '' : 's') : 'No changes'; }
+    var b = document.getElementById('savePending');
+    if (b) {
+      var n = Object.keys(X.pending).length;
+      b.disabled = !n;
+      var sem = n ? ('Save ' + n + ' change' + (n === 1 ? '' : 's')) : t('settings.no_changes', null, 'No changes');
+      b.textContent = n ? picardText(sem) : sem;
+      b.title = n ? picardTitle(sem) : '';
+    }
   }
   function commit(profile) {
     var changes = {}, removes = [];
@@ -1906,6 +1962,13 @@
         h('b', { text: 'Release updates' }),
         h('div', { class: 'small-text',
           text: 'The manual check asks the public PyPI metadata for pedacito now (one anonymous GET, 2 s timeout) and stores the answer in the same 24 h cache the startup check uses. The Update banner reads the same notice.' })),
+      ((X && X.data && X.data.show_update_reminder !== false) && !(info && info.ok && info.update_available))
+        ? h('div', { class: 'note-box small-text', style: 'margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap' },
+            h('span', { class: 'grow', text: t('gui.update.active_dev_tip', null,
+              'Tip: Pedacito is in active development with frequent bug fixes and updates \u2014 run `pedacito update` regularly to stay current.') }),
+            h('button', { class: 'small', text: UPD.busy ? t('gui.update.checking', null, 'Checking\u2026') : t('gui.update.check_btn', null, 'Check for updates'),
+              disabled: !enabled || UPD.busy, onclick: checkUpdateNow }))
+        : null,
       !enabled ? h('div', { class: 'note-box' },
         h('b', { text: 'Update checks are turned off' }),
         h('div', { class: 'small-text',
@@ -1991,7 +2054,7 @@
     var ta = h('textarea', { id: 'rawText', spellcheck: false, value: f.text || '' });
     var msg = h('div', { class: 'muted small-text', style: 'margin-top:6px', text: 'Saved edits are checked with the same rules the loader uses; the previous file is kept as ' + (f.path || '') + '.bak.' });
     return h('div', {}, ta, msg, h('div', { class: 'row', style: 'margin-top:8px' },
-      h('button', { class: 'primary', text: 'Validate & save', onclick: function () { save({ file: X.which, text: ta.value }, '/api/settings/raw', 'Config file saved.'); } }),
+      h('button', { class: 'primary', text: picardText('Validate & save'), title: picardTitle('Validate & save') || null, onclick: function () { save({ file: X.which, text: ta.value }, '/api/settings/raw', 'Config file saved.'); } }),
       h('button', { text: 'Revert', onclick: function () { ta.value = f.text || ''; } })),
       resetBox());
   }

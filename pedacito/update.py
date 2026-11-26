@@ -592,3 +592,42 @@ def check_for_update_async(cfg=None, fetch=None, on_done=None):
             _check_running = False
         raise
     return t
+
+
+# --- active-development update reminder ----------------------------------------
+
+_ACTIVE_DEV_REMINDER_EN = (
+    "Tip: Pedacito is in active development with frequent bug fixes and "
+    "updates -- run `pedacito update` regularly to stay current."
+)
+_ACTIVE_DEV_REMINDER_ES = (
+    "Consejo: Pedacito est\u00e1 en desarrollo activo con correcciones y mejoras "
+    "frecuentes -- ejecuta `pedacito update` con regularidad para mantenerte "
+    "al d\u00eda."
+)
+_UPDATE_AVAILABLE_EN = (
+    "Update available: {installed} -> {latest} -- run `pedacito update --run`."
+)
+_UPDATE_AVAILABLE_ES = (
+    "Actualizaci\u00f3n disponible: {installed} -> {latest} -- ejecuta `pedacito update --run`."
+)
+
+
+def active_dev_reminder(cfg=None, lang: str = "en") -> str:
+    """One-line localized active-development reminder (or cached update-available
+    notice). Purely local: reads `update_check.json` if present and never makes
+    a network call. Returns `""` when `show_update_reminder` is false."""
+    if cfg is not None and not getattr(cfg, "show_update_reminder", True):
+        return ""
+    is_es = str(lang or "en").strip().lower().startswith("es")
+    if updates_enabled(cfg):
+        cache = read_cache()
+        channel = release_channel(cfg)
+        if cache is not None and (
+                channel == "any" or is_stable_version(cache["latest"])):
+            latest = cache["latest"]
+            if is_newer(latest, __version__):
+                tpl = _UPDATE_AVAILABLE_ES if is_es else _UPDATE_AVAILABLE_EN
+                return tpl.format(installed=__version__, latest=latest)
+    return _ACTIVE_DEV_REMINDER_ES if is_es else _ACTIVE_DEV_REMINDER_EN
+
