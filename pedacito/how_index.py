@@ -671,6 +671,43 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "daemon",
+        "usage": "pedacito daemon [start|stop|status|sessions] [--port N] "
+                 "[--foreground] [--json]",
+        "summary": "Headless loopback-only daemon: a warm index and model "
+                   "leases shared by isolated workspace sessions. Every "
+                   "endpoint requires the per-run bearer token and nothing "
+                   "is exposed beyond 127.0.0.1. `status` (the default) exits "
+                   "0 cleanly when no daemon is running, and `sessions` "
+                   "lists attached clients.",
+        "keywords": ["daemon", "background", "sessions", "workspace sessions",
+                     "http", "sse", "attach", "detach", "bearer token",
+                     "loopback", "warm index", "shared lease"],
+        "examples": [
+            "pedacito daemon status",
+            "pedacito daemon start --foreground --port 8765",
+            "pedacito daemon sessions --json",
+            "pedacito daemon stop",
+        ],
+        "flags": [
+            {"flag": "--port N",
+             "help": "loopback port; 0 lets the OS choose an ephemeral one"},
+            {"flag": "--foreground",
+             "help": "keep the daemon in this process instead of detaching"},
+            {"flag": "--json", "help": "print one JSON object"},
+        ],
+        "notes": [
+            "discovery file: the per-user state folder's daemon.json (0o600 "
+            "where the platform honours it), removed on stop when its pid "
+            "matches",
+            "HTTP/SSE control surface: /v1/health, /v1/sessions, "
+            "/v1/sessions/<id>/events, /v1/quiesce and /v1/shutdown",
+            "every request needs X-Pedacito-Token or Authorization: Bearer",
+            "remote/WAN binding is refused by construction (loopback only)",
+        ],
+        "common": False,
+    },
+    {
         "name": "config",
         "usage": "pedacito config [--init | --setup | --check | --doctor | "
                  "--upgrade [--dry-run] | --reference]",

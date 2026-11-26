@@ -1041,4 +1041,21 @@ def _maintenance_unsafe_reason(root: Path, action: str) -> str:
     if _DEFAULT_LOCK_MANAGER.is_locked(root):
         verb = action or "maintain"
         return f"cannot {verb} now: another pedacito run is using this project"
+    # D15: a daemon in a separate process may hold live sessions for this
+    # root. Ask it to quiesce over loopback with a short timeout. When no
+    # daemon is running (the offline default) this is a cheap missing-file
+    # read and the maintenance action proceeds immediately.
+    try:
+        from . import daemon as daemon_mod
+        info = daemon_mod.read_daemon_info()
+        if info is not None and int(info.get("pid") or 0) != os.getpid():
+            status, body = daemon_mod.daemon_request(
+                "POST", "/v1/quiesce",
+                {"root": str(root), "timeout_s": 0.2}, timeout=1.0)
+            if status == 200 and body.get("ok") is False:
+                verb = action or "maintain"
+                reason = str(body.get("reason") or "daemon sessions are active")
+                return f"cannot {verb} now: {reason}"
+    except Exception:
+        pass
     return ""

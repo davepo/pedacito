@@ -463,6 +463,7 @@
   "settings.hosted.col_price": "$/Mtok (entrada/salida)",
   "settings.hosted.price_title": "USD estimados por mill\u00f3n de tokens (entrada / salida)",
   "cli.cmd.image": "generar una imagen usando un perfil de modelo de imagen configurado",
+  "cli.cmd.daemon": "daemon headless en loopback con sesiones de espacio de trabajo cálidas y aisladas",
   "cli.image.opt.prompt": "descripci\u00f3n de la imagen a generar",
   "cli.image.opt.out": "ruta del archivo de salida dentro del proyecto (por defecto: .pedacito/images/...)",
   "cli.image.opt.size": "dimensiones de la imagen, p. ej. 1024x1024",

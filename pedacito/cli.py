@@ -88,6 +88,9 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--model", help="model id/name as the server reports it")
     p.add_argument("--root", default=None,
                    help="project root (default: inferred from the paths given)")
+    p.add_argument("--attach-daemon", action="store_true",
+                   default=argparse.SUPPRESS,
+                   help="opt in to a running loopback daemon for this run")
     p.add_argument("--config", metavar="FILE", help="use this config file as well")
     p.add_argument("--profile", metavar="NAME",
                    help="apply a [profiles.NAME] block from your config")
@@ -2824,6 +2827,156 @@ def _cmd_undo(args) -> int:
     return 0
 
 
+def _cmd_daemon(args) -> int:
+    """`pedacito daemon [start|stop|status|sessions]` (loopback-only)."""
+    from . import daemon as daemon_mod
+
+    action = str(getattr(args, "action", "status") or "status").lower()
+    json_out = bool(getattr(args, "json", False))
+    state_dir = getattr(args, "state_dir", None)
+    if action == "status":
+        status = daemon_mod.daemon_status(state_dir)
+        status.pop("token", None)
+        info = status.get("info")
+        if isinstance(info, dict):
+            info.pop("token", None)
+        if json_out:
+            print(json.dumps(status, default=str))
+            return 0
+        if not status.get("running"):
+            print("daemon not running")
+            return 0
+        health = status.get("health") or {}
+        print(f"daemon running at {info.get('url') if info else ''} "
+              f"(pid {info.get('pid') if info else '?'}, "
+              f"sessions {health.get('sessions', 0)}, "
+              f"protocol {status.get('protocol_version')})")
+        return 0
+    if action == "stop":
+        info = daemon_mod.read_daemon_info(state_dir)
+        if info is None:
+            if json_out:
+                print(json.dumps({"ok": True, "running": False}))
+            else:
+                print("daemon not running")
+            return 0
+        code, body = daemon_mod.daemon_request(
+            "POST", "/v1/shutdown", {}, state_dir=state_dir, timeout=3.0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if daemon_mod.read_daemon_info(state_dir) is None:
+                break
+            time.sleep(0.05)
+        stopped = daemon_mod.read_daemon_info(state_dir) is None
+        if json_out:
+            print(json.dumps({"ok": stopped and code in (200, 202),
+                              "running": not stopped, "response": body}))
+        else:
+            print("daemon stopped" if stopped
+                  else f"daemon stop requested (status {code})")
+        return 0 if stopped or code in (200, 202) else 1
+    if action == "sessions":
+        if daemon_mod.read_daemon_info(state_dir) is None:
+            if json_out:
+                print(json.dumps({"sessions": []}))
+            else:
+                print("daemon not running")
+            return 0
+        code, body = daemon_mod.daemon_request(
+            "GET", "/v1/sessions", state_dir=state_dir, timeout=3.0)
+        if json_out:
+            print(json.dumps(body, default=str))
+            return 0 if code == 200 else 1
+        if code != 200:
+            print(f"daemon error: {body.get('error') or code}",
+                  file=sys.stderr)
+            return 1
+        sessions = body.get("sessions") or []
+        if not sessions:
+            print("no active sessions")
+            return 0
+        for ws in sessions:
+            branch = ws.get("worktree_branch") or ""
+            extra = f" worktree={branch}" if branch else ""
+            print(f"{ws.get('session_id')}  {ws.get('state')}  "
+                  f"{ws.get('root')}{extra}")
+        return 0
+
+    if action != "start":
+        print(f"unknown daemon action: {action}", file=sys.stderr)
+        return 2
+    if daemon_mod.read_daemon_info(state_dir) is not None:
+        status = daemon_mod.daemon_status(state_dir)
+        info = status.get("info") or {}
+        if json_out:
+            info.pop("token", None)
+            print(json.dumps({"ok": True, "already_running": True,
+                              **status}, default=str))
+        else:
+            print(f"daemon already running at {info.get('url')}")
+        return 0
+    port = int(getattr(args, "port", 0) or 0)
+    if not getattr(args, "foreground", False):
+        import subprocess
+        cmd = [sys.executable, "-m", "pedacito", "daemon", "start",
+               "--foreground"]
+        if port:
+            cmd += ["--port", str(port)]
+        if state_dir:
+            cmd += ["--state-dir", str(state_dir)]
+        kwargs: dict = {"shell": False, "stdin": subprocess.DEVNULL,
+                        "stdout": subprocess.DEVNULL,
+                        "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kwargs["creationflags"] = (0x00000008 | 0x00000200)  # detached
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except OSError as exc:
+            print(f"daemon start failed: {exc}", file=sys.stderr)
+            return 1
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            info = daemon_mod.read_daemon_info(state_dir)
+            if info is not None:
+                info = dict(info)
+                token = info.pop("token", "")
+                if json_out:
+                    print(json.dumps({"ok": True, "running": True, **info},
+                                     default=str))
+                else:
+                    print(f"daemon started at {info.get('url')} "
+                          f"(pid {info.get('pid')})")
+                    if token:
+                        print(f"token: {token}")
+                return 0
+            time.sleep(0.1)
+        print("daemon start timed out; no discovery file appeared",
+              file=sys.stderr)
+        return 1
+
+    server = daemon_mod.DaemonServer(port=port, state_dir=state_dir)
+    info = server.start()
+    token = info.get("token")
+    if json_out:
+        payload = dict(info)
+        payload.pop("token", None)
+        print(json.dumps(payload, default=str))
+    else:
+        print(f"daemon listening at {info['url']} (pid {info['pid']})")
+        print(f"token: {token}")
+        print("Ctrl-C stops it.")
+    try:
+        while not server._stopped.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    return 0
+
+
 def _cmd_serve(args) -> int:
     """`pedacito serve`: start a background dev server and register it."""
     from . import processes
@@ -3629,19 +3782,38 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         events=getattr(args, "events", "on") != "off")
     server_box["s"] = server
     server.set_client(client)
+    server._cfg = locals_ref["cfg"]          # ACP session cloning fallback
+    server._index = locals_ref["idx"]
     if acp:
         from . import acp as acp_mod
 
         def _acp_set_profile(ref):
+            # ACP sessions are scoped: only this session's cloned cfg changes.
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            if sess is not None and sess.cfg is not None:
+                profiles = getattr(sess.cfg, "profiles", {}) or {}
+                if profiles and ref not in profiles:
+                    have = ", ".join(sorted(profiles)) or "none"
+                    raise ConfigError(
+                        f"unknown profile {ref!r}; available: {have}")
+                sess.cfg.active_profile = str(ref)
+                return str(ref)
             return _rpc_switch(ref, "main")
 
         def _acp_set_execution_mode(mode):
-            cur = locals_ref["cfg"]
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            cur = sess.cfg if sess is not None and sess.cfg is not None \
+                else locals_ref["cfg"]
             cur.execution_mode = str(mode).strip().lower()
             return cur.execution_mode
 
         def _acp_set_images(images):
-            cur = locals_ref["cfg"]
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            cur = sess.cfg if sess is not None and sess.cfg is not None \
+                else locals_ref["cfg"]
             if images:
                 cur._task_images = list(images)
             else:
@@ -3652,7 +3824,8 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
             output_stream=real_stdout,
             set_profile=_acp_set_profile,
             set_execution_mode=_acp_set_execution_mode,
-            on_images=_acp_set_images)
+            on_images=_acp_set_images,
+            base_cfg=locals_ref["cfg"])
         elog.tee = bridge.out
         print("pedacito acp: Agent Client Protocol (JSON-RPC 2.0) over "
               "stdin/stdout - Ctrl-D to exit.", file=sys.stderr)
@@ -3751,6 +3924,9 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                     help=t("cli.opt.version"))
     ap.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES, default=None,
                     help=t("cli.opt.lang"))
+    ap.add_argument("--attach-daemon", action="store_true",
+                    help="opt in to the loopback daemon for warm, shared "
+                         "workspace sessions (off by default)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_index = sub.add_parser("index", help=t("cli.cmd.index"))
@@ -4231,6 +4407,24 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                        refine=False, plan=False, no_plan=True,
                        resume=False, jsonl=False, rpc=False)
 
+    p_daemon = sub.add_parser(
+        "daemon", help=t("cli.cmd.daemon"))
+    p_daemon.add_argument("action", nargs="?", default="status",
+                          choices=("start", "stop", "status", "sessions"),
+                          help="start, stop, status (default) or sessions")
+    p_daemon.add_argument("--port", type=int, default=0,
+                          help="loopback port (0 = let the OS choose)")
+    p_daemon.add_argument("--foreground", action="store_true",
+                          help="run in this process instead of detaching")
+    p_daemon.add_argument("--state-dir", default=None,
+                          help="directory for daemon.json (default: the "
+                               "per-user state folder)")
+    p_daemon.add_argument("--json", action="store_true",
+                          help="print one JSON object")
+    p_daemon.set_defaults(apply=False, review=False, no_review=True,
+                          refine=False, plan=False, no_plan=True,
+                          resume=False, jsonl=False, rpc=False)
+
     p_cal = sub.add_parser(
         "calibrate", help="measure the configured model (tool choice, edit "
                           "format, honesty, long context, ...) and save a "
@@ -4674,6 +4868,11 @@ def _main(argv=None) -> int:
         from . import rpc as rpc_mod
         print(json.dumps(rpc_mod.describe(), indent=2))
         return 0
+
+    # The daemon is loopback-only and needs no model/config/index to answer
+    # `status`, `sessions` or `stop`: it must exit 0 cleanly offline.
+    if args.cmd == "daemon":
+        return _cmd_daemon(args)
 
     # `acp` owns stdout for JSON-RPC 2.0. Point every human line at stderr
     # before config/index work starts, so not even setup chatter can corrupt

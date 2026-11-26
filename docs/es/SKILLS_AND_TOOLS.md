@@ -14,6 +14,7 @@ las skills personalizadas, los servidores MCP con nombre, los hooks JSON y la so
 - [Hooks JSON](#hooks-json)
 - [Acción de generación de imágenes](#acción-de-generación-de-imágenes)
 - [Formatos de recolección y observaciones grandes (v0.3.3)](#formatos-de-recolección-y-observaciones-grandes-v033)
+- [Manifiestos de paquete (`pedacito-package.toml`)](#manifiestos-de-paquete-pedacito-packagetoml)
 - [Sobrescritura de prompts](#sobrescritura-de-prompts)
 
 ## Skills incluidas
@@ -128,6 +129,37 @@ Cualquier observación por encima de `max_observation_tokens` de `run`, `run_tes
 inicio, el final, el número de líneas y el nombre del archivo. Después puede usar `read` o `grep` sobre
 líneas exactas de ese archivo, y solo sobre archivos `*.log` directos bajo `.pedacito/scratch/`. El modelo
 nunca puede escribir en ese directorio. Consulta [Seguridad](SECURITY.md#commits-pull-requests-undo-y-archivos-scratch-v033).
+
+## Manifiestos de paquete (`pedacito-package.toml`)
+
+Cada extensión, skill, conjunto de comandos o paquete de modelos distribuible se declara en un
+archivo `pedacito-package.toml` en la raíz del paquete:
+
+```toml
+schema_version = 1
+name = "acme-lint"
+version = "1.2.0"
+kind = "extension"          # extension | skill | command | model-pack
+description = "Reglas de lint de Acme para Pedacito"
+capabilities = ["read_workspace", "run_commands"]
+min_pedacito_version = "0.4.0"
+
+[entry_points]
+main = "acme_lint/plugin.py"
+```
+
+`schema_version` debe ser `1`. `name` acepta letras, dígitos, `.`, `_` y `-`.
+`capabilities` solo puede usar `read_workspace`, `write_workspace`, `run_commands`,
+`network`, `mcp_server`, `hooks`, `prompts` y `model_profiles`. Cada valor de
+`entry_points` debe ser una ruta relativa dentro del paquete: las rutas absolutas
+y el recorrido `..` se rechazan antes de cargar nada.
+
+El manifiesto es declarativo; por sí mismo nunca ejecuta código. `load_manifest`
+lo valida y calcula el SHA-256 de los bytes originales. `trust_manifest` fija
+ese hash en `trusted_packages.json` dentro de la carpeta de estado del usuario, e
+`is_manifest_trusted` devuelve `False` en cuanto el archivo cambia por un solo
+byte. Un paquete no confiable o malformado se rechaza antes de que pueda
+ejecutarse cualquier punto de entrada.
 
 ## Sobrescritura de prompts
 
