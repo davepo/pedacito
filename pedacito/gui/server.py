@@ -38,6 +38,7 @@ from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir, suggest_context
 from . import jobs, settings_api
+from . import core as gui_core
 from .core import (REGISTRY, STATE, install_permission_broker, install_runner,
                    install_tee, uninstall_permission_broker,
                    uninstall_runner, uninstall_tee)
@@ -1143,16 +1144,71 @@ def _fs(q, body=None):
 
 @get("/api/review")
 def _review(q, body=None):
+    sid, rid = _review_params(q)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            if rid:
+                return 404, {"ok": False,
+                             "detail": f"unknown review {rid!r}"}
+            target = REGISTRY.get(sid, create=False) if sid else REGISTRY.resolve()
+            return 200, {"review": target.review_meta() if target else None}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        return 200, {"review": gui_core.staged_review_meta(staged)}
     return 200, {"review": STATE.review_meta()}
+
+
+def _review_params(q, body=None):
+    """Optional `(session_id, review_id)` from a JSON body or query string."""
+    body = body or {}
+    sid = str(body.get("session_id")
+              or (q.get("session_id") or [""])[0] or "").strip()
+    rid = str(body.get("review_id")
+              or (q.get("review_id") or [""])[0] or "").strip()
+    if not rid:
+        raw = body.get("id") if body else (q.get("id") or [""])[0]
+        if isinstance(raw, str) and raw.startswith("rev_"):
+            rid = raw.strip()
+    return sid, rid
+
+
+def _review_queue_for(session_id):
+    if session_id:
+        target = REGISTRY.get(session_id, create=False)
+        return getattr(target, "review_queue", None) if target else None
+    target = REGISTRY.resolve()
+    return getattr(target, "review_queue", None)
+
+
+def _staged_for(queue, review_id):
+    if queue is None:
+        return None
+    if review_id:
+        return queue.get(review_id)
+    pending = queue.pending_reviews()
+    return pending[-1] if pending else None
 
 
 @get("/api/review/file")
 def _review_file(q, body=None):
+    sid, rid = _review_params(q)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            return 404, {"ok": False, "detail": "no such review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        out = gui_core.staged_review_file(staged, q.get("rel", [""])[0])
+        return (200, out) if out else (404, {"ok": False,
+                                             "detail": "no such file"})
     try:
-        rid = int(q.get("id", ["0"])[0])
+        rid_int = int(q.get("id", ["0"])[0])
     except ValueError:
-        rid = 0
-    out = STATE.review_file(rid, q.get("rel", [""])[0])
+        rid_int = 0
+    out = STATE.review_file(rid_int, q.get("rel", [""])[0])
     return (200, out) if out else (404, {"ok": False, "detail": "no such file"})
 
 
@@ -2426,10 +2482,12 @@ def _permission_decide(q, body):
 
 @post("/api/review/decide")
 def _decide(q, body):
-    try:
-        rid = int(body.get("id") or 0)
-    except (TypeError, ValueError):
-        return 400, {"ok": False, "detail": "id must be an integer."}
+    sid, _review_id = _review_params(q, body)
+    raw_id = body.get("review_id") or body.get("id")
+    is_queue_review = bool(
+        _review_id
+        or (isinstance(raw_id, str) and raw_id.startswith("rev_"))
+        or (sid and raw_id in (None, "", 0)))
     files = body.get("files")
     raw_hunks = body.get("accepted_hunks")
     hunks = None
@@ -2443,7 +2501,26 @@ def _decide(q, body):
                              "accepted_hunks must map file paths to lists "
                              "of hunk indices."}
             hunks[str(rel)] = ids
-    ok, detail = STATE.decide_review(
+    if is_queue_review:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, _review_id or str(raw_id or ""))
+        if staged is None:
+            return 404, {"ok": False, "detail": "unknown review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        ok, detail = queue.decide(
+            staged.review_id, str(body.get("action", "")),
+            files=list(files) if isinstance(files, list) else None,
+            accepted_hunks=hunks)
+        return (200 if ok else 409), {"ok": ok, "detail": detail}
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
+    target = REGISTRY.get(sid, create=False) if sid else STATE
+    if target is None:
+        return 404, {"ok": False, "detail": f"unknown session {sid!r}"}
+    ok, detail = target.decide_review(
         rid, str(body.get("action", "")),
         list(files) if isinstance(files, list) else None,
         accepted_hunks=hunks)
@@ -2452,11 +2529,23 @@ def _decide(q, body):
 
 @post("/api/review/rediff")
 def _rediff(q, body):
+    sid, rid = _review_params(q, body)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            return 404, {"ok": False, "detail": "unknown review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        out = gui_core.staged_review_rediff(
+            staged, str(body.get("rel", "")), str(body.get("text", "")))
+        return (200, out) if out else (
+            409, {"ok": False, "detail": "This file can't be edited."})
     try:
-        rid = int(body.get("id") or 0)
+        rid_int = int(body.get("id") or 0)
     except (TypeError, ValueError):
         return 400, {"ok": False, "detail": "id must be an integer."}
-    out = STATE.review_rediff(rid, str(body.get("rel", "")),
+    out = STATE.review_rediff(rid_int, str(body.get("rel", "")),
                               str(body.get("text", "")))
     return (200, out) if out else (409, {"ok": False,
                                          "detail": "This file can't be edited."})

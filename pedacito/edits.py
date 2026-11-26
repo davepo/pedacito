@@ -1212,6 +1212,7 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
 
     root_resolved = Path(root).resolve()
     task_text = str(getattr(cfg, "_task_text", "") or "")
+    policy = getattr(cfg, "policy", None)
 
     # ---- protected paths (.git/, .pedacito/, the plan file, config) --------
     for rel in list(groups):
@@ -1607,11 +1608,11 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             except security.SecurityError as e:
                 results.append(Result(False, rel, f"refused: {e}"))
                 continue
-            if security.is_sensitive_path(path):
-                results.append(Result(
-                    False, rel,
-                    "refused: this path holds secrets/credentials; remove it "
-                    "manually if you really mean to"))
+            allowed, sensitive_error = security.check_sensitive_write(
+                root_resolved, rel, action="delete", policy=policy)
+            if not allowed:
+                results.append(Result(False, rel,
+                                      f"refused: {sensitive_error}"))
                 continue
             if path.is_dir():
                 results.append(Result(False, rel,
@@ -1652,6 +1653,26 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             path = _resolve_inside(rel)
             if path is None:
                 results.append(Result(False, rel, "refusing to edit outside project root"))
+                continue
+            allowed, sensitive_error = security.check_sensitive_write(
+                root_resolved, rel, action="edit", policy=policy)
+            if not allowed:
+                results.append(Result(False, rel,
+                                      f"refused: {sensitive_error}"))
+                continue
+            # D10: a rename's SOURCE is as sensitive as its destination; the
+            # target group carries the source paths that `_finish` unlinks.
+            blocked_source = ""
+            for old in (o for o, new in renames.items()
+                        if new == rel and o != rel):
+                src_allowed, src_error = security.check_sensitive_write(
+                    root_resolved, old, action="rename", policy=policy)
+                if not src_allowed:
+                    blocked_source = src_error
+                    break
+            if blocked_source:
+                results.append(Result(False, rel,
+                                      f"refused: {blocked_source}"))
                 continue
             if path.is_dir():
                 results.append(Result(False, rel, "this path is a directory, not a file"))

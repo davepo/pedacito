@@ -163,6 +163,14 @@ class SessionContext:
             from . import resources
             self.resource_registry = resources.SessionResourceRegistry(
                 self.session_id)
+        if self.review_queue is None:
+            # D9: every session owns its own review routing state. The import
+            # is lazy (review imports security, which imports this module).
+            try:
+                from . import review as review_mod
+                self.review_queue = review_mod.ReviewQueue(self.session_id)
+            except Exception:           # pragma: no cover - import cycle guard
+                self.review_queue = None
 
     def cache(self, namespace: str) -> dict[Any, Any]:
         """Return a session-scoped cache dict for `namespace`."""
@@ -181,6 +189,7 @@ class SessionContext:
             "client_cancelled": False,
             "lease_released": False,
             "resources_closed": None,
+            "reviews_cancelled": 0,
         }
         with self._lock:
             broker = self.permission_broker
@@ -188,6 +197,19 @@ class SessionContext:
             lease = self.model_lease
             registry = self.resource_registry
             bus = self.event_bus
+            review_queue = self.review_queue
+
+        # D9: cancelling a session unblocks any review a worker is waiting on
+        # (the queue's `done` event is set by `cancel_all`). A sibling session's
+        # queue is untouched.
+        if review_queue is not None:
+            cancel_fn = getattr(review_queue, "cancel_all", None)
+            if callable(cancel_fn):
+                try:
+                    report["reviews_cancelled"] = int(
+                        cancel_fn(report["reason"]) or 0)
+                except Exception:
+                    pass
 
         if broker is not None:
             deny_all = getattr(broker, "deny_all", None)

@@ -237,17 +237,30 @@ def copy_file_atomic(src: Path, dest: Path, *, follow_symlinks: bool = False) ->
         raise
 
 
-def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> None:
+def backup_copy(src: Path, dest: Path, keep_existing: bool = True) -> bool:
     """Copy `src`'s exact bytes to `dest`, creating parent directories.
 
     With `keep_existing`, an existing `dest` is left alone: backup snapshot
     directories are shared by every write of a run, and the FIRST copy of a
     file is the original that `restore` must bring back. Replacement is
     atomic, so this is also safe for the reverse direction (`undo` restoring
-    a working file that may share an inode with a checkpoint)."""
+    a working file that may share an inode with a checkpoint).
+
+    Sensitive sources (`.env`, `*.pem`, `id_rsa`, `credentials.json`, ...) are
+    NEVER copied: the backup store must stay free of secret bytes. Returns
+    False when the source is sensitive (no file is created), True otherwise."""
+    try:
+        # Lazy import: security imports fileio at module load, so a top-level
+        # import here would be circular.
+        from . import security
+        if security.is_sensitive_path(Path(src)):
+            return False
+    except Exception:
+        pass                       # a failed guard must not break a backup
     if keep_existing and Path(dest).exists():
-        return
+        return True
     copy_file_atomic(src, dest)
+    return True
 
 
 def created_manifest(backup_dir) -> Path:

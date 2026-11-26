@@ -3349,6 +3349,10 @@ def tool_write(index, cfg, file: str, content: str,
         return f"ERROR: refusing to write outside the project root: {file}"
     if path.is_dir():
         return f"ERROR: {rel} is a directory, not a file."
+    allowed, sensitive_error = security.check_sensitive_write(
+        root, rel, action=verb, policy=getattr(cfg, "policy", None))
+    if not allowed:
+        return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, rel, verb) \
         or _task_allowlist_error(index, cfg, rel, verb)
     if err:
@@ -3485,6 +3489,12 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         return f"ERROR: refusing to move outside the project root: {file} -> {to}"
     if not src.is_file():
         return f"ERROR: {src_rel} is not an existing file."
+    policy = getattr(cfg, "policy", None)
+    for label in (src_rel, dst_rel):
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, label, action="move", policy=policy)
+        if not allowed:
+            return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, src_rel, "move") \
         or _protected_error(cfg, dst_rel, "move") \
         or _task_allowlist_error(index, cfg, src_rel, "move")
@@ -3585,6 +3595,10 @@ def tool_delete(index, cfg, file: str) -> str:
         return f"ERROR: refusing to delete outside the project root: {file}"
     if not path.is_file():
         return f"ERROR: {rel} is not an existing file."
+    allowed, sensitive_error = security.check_sensitive_write(
+        root, rel, action="delete", policy=getattr(cfg, "policy", None))
+    if not allowed:
+        return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, rel, "delete") \
         or _task_allowlist_error(index, cfg, rel, "delete")
     if err:

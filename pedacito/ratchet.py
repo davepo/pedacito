@@ -147,6 +147,15 @@ def _iter_candidate_files(root: Path, max_files: int):
                 continue
             if entry.name.startswith('.'):
                 continue
+            try:
+                rel = entry.relative_to(root).as_posix()
+            except ValueError:
+                rel = entry.name
+            # Non-dotfile secrets (`credentials.json`, `secrets.yaml`,
+            # `*.pem`, `service-account*.json`, ...) must never be snapshotted
+            # even though they carry a tracked suffix.
+            if security.is_sensitive_path(rel):
+                continue
             if entry.suffix.lower() not in _SUFFIXES:
                 continue
             count += 1

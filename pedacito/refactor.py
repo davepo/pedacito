@@ -38,7 +38,7 @@ import re
 import tokenize
 from pathlib import Path
 
-from . import fileio, safety
+from . import fileio, safety, security
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -645,6 +645,9 @@ def rename_symbol_across_project(root, old_name: str, new_name: str,
         if why:
             skipped.append(f"{rel} (protected: {why})")
             continue
+        if security.is_sensitive_path(rel):
+            skipped.append(f"{rel} (sensitive file: never read or renamed)")
+            continue
         path = root / rel
         try:
             text, style = fileio.read(path, errors="strict")
@@ -781,6 +784,11 @@ def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
     root = Path(index.root).resolve()
 
     def _gate(rel: str, path: Path) -> str | None:
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, rel, action="rename_symbol",
+            policy=getattr(cfg, "policy", None))
+        if not allowed:
+            return sensitive_error
         return (_protected_error(cfg, rel, "rename_symbol")
                 or _task_allowlist_error(index, cfg, rel, "rename_symbol")
                 or _snapshot(index, cfg, rel, path))
@@ -948,6 +956,10 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
             or _task_allowlist_error(index, cfg, rel, "rename")
         if err:
             return err
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, rel, action="rename", policy=getattr(cfg, "policy", None))
+        if not allowed:
+            return f"ERROR: {sensitive_error}; nothing was renamed."
         path = root / rel
         try:
             text, style = fileio.read(path, errors="strict")

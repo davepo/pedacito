@@ -83,6 +83,7 @@ __all__ = [
     "SessionPermissionBroker",
     "acknowledge_findings",
     "check_git_secret_hygiene",
+    "check_sensitive_write",
     "clear_security_cache",
     "ensure_gitignore_entries",
     "format_finding",
@@ -219,6 +220,118 @@ def is_sensitive_path(path) -> bool:
 def is_sensitive_rel(root, rel: str) -> bool:
     """`is_sensitive_path` for a project-relative path."""
     return is_sensitive_path(Path(str(root)) / str(rel or ""))
+
+
+def _display_rel(root: Path, rel: Any) -> str:
+    """A clean project-relative spelling of `rel` for messages and checks.
+
+    Handles POSIX (`sub/.env`), Windows backslash (`sub\\\\.env`) and absolute
+    spellings (`C:\\\\proj\\\\credentials.json`). An absolute path under `root`
+    becomes root-relative; an absolute path outside it keeps its meaningful
+    tail so `is_sensitive_path` still sees the final name."""
+    raw = str(rel or "").strip().strip("`\"'")
+    if not raw:
+        return ""
+    win = None
+    try:
+        win = PureWindowsPath(raw)
+    except (TypeError, ValueError):
+        win = None
+    is_abs = False
+    try:
+        is_abs = Path(raw).is_absolute()
+    except (TypeError, ValueError, OSError):
+        is_abs = False
+    is_abs = is_abs or bool(win is not None and win.is_absolute())
+    if is_abs:
+        for candidate in (raw, raw.replace("\\", "/")):
+            try:
+                return Path(candidate).resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+        if win is not None:
+            parts = [p for p in win.parts
+                     if not re.fullmatch(r"[A-Za-z]:[\\\\/]?", p)
+                     and p not in ("\\", "/")]
+            if parts:
+                return "/".join(parts)
+    return fileio.normalise_rel(raw)
+
+
+def check_sensitive_write(
+    root: Path | str,
+    rel: str,
+    *,
+    action: str = "write",
+    policy: Any = None,
+) -> tuple[bool, str]:
+    """The single write gate for secret/credential paths.
+
+    Returns ``(allowed, error_message)``. A non-sensitive path is always
+    allowed. A sensitive path is refused by default -- in BOTH edit engines,
+    for writes, edits, creations, moves, deletes and renames -- so `.env`,
+    `*.pem`, `id_rsa`, `credentials.json` and friends can never be staged,
+    reviewed or snapshotted.
+
+    ``policy`` is the WP-4005 hook: when it exposes ``evaluate`` and returns an
+    explicit ``decision == "allow"`` for ``capability="sensitive_write"`` AND
+    the human approves through the Permission Broker, the write is allowed.
+    With no policy (the default) the refusal is deterministic. Plan/ask/
+    headless/unattended sessions never consult the policy: nobody is there to
+    approve.
+    """
+    root_path = Path(str(root or ".")).expanduser()
+    try:
+        root_resolved = root_path.resolve()
+    except OSError:
+        root_resolved = root_path
+    target = _display_rel(root_resolved, rel)
+    if not is_sensitive_path(target) and not is_sensitive_path(
+            fileio.normalise_rel(str(rel or ""))):
+        return True, ""
+    message = f"refused to {action} sensitive file: {target or rel}"
+    if policy is None or not hasattr(policy, "evaluate"):
+        return False, message
+
+    sess = session_ctx.current_session()
+    mode = str(getattr(sess, "mode", "") or "").lower()
+    if sess is not None and mode in (
+            "plan", "ask", "headless", "unattended"):
+        return False, message
+    decision = None
+    try:
+        decision = policy.evaluate(
+            capability="sensitive_write", action=action, path=target,
+            root=str(root_resolved))
+    except TypeError:
+        try:
+            decision = policy.evaluate("sensitive_write", target)
+        except Exception:
+            decision = None
+    except Exception:
+        decision = None
+    verdict = getattr(decision, "decision", None)
+    if verdict is None and isinstance(decision, dict):
+        verdict = decision.get("decision")
+    if verdict is None and isinstance(decision, str):
+        verdict = decision
+    if str(verdict or "").lower() != "allow":
+        return False, message
+    try:
+        approved, _why = request_permission(
+            CAT_SENSITIVE_FILE,
+            f"{action.capitalize()} sensitive file `{target}`",
+            detail=f"policy allowed {action} of a secret/credential path; "
+                   "human confirmation is still required",
+            risk_level="high",
+            reason=message,
+            project_root=str(root_resolved),
+        )
+    except Exception:
+        approved = False
+    if approved:
+        return True, ""
+    return False, message
 
 
 # --- 3. GUI server origin guard ---------------------------------------------------

@@ -13,6 +13,7 @@ and terminal text are also kept here, so a reloaded page rebuilds itself from
 
 from __future__ import annotations
 
+import copy
 import json
 import queue
 import re
@@ -30,7 +31,7 @@ from .. import config as config_mod
 from .. import fileio
 from .. import i18n
 from .. import review as review_mod
-from .. import security, session_ctx, themes as themes_mod, workspace
+from .. import safety, security, session_ctx, themes as themes_mod, workspace
 from .. import update as update_mod
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
@@ -387,15 +388,23 @@ def before_text(fd) -> str:
 
 
 def pack_rows(rows) -> list:
-    """Compact JSON form of diff rows for the browser."""
+    """Compact JSON form of diff rows for the browser.
+
+    Displayed line text passes through `safety.redact`, so an accidental
+    embedded token (`sk-...`, `ghp_...`, `AKIA...`) never reaches the JSON
+    preview payload. The FileDiff's before/after text is left intact for the
+    real write."""
     out = []
     for r in rows:
         if r.kind == "skip":
             out.append(["skip", r.hidden, r.fold])
         else:
-            out.append([r.kind, r.a_no, r.a, r.b_no, r.b,
-                        [list(s) for s in r.a_spans],
-                        [list(s) for s in r.b_spans], r.fold,
+            a = safety.redact(r.a)
+            b = safety.redact(r.b)
+            a_spans = [list(s) for s in r.a_spans] if a == r.a else []
+            b_spans = [list(s) for s in r.b_spans] if b == r.b else []
+            out.append([r.kind, r.a_no, a, r.b_no, b,
+                        a_spans, b_spans, r.fold,
                         getattr(r, "hunk", -1)])
     return out
 
@@ -408,6 +417,75 @@ def pack_hunks(hunks) -> list:
              "added": h.added, "removed": h.removed, "rows": list(h.rows),
              "clauses": list(getattr(h, "clauses", ()))}
             for h in (hunks or [])]
+
+
+def staged_review_meta(staged) -> dict:
+    """JSON-safe summary for a per-session `review.StagedReview`."""
+    return {
+        "id": staged.review_id,
+        "review_id": staged.review_id,
+        "session_id": staged.session_id,
+        "task": safety.redact(staged.task),
+        "outcome": staged.outcome,
+        "detail": staged.detail,
+        "partial_ok": staged.partial_ok,
+        "pending": not staged.outcome,
+        "clause_texts": {k: safety.redact(v)
+                         for k, v in (staged.clause_texts or {}).items()},
+        "unaccepted": list(staged.unaccepted),
+        "accepted_hunks": dict(staged.accepted_hunks or {}),
+        "files": [{
+            "rel": d.rel,
+            "added": d.added,
+            "removed": d.removed,
+            "message": safety.redact(d.message),
+            "source": d.removed_source,
+            "renames_from": list(d.renames_from),
+            "edited": d.rel in staged.edits,
+            "clauses": list(getattr(d, "clauses", ())),
+            "hunks": pack_hunks(getattr(d, "hunks", ())),
+            "accepted_hunks": (
+                list(d.hunk_selection)
+                if getattr(d, "hunk_selection", None) is not None else None),
+        } for d in staged.diffs],
+    }
+
+
+def staged_review_file(staged, rel: str) -> dict | None:
+    """One staged review's rows for `/api/review/file`."""
+    for fd in staged.diffs:
+        if fd.rel == rel:
+            return {
+                "rel": fd.rel,
+                "rows": pack_rows(fd.rows),
+                "after": staged.edits.get(rel, fd.after_text),
+                "added": fd.added,
+                "removed": fd.removed,
+                "message": safety.redact(fd.message),
+                "hunks": pack_hunks(getattr(fd, "hunks", ())),
+            }
+    return None
+
+
+def staged_review_rediff(staged, rel: str, text: str) -> dict | None:
+    """Hand-edit one staged file and return its diff against the original."""
+    if staged.outcome or not staged.partial_ok:
+        return None
+    fd = next((d for d in staged.diffs if d.rel == rel), None)
+    if fd is None or fd.removed_source:
+        return None
+    before = before_text(fd)
+    text = str(text or "").replace("\r\n", "\n")
+    rows, added, removed, hunks = review_mod.build_diff(before, text)
+    fd.rows, fd.added, fd.removed = rows, added, removed
+    fd.after_text = text
+    fd.hunks = hunks
+    fd.hunk_selection = None
+    staged.edits[rel] = text
+    return {"rel": rel, "rows": pack_rows(rows), "after": text,
+            "added": added, "removed": removed,
+            "message": safety.redact(fd.message),
+            "hunks": pack_hunks(hunks)}
 
 
 def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
@@ -560,6 +638,10 @@ class State:
         self.review: Review | None = None
         self._rid = 0
         self.apply_lock = threading.Lock()
+        # D9: every GUI session owns a review queue; /api/review* can route by
+        # (session_id, review_id) while the legacy `review`/int-id flow keeps
+        # working unchanged.
+        self.review_queue = review_mod.ReviewQueue(self.session_id)
 
         # Live Permission Broker: a gated tool call (web fetch,
         # pip install, unapproved shell command, sensitive file read) parks
@@ -1839,6 +1921,11 @@ class State:
         # so": if the review became visible first, `/api/state` could return
         # the card without the "Staged changes..." line (the two are read by
         # separate calls in the state handler).
+        rv_args = dict(rv_args or {})
+        # D10: secret/credential files never reach the review page, the JSON
+        # preview or the write step.
+        rv_args["diffs"] = review_mod.filter_sensitive_diffs(
+            rv_args.get("diffs") or [])
         with self.lock:
             self._rid += 1
             rv = Review(self._rid, **rv_args)
@@ -2094,6 +2181,13 @@ class State:
                     extra["hunks_total"] = total_h
         self.set_message(rv.mid, **extra)
         rv.done.set()
+        # Keep the per-session queue mirror consistent when the legacy int-id
+        # flow made the decision (no second write: the queue only records it).
+        attached = getattr(rv, "queue_review", None)
+        if attached is not None and not attached.outcome:
+            attached.outcome = outcome
+            attached.detail = detail
+            attached.done.set()
         self.bus.publish("review_done", id=rv.id, outcome=outcome)
 
     # --- snapshots for the browser ---------------------------------------------
@@ -2526,6 +2620,23 @@ def install_runner() -> None:
             "task": task, "diffs": diffs, "writer": writer,
             "on_discard": on_discard, "partial_ok": on_discard is None,
             "clause_texts": clause_texts})
+        # D9: mirror the review into this session's ReviewQueue so the
+        # /api/review* routes can address it by (session_id, review_id) while
+        # the legacy `STATE.review` int-id flow keeps working.
+        try:
+            state = STATE._resolve() if hasattr(STATE, "_resolve") else STATE
+            staged = state.review_queue.stage(
+                task=task, diffs=copy.deepcopy(rv.diffs), writer=(
+                    lambda *, files=None, accepted_hunks=None:
+                    state.decide_review(rv.id, "apply", files,
+                                        accepted_hunks=accepted_hunks)),
+                on_discard=lambda: state.decide_review(
+                    rv.id, "reject", None),
+                partial_ok=rv.partial_ok,
+                clause_texts=clause_texts, ttl_s=timeout)
+            rv.queue_review = staged
+        except Exception:
+            pass                    # the legacy review path still works
         job = STATE.job
         deadline = time.time() + float(timeout or 1800)
         while not rv.done.wait(0.5):

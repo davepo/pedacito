@@ -200,6 +200,17 @@ class VirtualWorkspace:
         why = safety.is_protected(canon, self.cfg if write else None, write=write)
         if why:
             raise PathRefused(why)
+        if write and not allow_sensitive:
+            # D10: the SAME gate as the two-phase engine. Every write/edit/
+            # create/delete/rename path goes through `_resolve(write=True)`,
+            # so sensitive files are refused identically in both engines.
+            allowed, error = security.check_sensitive_write(
+                self.root, canon, action="write",
+                policy=getattr(self.cfg, "policy", None))
+            if not allowed:
+                exc = PathRefused(error)
+                exc.sensitive = True
+                raise exc
         if not allow_sensitive and security.is_sensitive_path(canon):
             exc = PathRefused(
                 f"`{canon}` holds secrets/credentials; it is never read or "
@@ -599,6 +610,8 @@ class VirtualWorkspace:
             return self._mirror
         mirror = self._mirror
         for rel in sorted(self._mirror_touched - set(self._entries)):
+            if security.is_sensitive_path(rel):
+                continue
             # Rolled back since the last sync: put the real file back.
             dest = mirror / rel
             src = self.root / rel
@@ -608,6 +621,8 @@ class VirtualWorkspace:
             elif dest.exists():
                 dest.unlink()
         for rel, entry in self._entries.items():
+            if security.is_sensitive_path(rel):
+                continue                     # never mirror secret bytes
             dest = mirror / rel
             if entry.current is None:
                 if dest.exists():

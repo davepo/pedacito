@@ -240,11 +240,16 @@ def iter_workspace_files(root) -> list[tuple[str, Path]]:
             if name not in EXCLUDED_DIRS and not (d / name).is_symlink())
         for name in sorted(filenames):
             p = d / name
-            if not _trackable(p):
-                continue
             try:
                 rel = p.relative_to(root).as_posix()
             except ValueError:
+                continue
+            # Defense in depth: secret/credential material is never opened,
+            # hashed or copied into `.pedacito/checkpoints/snapshots/<id>/`
+            # (or anywhere else the checkpoint store can restore from).
+            if security.is_sensitive_path(rel):
+                continue
+            if not _trackable(p):
                 continue
             out.append((rel, p))
     return out

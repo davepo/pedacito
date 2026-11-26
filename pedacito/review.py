@@ -20,9 +20,11 @@ import hashlib
 import html
 import inspect
 import json
+import logging
 import re
 import secrets
 import threading
+import time
 import webbrowser
 from bisect import bisect_right
 from contextlib import nullcontext
@@ -32,7 +34,7 @@ from http.server import BaseHTTPRequestHandler
 from itertools import accumulate
 from pathlib import Path
 
-from . import fileio, security
+from . import fileio, safety, security, session_ctx
 from .index import state_dir
 from .local_server import LocalHTTPServer
 
@@ -361,6 +363,309 @@ def apply_hunk_selection(diffs: list[FileDiff],
     return True, ""
 
 
+# --------------------------------------------------------------------------
+# Per-session review routing (D9)
+# --------------------------------------------------------------------------
+_log = logging.getLogger(__name__)
+
+
+def is_sensitive_diff(fd) -> bool:
+    """True when a FileDiff stages secret/credential material."""
+    if security.is_sensitive_path(getattr(fd, "rel", "")):
+        return True
+    return any(security.is_sensitive_path(old)
+               for old in (getattr(fd, "renames_from", ()) or ()))
+
+
+def filter_sensitive_diffs(diffs) -> list:
+    """Drop every FileDiff that names (or renames from) a sensitive path.
+
+    When nothing is sensitive the ORIGINAL list object is returned, so a
+    caller that captured the diffs list (the legacy review writer) keeps
+    seeing the same in-place selection the GUI filters."""
+    if not diffs:
+        return diffs if isinstance(diffs, list) else []
+    kept: list = []
+    skipped: list[str] = []
+    for fd in diffs:
+        if is_sensitive_diff(fd):
+            skipped.append(str(getattr(fd, "rel", "")))
+            continue
+        kept.append(fd)
+    if skipped:
+        _log.warning("review skipped sensitive path(s): %s",
+                     ", ".join(skipped))
+        return kept
+    return diffs if isinstance(diffs, list) else kept
+
+
+@dataclass
+class StagedReview:
+    """One review waiting in a session's queue."""
+
+    review_id: str
+    session_id: str
+    task: str
+    diffs: list[FileDiff]
+    writer: "callable"
+    on_discard: "callable | None" = None
+    partial_ok: bool = True
+    clause_texts: dict[str, str] = field(default_factory=dict)
+    created_at: float = 0.0
+    expires_at: float = 0.0
+    outcome: str = ""               # "" | applied | cancelled | timeout | expired
+    detail: str = ""
+    done: threading.Event = field(default_factory=threading.Event)
+    # GUI compatibility: the transcript message id, hand edits and accepted
+    # hunk bookkeeping mirror the legacy `gui.core.Review` shape.
+    edits: dict[str, str] = field(default_factory=dict)
+    unaccepted: list[str] = field(default_factory=list)
+    accepted_hunks: dict[str, list[int]] = field(default_factory=dict)
+    mid: int = 0
+
+
+class ReviewQueue:
+    """Thread-safe per-session review queue (D9).
+
+    Each session owns its own queue, so two concurrent sessions can stage
+    reviews without sharing ids, pending lists or decisions. Review ids are
+    ``rev_<session-short>_<seq>``; a review id from another session is never
+    visible (and the GUI rejects it)."""
+
+    def __init__(self, session_id: str, *,
+                 default_ttl_s: float = 1800.0) -> None:
+        self.session_id = str(session_id or "session")
+        clean = re.sub(r"[^A-Za-z0-9]", "", self.session_id)
+        if clean.lower().startswith("ses"):
+            clean = clean[3:]
+        self._short = (clean[-8:] or "default")
+        self.default_ttl_s = float(default_ttl_s or 1800.0)
+        self._lock = threading.RLock()
+        self._reviews: dict[str, StagedReview] = {}
+        self._seq = 0
+        # A non-GUI host (TUI/RPC/daemon) sets this to be notified when a
+        # review is staged; `review.run` then routes through this queue.
+        self.listener = None
+
+    # -- configuration -----------------------------------------------------
+    def set_listener(self, listener) -> None:
+        """Install (or clear, with None) the staging callback."""
+        with self._lock:
+            self.listener = listener
+
+    def has_listener(self) -> bool:
+        with self._lock:
+            return callable(self.listener)
+
+    # -- staging -----------------------------------------------------------
+    def stage(self, *, task: str, diffs: list[FileDiff], writer,
+              on_discard=None, partial_ok: bool = True,
+              clause_texts: dict[str, str] | None = None,
+              ttl_s: float | None = None) -> StagedReview:
+        """Queue a review for this session; sensitive diffs are dropped."""
+        filtered = list(filter_sensitive_diffs(diffs))
+        now = time.time()
+        ttl = self.default_ttl_s if ttl_s is None else max(0.0, float(ttl_s))
+        with self._lock:
+            self._seq += 1
+            review = StagedReview(
+                review_id=f"rev_{self._short}_{self._seq}",
+                session_id=self.session_id,
+                task=str(task or ""),
+                diffs=filtered,
+                writer=writer,
+                on_discard=on_discard,
+                partial_ok=bool(partial_ok),
+                clause_texts=dict(clause_texts or {}),
+                created_at=now,
+                expires_at=now + ttl,
+            )
+            self._reviews[review.review_id] = review
+            listener = self.listener
+        if callable(listener):
+            try:
+                listener(review)
+            except Exception:
+                _log.exception("review queue listener failed")
+        return review
+
+    # -- lookup ------------------------------------------------------------
+    def get(self, review_id: str) -> StagedReview | None:
+        with self._lock:
+            return self._reviews.get(str(review_id or ""))
+
+    def list_pending(self) -> list[dict]:
+        """JSON-safe summaries of every undecided review."""
+        with self._lock:
+            return [{
+                "review_id": r.review_id,
+                "session_id": r.session_id,
+                "task": r.task,
+                "files": [d.rel for d in r.diffs if not d.removed_source],
+                "partial_ok": r.partial_ok,
+                "created_at": r.created_at,
+                "expires_at": r.expires_at,
+            } for r in self._reviews.values() if not r.outcome]
+
+    def pending_reviews(self) -> list[StagedReview]:
+        """The live StagedReview objects, oldest first (GUI convenience)."""
+        with self._lock:
+            return sorted((r for r in self._reviews.values() if not r.outcome),
+                          key=lambda r: r.created_at)
+
+    # -- decisions ---------------------------------------------------------
+    def decide(self, review_id: str, action: str, *,
+               files: list[str] | None = None,
+               accepted_hunks: dict[str, list[int]] | None = None
+               ) -> tuple[bool, str]:
+        """Apply or reject one review. Returns (ok, detail)."""
+        with self._lock:
+            review = self._reviews.get(str(review_id or ""))
+            if review is None:
+                return False, f"unknown review {review_id!r}"
+            if review.outcome:
+                return False, f"this review was already {review.outcome}"
+            now = time.time()
+            if review.expires_at and now >= review.expires_at:
+                self._expire_locked(review)
+                return False, "this review expired; stage it again"
+            verb = str(action or "").lower()
+            if verb in ("reject", "cancel", "discard"):
+                detail = self._discard_locked(review, "cancelled",
+                                              "No files were changed.")
+                return True, detail or "cancelled"
+            if verb != "apply":
+                return False, f"unknown review action {action!r}"
+
+            hmap = accepted_hunks if isinstance(accepted_hunks, dict) else {}
+            if review.partial_ok and (files is not None or hmap):
+                keep = (set(files) if files is not None
+                        else {d.rel for d in review.diffs
+                              if not d.removed_source}) | set(hmap)
+                snapshot = list(review.diffs)
+                fd_snap = [(d, d.after_text, d.added, d.removed,
+                            getattr(d, "hunk_selection", None))
+                           for d in review.diffs]
+                review.diffs[:] = [d for d in review.diffs
+                                   if d.removed_source or d.rel in keep]
+                if not any(not d.removed_source for d in review.diffs):
+                    review.diffs[:] = snapshot
+                    return False, ("Select at least one file or hunk to accept."
+                                   if hmap else
+                                   "Select at least one file to accept.")
+                ok, detail = apply_hunk_selection(review.diffs, hmap)
+                if not ok:
+                    review.diffs[:] = snapshot
+                    for d, after, added, removed, sel in fd_snap:
+                        d.after_text = after
+                        d.added = added
+                        d.removed = removed
+                        d.hunk_selection = sel
+                    return False, detail
+                for d in review.diffs:
+                    if d.rel in review.edits:
+                        d.after_text = review.edits[d.rel]
+                review.accepted_hunks = {}
+                for d in review.diffs:
+                    if d.removed_source:
+                        continue
+                    sel = getattr(d, "hunk_selection", None)
+                    if sel is not None:
+                        review.accepted_hunks[d.rel] = list(sel)
+                    elif d.rel in hmap:
+                        review.accepted_hunks[d.rel] = sorted(set(hmap[d.rel]))
+            elif review.edits:
+                for d in review.diffs:
+                    if d.rel in review.edits:
+                        d.after_text = review.edits[d.rel]
+
+            try:
+                ok, detail = _call_staged_writer(
+                    review.writer, review.diffs, files, hmap)
+            except Exception as exc:
+                return False, f"write failed: {exc}"
+            detail = str(detail or "")
+            if not ok:
+                review.detail = detail
+                return False, detail
+            review.outcome = "applied"
+            review.detail = detail
+            review.done.set()
+            return True, detail
+
+    def _discard_locked(self, review: StagedReview, outcome: str,
+                        detail: str, reason: str = "") -> str:
+        if review.on_discard is not None:
+            try:
+                review.on_discard()
+            except Exception as exc:
+                detail = f"Discard failed: {exc}"
+        review.outcome = outcome
+        review.detail = detail or reason or outcome
+        review.done.set()
+        return review.detail
+
+    def _expire_locked(self, review: StagedReview) -> None:
+        self._discard_locked(
+            review, "expired",
+            "Review window timed out; nothing was written.")
+
+    def expire_stale(self, now: float | None = None) -> int:
+        """Expire every undecided review whose TTL has elapsed."""
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            stale = [r for r in self._reviews.values()
+                     if not r.outcome and r.expires_at
+                     and moment >= r.expires_at]
+            for review in stale:
+                self._expire_locked(review)
+            return len(stale)
+
+    def cancel_all(self, reason: str = "session cancelled") -> int:
+        """Cancel every undecided review (a session teardown unblocks waiters)."""
+        with self._lock:
+            pending = [r for r in self._reviews.values() if not r.outcome]
+            for review in pending:
+                self._discard_locked(
+                    review, "cancelled",
+                    str(reason or "Cancelled; nothing was written."),
+                    reason=reason)
+            return len(pending)
+
+
+def _call_staged_writer(writer, diffs: list[FileDiff],
+                        files: list[str] | None,
+                        accepted_hunks: dict | None = None):
+    """Invoke a queue writer, supporting every existing signature.
+
+    - a writer naming `files`/`accepted_hunks` receives those selections;
+    - a writer with one required positional receives the accepted {rel: text}
+      map (the legacy `_call_writer` contract);
+    - a zero-argument writer (the GUI and standalone page writers) is called
+      as-is."""
+    try:
+        params = inspect.signature(writer).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "files" in params or "accepted_hunks" in params:
+        kwargs: dict = {}
+        if "files" in params:
+            kwargs["files"] = list(files) if files is not None else None
+        if "accepted_hunks" in params:
+            kwargs["accepted_hunks"] = dict(accepted_hunks or {})
+        return writer(**kwargs)
+    required = [p for p in params.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                and p.default is p.empty]
+    if len(required) >= 2:
+        return writer(list(files) if files is not None else None,
+                      dict(accepted_hunks or {}))
+    if required and diffs is not None:
+        return writer({fd.rel: fd.after_text for fd in diffs
+                       if not fd.removed_source and not fd.deleted})
+    return writer()
+
+
 def hunk_clauses_for_file(fd: FileDiff,
                           clause_texts: dict | None = None) -> dict[int, tuple[str, ...]]:
     """Attribute a file's clauses to individual hunks when the file has
@@ -466,6 +771,10 @@ def diffs_from_results(results, root=None, clauses=None,
     for r in results:
         if not r.ok or not r.sha:
             continue
+        if security.is_sensitive_path(r.file) or any(
+                security.is_sensitive_path(old) for old in r.renames_from):
+            _log.warning("review skipped sensitive path: %s", r.file)
+            continue
         rows, added, removed, hunks = build_diff(r.before, r.after)
         ids = tuple(clauses.get(r.file, ()))
         fd = FileDiff(r.file, rows, added, removed, r.sha, r.after,
@@ -480,6 +789,9 @@ def diffs_from_results(results, root=None, clauses=None,
         if root is None:
             continue
         for old in r.renames_from:
+            if security.is_sensitive_path(old):
+                _log.warning("review skipped sensitive rename source: %s", old)
+                continue
             try:
                 otext, _ = fileio.read(Path(root) / old, errors="replace")
             except OSError:
@@ -503,6 +815,9 @@ def diffs_from_backup(root: Path, backup_dir: Path) -> list[FileDiff]:
         if src.is_symlink() or not src.is_file():
             continue
         rel = src.relative_to(backup_dir).as_posix()
+        if security.is_sensitive_path(rel):
+            _log.warning("review skipped sensitive backup path: %s", rel)
+            continue
         try:
             cur = security.resolve_safe_path(root, rel)
         except (security.SecurityError, OSError, ValueError):
@@ -899,10 +1214,16 @@ def _rows_html(fd: FileDiff, fid: int, interactive: bool = False) -> str:
                 f'</label></td></tr>')
         a_no = "" if row.a_no is None else row.a_no
         b_no = "" if row.b_no is None else row.b_no
-        a_txt = _mark(row.a, row.a_spans) if row.kind == "replace" else (
-            html.escape(row.a) or "&nbsp;")
-        b_txt = _mark(row.b, row.b_spans) if row.kind == "replace" else (
-            html.escape(row.b) or "&nbsp;")
+        # Displayed text is redacted; the FileDiff's before_text/after_text
+        # stay intact so partial hunk selection still writes real code.
+        a_plain = safety.redact(row.a)
+        b_plain = safety.redact(row.b)
+        a_spans = row.a_spans if a_plain == row.a else []
+        b_spans = row.b_spans if b_plain == row.b else []
+        a_txt = _mark(a_plain, a_spans) if row.kind == "replace" else (
+            html.escape(a_plain) or "&nbsp;")
+        b_txt = _mark(b_plain, b_spans) if row.kind == "replace" else (
+            html.escape(b_plain) or "&nbsp;")
         if row.kind == "insert":
             a_no, a_txt = "", "&nbsp;"
         if row.kind == "delete":
@@ -926,7 +1247,7 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
     files_html = []
     for i, fd in enumerate(diffs):
         badges = "".join(
-            f'<span class="clause" title="{html.escape(clause_texts.get(c, c))}">'
+            f'<span class="clause" title="{html.escape(safety.redact(clause_texts.get(c, c)))}">'
             f'{html.escape(c)}</span>' for c in fd.clauses)
         file_box = ""
         if interactive and not fd.removed_source:
@@ -993,13 +1314,13 @@ def build_page(diffs: list[FileDiff], task: str, model: str, profile: str,
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍰</text></svg>">
-<title>Review &mdash; {html.escape(task[:60])}</title>
+<title>Review &mdash; {html.escape(safety.redact(task[:60]))}</title>
 <style>{CSS}</style>
 </head>
 <body>
 <header>
   <h1>Proposed changes <span class="sub">awaiting sign-off</span></h1>
-  <p class="task">{html.escape(task)}</p>
+  <p class="task">{html.escape(safety.redact(task))}</p>
   <div class="meta">
     <span class="lbl">{total_files} {noun} &middot; +{total_add} &minus;{total_rem} lines</span>
     {f'<span class="who">{html.escape(profile)}</span>' if profile else ""}
@@ -1214,6 +1535,10 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
     root = Path(root)
     safe_targets: dict[int, Path] = {}
     for idx, fd in enumerate(diffs):
+        if security.is_sensitive_path(fd.rel) or any(
+                security.is_sensitive_path(old) for old in fd.renames_from):
+            return (False, "Not written: refused to write sensitive file: "
+                    f"{fd.rel}")
         if Path(fd.rel).is_absolute():
             return False, f"Not written: unsafe path {fd.rel!r} (must be relative)."
         try:
@@ -1390,8 +1715,35 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
         return RUNNER(page=page, nonce=nonce, writer=writer, timeout=timeout,
                       on_discard=on_discard, diffs=diffs, task=task,
                       clause_texts=clause_texts)
+    # A session with its own queue listener (TUI/RPC/daemon) routes the review
+    # through that session's ReviewQueue instead of opening a second browser.
+    sess = session_ctx.current_session()
+    queue = getattr(sess, "review_queue", None) if sess is not None else None
+    if queue is not None and (
+            (callable(getattr(queue, "has_listener", None))
+             and queue.has_listener())
+            or callable(getattr(queue, "listener", None))):
+        staged = queue.stage(
+            task=task, diffs=diffs or [], writer=writer,
+            on_discard=on_discard, partial_ok=on_discard is None,
+            clause_texts=clause_texts, ttl_s=timeout)
+        deadline = time.time() + float(timeout or 0.0)
+        while not staged.done.wait(0.5):
+            if sess is not None and sess.cancel_event.is_set():
+                queue.cancel_all("session cancelled")
+                break
+            if deadline and time.time() > deadline:
+                queue.expire_stale()
+                if not staged.done.is_set():
+                    queue.expire_stale(now=staged.expires_at + 0.001)
+                break
+        return (staged.outcome or "timeout",
+                staged.detail
+                or "Review window timed out; nothing was written.")
     srv = LocalHTTPServer(("127.0.0.1", port), _Handler)
     thread = None
+    registry = getattr(sess, "resource_registry", None) if sess is not None else None
+    resource_id = None
     try:
         srv.page = page
         srv.nonce = nonce
@@ -1402,6 +1754,33 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
         srv.done = threading.Event()
         srv.outcome = ("timeout", "Review window timed out; nothing was written.")
         url = f"http://127.0.0.1:{srv.server_address[1]}/"
+
+        def _shutdown_review_server() -> None:
+            """Release the loopback server; unblock a waiting review first."""
+            try:
+                with srv.lock:
+                    if not srv.done.is_set():
+                        srv.outcome = (
+                            "cancelled",
+                            "Session cancelled; nothing was written.")
+                        srv.done.set()
+            except Exception:
+                pass
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except Exception:
+                pass
+
+        if registry is not None:
+            try:
+                resource_id = registry.register(
+                    "review_server", url, _shutdown_review_server)
+            except Exception:
+                resource_id = None
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
         if on_url:
@@ -1417,6 +1796,11 @@ def run(page: str, nonce: str, writer, port: int = 0, open_browser: bool = True,
             srv.outcome = ("cancelled", "Interrupted; nothing was written.")
         return srv.outcome
     finally:
+        if resource_id is not None and registry is not None:
+            try:
+                registry.unregister(resource_id)
+            except Exception:
+                pass
         srv.shutdown()
         srv.server_close()
         if thread is not None:
