@@ -13,7 +13,7 @@ Backends are the unprivileged tools each platform already ships:
 
     Linux    bubblewrap (`bwrap`)
     macOS    `sandbox-exec` (Seatbelt)
-    Windows  none that works without admin rights
+    Windows  `win_restricted` (Job Object + restricted token, Low Integrity)
 
 Where no backend is usable (not installed, user namespaces disabled, Windows,
 a Flatpak/containers that forbid nesting) commands run unsandboxed with ONE
@@ -218,8 +218,10 @@ def status(cfg, root=None) -> tuple[str, str]:
                "Windows: the built-in Job Object sandbox is unavailable here)")
         return "unavailable", why
     if backend == "win_restricted":
-        return "active", ("win_restricted: Job Object + restricted token "
-                          f"(Low Integrity); network {'on' if net else 'off'}")
+        return "active", (
+            "win_restricted: Job Object + restricted token (Low Integrity; "
+            "writes restricted to project/temp; outbound network and "
+            "user-readable files not blocked without AppContainer)")
     ok, why = _probe(backend, net)
     if not ok:
         return "unavailable", f"{backend} cannot start here ({why})"
@@ -234,30 +236,36 @@ class SandboxRefused(RuntimeError):
 
 def enforce_unattended_gate(cfg, *, permission_mode: str = "",
                             approval_policy: str = "",
-                            background: bool = False) -> None:
+                            background: bool = False,
+                            requires_sandbox: bool = False) -> None:
     """Refuse unattended execution that has no OS sandbox behind it.
 
-    The hard gate (D14): unattended `workspace-write`, `danger`, or
-    `background=True` command execution must run inside an active OS sandbox.
-    Raises `SandboxRefused` when `backend_name()` is empty AND
-    (`sandbox_strict` is true OR (`approval_policy == "never"` and `sandbox`
-    is true)).
+    The hard gate (D14): unattended `workspace-write`, `danger`,
+    `background=True`, or `requires_sandbox` command execution must run inside
+    an active OS sandbox. `sandbox` defaults to True (matching `status()`), so
+    a config that never mentions it still opts into the gate.
     """
     mode = str(permission_mode
                or getattr(cfg, "permission_mode", "ask") or "ask").lower()
     approval = str(approval_policy
                    or getattr(cfg, "approval_policy", "ask") or "ask").lower()
-    unattended = background or mode in ("workspace-write", "danger")
+    sandbox_on = bool(getattr(cfg, "sandbox", True))
+    unattended = (background or requires_sandbox
+                  or mode in ("workspace-write", "danger"))
     if not unattended:
         return
-    if backend_name():
-        return                      # an OS sandbox is active
-    if bool(getattr(cfg, "sandbox_strict", False)) or (
-            approval == "never" and bool(getattr(cfg, "sandbox", False))):
+    active = bool(backend_name()) and sandbox_on
+    if active:
+        return                      # an OS sandbox is active and enabled
+    strict = bool(getattr(cfg, "sandbox_strict", False))
+    if (strict or background or requires_sandbox
+            or (approval == "never" and sandbox_on)):
         raise SandboxRefused(
             "unattended execution (permission_mode="
             f"{mode!r}, background={background}) requires an OS sandbox, but "
             "no backend is active here")
+    # `sandbox = false` is the explicit opt-out: an unattended, headless
+    # (`approval = "never"`) run with the sandbox switched off is allowed.
 
 
 def wrap(argv: list[str], cfg, root) -> tuple[list[str], str]:

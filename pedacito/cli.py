@@ -2941,15 +2941,13 @@ def _cmd_daemon(args) -> int:
             info = daemon_mod.read_daemon_info(state_dir)
             if info is not None:
                 info = dict(info)
-                token = info.pop("token", "")
+                info.pop("token", "")   # the discovery file is the token carrier
                 if json_out:
                     print(json.dumps({"ok": True, "running": True, **info},
                                      default=str))
                 else:
                     print(f"daemon started at {info.get('url')} "
                           f"(pid {info.get('pid')})")
-                    if token:
-                        print(f"token: {token}")
                 return 0
             time.sleep(0.1)
         print("daemon start timed out; no discovery file appeared",
@@ -2958,14 +2956,13 @@ def _cmd_daemon(args) -> int:
 
     server = daemon_mod.DaemonServer(port=port, state_dir=state_dir)
     info = server.start()
-    token = info.get("token")
     if json_out:
         payload = dict(info)
         payload.pop("token", None)
         print(json.dumps(payload, default=str))
     else:
         print(f"daemon listening at {info['url']} (pid {info['pid']})")
-        print(f"token: {token}")
+        print("the bearer token is in the discovery file (daemon.json)")
         print("Ctrl-C stops it.")
     try:
         while not server._stopped.wait(0.5):

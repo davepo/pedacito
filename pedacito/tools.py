@@ -3070,6 +3070,15 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
     if op not in ("definition", "references", "hover", "diagnostics"):
         return ("ERROR: lsp symbol must be definition, references, hover, or "
                 "diagnostics.")
+    # H7: spawning an external language server is execution; gate it with the
+    # unified policy engine (a trusted `[commands].deny` or `plan` mode refuses
+    # it) while read-only `lsp` with no server stays allowed.
+    lsp_cmd = lsp.command_for(index.root, rel, cfg)
+    if lsp_cmd:
+        policy_err = _policy_denied(cfg, "run", " ".join(lsp_cmd),
+                                    root=index.root)
+        if policy_err:
+            return policy_err
     return lsp.result(index.root, cfg, op, rel,
                       line=_as_int(start, 1) or 1,
                       column=_as_int(end, 1) or 1)
@@ -3107,6 +3116,9 @@ def tool_serve(index, cfg, symbol: str = "", command: str = "",
         policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
         if policy_err:
             return policy_err
+        gate_err = _run_gate(cfg, cmd, index.root)
+        if gate_err:
+            return gate_err
         denied = _allowlist_error(cfg, argv)
         if denied:
             return denied
@@ -3335,8 +3347,9 @@ def _policy_denied(cfg, capability: str, target: str, root=None) -> str:
     try:
         from . import policy as policy_mod
         d = policy_mod.enforce(cfg, capability, target, root=root)
-    except Exception:
-        return ""
+    except Exception as exc:
+        # FAIL CLOSED: a policy evaluation error is a denial, never "".
+        return (f"ERROR: denied by policy: policy evaluation error: {exc}")
     if d is not None and d.decision == "deny":
         return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
     return ""
@@ -3857,6 +3870,66 @@ def _project_shell_patterns(cfg, root) -> tuple[str, ...]:
 _ADHOC_BG_HEADS = frozenset({"nohup", "setsid", "disown", "bg"})
 
 
+def _call_unattended_gate(cfg, *, permission_mode="", approval_policy="",
+                          background=False, requires_sandbox=False) -> None:
+    """Call `sandbox.enforce_unattended_gate`, passing `requires_sandbox` when
+    the installed sandbox accepts it (Track A lands that parameter in parallel;
+    the `TypeError` fallback keeps Track B green either way)."""
+    try:
+        sandbox.enforce_unattended_gate(
+            cfg,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            background=background,
+            requires_sandbox=requires_sandbox,
+        )
+    except TypeError:
+        sandbox.enforce_unattended_gate(
+            cfg,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            background=background,
+        )
+
+
+def _run_gate(cfg, command: str, root, *, decision=None) -> str:
+    """The D14 unattended-execution gate, or "" when the run may proceed.
+
+    Evaluates the `run` policy decision (unless one is handed in), then calls
+    `sandbox.enforce_unattended_gate` with the decision's `requires_sandbox`
+    and a `background` flag derived from the session. Returns a refusal error
+    string on `SandboxRefused` or a policy evaluation error (fail-closed)."""
+    from . import policy as policy_mod
+    from . import session_ctx
+    if decision is None:
+        try:
+            decision = policy_mod.enforce(cfg, "run", command, root=root)
+        except Exception as exc:
+            return (f"ERROR: denied by policy: policy evaluation error: {exc}")
+    perm = str(getattr(cfg, "permission_mode", "ask") or "ask").lower()
+    approval = str(getattr(cfg, "approval_policy", "ask") or "ask").lower()
+    sess = session_ctx.current_session()
+    sess_mode = str(getattr(sess, "mode", "") or "").lower()
+    background = False
+    if perm in ("workspace-write", "danger") or approval == "never":
+        if sess_mode in ("daemon", "headless") \
+                or not getattr(cfg, "_interactive", True):
+            background = True
+    requires_sandbox = bool(decision is not None
+                            and decision.requires_sandbox)
+    try:
+        _call_unattended_gate(
+            cfg,
+            permission_mode=perm,
+            approval_policy=approval,
+            background=background,
+            requires_sandbox=requires_sandbox,
+        )
+    except sandbox.SandboxRefused as exc:
+        return f"ERROR: {exc}"
+    return ""
+
+
 def tool_run(index, cfg, command: str) -> str:
     """Run one command in the project root and return its output. Gated by
     `allow_shell`.
@@ -3950,6 +4023,9 @@ def tool_run(index, cfg, command: str) -> str:
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, cmd, index.root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, index.root)
     except sandbox.SandboxRefused as e:
@@ -4283,6 +4359,9 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
@@ -4446,6 +4525,9 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
@@ -4683,6 +4765,9 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
@@ -4826,6 +4911,16 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     cmd = _as_text(command).strip()
     file = _as_text(file).strip()
     start = _as_int(start, 0)
+    # H7: writing a screenshot is a write; launching a command is a run. Both
+    # funnel through the policy engine so `plan` mode cannot capture screens.
+    policy_err = _policy_denied(cfg, "write", ".pedacito/screenshots/shot.png",
+                                root=index.root)
+    if policy_err:
+        return policy_err
+    if cmd:
+        policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+        if policy_err:
+            return policy_err
     prev = _resolve_screenshot(index, file) if file else None
     if file and prev is None:
         return f"ERROR: no screenshot named '{file}' under the project root."
@@ -4959,6 +5054,14 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     if not cmd:
         return ("ERROR: browser needs `command`: an http(s) URL, or a command "
                 "that starts a local server and prints its URL.")
+    # H7: driving a browser is a run/network action; `plan` mode must not
+    # launch a browser or reach a page.
+    policy_err = _policy_denied(cfg, "network" if re.match(
+        r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"
+        r"127\.0\.0\.1(?::\d+)?(?:/|$))", cmd, re.IGNORECASE)
+        else "run", cmd, root=index.root)
+    if policy_err:
+        return policy_err
     prev = _resolve_screenshot(index, file) if file else None
     if file and prev is None:
         return f"ERROR: no screenshot named '{file}' under the project root."
@@ -5568,6 +5671,11 @@ def tool_generate_image(index, cfg, prompt: str, file: str = "",
         if not allowed:
             return msg
     root = Path(index.root).resolve()
+    target_rel = fileio.normalise_rel(str(file or "")) \
+        if str(file or "").strip() else ".pedacito/images/image"
+    policy_err = _policy_denied(cfg, "write", target_rel, root=index.root)
+    if policy_err:
+        return policy_err
     try:
         result = imagegen.generate_image(
             cfg, prompt, output_path=(file or None), size=size, root=root)
@@ -5619,6 +5727,12 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
         from . import gitinfo
         return gitinfo.tool_git_diff(index, cfg, step.get("file", ""))
     if action == "remember":
+        # H7: `remember` mutates project memory; gate it as a write so `plan`
+        # mode cannot change `.pedacito/memory.md`.
+        policy_err = _policy_denied(cfg, "write", ".pedacito/memory.md",
+                                    root=getattr(index, "root", None))
+        if policy_err:
+            return policy_err
         from . import memory
         return memory.tool_remember(index, cfg, step.get("content", ""))
     if action == "skill":
@@ -5654,6 +5768,13 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
     if action == DIAGNOSE_ACTION:
         return tool_diagnose(index, cfg, step.get("file", ""))
     if action == TODO_ACTION:
+        # `todo` mutates `.pedacito/todo.md` when content is given; gate that
+        # write so `plan` mode cannot edit the checklist.
+        if _as_text(step.get("content")).strip():
+            policy_err = _policy_denied(cfg, "write", ".pedacito/todo.md",
+                                        root=getattr(index, "root", None))
+            if policy_err:
+                return policy_err
         return tool_todo(index, cfg, step.get("content", ""))
     if action == MCP_ACTION:
         return tool_mcp(index, cfg, step.get("symbol", ""),

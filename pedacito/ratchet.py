@@ -134,7 +134,7 @@ def _iter_candidate_files(root: Path, max_files: int):
             continue
         for entry in entries:
             try:
-                if entry.is_symlink():
+                if entry.is_symlink() or security.is_junction_or_reparse(entry):
                     continue
                 if entry.is_dir():
                     if entry.name in SKIP_DIRS or entry.name.startswith('.'):
@@ -393,7 +393,8 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
         if rel in manifest or rel in skip_set:
             continue
         try:
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or security.is_junction_or_reparse(path) \
+                    or not path.is_file():
                 continue
             path.unlink()
             result["deleted"].append(rel)

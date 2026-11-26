@@ -522,6 +522,20 @@ def generate_image(cfg, prompt: str, *, output_path=None, size="", steps=0,
             "The image profile is missing a model id or base_url. Set both in "
             f"the [profiles.{profile_name}] table (model and base_url).")
 
+    # D14 / H7: the model-called image tool is gated by the unified policy
+    # engine (network to the image endpoint, write to the output path). The
+    # CLI (`user_out`) is the user's own action and stays ungated.
+    if not user_out:
+        from . import policy as policy_mod
+        try:
+            host = (urlparse(base_url).hostname or "") or base_url
+            d = policy_mod.enforce(cfg, "network", host, root=resolved_root)
+        except Exception as exc:
+            raise ImageGenError(f"policy evaluation error (network): {exc}")
+        if d is not None and d.decision == "deny":
+            raise ImageGenError(
+                f"refused by policy ({d.matched_rule}): {d.reason}")
+
     size = str(size or "").strip() \
         or str(getattr(pcfg, "image_default_size", "") or "").strip()
     steps = int(steps or 0) or int(getattr(pcfg, "image_default_steps", 0) or 0)
@@ -616,6 +630,29 @@ def generate_image(cfg, prompt: str, *, output_path=None, size="", steps=0,
         rel = dest.relative_to(resolved_root).as_posix()
     except ValueError:
         rel = str(dest)
+
+    # H7: refuse to write the image bytes over a secret/credential path
+    # (`.env`, `id_rsa`), a VCS/hook path (`.git/hooks/x`), or the trusted
+    # policy file (`.pedacito/policy.toml`). The default output lives under
+    # `.pedacito/images/`, which is exempt from the protected-path guard.
+    if not user_out:
+        from . import policy as policy_mod
+        from . import safety
+        try:
+            d = policy_mod.enforce(cfg, "write", rel, root=resolved_root)
+        except Exception as exc:
+            raise ImageGenError(f"policy evaluation error (write): {exc}")
+        if d is not None and d.decision == "deny":
+            raise ImageGenError(
+                f"refused by policy ({d.matched_rule}): {d.reason}")
+        allowed, why = security.check_sensitive_write(
+            resolved_root, rel, action="write")
+        if not allowed:
+            raise ImageGenError(f"refused: {why}")
+        if output_path:
+            why = safety.is_protected(rel, cfg)
+            if why:
+                raise ImageGenError(f"refused: {why}")
 
     fileio.write_bytes(dest, image_bytes)
 

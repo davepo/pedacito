@@ -1254,8 +1254,9 @@ class _ToolRunner:
             root = getattr(self.ws, "root", None) or getattr(
                 self.cfg, "_root", None)
             d = policy_mod.enforce(self.cfg, capability, target, root=root)
-        except Exception:
-            return ""
+        except Exception as exc:
+            # FAIL CLOSED: a policy evaluation error is a denial, never "".
+            return (f"ERROR: denied by policy: policy evaluation error: {exc}")
         if d is not None and d.decision == "deny":
             return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
         return ""

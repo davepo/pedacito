@@ -326,3 +326,82 @@ def test_check_maintenance_safe_quiesce_hook(tmp_path):
         assert ok2
     finally:
         workspace.unregister_quiesce_hook(hook)
+
+
+# ---------------------------------------------------- H5 lockfile hardening
+def test_malformed_lockfile_does_not_crash(tmp_path):
+    lock = _lock_file(tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(json.dumps({
+        "version": 2, "pid": "abc", "start_time": "not-a-float",
+        "owner_token": 123, "session_id": "", "mode": "exclusive",
+        "created_at": "y",
+    }), encoding="utf-8")
+    # Malformed pid/start_time must never crash: treated as stale, taken over.
+    workspace.acquire_lock(tmp_path)
+    assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    workspace.release_lock(tmp_path)
+    assert not lock.exists()
+
+
+def test_empty_fresh_lockfile_is_busy_not_stolen(tmp_path):
+    lock = _lock_file(tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("", encoding="utf-8")   # fresh, empty (mid-create)
+    with pytest.raises(workspace.ProjectBusy):
+        workspace.acquire_lock(tmp_path)
+
+
+def test_two_managers_in_one_process_conflict(tmp_path):
+    a = workspace.ProjectLockManager()
+    b = workspace.ProjectLockManager()
+    oa = a.acquire(tmp_path)
+    try:
+        with pytest.raises(workspace.ProjectBusy):
+            b.acquire(tmp_path)          # own-pid lock is NOT stale
+    finally:
+        a.release(tmp_path, oa)
+    assert not _lock_file(tmp_path).exists()
+
+
+def test_shared_reentry_upgrade_to_exclusive(tmp_path):
+    mgr = workspace.ProjectLockManager()
+    o1 = mgr.acquire(tmp_path, mode="shared", session_id="s1")
+    o2 = mgr.acquire(tmp_path, mode="exclusive", session_id="s1")  # upgrade
+    assert o2.mode == "exclusive"
+    mgr.release(tmp_path, o1)
+    mgr.release(tmp_path, o2)
+    assert not _lock_file(tmp_path).exists()
+
+
+def test_shared_reentry_upgrade_conflicts_with_other_owner(tmp_path):
+    mgr = workspace.ProjectLockManager()
+    o1 = mgr.acquire(tmp_path, mode="shared", session_id="s1")
+    o2 = mgr.acquire(tmp_path, mode="shared", session_id="s2")
+    with pytest.raises(workspace.ProjectBusy):
+        mgr.acquire(tmp_path, mode="exclusive", session_id="s1")
+    mgr.release(tmp_path, o1)
+    mgr.release(tmp_path, o2)
+    assert not _lock_file(tmp_path).exists()
+
+
+def test_shared_release_cleans_up_lockfile(tmp_path):
+    mgr = workspace.ProjectLockManager()
+    o1 = mgr.acquire(tmp_path, mode="shared", session_id="s1")
+    o2 = mgr.acquire(tmp_path, mode="shared", session_id="s2")
+    mgr.release(tmp_path, o1)               # first (on-disk) owner first
+    assert _lock_file(tmp_path).exists()    # still held by o2
+    mgr.release(tmp_path, o2)
+    assert not _lock_file(tmp_path).exists()  # no lingering run.lock
+
+
+def test_check_maintenance_safe_fails_closed_on_hook_error(tmp_path):
+    def boom(root, action):
+        raise RuntimeError("hook exploded")
+
+    workspace.register_quiesce_hook(boom)
+    try:
+        ok, reason = workspace.check_maintenance_safe(tmp_path, action="reset")
+        assert not ok and "safety hook failed" in reason
+    finally:
+        workspace.unregister_quiesce_hook(boom)

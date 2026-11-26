@@ -407,3 +407,224 @@ def test_decision_dataclass_shape():
     d = PolicyDecision("deny", "mode:plan", "reason", True)
     assert d.decision == "deny" and d.matched_rule == "mode:plan"
     assert d.requires_sandbox is True
+
+
+# --------------------------------------------------------------------------- #
+# H3 — fail-closed schema validation & unknown capabilities                    #
+# --------------------------------------------------------------------------- #
+
+def _trusted_policy(tmp_path, monkeypatch, text: str) -> None:
+    (tmp_path / ".pedacito").mkdir(exist_ok=True)
+    (tmp_path / ".pedacito" / "policy.toml").write_text(text, encoding="utf-8")
+    from pedacito import config as config_mod
+    monkeypatch.setattr(config_mod, "is_trusted", lambda p: True)
+
+
+def test_malformed_paths_table_fails_closed(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[paths]\nallow = "not-a-list"\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    d = eng.evaluate(PolicyRequest("write", "app.py"))
+    assert d.decision == "deny" and d.matched_rule == "policy.toml:schema_error"
+    # reads are still allowed even with a malformed policy table
+    assert eng.evaluate(PolicyRequest("read", "app.py")).decision == "allow"
+
+
+def test_malformed_policy_table_fails_closed(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, 'policy = ["not", "a", "table"]\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    d = eng.evaluate(PolicyRequest("run", "pytest -q"))
+    assert d.decision == "deny" and d.matched_rule == "policy.toml:schema_error"
+
+
+def test_malformed_commands_list_fails_closed(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[commands]\ndeny = "rm -rf *"\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    d = eng.evaluate(PolicyRequest("run", "rm -rf /tmp"))
+    assert d.decision == "deny" and d.matched_rule == "policy.toml:schema_error"
+
+
+def test_unknown_or_empty_capability_denies():
+    eng = _engine("danger")
+    for cap in ("", "teleport", "sudo"):
+        d = eng.evaluate(PolicyRequest(cap, "x"))
+        assert d.decision == "deny" and d.matched_rule == "policy:unknown_capability", cap
+
+
+def test_budget_check_exception_fails_closed():
+    class BoomLedger:
+        def check(self):
+            raise RuntimeError("ledger boom")
+
+    eng = PolicyEngine(Config(), None, budget_ledger=BoomLedger())
+    d = eng.evaluate(PolicyRequest("run", "pytest"))
+    assert d.decision == "deny" and d.matched_rule == "budget:error"
+
+
+# --------------------------------------------------------------------------- #
+# H3 — fail-closed call sites (tools / edits / hooks / interleaved)           #
+# --------------------------------------------------------------------------- #
+
+def _boom_enforce(monkeypatch):
+    from pedacito import policy as policy_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("policy boom")
+
+    monkeypatch.setattr(policy_mod, "enforce", boom)
+
+
+def test_tool_write_fails_closed_on_policy_error(tmp_path, monkeypatch):
+    _boom_enforce(monkeypatch)
+    idx = Index(tmp_path, [])
+    cfg = Config()
+    cfg.allow_write = True
+    obs = tools.tool_write(idx, cfg, "new.py", "x = 1\n")
+    assert "policy evaluation error" in obs
+
+
+def test_tool_run_fails_closed_on_policy_error(tmp_path, monkeypatch):
+    _boom_enforce(monkeypatch)
+    idx = Index(tmp_path, [])
+    cfg = Config()
+    cfg.allow_shell = True
+    obs = tools.tool_run(idx, cfg, "echo hi")
+    assert "policy evaluation error" in obs
+
+
+def test_edits_fail_closed_on_policy_error(tmp_path, monkeypatch):
+    _boom_enforce(monkeypatch)
+    from pedacito import edits
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    results = edits.apply_edits(
+        tmp_path, [edits.Edit("app.py", "x = 1", "x = 2")],
+        backup=False, dry_run=True, cfg=Config())
+    assert results and not results[0].ok
+    assert "policy evaluation error" in results[0].message
+
+
+def test_hooks_fail_closed_on_policy_error(tmp_path, monkeypatch):
+    _boom_enforce(monkeypatch)
+    cfg = Config()
+    cfg.hooks = {"pre_task": ["echo x"]}
+    res = hooks.fire(cfg, tmp_path, "pre_task")
+    assert res.denied and "policy evaluation error" in res.message
+
+
+def test_interleaved_policy_deny_fails_closed(tmp_path, monkeypatch):
+    _boom_enforce(monkeypatch)
+    from pedacito import interleaved as interleaved_mod
+    cfg = Config()
+    cfg._root = tmp_path
+    runner = interleaved_mod._ToolRunner.__new__(interleaved_mod._ToolRunner)
+    runner.cfg = cfg
+    runner.ws = None
+    msg = runner._policy_deny("write", "app.py")
+    assert "policy evaluation error" in msg
+
+
+# --------------------------------------------------------------------------- #
+# H4 — canonicalised path & command matching                                  #
+# --------------------------------------------------------------------------- #
+
+def test_path_canonicalization_catches_tricks(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[paths]\ndeny = ["secrets/**"]\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    for rel in ("./secrets/a", "x/../secrets/a", "sub/../secrets/a"):
+        d = eng.evaluate(PolicyRequest("write", rel))
+        assert d.decision == "deny" and "paths.deny" in d.matched_rule, rel
+    # an absolute path under the root (Windows drive or POSIX) is caught too
+    abs_target = str(tmp_path / "secrets" / "a")
+    d = eng.evaluate(PolicyRequest("write", abs_target))
+    assert d.decision == "deny" and "paths.deny" in d.matched_rule
+    # a path escaping the root is denied even without a matching deny pattern
+    d = eng.evaluate(PolicyRequest("write", "../outside.txt"))
+    assert d.decision == "deny" and "path_escape" in d.matched_rule
+
+
+def test_norm_path_windows_drive_spelling():
+    from pedacito.policy import _norm_path
+    assert _norm_path(r"C:\proj\secrets\a", root=r"C:\proj") == "secrets/a"
+    assert _norm_path(r"C:\other\secrets\a", root=r"C:\proj") is None
+    assert _norm_path(r"C:\proj\secrets\a", root=r"c:\proj") == "secrets/a"
+    assert _norm_path("../escape", root="C:/proj") is None
+
+
+def test_command_canonicalization_catches_wrappers(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[commands]\ndeny = ["git push"]\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    for cmd in ("/usr/bin/git push", "env git push", "git  push",
+                "env FOO=1 git push"):
+        d = eng.evaluate(PolicyRequest("run", cmd))
+        assert d.decision == "deny" and "commands.deny" in d.matched_rule, cmd
+
+
+def test_command_word_boundary_no_overmatch(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[commands]\ndeny = ["ls", "pytest"]\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    assert eng.evaluate(PolicyRequest("run", "lsof")).decision == "allow"
+    assert eng.evaluate(PolicyRequest("run", "pytest-evil")).decision == "allow"
+    assert eng.evaluate(PolicyRequest("run", "ls -la")).decision == "deny"
+    assert eng.evaluate(PolicyRequest("run", "pytest -q")).decision == "deny"
+
+
+# --------------------------------------------------------------------------- #
+# MEDIUM 6 — tightened auto-safe                                              #
+# --------------------------------------------------------------------------- #
+
+def test_auto_safe_rejects_output_flag_and_shell_meta():
+    eng = _engine("ask", approval="auto-safe")
+    d = eng.evaluate(PolicyRequest("run", "git diff --output=evil.txt"))
+    assert d.decision == "ask"
+    d = eng.evaluate(PolicyRequest("run", "pytest ; rm -rf /"))
+    assert d.decision == "ask"
+    d = eng.evaluate(PolicyRequest("run", "git status && whoami"))
+    assert d.decision == "ask"
+
+
+def test_auto_safe_run_requires_sandbox():
+    d = _engine("ask", approval="auto-safe").evaluate(
+        PolicyRequest("run", "pytest -q"))
+    assert d.decision == "allow" and d.requires_sandbox is True
+
+
+# --------------------------------------------------------------------------- #
+# MEDIUM 7 — stricter of CLI vs policy.toml                                   #
+# --------------------------------------------------------------------------- #
+
+def test_policy_file_cannot_loosen_cli_mode(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[policy]\npermission_mode = "danger"\n')
+    cfg = Config()
+    cfg.permission_mode = "plan"
+    eng = PolicyEngine(cfg, tmp_path)
+    assert eng.mode == "plan"
+    assert eng.evaluate(PolicyRequest("write", "x")).decision == "deny"
+
+
+def test_policy_file_narrows_cli_mode(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[policy]\npermission_mode = "plan"\n')
+    cfg = Config()
+    cfg.permission_mode = "danger"
+    eng = PolicyEngine(cfg, tmp_path)
+    assert eng.mode == "plan"
+
+
+def test_policy_file_approval_is_stricter(tmp_path, monkeypatch):
+    _trusted_policy(tmp_path, monkeypatch, '[policy]\napproval_policy = "never"\n')
+    cfg = Config()
+    cfg.approval_policy = "ask"
+    eng = PolicyEngine(cfg, tmp_path)
+    assert eng.approval_policy == "never"
+    d = eng.evaluate(PolicyRequest("write", "x"))
+    assert d.decision == "deny"

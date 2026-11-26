@@ -51,6 +51,10 @@ DISCOVERY_FILENAME = "daemon.json"
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 _LOOPBACK_SET = set(_LOOPBACK_HOSTS)
 
+# Sensible cap on request bodies so a client cannot force unbounded reads.
+_MAX_BODY_BYTES = 2 * 1024 * 1024
+_BODY_TOO_LARGE = object()
+
 
 def _state_path(state_dir: Path | str | None = None) -> Path:
     if state_dir is not None:
@@ -349,7 +353,10 @@ class DaemonServer:
 
     def quiesce(self, root: Path | str | None = None,
                 *, timeout_s: float = 10.0) -> tuple[bool, str]:
-        """Drain matching sessions; refuse while a worker is still running."""
+        """Drain active (running) sessions; refuse while a worker still runs.
+
+        Idle sessions are left open: quiescing is about waiting out in-flight
+        work, not forcibly closing a session that is merely parked."""
         wanted = Path(root).expanduser().resolve() if root is not None else None
         targets: list[WorkspaceSession] = []
         for ws in self._all_sessions():
@@ -363,24 +370,24 @@ class DaemonServer:
                 except OSError:
                     continue
             targets.append(ws)
-        if not targets:
+        running = [ws for ws in targets if ws.state == "running"]
+        if not running:
             return True, ""
-        for ws in targets:
-            if ws.state == "running":
-                ws.state = "draining"
+        for ws in running:
+            ws.state = "draining"
         deadline = time.monotonic() + max(0.0, float(timeout_s or 0.0))
         while True:
-            running = [ws for ws in targets
-                       if ws.state in ("running", "draining")]
-            if not running:
+            still = [ws for ws in running
+                     if ws.state in ("running", "draining")]
+            if not still:
                 break
             if time.monotonic() >= deadline:
                 verb = f" for {root}" if root is not None else ""
                 return (False,
-                        f"cannot maintain now: {len(running)} active "
+                        f"cannot maintain now: {len(still)} active "
                         f"session(s){verb}")
             time.sleep(0.02)
-        for ws in targets:
+        for ws in running:
             self.close_session(ws.session_id, reason="quiesced")
         return True, ""
 
@@ -479,11 +486,9 @@ class DaemonServer:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self._info(), indent=1, sort_keys=True).encode(
             "utf-8")
-        fileio.write_bytes(path, payload)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass                     # Windows: best-effort only
+        # Write with 0o600 in a single step so there is no post-write chmod
+        # window where the token-bearing file is world-readable.
+        fileio.write_bytes(path, payload, mode=0o600)
 
     def _remove_discovery(self) -> None:
         path = _discovery_path(self.state_dir)
@@ -528,8 +533,11 @@ class DaemonServer:
                         and parts[3] == "events"):
                     self._stream_events(handler, query)
                     return
-            status, payload = self._route(method, parsed.path, query,
-                                          self._body(handler))
+            body = self._body(handler)
+            if body is _BODY_TOO_LARGE:
+                self._json(handler, 413, {"error": "request body too large"})
+                return
+            status, payload = self._route(method, parsed.path, query, body)
             self._json(handler, status, payload)
         except Exception as exc:      # never kill the daemon on one request
             try:
@@ -544,7 +552,12 @@ class DaemonServer:
             auth = str(handler.headers.get("Authorization") or "")
             if auth.lower().startswith("bearer "):
                 supplied = auth[7:].strip()
-        return bool(supplied) and hmac.compare_digest(supplied, self._token)
+        if not supplied:
+            return False
+        # Compare as UTF-8 bytes so a non-ASCII header value answers 401
+        # instead of raising a 500 TypeError from `hmac.compare_digest`.
+        return hmac.compare_digest(supplied.encode("utf-8"),
+                                   self._token.encode("utf-8"))
 
     @staticmethod
     def _body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -554,6 +567,8 @@ class DaemonServer:
             length = 0
         if length <= 0:
             return {}
+        if length > _MAX_BODY_BYTES:
+            return _BODY_TOO_LARGE
         raw = handler.rfile.read(length)
         if not raw:
             return {}
@@ -846,7 +861,10 @@ def read_daemon_info(state_dir: Path | str | None = None) -> dict[str, Any] | No
         return None
     if pid <= 0 or not workspace._pid_alive(pid):
         return None
-    recorded = float(data.get("start_time") or 0.0)
+    try:
+        recorded = float(data.get("start_time") or 0.0)
+    except (TypeError, ValueError):
+        recorded = 0.0
     if recorded > 0.0:
         current = workspace._process_start_time(pid)
         if current > 0.0 and abs(current - recorded) > 2.0:

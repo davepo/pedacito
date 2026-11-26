@@ -51,6 +51,7 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import shlex
 import socket
@@ -168,12 +169,14 @@ SENSITIVE_NAMES = {
     ".npmrc", ".pypirc", ".netrc", ".git-credentials",
     "credentials.json", "credentials.yml", "credentials.yaml",
     "secrets.json", "secrets.yaml", "secrets.yml",
+    "service_account.json", ".pgpass", ".my.cnf", ".htpasswd", "kubeconfig",
 }
 # Globs (matched against the lower-cased file name).
 SENSITIVE_PATTERNS = (
     "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.kdbx",
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "id_sk_ed25519*",
     "*.credentials", "service-account*.json", "*-service-account*.json",
+    "*.tfstate", "*.tfstate.backup",
 )
 # `.env` variants that are templates, not secrets.
 ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template",
@@ -181,14 +184,37 @@ ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template",
 # Directories whose very name means "credentials live here".
 SENSITIVE_DIRS = {".ssh", ".gnupg", ".aws", ".docker", ".config/gcloud"}
 
+# A secret/credential file with one of these suffixes is still secret:
+# `server.pem.bak`, `id_rsa.old`, `credentials.json.orig`.
+_SENSITIVE_BACKUP_SUFFIXES = (".bak", ".old", ".orig")
+
 # Is `.foo.env` sensitive? Only as an exact name; `app.env` style files are
 # the project's own config samples and stay readable.
 
+
+def _strip_ntfs_tricks(part: str) -> str:
+    """Undo Windows NTFS normalisation on one path component: strip an
+    Alternate Data Stream suffix (`env::$DATA` -> `env`) and trailing
+    spaces/dots (`.env ` -> `.env`, `server.pem ` -> `server.pem`,
+    `credentials.json.` -> `credentials.json`)."""
+    s = str(part or "")
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    return s.rstrip(" .")
+
+
 def is_sensitive_path(path) -> bool:
     """True when `path` names secret/credential material that must never be
-    indexed or read into a model prompt without an explicit human approval."""
+    indexed or read into a model prompt without an explicit human approval.
+
+    Windows NTFS tricks are defeated first (`.env::$DATA`, `server.pem `,
+    `credentials.json.`), then the usual name/suffix checks run."""
     p = PurePosixPath(str(path or "").replace("\\", "/"))
     parts = tuple(x.lower() for x in p.parts if x not in ("/", "", "."))
+    if not parts:
+        return False
+    parts = tuple(_strip_ntfs_tricks(x) for x in parts)
+    parts = tuple(x for x in parts if x)
     if not parts:
         return False
     name = parts[-1]
@@ -204,15 +230,21 @@ def is_sensitive_path(path) -> bool:
                 return True
     if name in ENV_TEMPLATE_NAMES:
         return False
-    if name == ".env" or name.startswith(".env."):
+    # A secret with a backup/old/orig suffix is still secret.
+    base_name = name
+    for suffix in _SENSITIVE_BACKUP_SUFFIXES:
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)]
+            break
+    if base_name == ".env" or base_name.startswith(".env."):
         # `.env`, `.env.local`, `.env.production`... all hold live secrets.
         return True
-    if name.endswith(".env"):
+    if base_name.endswith(".env"):
         return True                       # `prod.env` style dotenv files too
-    if name in SENSITIVE_NAMES:
+    if base_name in SENSITIVE_NAMES:
         return True
     for pat in SENSITIVE_PATTERNS:
-        if fnmatch.fnmatch(name, pat):
+        if fnmatch.fnmatch(base_name, pat):
             return True
     return False
 
@@ -220,6 +252,17 @@ def is_sensitive_path(path) -> bool:
 def is_sensitive_rel(root, rel: str) -> bool:
     """`is_sensitive_path` for a project-relative path."""
     return is_sensitive_path(Path(str(root)) / str(rel or ""))
+
+
+def is_junction_or_reparse(path) -> bool:
+    """True when `path` is a Windows junction/reparse point (in addition to any
+    symlink). A junction to a secrets folder must never be followed by a
+    snapshot walk, even when `is_symlink()` reports False."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
 def _display_rel(root: Path, rel: Any) -> str:
@@ -286,8 +329,21 @@ def check_sensitive_write(
     except OSError:
         root_resolved = root_path
     target = _display_rel(root_resolved, rel)
-    if not is_sensitive_path(target) and not is_sensitive_path(
-            fileio.normalise_rel(str(rel or ""))):
+    raw_rel = fileio.normalise_rel(str(rel or ""))
+    # Resolve the real target inside the root and check the RESOLVED root-
+    # relative path too, so a symlink `notes.txt -> .env` (or a Windows
+    # `.env ` / `.env::$DATA` spelling) cannot slip past the raw `rel` check.
+    resolved_rel = target
+    try:
+        resolved = resolve_safe_path(root_resolved, rel)
+        try:
+            resolved_rel = resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            resolved_rel = target
+    except SecurityError:
+        resolved_rel = target
+    if not (is_sensitive_path(target) or is_sensitive_path(raw_rel)
+            or is_sensitive_path(resolved_rel)):
         return True, ""
     message = f"refused to {action} sensitive file: {target or rel}"
     if policy is None or not hasattr(policy, "evaluate"):
@@ -325,6 +381,7 @@ def check_sensitive_write(
                    "human confirmation is still required",
             risk_level="high",
             reason=message,
+            key=f"sensitive:{action}:{resolved_rel}",
             project_root=str(root_resolved),
         )
     except Exception:
@@ -578,6 +635,17 @@ class PermissionRequest:
         }
 
 
+def _broker_key(key: str) -> str:
+    """The broker's grant key for `key`: hashed (sha256) when unusually long so
+    two long command suffixes can never collide by truncation. Short keys pass
+    through unchanged."""
+    text = str(key or "")
+    if len(text) > 400:
+        return "sha256:" + hashlib.sha256(
+            text.encode("utf-8", "replace")).hexdigest()
+    return text
+
+
 class SessionPermissionBroker:
     """Isolated permission broker scoped strictly to one `session_id`.
 
@@ -643,12 +711,29 @@ class SessionPermissionBroker:
         action_summary = str(info.get("action_summary") or "")
         risk_level = str(info.get("risk_level") or "medium")
         reason = str(info.get("reason") or "")
-        key = str(info.get("key") or detail or "")[:500]
+        key = _broker_key(str(info.get("key") or detail or ""))
         setting_key = str(info.get("setting_key") or "")
         suggested_pattern = str(info.get("suggested_pattern") or "")
         if not suggested_pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
             suggested_pattern = suggest_shell_pattern(detail)
         project_root = normalize_project_root(info.get("project_root") or "")
+
+        # `approval_policy == "never"` (or a headless broker) refuses BEFORE any
+        # run/session grant is consulted, so a stale grant can never bypass an
+        # explicit "never" policy.
+        if self.approval_policy == "never" or (
+            self._responder is None and not self._interactive
+        ):
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                category=category,
+                key=key,
+                decision="deny",
+                reason="non_interactive_or_policy_never",
+            )
+            return False, DENIED_MESSAGE
 
         with self._lock:
             if (category, key) in self._run_grants or (category, key) in self._session_grants:
@@ -674,20 +759,6 @@ class SessionPermissionBroker:
                 reason="policy_auto_safe",
             )
             return True, ""
-
-        if self.approval_policy == "never" or (
-            self._responder is None and not self._interactive
-        ):
-            self._emit(
-                "permission_decision",
-                session_id=self.session_id,
-                request_id="",
-                category=category,
-                key=key,
-                decision="deny",
-                reason="non_interactive_or_policy_never",
-            )
-            return False, DENIED_MESSAGE
 
         with self._lock:
             self._seq += 1
@@ -924,7 +995,7 @@ def request_permission(category: str, action_summary: str, detail: str = "",
             "detail": str(detail or "")[:4000],
             "risk_level": str(risk_level or "medium"),
             "reason": str(reason or ""),
-            "key": str(key or detail or "")[:500],
+            "key": _broker_key(str(key or detail or "")),
             "setting_key": str(setting_key or ""),
             "suggested_pattern": pattern,
             "project_root": normalize_project_root(project_root)}

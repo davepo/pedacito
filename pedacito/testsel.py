@@ -373,6 +373,15 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     if not argv:
         return False, "(empty test command)"
     timeout = int(timeout or getattr(cfg, "test_timeout", 300) or 300)
+    # D14: the unattended-execution gate runs BEFORE the sandbox wrap (same
+    # contract as tools.tool_run).
+    try:
+        from . import tools as tools_mod
+        gate_err = tools_mod._run_gate(cfg, command, root)
+    except Exception as exc:
+        gate_err = f"ERROR: denied by policy: policy evaluation error: {exc}"
+    if gate_err:
+        return False, gate_err
     try:
         argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:

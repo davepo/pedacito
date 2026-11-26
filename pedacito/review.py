@@ -1533,18 +1533,28 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
         return False, ("Not written: this review contains no applicable "
                        "changes. Re-run the task to rebuild the review.")
     root = Path(root)
+    root_resolved = root.resolve()
     safe_targets: dict[int, Path] = {}
     for idx, fd in enumerate(diffs):
-        if security.is_sensitive_path(fd.rel) or any(
-                security.is_sensitive_path(old) for old in fd.renames_from):
-            return (False, "Not written: refused to write sensitive file: "
-                    f"{fd.rel}")
         if Path(fd.rel).is_absolute():
             return False, f"Not written: unsafe path {fd.rel!r} (must be relative)."
         try:
-            safe_targets[idx] = security.resolve_safe_path(root, fd.rel)
+            resolved = security.resolve_safe_path(root, fd.rel)
         except (security.SecurityError, OSError, ValueError) as exc:
             return False, f"Not written: unsafe path {fd.rel!r}: {exc}"
+        # D10 parity: check the RESOLVED path too, so a symlink `notes.txt ->
+        # .env` (or a Windows `.env ` / `.env::$DATA` spelling) is refused.
+        try:
+            rel_resolved = resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            rel_resolved = fd.rel
+        if (security.is_sensitive_path(fd.rel)
+                or security.is_sensitive_path(rel_resolved)
+                or any(security.is_sensitive_path(old)
+                       for old in fd.renames_from)):
+            return (False, "Not written: refused to write sensitive file: "
+                    f"{fd.rel}")
+        safe_targets[idx] = resolved
         for old in fd.renames_from:
             old_rel = old.strip()
             if not old_rel:
@@ -1623,6 +1633,16 @@ def write_files(root: Path, diffs: list[FileDiff], backup_dir: Path | None):
                            "in this batch: " + (", ".join(written) or "none") +
                            ". Re-run the task to rebuild the review.")
         if backup_dir is not None and original:
+            # D10 defense-in-depth: never write sensitive bytes into a backup,
+            # even on the RESOLVED path.
+            try:
+                backup_rel = p.relative_to(root_resolved).as_posix()
+            except ValueError:
+                backup_rel = fd.rel
+            if security.is_sensitive_path(fd.rel) \
+                    or security.is_sensitive_path(backup_rel):
+                return (False, "Not written: refused to write sensitive file: "
+                        f"{fd.rel}")
             dest = backup_dir / fd.rel
             if not dest.exists() and not dest.is_symlink():
                 dest.parent.mkdir(parents=True, exist_ok=True)

@@ -9,8 +9,11 @@ and `id_rsa.pub` stay allowed.
 """
 from __future__ import annotations
 
+import base64
 import json
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 
@@ -29,6 +32,8 @@ from pedacito import (  # noqa: E402
 from pedacito.config import Config  # noqa: E402
 from pedacito.gui import core as gui_core  # noqa: E402
 from pedacito.index import Index  # noqa: E402
+from pedacito.local_server import LocalHTTPServer  # noqa: E402
+from pedacito.policy import PolicyDecision  # noqa: E402
 
 SENSITIVE_FILES = {
     "sub/.env": "API_KEY=super-secret-value\n",
@@ -275,3 +280,201 @@ def test_review_page_and_gui_rows_redact_but_keep_apply_text(tmp_path):
     assert "a = 10" in safe.after_text
     assert "b = 2" in safe.after_text
     assert "b = 20" not in safe.after_text
+
+
+# ------------------------------------------------------------- H6 NTFS tricks ---
+
+def test_is_sensitive_path_windows_ntfs_tricks():
+    for name in (".env ", "sub/.env ", ".env::$DATA", "server.pem ",
+                 "credentials.json.", "sub\\server.pem ", "id_rsa.old",
+                 "server.pem.bak", "credentials.json.orig", "terraform.tfstate",
+                 "terraform.tfstate.backup", "service_account.json", ".pgpass",
+                 ".my.cnf", ".htpasswd", "kubeconfig", ".env.production.bak"):
+        assert security.is_sensitive_path(Path("proj") / name), name
+    for name in (".env.example", ".env.sample", ".env.template",
+                 "id_rsa.pub", "server.crt", "app.py"):
+        assert not security.is_sensitive_path(Path("proj") / name), name
+
+
+def test_resolved_path_parity_in_edits_and_review(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / ".env").write_text("SECRET=x\n", encoding="utf-8")
+    try:
+        (root / "notes.txt").symlink_to(root / ".env")
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks unavailable on this platform")
+
+    # edits.apply_edits on the symlink (resolves to .env) is refused
+    results = edits.apply_edits(
+        root, [edits.Edit("notes.txt", "SECRET=x", "SECRET=y")],
+        backup=False, dry_run=True, cfg=Config())
+    assert results and not results[0].ok
+    assert "sensitive" in results[0].message.lower()
+
+    # review.write_files on the symlink (resolves to .env) is refused
+    fd = review.FileDiff("notes.txt", [], 1, 0, "", "leaked\n", "edit")
+    ok, detail = review.write_files(root, [fd], None)
+    assert not ok and "sensitive" in detail.lower()
+    assert (root / ".env").read_text(encoding="utf-8") == "SECRET=x\n"
+
+
+# ------------------------------------------------------- H7 central policy gate ---
+
+def test_plan_mode_denies_mutating_and_external_tools(tmp_path):
+    from pedacito import refactor
+    idx = Index(tmp_path, [])
+    cfg = Config()
+    cfg.permission_mode = "plan"
+    cfg.allow_write = True
+    cfg.allow_shell = True
+    cfg.allow_image_gen = True
+    cfg.allow_screenshots = True
+    cfg.allow_browser = True
+
+    assert "denied by policy" in tools.tool_generate_image(
+        idx, cfg, "a cat", file="out.png")
+    assert "denied by policy" in refactor.tool_rename(idx, cfg, "old", "new")
+    assert "denied by policy" in refactor.tool_rename_symbol(
+        idx, cfg, "old", "new")
+    assert "denied by policy" in tools.tool_browser(
+        idx, cfg, None, command="http://example.com")
+    assert "denied by policy" in tools.tool_screenshot(idx, cfg, None)
+    assert "denied by policy" in tools.dispatch(
+        idx, cfg, {"action": "remember", "content": "a durable fact"})
+
+
+def _png(width=8, height=8) -> bytes:
+    data = b"\x89PNG\r\n\x1a\n"
+    data += (13).to_bytes(4, "big") + b"IHDR"
+    data += width.to_bytes(4, "big") + height.to_bytes(4, "big")
+    data += bytes([8, 2, 0, 0, 0]) + b"\x00\x00\x00\x00"
+    return data
+
+
+def _img_server():
+    b64 = base64.b64encode(_png()).decode()
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            self.rfile.read(n)
+            body = json.dumps({"data": [{"b64_json": b64}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = LocalHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _img_cfg(base_url: str) -> Config:
+    cfg = Config()
+    cfg.base_url = base_url
+    cfg.model = "flux-schnell"
+    cfg.modality = "image"
+    cfg.image_profile = "flux"
+    cfg.profiles = {"flux": {"base_url": base_url, "model": "flux-schnell",
+                             "modality": "image"}}
+    cfg.auto_evict_servers = False
+    cfg.auto_fit = False
+    cfg.auto_detect_context = False
+    cfg.timeout = 10.0
+    return cfg
+
+
+def test_generate_image_refuses_sensitive_and_protected_outputs(tmp_path):
+    srv = _img_server()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        cfg = _img_cfg(base)
+        cfg.allow_image_gen = True
+        idx = Index(tmp_path, [])
+        for bad in (".env", "id_rsa", ".git/hooks/x", ".pedacito/policy.toml"):
+            out = tools.tool_generate_image(idx, cfg, "x", file=bad)
+            assert out.startswith("ERROR"), (bad, out)
+            assert "sensitive" in out or "refused" in out, (bad, out)
+            assert not (tmp_path / bad).exists(), bad
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ------------------------------------------------------------- MEDIUM 5 broker ---
+
+def test_check_sensitive_write_uses_per_file_key(tmp_path, monkeypatch):
+    from pedacito import security as security_mod
+    keys: list[str] = []
+
+    def fake_request(category, summary, **kw):
+        keys.append(kw.get("key"))
+        return False, "denied"
+
+    monkeypatch.setattr(security_mod, "request_permission", fake_request)
+
+    class Allow:
+        def evaluate(self, **kw):
+            return PolicyDecision("allow", "policy.toml:paths.allow", "ok")
+
+    root = tmp_path / "proj"
+    (root / "sub").mkdir(parents=True)
+    (root / "certs").mkdir()
+    (root / "sub" / ".env").write_text("x", encoding="utf-8")
+    (root / "certs" / "server.pem").write_text("x", encoding="utf-8")
+
+    security_mod.check_sensitive_write(root, "sub/.env", action="write",
+                                       policy=Allow())
+    security_mod.check_sensitive_write(root, "certs/server.pem", action="write",
+                                       policy=Allow())
+    assert keys == ["sensitive:write:sub/.env",
+                    "sensitive:write:certs/server.pem"], keys
+
+
+def test_check_sensitive_write_key_uses_resolved_path(tmp_path, monkeypatch):
+    from pedacito import security as security_mod
+    keys: list[str] = []
+
+    def fake_request(category, summary, **kw):
+        keys.append(kw.get("key"))
+        return False, "denied"
+
+    monkeypatch.setattr(security_mod, "request_permission", fake_request)
+
+    class Allow:
+        def evaluate(self, **kw):
+            return PolicyDecision("allow", "policy.toml:paths.allow", "ok")
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / ".env").write_text("SECRET=x\n", encoding="utf-8")
+    try:
+        (root / "notes.txt").symlink_to(root / ".env")
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks unavailable on this platform")
+    security_mod.check_sensitive_write(root, "notes.txt", action="write",
+                                       policy=Allow())
+    assert keys and keys[0] == "sensitive:write:.env", keys
+
+
+def test_broker_hashes_long_keys_and_never_beats_grants():
+    from pedacito.security import SessionPermissionBroker, _broker_key
+    assert _broker_key("x" * 400) == "x" * 400
+    hashed = _broker_key("y" * 600)
+    assert hashed.startswith("sha256:") and len(hashed) == 7 + 64
+    # no prefix collision: two long keys differing only at the tail hash apart
+    assert _broker_key("a" * 500 + "x") != _broker_key("a" * 500 + "y")
+
+    broker = SessionPermissionBroker("ses_x", approval_policy="never",
+                                     interactive=True)
+    broker._session_grants.add((security.CAT_SHELL, "cmd"))
+    ok, _msg = broker.request({"category": security.CAT_SHELL, "detail": "cmd",
+                               "key": "cmd"})
+    assert not ok

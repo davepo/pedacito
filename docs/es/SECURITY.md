@@ -304,11 +304,21 @@ proceso hijo dentro de un Job Object de Windows y de un token restringido con in
 baja (`ctypes`, cargado de forma diferida tras `os.name == "nt"`; sin paquetes de terceros).
 El job está configurado para terminar todos los procesos al cerrarse, así que un comando
 cancelado, con tiempo agotado o caído se lleva consigo todo su árbol de procesos, y Pedacito
-espera al hijo antes de borrar cualquier directorio temporal. Al arrancar, Pedacito prueba el
-backend con un proceso hijo real que no hace nada; si fallan el Job Object, el token
-restringido o el lanzamiento del hijo, el backend figura como `unavailable` y nunca se
-anuncia como activo. `sandbox.status()` devuelve `active`, `unavailable` u `off`. La red sigue
-a `sandbox_network`, y `sandbox = false` desactiva por completo el envoltorio.
+espera al hijo antes de borrar cualquier directorio temporal. La etiqueta de integridad baja
+se aplica solo a los directorios del proyecto y temporales, y el recorrido que la aplica se
+salta los protegidos `.git`, `.pedacito` y `.pedacito.toml` (y nunca sigue uniones NTFS ni
+symlinks), de modo que un comando en sandbox no puede reescribir un hook de git, el archivo
+de política ni sus propias barreras de protección. Al arrancar, Pedacito prueba el backend
+con un proceso hijo real que no hace nada; si fallan el Job Object, el token restringido o el
+lanzamiento del hijo, el backend figura como `unavailable` y nunca se anuncia como activo.
+`sandbox.status()` devuelve `active`, `unavailable` u `off`.
+
+`win_restricted` aísla la vida del proceso (Job Object) y restringe las escrituras a los
+directorios del proyecto y temporales reetiquetados (integridad baja, saltando las rutas
+protegidas de arriba), pero **no** filtra el tráfico de red saliente ni oculta archivos
+legibles por el usuario: el filtrado de red saliente y el ocultamiento de lecturas requieren
+un AppContainer en Windows, o los backends POSIX `bwrap` / `sandbox-exec`. `sandbox = false`
+desactiva por completo el envoltorio.
 
 **Puerta dura para ejecución desatendida (D14).** Los modos `workspace-write` y `danger`
 desatendidos, las tareas en segundo plano y `approval_policy = "never"` con `sandbox`
@@ -699,7 +709,8 @@ Estos son límites reales. Léelos antes de depender de Pedacito para código no
   programa que elegiste ejecutar.
 - **El sandbox de Windows es a nivel de proceso, no un contenedor.** `win_restricted` usa un Job Object
   y un token restringido de integridad baja. No aísla el sistema de archivos como lo haría una VM o un
-  AppContainer, así que un comando aún puede leer lo que el usuario puede leer. Cuando el backend no está
+  AppContainer, así que un comando aún puede leer lo que el usuario puede leer, y tampoco filtra el
+  tráfico de red saliente (eso requiere un AppContainer). Cuando el backend no está
   disponible, los comandos interactivos se ejecutan sin sandbox tras un aviso, y las ejecuciones desatendidas
   se rechazan (ver la puerta dura de arriba).
 - **Los entornos de contenedores y CI pueden deshabilitar el sandbox.** Si los espacios de nombres de usuario están desactivados,

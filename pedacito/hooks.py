@@ -87,8 +87,10 @@ def fire(cfg, root, event: str, **fields) -> HookResult:
     try:
         from . import policy as policy_mod
         decision = policy_mod.enforce(cfg, "hook", event, root=root)
-    except Exception:
-        decision = None
+    except Exception as exc:
+        # FAIL CLOSED: a policy evaluation error refuses the hook, never runs it.
+        return HookResult("deny",
+                          f"denied by policy: policy evaluation error: {exc}")
     if decision is not None and decision.decision == "deny":
         return HookResult("deny",
                           f"denied by policy ({decision.matched_rule}): "

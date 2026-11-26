@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -142,3 +143,28 @@ def test_trust_refuses_an_invalid_manifest(tmp_path):
     with pytest.raises(ValueError):
         pkg.trust_manifest(root)
     assert pkg.is_manifest_trusted(root) is False
+
+
+def test_entry_point_file_mutation_invalidates_trust(tmp_path):
+    root = _package(tmp_path)
+    (root / "acme_lint").mkdir()
+    ep = root / "acme_lint" / "plugin.py"
+    ep.write_text("x = 1\n", encoding="utf-8")
+    pkg.trust_manifest(root)
+    assert pkg.is_manifest_trusted(root) is True
+    # Mutating a resolved entry-point file (not the manifest) revokes trust.
+    ep.write_text("x = 2\n", encoding="utf-8")
+    assert pkg.is_manifest_trusted(root) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink escape test")
+def test_entry_point_symlink_escape_is_rejected(tmp_path):
+    root = _package(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("evil", encoding="utf-8")
+    (root / "acme_lint").mkdir()
+    link = root / "acme_lint" / "plugin.py"
+    link.symlink_to(outside)
+    with pytest.raises(ValueError) as err:
+        pkg.load_manifest(root)
+    assert "escapes the package" in str(err.value)

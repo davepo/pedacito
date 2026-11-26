@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import ctypes
 import os
+import stat as _stat
 import subprocess
+import tempfile
 import threading
 import time
 from ctypes import wintypes
@@ -76,6 +78,25 @@ STILL_ACTIVE = 259
 WAIT_TIMEOUT = 0x00000102
 WAIT_OBJECT_0 = 0x00000000
 INFINITE = 0xFFFFFFFF
+
+# NTFS reparse point (symlink / junction / mount point) attribute bit.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+# Project paths the Low-Integrity child must never be able to write: they stay
+# Medium Integrity so `.git/hooks`, `.pedacito/policy.toml` and
+# `.pedacito.toml` cannot be rewritten by the child. Mirrors the guarded set in
+# `sandbox.py` plus the extra config filenames and cache dirs.
+GUARDED = (".git", ".pedacito", ".pedacito.toml", ".pedacito.yml",
+           ".pedacito.yaml", "node_modules", ".venv")
+
+# Directory trees larger than this are not walked to relabel; the root is still
+# relabeled, and the child simply cannot write to the unrelabeled remainder
+# (fail closed) rather than stalling `run` on an enormous tree.
+_MAX_RELABEL_ENTRIES = 5000
+
+# Environment variables naming protected system directories.
+_SYSTEM_ENV_VARS = ("SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)",
+                    "ProgramData", "APPDATA", "LOCALAPPDATA")
 
 # --------------------------------------------------------------------------- #
 # win32 structs                                                               #
@@ -306,20 +327,144 @@ def _command_line(argv: list[str]) -> str:
     return subprocess.list2cmdline([str(a) for a in argv])
 
 
-def _label_low_integrity(path: Path) -> bool:
-    """Best-effort: relabel `path` (recursively) Low Integrity so the
-    restricted-token child can write there -- and only there. The Low
-    Integrity SID makes the child refuse writes to every Medium/High
-    Integrity path outside the relabeled project and temp dirs (the Windows
-    analogue of bwrap/seatbelt "writes limited to the project"). Idempotent,
-    and a failure just means the child cannot write (still a sandbox)."""
+def _under(path: Path, parent: Path) -> bool:
+    """True when `path` is `parent` or a descendant of `parent`."""
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_safe_to_relabel(path: Path) -> bool:
+    """Refuse to relabel anything dangerous.
+
+    The Low-Integrity relabel is a real, persistent change to the object's
+    mandatory label, so it must never touch a drive root, the user's home (or
+    any of its ancestors), a system directory (or any path that contains one
+    or lives under one), or a reparse point / junction / symlink itself. Only
+    the designated temporary directory (and everything beneath it) is exempt
+    from the system-directory rule, because it is the sandbox's own scratch
+    space that `run_sandboxed` must be able to relabel.
+    """
+    try:
+        p = path.resolve()
+    except OSError:
+        return False
+    # Drive / filesystem roots.
+    if p == p.parent or len(p.parts) <= 1:
+        return False
+    # The user's home and every ancestor of it.
+    try:
+        home = Path.home().resolve()
+    except OSError:
+        home = None
+    if home is not None and (p == home or _under(home, p)):
+        return False
+    # System directories and their ancestors/descendants (unless in temp).
+    try:
+        temp = Path(tempfile.gettempdir()).resolve()
+    except OSError:
+        temp = None
+    if temp is None or not _under(p, temp):
+        for name in _SYSTEM_ENV_VARS:
+            base = os.environ.get(name)
+            if not base:
+                continue
+            try:
+                bp = Path(base).resolve()
+            except OSError:
+                continue
+            if p == bp or _under(bp, p) or _under(p, bp):
+                return False
+    # A reparse point / junction / symlink itself is never relabeled.
+    try:
+        if path.is_symlink():
+            return False
+        st = path.lstat()
+    except OSError:
+        return False
+    if bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT):
+        return False
+    return True
+
+
+def _entry_is_reparse(entry) -> bool:
+    """True when a scandir entry is a symlink / junction / reparse point."""
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return True              # cannot inspect -> skip (fail closed)
+    if bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT):
+        return True
+    try:
+        return bool(entry.is_symlink())
+    except OSError:
+        return True
+
+
+def _icacls_setintegrity(target: str, level: str) -> bool:
+    """`icacls <target> /setintegritylevel <level> /L /Q` -- never `/T`.
+
+    `/T` would follow NTFS junctions/reparse points and relabel `.git/hooks`,
+    `.pedacito` and `.pedacito.toml`; the non-recursive form touches exactly
+    one object. `level` is ``"L"`` (Low) or ``"M"`` (Medium)."""
     try:
         r = subprocess.run(
-            ["icacls", str(path), "/setintegritylevel", "L", "/T", "/Q"],
-            capture_output=True, timeout=120)
+            ["icacls", target, "/setintegritylevel", level, "/L", "/Q"],
+            capture_output=True, timeout=30)
         return r.returncode == 0
     except Exception:
         return False
+
+
+def _label_low_integrity(path: Path, *, guarded=None) -> bool:
+    """Best-effort: relabel `path` (and its safe, non-reparse, non-guarded
+    descendants) Low Integrity so the restricted-token child can write there
+    -- and only there. The Low Integrity SID makes the child refuse writes to
+    every Medium/High Integrity path outside the relabeled project and temp
+    dirs (the Windows analogue of bwrap/seatbelt "writes limited to the
+    project").
+
+    Never uses `icacls /T`: a Python walker skips every symlink / NTFS
+    junction / reparse point and every guarded name, relabels the root and its
+    non-guarded children/files non-recursively, and pins guarded paths back to
+    Medium Integrity if a previous run left them Low. A failure just means the
+    child cannot write there (still a sandbox)."""
+    if not _is_safe_to_relabel(path):
+        return False
+    guarded = set(guarded if guarded is not None else GUARDED)
+    ok = _icacls_setintegrity(str(path), "L")
+    budget = _MAX_RELABEL_ENTRIES
+    stack = [path]
+    while stack and budget > 0:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for entry in entries:
+            budget -= 1
+            if budget <= 0:
+                break
+            if entry.name in guarded:
+                # Keep `.git`, `.pedacito`, `.pedacito.toml`, ... Medium so a
+                # Low-Integrity child cannot rewrite hooks/policy/config.
+                if not _entry_is_reparse(entry):
+                    ok = _icacls_setintegrity(entry.path, "M") and ok
+                continue
+            if _entry_is_reparse(entry):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if _stat.S_ISDIR(st.st_mode):
+                ok = _icacls_setintegrity(entry.path, "L") and ok
+                stack.append(Path(entry.path))
+            elif _stat.S_ISREG(st.st_mode):
+                ok = _icacls_setintegrity(entry.path, "L") and ok
+    return ok
 
 
 # --------------------------------------------------------------------------- #
@@ -339,10 +484,15 @@ def _probe_windows() -> WinSandboxCapabilities:
     tok_ok, tok_err, low_ok = _check_restricted_token()
     ac_ok = _check_appcontainer()
     launch_ok, launch_err = _check_child_launch()
-    available = job_ok and tok_ok and launch_ok
+    # `low_ok` is required: a Medium-integrity child must NEVER be reported as
+    # `available=True` (it would run with far more write access than the
+    # Low-Integrity restricted token promises).
+    available = job_ok and tok_ok and low_ok and launch_ok
     reason = ""
     if not available:
         parts = [p for p in (job_err, tok_err, launch_err) if p]
+        if not parts and tok_ok and not low_ok:
+            parts.append("Low Integrity restricted token unavailable")
         reason = parts[0] if parts else "sandbox unavailable"
     return WinSandboxCapabilities(
         available=available, job_object=job_ok,
@@ -430,21 +580,24 @@ def _check_child_launch() -> tuple[bool, str]:
     token + CreateProcessAsUserW path and verify exit code 0."""
     if os.name != "nt":
         return False, "not Windows"
-    try:
-        child = _spawn_child(
-            [os.environ.get("COMSPEC") or "cmd.exe", "/c", "exit 0"],
-            cwd=Path(os.getcwd()), env=dict(os.environ), stdin_text=None)
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-    try:
-        rc = child.wait(10.0)
-        if rc == 0:
-            return True, ""
-        err = child.last_error or f"child exited {rc}"
-        return False, err
-    finally:
-        child.terminate()
-        child.close()
+    # Run the probe in a private temporary directory so `os.getcwd()` is NEVER
+    # touched or relabeled (a probe must not relabel the agent's own cwd).
+    with tempfile.TemporaryDirectory(prefix="pedacito-sandbox-probe-") as tmp:
+        try:
+            child = _spawn_child(
+                [os.environ.get("COMSPEC") or "cmd.exe", "/c", "exit 0"],
+                cwd=Path(tmp), env=dict(os.environ), stdin_text=None)
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        try:
+            rc = child.wait(10.0)
+            if rc == 0:
+                return True, ""
+            err = child.last_error or f"child exited {rc}"
+            return False, err
+        finally:
+            child.terminate()
+            child.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -667,7 +820,15 @@ def _read_pipe(handle) -> bytes | None:
     return None
 
 
-def _make_pipe() -> tuple[int, int]:
+def _make_pipe(inherit_read: bool = False, inherit_write: bool = False
+               ) -> tuple[int, int]:
+    """Create an anonymous pipe and return `(read_handle, write_handle)`.
+
+    Each end's inheritability is set explicitly: the end the CHILD keeps must
+    be inheritable, the end the PARENT keeps must not be, so that closing the
+    parent's end delivers an immediate EOF (a leaked inheritable write end
+    would keep a reader from ever seeing EOF, and a leaked inheritable read
+    end would keep a writer from ever seeing a broken pipe)."""
     k = _kernel32()
     r = wintypes.HANDLE()
     w = wintypes.HANDLE()
@@ -677,9 +838,23 @@ def _make_pipe() -> tuple[int, int]:
     if not k.CreatePipe(ctypes.byref(r), ctypes.byref(w), ctypes.byref(sa), 0):
         err = ctypes.get_last_error()
         raise OSError(err, f"CreatePipe failed (winerror {err})")
-    # The read ends stay non-inheritable; write ends are passed to the child.
-    k.SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0)
+    k.SetHandleInformation(r, HANDLE_FLAG_INHERIT,
+                           HANDLE_FLAG_INHERIT if inherit_read else 0)
+    k.SetHandleInformation(w, HANDLE_FLAG_INHERIT,
+                           HANDLE_FLAG_INHERIT if inherit_write else 0)
     return int(r.value), int(w.value)
+
+
+def _close_handle(h) -> None:
+    """Close one Win32 handle (an int or a ``wintypes.HANDLE``), never raising."""
+    if h is None:
+        return
+    try:
+        if isinstance(h, int):
+            h = wintypes.HANDLE(h)
+        _kernel32().CloseHandle(h)
+    except Exception:
+        pass
 
 
 def _spawn_child(argv, *, cwd: Path, env: dict[str, str],
@@ -697,92 +872,134 @@ def _spawn_child(argv, *, cwd: Path, env: dict[str, str],
     for d in dict.fromkeys((Path(cwd), *[Path(p) for p in writable_dirs])):
         _label_low_integrity(d)
 
-    # Job object.
-    job = k.CreateJobObjectW(None, None)
-    if not job:
-        err = ctypes.get_last_error()
-        raise OSError(err, f"CreateJobObjectW failed (winerror {err})")
-    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = (
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
-    k.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                              ctypes.byref(info), ctypes.sizeof(info))
-
-    # Restricted token (DISABLE_MAX_PRIVILEGE + Low Integrity).
-    cur = wintypes.HANDLE()
-    if not a.OpenProcessToken(k.GetCurrentProcess(), _OPEN_TOKEN_ACCESS,
-                              ctypes.byref(cur)):
-        err = ctypes.get_last_error()
-        k.CloseHandle(job)
-        raise OSError(err, f"OpenProcessToken failed (winerror {err})")
-    token = wintypes.HANDLE()
+    job = None
+    token = None
+    in_r = in_w = out_r = out_w = err_r = err_w = None
+    proc = None
+    thread = None
     try:
-        if not a.CreateRestrictedToken(
-                cur, DISABLE_MAX_PRIVILEGE, 0, None, 0, None, 0, None,
-                ctypes.byref(token)):
+        # Job object.
+        job = k.CreateJobObjectW(None, None)
+        if not job:
             err = ctypes.get_last_error()
-            raise OSError(err, f"CreateRestrictedToken failed (winerror {err})")
-        sid = ctypes.c_void_p()
-        if a.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)) and sid:
+            raise OSError(err, f"CreateJobObjectW failed (winerror {err})")
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
+        if not k.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"SetInformationJobObject failed (winerror {err})")
+
+        # Restricted token (DISABLE_MAX_PRIVILEGE + Low Integrity).
+        cur = wintypes.HANDLE()
+        if not a.OpenProcessToken(k.GetCurrentProcess(), _OPEN_TOKEN_ACCESS,
+                                  ctypes.byref(cur)):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"OpenProcessToken failed (winerror {err})")
+        try:
+            token = wintypes.HANDLE()
+            if not a.CreateRestrictedToken(
+                    cur, DISABLE_MAX_PRIVILEGE, 0, None, 0, None, 0, None,
+                    ctypes.byref(token)):
+                err = ctypes.get_last_error()
+                raise OSError(err, f"CreateRestrictedToken failed (winerror {err})")
+            sid = ctypes.c_void_p()
+            if not (a.ConvertStringSidToSidW("S-1-16-4096",
+                                             ctypes.byref(sid)) and sid):
+                err = ctypes.get_last_error()
+                raise OSError(
+                    err, "ConvertStringSidToSidW failed (Low Integrity SID)")
             label = TOKEN_MANDATORY_LABEL()
             label.Label.Sid = sid
             label.Label.Attributes = SE_GROUP_INTEGRITY
-            a.SetTokenInformation(token, TokenIntegrityLevel,
-                                  ctypes.byref(label), ctypes.sizeof(label))
-            k.LocalFree(sid)
-    finally:
-        k.CloseHandle(cur)
+            try:
+                if not a.SetTokenInformation(
+                        token, TokenIntegrityLevel, ctypes.byref(label),
+                        ctypes.sizeof(label)):
+                    err = ctypes.get_last_error()
+                    raise OSError(
+                        err, f"SetTokenInformation failed (winerror {err})")
+            finally:
+                k.LocalFree(sid)
+        finally:
+            k.CloseHandle(cur)
 
-    # Pipes.
-    out_r, out_w = _make_pipe()
-    err_r, err_w = _make_pipe()
-    in_r, in_w = _make_pipe()
+        # Pipes: the child keeps the stdin read end, the stdout/stderr write
+        # ends; the parent keeps the opposite ends, non-inheritable.
+        out_r, out_w = _make_pipe(inherit_read=False, inherit_write=True)
+        err_r, err_w = _make_pipe(inherit_read=False, inherit_write=True)
+        in_r, in_w = _make_pipe(inherit_read=True, inherit_write=False)
 
-    si = STARTUPINFOW()
-    si.cb = ctypes.sizeof(STARTUPINFOW)
-    si.dwFlags = STARTF_USESTDHANDLES
-    si.hStdInput = wintypes.HANDLE(in_r)
-    si.hStdOutput = wintypes.HANDLE(out_w)
-    si.hStdError = wintypes.HANDLE(err_w)
-    pi = PROCESS_INFORMATION()
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        si.dwFlags = STARTF_USESTDHANDLES
+        si.hStdInput = wintypes.HANDLE(in_r)
+        si.hStdOutput = wintypes.HANDLE(out_w)
+        si.hStdError = wintypes.HANDLE(err_w)
+        pi = PROCESS_INFORMATION()
 
-    cmdline = _command_line(argv)
-    cmd_buf = ctypes.create_unicode_buffer(cmdline)
-    env_block = _env_block(env)
-    env_buf = ctypes.create_string_buffer(env_block)
-    flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+        cmdline = _command_line(argv)
+        cmd_buf = ctypes.create_unicode_buffer(cmdline)
+        env_block = _env_block(env)
+        env_buf = ctypes.create_string_buffer(env_block)
+        flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
 
-    ok = k.CreateProcessAsUserW(
-        token, None, cmd_buf, None, None, True, flags, env_buf,
-        str(cwd), ctypes.byref(si), ctypes.byref(pi))
-    if not ok:
-        err = ctypes.get_last_error()
-        for h in (in_r, in_w, out_r, out_w, err_r, err_w):
-            k.CloseHandle(wintypes.HANDLE(h))
-        k.CloseHandle(token)
-        k.CloseHandle(job)
-        raise OSError(err, f"CreateProcessAsUserW failed (winerror {err})")
+        ok = k.CreateProcessAsUserW(
+            token, None, cmd_buf, None, None, True, flags, env_buf,
+            str(cwd), ctypes.byref(si), ctypes.byref(pi))
+        if not ok:
+            err = ctypes.get_last_error()
+            raise OSError(err, f"CreateProcessAsUserW failed (winerror {err})")
+        proc = pi.hProcess
+        thread = pi.hThread
 
-    # Parent closes the child-end of each pipe, and the stdin read end.
-    k.CloseHandle(wintypes.HANDLE(out_w))
-    k.CloseHandle(wintypes.HANDLE(err_w))
-    k.CloseHandle(wintypes.HANDLE(in_r))
+        # Parent closes the child-end of each pipe right after creation.
+        _close_handle(out_w)
+        out_w = None
+        _close_handle(err_w)
+        err_w = None
+        _close_handle(in_r)
+        in_r = None
 
-    # Feed stdin, if any, then close the write end so the child sees EOF.
-    if stdin_text is not None:
-        data = stdin_text.encode("utf-8", "replace")
-        written = wintypes.DWORD()
-        k.WriteFile(wintypes.HANDLE(in_w), data, len(data),
-                    ctypes.byref(written), None)
-    k.CloseHandle(wintypes.HANDLE(in_w))
+        # Feed stdin, if any, then close the write end so the child sees EOF.
+        if stdin_text is not None:
+            data = stdin_text.encode("utf-8", "replace")
+            written = wintypes.DWORD()
+            k.WriteFile(wintypes.HANDLE(in_w), data, len(data),
+                        ctypes.byref(written), None)
+        _close_handle(in_w)
+        in_w = None
 
-    # Put the child in the job, then let it run.
-    k.AssignProcessToJobObject(job, pi.hProcess)
-    k.ResumeThread(pi.hThread)
+        # Put the child in the job, then let it run. Every Win32 call is
+        # checked: on failure the suspended child is terminated and never
+        # resumed un-sandboxed.
+        if not k.AssignProcessToJobObject(job, proc):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"AssignProcessToJobObject failed (winerror {err})")
+        if k.ResumeThread(thread) == 0xFFFFFFFF:
+            err = ctypes.get_last_error()
+            raise OSError(err, f"ResumeThread failed (winerror {err})")
 
-    return _WinChild(job, pi.hProcess, pi.hThread, wintypes.HANDLE(out_r),
-                     wintypes.HANDLE(err_r), token=token)
+        child = _WinChild(job, proc, thread, wintypes.HANDLE(out_r),
+                          wintypes.HANDLE(err_r), token=token)
+        job = token = proc = thread = None
+        out_r = err_r = None
+        return child
+    except BaseException:
+        # Fail closed: terminate the (still suspended) child, then close every
+        # handle we opened -- never leak a job, token, pipe, process or thread.
+        if proc is not None:
+            try:
+                k.TerminateProcess(proc, 1)
+            except Exception:
+                pass
+        for h in (in_r, in_w, out_r, out_w, err_r, err_w, thread, proc,
+                  job, token):
+            _close_handle(h)
+        raise
 
 
 # Import guard for `ctypes.WinDLL` on non-Windows: the module-level import of

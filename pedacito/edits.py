@@ -1224,8 +1224,14 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     False, rel,
                     f"denied by policy ({d.matched_rule}): {d.reason}"))
                 del groups[rel]
-    except Exception:
-        pass
+    except Exception as exc:
+        # FAIL CLOSED: a policy evaluation error must never read as "allowed";
+        # every remaining edit is refused rather than applied un-gated.
+        for rel in list(groups):
+            results.append(Result(
+                False, rel,
+                f"denied by policy: policy evaluation error: {exc}"))
+        groups.clear()
 
     # ---- protected paths (.git/, .pedacito/, the plan file, config) --------
     for rel in list(groups):

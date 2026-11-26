@@ -57,7 +57,9 @@ _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 @dataclass(frozen=True)
 class PackageManifest:
-    """A validated manifest; ``sha256`` pins the exact bytes that were read."""
+    """A validated manifest; ``sha256`` pins the exact bytes that were read,
+    and ``entry_points_sha256`` pins a deterministic digest of the resolved
+    entry-point files (empty when none exist on disk)."""
 
     schema_version: int
     name: str
@@ -68,6 +70,7 @@ class PackageManifest:
     entry_points: dict[str, str]
     min_pedacito_version: str = "0.4.0"
     sha256: str = ""
+    entry_points_sha256: str = ""
 
 
 def _manifest_path(path: Path | str) -> Path:
@@ -180,6 +183,52 @@ def validate_manifest(data: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _resolve_entry_point(pkg_root: Path, rel: str) -> Path | None:
+    """Resolve an entry-point path inside the package root.
+
+    Returns the resolved path when the file exists on disk, or ``None`` when
+    it does not (minimal test manifests do not create dummy entry-point
+    files). Raises ``ValueError`` for a traversal or a symlink that escapes
+    the package root."""
+    from . import security
+    try:
+        resolved = security.resolve_safe_path(pkg_root, rel)
+    except (security.SecurityError, OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(
+            f"entry point {rel!r} escapes the package: {exc}") from exc
+    return resolved if resolved.is_file() else None
+
+
+def _entry_points_digest(pkg_root: Path, entry_points: dict[str, str]) -> str:
+    """A deterministic SHA-256 over the resolved entry-point files' bytes.
+
+    Only entry points whose files exist on disk are hashed (in sorted name
+    order); the digest is empty when there are no such files, so a manifest
+    whose entry points are not present still loads and trusts cleanly. A
+    symlink escape is rejected by `_resolve_entry_point`."""
+    if not entry_points:
+        return ""
+    digest = hashlib.sha256()
+    any_file = False
+    for name in sorted(entry_points):
+        rel = str(entry_points[name])
+        target = _resolve_entry_point(pkg_root, rel)
+        if target is None:
+            continue
+        try:
+            data = target.read_bytes()
+        except OSError:
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(data)
+        digest.update(b"\x00")
+        any_file = True
+    return digest.hexdigest() if any_file else ""
+
+
 def load_manifest(path: Path | str) -> PackageManifest:
     """Read, validate and return one manifest (raises ``ValueError``).
 
@@ -199,7 +248,7 @@ def load_manifest(path: Path | str) -> PackageManifest:
         raise ValueError(
             f"invalid package manifest {manifest_path}: " + "; ".join(errors))
     capabilities = data.get("capabilities") or []
-    entry_points = data.get("entry_points") or {}
+    entry_points = {str(k): str(v) for k, v in (data.get("entry_points") or {}).items()}
     return PackageManifest(
         schema_version=int(data["schema_version"]),
         name=str(data["name"]).strip(),
@@ -207,10 +256,12 @@ def load_manifest(path: Path | str) -> PackageManifest:
         kind=str(data["kind"]).strip(),
         description=str(data.get("description") or ""),
         capabilities=tuple(str(cap) for cap in capabilities),
-        entry_points={str(k): str(v) for k, v in entry_points.items()},
+        entry_points=entry_points,
         min_pedacito_version=str(
             data.get("min_pedacito_version") or "0.4.0"),
         sha256=hashlib.sha256(raw).hexdigest(),
+        entry_points_sha256=_entry_points_digest(
+            manifest_path.parent, entry_points),
     )
 
 
@@ -249,11 +300,9 @@ def _write_store(data: dict[str, Any]) -> None:
 
 
 def is_manifest_trusted(path: Path | str) -> bool:
-    """True only when the manifest's current bytes match its pinned SHA-256."""
+    """True only when the manifest's current bytes AND its resolved entry-point
+    files match the pinned digests (verified from a single consistent read)."""
     key = _path_key(path)
-    digest = sha256_manifest(path)
-    if not digest:
-        return False
     data = _read_store()
     entries = data.get("packages")
     if not isinstance(entries, dict):
@@ -262,11 +311,21 @@ def is_manifest_trusted(path: Path | str) -> bool:
     if not isinstance(entry, dict):
         return False
     pinned = str(entry.get("sha256") or "")
-    return bool(pinned) and pinned == digest
+    if not pinned:
+        return False
+    try:
+        manifest = load_manifest(path)     # one read, both digests
+    except ValueError:
+        return False
+    if manifest.sha256 != pinned:
+        return False
+    pinned_eps = str(entry.get("entry_points_sha256") or "")
+    return manifest.entry_points_sha256 == pinned_eps
 
 
 def trust_manifest(path: Path | str) -> Path:
-    """Pin the manifest's SHA-256 in the per-user trust store."""
+    """Pin the manifest's SHA-256 (and its entry-point files' digest) in the
+    per-user trust store."""
     manifest = load_manifest(path)          # validate before trusting
     manifest_path = _manifest_path(path)
     data = _read_store()
@@ -275,6 +334,7 @@ def trust_manifest(path: Path | str) -> Path:
         entries = {}
     entries[_path_key(manifest_path)] = {
         "sha256": manifest.sha256,
+        "entry_points_sha256": manifest.entry_points_sha256,
         "name": manifest.name,
         "version": manifest.version,
         "kind": manifest.kind,

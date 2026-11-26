@@ -783,6 +783,16 @@ def tool_rename_symbol(index, cfg, old: str, new: str, file: str = "",
         return "ERROR: `rename_symbol` needs allow_write = true."
     root = Path(index.root).resolve()
 
+    # H7: a rename is a write; plan/ask/never modes gate it through the
+    # unified policy engine (fail-closed on a policy evaluation error).
+    from . import policy as policy_mod
+    try:
+        d = policy_mod.enforce(cfg, "write", old, root=root)
+    except Exception as exc:
+        return f"ERROR: denied by policy: policy evaluation error: {exc}"
+    if d is not None and d.decision == "deny":
+        return f"ERROR: denied by policy ({d.matched_rule}): {d.reason}"
+
     def _gate(rel: str, path: Path) -> str | None:
         allowed, sensitive_error = security.check_sensitive_write(
             root, rel, action="rename_symbol",
@@ -847,6 +857,17 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
         return "ERROR: `rename` needs allow_write = true."
     if not old or not new:
         return "ERROR: rename needs `symbol` (the old name) and `to` (the new one)."
+
+    # H7: a rename is a write; plan/ask/never modes gate it through the
+    # unified policy engine (fail-closed on a policy evaluation error).
+    from . import policy as policy_mod
+    try:
+        d = policy_mod.enforce(cfg, "write", old, root=index.root)
+    except Exception as exc:
+        return f"ERROR: denied by policy: policy evaluation error: {exc}"
+    if d is not None and d.decision == "deny":
+        return f"ERROR: denied by policy ({d.matched_rule}): {d.reason}"
+
     base_old, base_new = old.split(".")[-1], new.split(".")[-1]
     if not _IDENT.match(base_new) or keyword.iskeyword(base_new):
         return f"ERROR: `{new}` is not a valid identifier."

@@ -72,6 +72,16 @@ def test_requires_the_per_run_bearer_token(server):
     assert payload["ok"] is True
 
 
+def test_non_ascii_token_header_returns_401_not_500(server):
+    srv, info, _state = server
+    # A non-ASCII header value must compare cleanly (401), not crash the
+    # handler into a 500 TypeError from hmac.compare_digest.
+    status, payload = _request(info, "GET", "/v1/health",
+                               token="caf\u00e9-token")
+    assert status == 401
+    assert payload["error"] == "unauthorized"
+
+
 def test_discovery_file_is_created_and_removed(tmp_path):
     state = tmp_path / "state"
     srv = daemon.DaemonServer(state_dir=state)

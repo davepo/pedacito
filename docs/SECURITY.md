@@ -304,11 +304,21 @@ the child inside a Windows Job Object and a restricted token at Low integrity
 (`ctypes`, loaded lazily behind `os.name == "nt"`; no third-party packages). The
 job is set to kill every process when it closes, so a cancelled, timed-out or
 crashed command takes its whole process tree with it, and Pedacito waits for the
-child before it removes any temporary directory. Pedacito probes the backend at
+child before it removes any temporary directory. The Low-integrity label is
+applied to the project and temporary directories only, and the relabel walker
+skips the guarded `.git`, `.pedacito` and `.pedacito.toml` (and never follows
+NTFS junctions or symlinks), so a sandboxed command cannot rewrite a git hook,
+the policy file or its own guard rails. Pedacito probes the backend at
 start-up with a real no-op child; if the Job Object, restricted token or child
 launch fails, the backend reports `unavailable` and is never claimed.
-`sandbox.status()` reports `active`, `unavailable` or `off`. Network access follows
-`sandbox_network`, and `sandbox = false` turns wrapping off entirely.
+`sandbox.status()` reports `active`, `unavailable` or `off`.
+
+`win_restricted` isolates process lifetime (Job Object) and restricts writes to
+the relabeled project and temporary directories (Low Integrity, skipping the
+guarded paths above), but it does **not** filter outbound network traffic or
+hide user-readable files: outbound network filtering and read-hiding require an
+AppContainer on Windows, or the POSIX `bwrap` / `sandbox-exec` backends.
+`sandbox = false` turns wrapping off entirely.
 
 **Unattended hard gate (D14).** Unattended `workspace-write` and `danger` modes,
 background tasks, and `approval_policy = "never"` with `sandbox` on must run inside
@@ -702,7 +712,8 @@ These are real boundaries. Read them before you rely on Pedacito for untrusted c
   program you chose to run.
 - **Windows sandbox is process-level, not a container.** `win_restricted` uses a Job Object
   and a Low-integrity restricted token. It does not isolate the file system the way a VM or
-  AppContainer does, so a command can still read what the user can read. Where the backend
+  AppContainer does, so a command can still read what the user can read, and it does not
+  filter outbound network traffic (that needs an AppContainer). Where the backend
   is unavailable, interactive commands run unsandboxed after one notice, and unattended runs
   are refused (see the unattended hard gate above).
 - **Container and CI environments may disable the sandbox.** If user namespaces are off,

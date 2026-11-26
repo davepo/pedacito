@@ -183,7 +183,7 @@ def _cancel_requested_proc(cancel_event: threading.Event | None) -> bool:
 
 
 def _run_windows_sandboxed(command, *, cwd, timeout, idle_timeout, max_output,
-                           env, stdin_text, cancel_event):
+                           env, stdin_text, cancel_event, writable_dirs=()):
     """Run `command` through the Windows Job Object + restricted-token sandbox
     and map the result onto `run()`'s (rc, output, stopped, seconds) shape."""
     from . import sandbox_win
@@ -194,7 +194,8 @@ def _run_windows_sandboxed(command, *, cwd, timeout, idle_timeout, max_output,
             list(command), cwd=Path(cwd), env=full_env,
             timeout=timeout or None, idle_timeout=idle_timeout,
             max_output=max_output, stdin_text=stdin_text,
-            cancel_event=cancel_event)
+            cancel_event=cancel_event,
+            writable_dirs=tuple(Path(p) for p in (writable_dirs or ())))
     except Exception as exc:            # sandbox unavailable at dispatch time
         return None, str(exc), "error", time.monotonic() - started
     return rc, out, stopped, time.monotonic() - started
@@ -205,7 +206,8 @@ def run(command, *, cwd, timeout: float | None = None,
         max_output: int = 8000, env: dict | None = None,
         stdin_text: str | None = None,
         cancel_event: threading.Event | None = None,
-        windows_sandbox: bool = False
+        windows_sandbox: bool = False,
+        writable_dirs: tuple = (),
         ) -> tuple[int | None, str, str, float]:
     """Run `command` and return (returncode, output, stopped, seconds).
 
@@ -222,12 +224,14 @@ def run(command, *, cwd, timeout: float | None = None,
 
     `windows_sandbox` (Windows only) runs the child under the built-in Job
     Object + restricted-token sandbox instead of a plain `Popen`.
+    `writable_dirs` (Windows sandbox only) lists extra directories the child
+    may write; they come from `cfg.sandbox_writable`.
     """
     if windows_sandbox and os.name == "nt":
         return _run_windows_sandboxed(
             command, cwd=cwd, timeout=timeout, idle_timeout=idle_timeout,
             max_output=max_output, env=env, stdin_text=stdin_text,
-            cancel_event=cancel_event)
+            cancel_event=cancel_event, writable_dirs=writable_dirs)
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
     cap = max(200, int(max_output or 8000))

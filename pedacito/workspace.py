@@ -574,12 +574,99 @@ def _process_start_time(pid: int) -> float:
 # owner_token, session_id, mode, created_at}. The reader stays
 # backwards-compatible with the v1 single-integer `<pid>\n` format.
 
+# An empty/corrupt lockfile younger than this many seconds is a writer caught
+# mid-create (the atomic-link fallback), so it is treated as BUSY, not stale.
+_LOCK_GRACE_SECONDS = 2.0
+
+# In-process owners, keyed by the canonical identity of the lock's parent
+# directory. Every `ProjectLockManager` instance registers here so two
+# distinct managers in one process share one view and never evict each other
+# through the own-pid stale path.
+_IN_PROC_GUARD = threading.Lock()
+_IN_PROC_OWNERS: dict[str, set[str]] = {}
+# Tokens this process has minted for each root, kept until the root fully
+# unlocks so the last owner's release can verify the on-disk lockfile.
+_IN_PROC_TOKENS: dict[str, set[str]] = {}
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_path_key(path: Path) -> str:
+    """A stable, normalized identity for a path, safe under concurrency.
+
+    Windows `Path.resolve()` intermittently returns the ``\\\\?\\`` extended-
+    length prefix (only once the target exists), which would split the same
+    file into two lock keys and race; strip it before normalizing case."""
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    if resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(resolved)
+
+
+def _lock_key(path: Path) -> str:
+    """Canonical identity of a lock's parent directory, shared across all
+    `ProjectLockManager` instances in this process (computed after the parent
+    exists; falls back to the normalized resolved path when it cannot)."""
+    try:
+        st = path.parent.stat()
+        return f"{st.st_dev}:{st.st_ino}"
+    except OSError:
+        return _norm_path_key(path)
+
+
+def _register_in_process(key: str, token: str) -> None:
+    with _IN_PROC_GUARD:
+        _IN_PROC_OWNERS.setdefault(key, set()).add(token)
+        _IN_PROC_TOKENS.setdefault(key, set()).add(token)
+
+
+def _unregister_in_process(key: str, token: str) -> None:
+    with _IN_PROC_GUARD:
+        tokens = _IN_PROC_OWNERS.get(key)
+        if tokens is None:
+            return
+        tokens.discard(token)
+        if not tokens:
+            del _IN_PROC_OWNERS[key]
+        # _IN_PROC_TOKENS[key] is left until _unlink_if_ours clears it, so the
+        # release of the last owner can still verify against every minted token.
+
+
+def _in_process_holds(key: str) -> bool:
+    with _IN_PROC_GUARD:
+        return bool(_IN_PROC_OWNERS.get(key))
+
+
 def _lock_path(root) -> Path:
     return state_dir(Path(root)) / "run.lock"
 
 
 def _read_lockfile(path: Path) -> dict | None:
-    """The parsed holder record, or None when missing/corrupt/unreadable."""
+    """The parsed holder record, or None when missing/unreadable.
+
+    An empty or corrupt lockfile whose mtime is within the grace period is a
+    writer caught mid-create, so it is returned as a ``{"version": 0,
+    "busy": True}`` marker (BUSY, not stale) to stop a reader from stealing a
+    lock that is still being written."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -596,23 +683,36 @@ def _read_lockfile(path: Path) -> dict | None:
                 "owner_token": "", "session_id": "", "mode": "exclusive",
                 "created_at": 0.0}
     except (ValueError, IndexError):
-        return None
+        pass
+    try:
+        age = time.time() - st.st_mtime
+    except OSError:
+        age = 0.0
+    if age < _LOCK_GRACE_SECONDS:
+        return {"version": 0, "busy": True, "pid": 0, "start_time": 0.0,
+                "owner_token": "", "session_id": "", "mode": "exclusive",
+                "created_at": st.st_mtime}
+    return None
 
 
-def _is_stale(holder: dict, my_pid: int) -> bool:
+def _is_stale(holder: dict, my_pid: int, key: str | None = None) -> bool:
     """True when `holder` no longer names a live run and may be taken over.
 
     A recorded start_time of 0.0 (legacy v1, or an unreadable / mocked pid) is
     tolerated: it never by itself declares the lock stale, so access-denied
-    and test doubles cannot be evicted by a false positive."""
-    pid = int(holder.get("pid", 0) or 0)
+    and test doubles cannot be evicted by a false positive. An own-pid holder
+    is only stale when NO in-process owner holds that root key -- two
+    `ProjectLockManager` instances in one process must not evict each other."""
+    if holder.get("version") == 0 or holder.get("busy"):
+        return False                     # fresh empty/corrupt: busy, never stale
+    pid = _safe_int(holder.get("pid"), 0)
     if pid <= 0:
         return True
     if pid == my_pid:
-        return True                       # our own pid left by a crash
+        return not (key is not None and _in_process_holds(key))
     if not _pid_alive(pid):
         return True
-    rec_start = float(holder.get("start_time", 0.0) or 0.0)
+    rec_start = _safe_float(holder.get("start_time"), 0.0)
     if rec_start <= 0.0:
         return False
     cur_start = _process_start_time(pid)
@@ -648,11 +748,15 @@ class ProjectLockManager:
     In-process: multiple `shared` owners coexist; an `exclusive` owner
     conflicts with any other owner. Re-entry is allowed for the same
     `session_id` (when non-empty) or the same thread (when no session is
-    given), so a session that nests acquires never deadlocks itself.
+    given), so a session that nests acquires never deadlocks itself. A
+    `shared` owner that re-enters requesting `exclusive` upgrades only when no
+    other owner holds the root.
 
     Cross-process: the first in-process owner writes `<root>/.pedacito/
-    run.lock` atomically (`O_CREAT | O_EXCL`) and every other process fails
-    fast with `ProjectBusy` until it is released or detected stale.
+    run.lock` atomically (hard link, then `O_CREAT | O_EXCL` fallback) and
+    every other process fails fast with `ProjectBusy` until it is released or
+    detected stale. All `ProjectLockManager` instances in one process share a
+    module-level registry, so two managers never evict each other.
     """
 
     def __init__(self) -> None:
@@ -666,8 +770,8 @@ class ProjectLockManager:
         if mode not in ("exclusive", "shared"):
             raise ValueError(f"unknown lock mode {mode!r}")
         path = _lock_path(root)
-        key = str(path.resolve())
         path.parent.mkdir(parents=True, exist_ok=True)
+        key = _lock_key(path)
         pid = os.getpid()
         start = _process_start_time(pid)
         tid = threading.get_ident()
@@ -678,6 +782,22 @@ class ProjectLockManager:
                 owners = self._owners.get(key, [])
                 reentry = self._find_reentry(owners, session_id, tid)
                 if reentry is not None:
+                    if mode == "exclusive" and reentry.owner.mode != "exclusive":
+                        # Honor the requested mode on re-entry: upgrade a
+                        # shared owner to exclusive only when no OTHER owner
+                        # holds this root.
+                        if any(o is not reentry for o in owners):
+                            reason = self._busy_reason(owners)
+                            if deadline is None:
+                                raise ProjectBusy(reason)
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise ProjectBusy(reason)
+                            self._cond.wait(timeout=min(0.05, remaining))
+                            continue
+                        reentry.owner = LockOwner(
+                            pid, start, reentry.owner.owner_token, session_id,
+                            "exclusive", reentry.owner.created_at)
                     reentry.refs += 1
                     return LockOwner(pid, start, reentry.owner.owner_token,
                                      session_id, reentry.owner.mode, time.time())
@@ -685,11 +805,12 @@ class ProjectLockManager:
                     token = uuid.uuid4().hex
                     if not owners:
                         self._write_lockfile(path, pid, start, token,
-                                             session_id, mode)
+                                             session_id, mode, key)
                     owner = LockOwner(pid, start, token, session_id, mode,
                                       time.time())
                     self._owners.setdefault(key, []).append(
                         _InProcOwner(owner, tid))
+                    _register_in_process(key, token)
                     return owner
                 # A different session/thread holds a conflicting lock.
                 reason = self._busy_reason(owners)
@@ -725,22 +846,67 @@ class ProjectLockManager:
                 f"({', '.join(names)}); wait for it, or delete the run.lock "
                 f"if it is stale")
 
-    def _write_lockfile(self, path, pid, start, token, session_id, mode):
+    def _write_lockfile(self, path, pid, start, token, session_id, mode, key):
+        payload = json.dumps({"version": 2, "pid": pid, "start_time": start,
+                              "owner_token": token, "session_id": session_id,
+                              "mode": mode, "created_at": time.time()})
+        data = payload.encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f"run.lock.{pid}.{token}.tmp"
         while True:
             try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
-                pass
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
             except OSError as exc:
                 raise RuntimeError(
                     f"could not acquire run lock {path}: {exc}") from exc
-            else:
-                break
+            acquired = False
+            try:
+                try:
+                    # Atomic hard link: fails with FileExistsError if run.lock
+                    # exists, so a reader NEVER sees an empty run.lock.
+                    os.link(tmp, path)
+                    acquired = True
+                except FileExistsError:
+                    acquired = False
+                except OSError:
+                    # Filesystem without hard links: O_CREAT | O_EXCL with an
+                    # immediate write; the reader's grace period covers the
+                    # tiny window before the write lands.
+                    try:
+                        fd = os.open(
+                            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                    except FileExistsError:
+                        acquired = False
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"could not acquire run lock {path}: {exc}") from exc
+                    else:
+                        try:
+                            os.write(fd, data)
+                        finally:
+                            os.close(fd)
+                        acquired = True
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            if acquired:
+                return
+            # `run.lock` already exists: take it over only when genuinely stale.
             holder = _read_lockfile(path)
-            if holder is not None and not _is_stale(holder, pid):
+            if holder is not None and not _is_stale(holder, pid, key):
                 raise ProjectBusy(
                     f"another pedacito run (pid {holder.get('pid')}) is using "
                     f"this project; wait for it, or delete {path} if it is stale")
+            # Re-read immediately before unlinking so we never delete a lock
+            # another process created in the meantime.
+            before = _read_lockfile(path)
+            if before != holder:
+                continue
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -748,18 +914,11 @@ class ProjectLockManager:
             except OSError as exc:
                 raise RuntimeError(
                     f"could not replace stale run lock {path}: {exc}") from exc
-        payload = json.dumps({"version": 2, "pid": pid, "start_time": start,
-                              "owner_token": token, "session_id": session_id,
-                              "mode": mode, "created_at": time.time()})
-        try:
-            os.write(fd, payload.encode("utf-8"))
-        finally:
-            os.close(fd)
 
     # -------------------------------------------------------------- release
     def release(self, root: Path | str, owner: LockOwner | None = None) -> None:
         path = _lock_path(root)
-        key = str(path.resolve())
+        key = _lock_key(path)
         with self._cond:
             owners = self._owners.get(key, [])
             if not owners:
@@ -772,10 +931,12 @@ class ProjectLockManager:
                 self._cond.notify_all()
                 return
             owners.remove(target)
+            _unregister_in_process(key, target.owner.owner_token)
             if not owners:
                 del self._owners[key]
-                self._unlink_if_ours(path, target.owner)
             self._cond.notify_all()
+            if not owners:
+                self._unlink_if_ours(path, key)
 
     def _find_target(self, owners, owner):
         if owner is not None:
@@ -793,52 +954,64 @@ class ProjectLockManager:
                 return o
         return None
 
-    def _unlink_if_ours(self, path, owner: LockOwner) -> None:
-        """Unlink the lockfile only when it still names this owner's token (or
-        pid for a legacy v1 file) -- a file another process took over is not
-        ours to remove."""
-        holder = _read_lockfile(path)
-        if holder is None:
+    def _unlink_if_ours(self, path, key) -> None:
+        """Unlink the lockfile only when no in-process owner still holds this
+        root (across every manager) and the on-disk record belongs to one of
+        this process's owners (pid match, token match) -- a file another
+        process took over is never ours to remove."""
+        if _in_process_holds(key):
             return
-        if int(holder.get("version", 1) or 1) == 1:
-            if int(holder.get("pid", 0) or 0) == owner.pid:
+        holder = _read_lockfile(path)
+        try:
+            if holder is None:
+                return
+            version = _safe_int(holder.get("version"), 1) or 1
+            do_unlink = False
+            if version == 1:
+                do_unlink = _safe_int(holder.get("pid"), 0) == os.getpid()
+            elif version == 0:
+                do_unlink = False                 # busy marker: never ours yet
+            else:
+                with _IN_PROC_GUARD:
+                    minted = set(_IN_PROC_TOKENS.get(key, ()))
+                do_unlink = (
+                    _safe_int(holder.get("pid"), 0) == os.getpid()
+                    and str(holder.get("owner_token", "")) in minted)
+            if do_unlink:
                 try:
                     path.unlink()
                 except OSError:
                     pass
-            return
-        if str(holder.get("owner_token", "")) == owner.owner_token:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        finally:
+            with _IN_PROC_GUARD:
+                _IN_PROC_TOKENS.pop(key, None)
 
     # ------------------------------------------------------------- queries
     def active_owners(self, root: Path | str) -> list[LockOwner]:
         path = _lock_path(root)
-        key = str(path.resolve())
+        key = _lock_key(path)
         with self._cond:
             owners = [o.owner for o in self._owners.get(key, [])]
         if owners:
             return owners
         holder = _read_lockfile(path)
-        if holder is None:
+        if holder is None or holder.get("version") == 0 or holder.get("busy"):
             return []
-        return [LockOwner(int(holder.get("pid", 0) or 0),
-                          float(holder.get("start_time", 0.0) or 0.0),
+        return [LockOwner(_safe_int(holder.get("pid"), 0),
+                          _safe_float(holder.get("start_time"), 0.0),
                           str(holder.get("owner_token", "")),
                           str(holder.get("session_id", "")),
                           str(holder.get("mode", "exclusive")),
-                          float(holder.get("created_at", 0.0) or 0.0))]
+                          _safe_float(holder.get("created_at"), 0.0))]
 
     def is_locked(self, root: Path | str) -> bool:
         path = _lock_path(root)
-        key = str(path.resolve())
+        key = _lock_key(path)
         with self._cond:
             if self._owners.get(key):
                 return True
         holder = _read_lockfile(path)
-        return holder is not None and not _is_stale(holder, os.getpid())
+        return holder is not None and not _is_stale(holder, os.getpid(), key)
 
 
 # Process-default manager and the legacy module-level helpers. `acquire_lock`
@@ -894,15 +1067,41 @@ def release_lock(root) -> None:
 _FILE_LOCKS_GUARD = threading.Lock()
 _FILE_LOCKS: dict[str, threading.Lock] = {}
 
+# Transient PermissionError (Windows sharing violation) retry budget for the
+# atomic read-modify-write helpers: retry with bounded backoff rather than
+# silently clobbering the file with `default()`.
+_ATOMIC_RETRIES = 5
+_ATOMIC_RETRY_BASE = 0.02
+
 
 def _file_lock(path: Path) -> threading.Lock:
-    key = str(path)
+    key = _norm_path_key(path)
     with _FILE_LOCKS_GUARD:
         lock = _FILE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             _FILE_LOCKS[key] = lock
         return lock
+
+
+def _read_text_retry(p: Path) -> str:
+    """Read `p`, retrying transient `PermissionError` (a Windows sharing
+    violation) with bounded backoff. Raises `FileNotFoundError` when the file
+    is absent and the last `PermissionError` when it stays locked, so callers
+    never overwrite a file that is merely busy with `default()`."""
+    delay = _ATOMIC_RETRY_BASE
+    last_perm: PermissionError | None = None
+    for _ in range(_ATOMIC_RETRIES):
+        try:
+            return p.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise
+        except PermissionError as exc:
+            last_perm = exc
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+    assert last_perm is not None
+    raise last_perm
 
 
 def atomic_update_json(
@@ -917,9 +1116,14 @@ def atomic_update_json(
     p = Path(path)
     with _file_lock(p):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            text = _read_text_retry(p)
+        except FileNotFoundError:
             data = default()
+        else:
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = default()
         if not isinstance(data, dict):
             data = default()
         data = updater(data)
@@ -944,8 +1148,8 @@ def atomic_update_text(
     p = Path(path)
     with _file_lock(p):
         try:
-            text = p.read_text(encoding="utf-8")
-        except OSError:
+            text = _read_text_retry(p)
+        except FileNotFoundError:
             text = ""
         text = updater(text)
         if not isinstance(text, str):
@@ -1027,19 +1231,21 @@ def check_maintenance_safe(
 
 
 def _maintenance_unsafe_reason(root: Path, action: str) -> str:
+    verb = action or "maintain"
     with _QUIESCE_LOCK:
         hooks = list(_QUIESCE_HOOKS)
     for hook in hooks:
         try:
-            active = _hook_active_sessions(hook(root, action))
-        except Exception:
-            continue
+            result = hook(root, action)
+        except Exception as exc:
+            # Fail CLOSED: a safety hook that raises must not be ignored.
+            return (f"cannot {verb} now: a safety hook failed "
+                    f"({type(exc).__name__}: {exc})")
+        active = _hook_active_sessions(result)
         if active:
-            verb = action or "maintain"
             return (f"cannot {verb} now: {len(active)} active session(s) "
                     f"({', '.join(active[:4])})")
     if _DEFAULT_LOCK_MANAGER.is_locked(root):
-        verb = action or "maintain"
         return f"cannot {verb} now: another pedacito run is using this project"
     # D15: a daemon in a separate process may hold live sessions for this
     # root. Ask it to quiesce over loopback with a short timeout. When no
@@ -1048,14 +1254,33 @@ def _maintenance_unsafe_reason(root: Path, action: str) -> str:
     try:
         from . import daemon as daemon_mod
         info = daemon_mod.read_daemon_info()
-        if info is not None and int(info.get("pid") or 0) != os.getpid():
-            status, body = daemon_mod.daemon_request(
-                "POST", "/v1/quiesce",
-                {"root": str(root), "timeout_s": 0.2}, timeout=1.0)
-            if status == 200 and body.get("ok") is False:
-                verb = action or "maintain"
-                reason = str(body.get("reason") or "daemon sessions are active")
-                return f"cannot {verb} now: {reason}"
-    except Exception:
-        pass
-    return ""
+    except Exception as exc:
+        return (f"cannot {verb} now: daemon discovery failed "
+                f"({type(exc).__name__}: {exc})")
+    if info is None:
+        return ""
+    try:
+        pid = _safe_int(info.get("pid"), 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0 or pid == os.getpid():
+        return ""                # our own daemon, or no valid pid: allow
+    try:
+        status, body = daemon_mod.daemon_request(
+            "POST", "/v1/quiesce",
+            {"root": str(root), "timeout_s": 0.2}, timeout=1.0)
+    except Exception as exc:
+        return (f"cannot {verb} now: daemon unreachable "
+                f"({type(exc).__name__}: {exc})")
+    if status == 0:
+        # No daemon running / connection refused (stale discovery): allow.
+        return ""
+    if status == 200 and body.get("ok") is True:
+        return ""
+    if status == 200 and body.get("ok") is False:
+        reason = str(body.get("reason") or "daemon sessions are active")
+        return f"cannot {verb} now: {reason}"
+    # A live daemon answered with a non-200 / error: fail closed.
+    reason = str(body.get("error") or body.get("reason")
+                 or f"daemon returned {status}")
+    return f"cannot {verb} now: {reason}"

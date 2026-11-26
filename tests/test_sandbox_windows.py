@@ -315,3 +315,147 @@ def test_live_run_and_cancel():
         [sys.executable, "-c", "import time; time.sleep(30)"], cwd=cwd,
         env=env, timeout=30, cancel_event=ev)
     assert rc is None
+
+
+# --------------------------------------------------------------------------- #
+# C1: safe relabel guard + probe never touches os.getcwd()                    #
+# --------------------------------------------------------------------------- #
+
+def test_is_safe_to_relabel_rejects_roots_and_home(tmp_path):
+    assert sandbox_win._is_safe_to_relabel(Path.home()) is False
+    # The filesystem/drive root.
+    assert sandbox_win._is_safe_to_relabel(Path(Path.home().anchor)) is False
+    # A private directory under the temp dir is safe to relabel.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert sandbox_win._is_safe_to_relabel(proj) is True
+
+
+def test_is_safe_to_relabel_rejects_system_dirs(monkeypatch, tmp_path):
+    if os.name == "nt":
+        base = r"C:\PedacitoFakeSystemRoot"
+    else:
+        base = "/opt/pedacito-fake-system-root"
+    monkeypatch.setitem(os.environ, "SystemRoot", base)
+    # A system directory and a descendant are both refused, even if they do
+    # not exist on disk (the guard refuses before touching them).
+    assert sandbox_win._is_safe_to_relabel(Path(base)) is False
+    assert sandbox_win._is_safe_to_relabel(Path(base) / "sub") is False
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX symlink (Windows covered by live junction test)")
+def test_is_safe_to_relabel_rejects_symlink(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    assert sandbox_win._is_safe_to_relabel(link) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only probe path")
+def test_probe_runs_in_private_tempdir_not_cwd(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_spawn(argv, *, cwd, env, stdin_text=None, writable_dirs=()):
+        captured["cwd"] = str(cwd)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(sandbox_win, "_spawn_child", fake_spawn)
+    monkeypatch.chdir(tmp_path)
+    ok, err = sandbox_win._check_child_launch()
+    assert not ok and "RuntimeError" in err
+    # The probe never uses os.getcwd(): it runs in a private temp directory.
+    assert captured.get("cwd") and captured["cwd"] != str(tmp_path)
+    assert captured["cwd"].startswith(str(Path(tempfile.gettempdir())))
+
+
+# --------------------------------------------------------------------------- #
+# C2/H1 + MEDIUM 2: live Windows junction / guarded paths / stdin             #
+# --------------------------------------------------------------------------- #
+
+_WRITE_PROBE = (
+    "import sys\n"
+    "try:\n"
+    "    open(sys.argv[1], 'w').write('pwned')\n"
+    "    print('WROTE')\n"
+    "except PermissionError:\n"
+    "    print('DENIED')\n"
+    "except OSError:\n"
+    "    print('DENIED')\n"
+)
+
+_STDIN_PROBE = (
+    "import sys\n"
+    "print('STDIN:' + repr(sys.stdin.read()))\n"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows-only live junction test")
+def test_live_junction_not_relabeled_and_child_cannot_write_outside(tmp_path):
+    caps = sandbox_win.probe()
+    if not caps.available:
+        pytest.skip("Windows sandbox unavailable")
+    proj = tmp_path / "proj"
+    outside = tmp_path / "outside"
+    proj.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    jn = proj / "jn"
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(jn), str(outside)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not jn.exists():
+        pytest.skip("cannot create NTFS junction (mklink unavailable)")
+    env = dict(os.environ)
+    rc, out, err, _el = sandbox_win.run_sandboxed(
+        [sys.executable, "-c", _WRITE_PROBE, str(jn / "secret.txt")],
+        cwd=proj, env=env, timeout=30)
+    assert rc == 0
+    assert "DENIED" in out, out
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "secret"
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows-only live guarded-paths test")
+def test_live_child_cannot_write_guarded_paths(tmp_path):
+    caps = sandbox_win.probe()
+    if not caps.available:
+        pytest.skip("Windows sandbox unavailable")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".git" / "hooks").mkdir(parents=True)
+    (proj / ".git" / "hooks" / "pre-commit").write_text(
+        "#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (proj / ".pedacito").mkdir()
+    (proj / ".pedacito" / "policy.toml").write_text(
+        "[policy]\n", encoding="utf-8")
+    (proj / ".pedacito.toml").write_text(
+        "sandbox = true\n", encoding="utf-8")
+    env = dict(os.environ)
+    for rel in (".git/hooks/pre-commit", ".pedacito/policy.toml",
+                ".pedacito.toml"):
+        target = proj / rel
+        before = target.read_text(encoding="utf-8")
+        rc, out, err, _el = sandbox_win.run_sandboxed(
+            [sys.executable, "-c", _WRITE_PROBE, str(target)],
+            cwd=proj, env=env, timeout=30)
+        assert rc == 0, (rel, out, err)
+        assert "DENIED" in out, (rel, out)
+        assert target.read_text(encoding="utf-8") == before, rel
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows-only live stdin test")
+def test_live_stdin_text_passed_and_eof(tmp_path):
+    caps = sandbox_win.probe()
+    if not caps.available:
+        pytest.skip("Windows sandbox unavailable")
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    env = dict(os.environ)
+    rc, out, err, _el = sandbox_win.run_sandboxed(
+        [sys.executable, "-c", _STDIN_PROBE], cwd=cwd, env=env, timeout=30,
+        stdin_text="hello_stdin")
+    assert rc == 0
+    assert "STDIN:'hello_stdin'" in out

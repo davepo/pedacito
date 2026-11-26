@@ -107,6 +107,7 @@ def child_config(cfg):
     # read-only child policy; the `task` action is always the "explore" role.
     try:
         from . import session_ctx
+        from . import policy as policy_mod
         parent_policy = getattr(cfg, "policy", None)
         if parent_policy is None:
             sess = session_ctx.current_session()
@@ -114,8 +115,14 @@ def child_config(cfg):
                 parent_policy = getattr(sess, "policy", None)
         if parent_policy is not None and hasattr(parent_policy, "child_policy"):
             child.policy = parent_policy.child_policy(role="explore")
-        else:
+        elif parent_policy is not None:
             child.policy = parent_policy
+        else:
+            # MEDIUM 8: never skip read-only narrowing -- even with no parent
+            # policy, attach a `plan` (read-only) engine so the `task` child
+            # can never widen to a write.
+            child.policy = policy_mod.PolicyEngine(
+                cfg, root=getattr(cfg, "_root", None), _forced_mode="plan")
     except Exception:
         child.policy = getattr(cfg, "policy", None)
     return child
@@ -584,7 +591,17 @@ def _narrow_policy_for_root(
         return child
     cfg = getattr(parent_ctx, "cfg", None)
     forced = "plan" if spec.role in ("explore", "verifier") else ""
-    return policy_mod.PolicyEngine(cfg, root=root, _forced_mode=forced)
+    # MEDIUM 8: load the trusted `.pedacito/policy.toml` from the PARENT repo
+    # root, not the (empty) worktree, so deny lists and budgets are preserved.
+    parent_root = getattr(parent_ctx, "root", None)
+    doc = None
+    if parent_root is not None:
+        try:
+            doc = policy_mod.load_policy_file(parent_root, cfg)
+        except Exception:
+            doc = None
+    return policy_mod.PolicyEngine(cfg, root=root, policy_doc=doc,
+                                   _forced_mode=forced)
 
 
 def _with_verifier_family(
