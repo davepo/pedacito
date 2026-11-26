@@ -1160,15 +1160,18 @@ class TuiSession:
                       if state == "warn" else "")
         active_text = self._style(active, "accent")
         label = lambda text: self._style(text, "muted")  # noqa: E731
+        turn_label = label(i18n.t("tui.footer.turn", lang=self.lang))
+        session_label = label(i18n.t("tui.footer.session", lang=self.lang))
+        sess_label = label(i18n.t("tui.footer.sess", lang=self.lang))
 
         if width >= 120:
             line1 = (
                 f"{label('Ctx:')} {painted} {prompt:,} / {context:,} "
-                f"({pct:.1f}%) | {label('Turn:')} +{prompt:,} in / "
+                f"({pct:.1f}%) | {turn_label} +{prompt:,} in / "
                 f"+{completion:,} out | {label('Speed:')} {speed:.1f} tok/s "
                 f"(avg {avg:.1f} tok/s){state_note}")
             line2 = (
-                f"{label('Session:')} "
+                f"{session_label} "
                 f"{_compact_tokens(t['session_prompt_tokens'])} in / "
                 f"{_compact_tokens(t['session_completion_tokens'])} out | "
                 f"{label('KV Cache:')} {cache:.0f}% | "
@@ -1177,8 +1180,8 @@ class TuiSession:
         else:
             line1 = (f"{label('Ctx:')} {prompt:,} / {context:,} ({pct:.1f}%) "
                      f"{painted} {speed:.1f} tok/s{state_note}")
-            line2 = (f"{label('Turn:')} +{prompt:,}/+{completion:,} | "
-                     f"{label('Sess:')} "
+            line2 = (f"{turn_label} +{prompt:,}/+{completion:,} | "
+                     f"{sess_label} "
                      f"{_compact_tokens(t['session_prompt_tokens'])}/"
                      f"{_compact_tokens(t['session_completion_tokens'])} | "
                      f"{label('KV:')} {cache:.0f}% | {active_text}")
@@ -1462,7 +1465,7 @@ class TuiSession:
     def _expand_command(self, arg: str, *, expand: bool) -> None:
         raw = str(arg or "").strip()
         if not self.tool_cards:
-            self._append("No tool-call cards in this session yet.", "system")
+            self._append(i18n.t("tui.expand.none", lang=self.lang), "system")
             return
         if raw and raw.lower() != "all":
             try:
@@ -4139,6 +4142,10 @@ class TuiSession:
         except Exception:
             return None
 
+    def _symbol_count(self, n: int) -> str:
+        key = "tui.map.symbol_one" if n == 1 else "tui.map.symbol_other"
+        return i18n.t(key, lang=self.lang, n=n)
+
     def _map_command(self) -> None:
         """`/map`: indexed files with their top symbols; sensitive files hidden."""
         idx = self._index_for_view()
@@ -4164,7 +4171,8 @@ class TuiSession:
                 names.append(qual)
         total = sum(len(names) for names in symbols.values())
         lines = [i18n.t("tui.map.title", lang=self.lang,
-                        files=len(visible), symbols=total)]
+                        files=len(visible),
+                        symbols=self._symbol_count(total))]
         for rel in visible[:_MAP_FILE_LIMIT]:
             names = symbols.get(rel, [])
             if not names:
@@ -4175,7 +4183,8 @@ class TuiSession:
             if len(names) > _MAP_SYMBOL_LIMIT:
                 shown += f", +{len(names) - _MAP_SYMBOL_LIMIT}"
             lines.append(i18n.t("tui.map.row", lang=self.lang, file=rel,
-                                n=len(names), symbols=shown))
+                                count=self._symbol_count(len(names)),
+                                symbols=shown))
         if len(visible) > _MAP_FILE_LIMIT:
             lines.append(i18n.t("tui.map.more", lang=self.lang,
                                 n=len(visible) - _MAP_FILE_LIMIT))

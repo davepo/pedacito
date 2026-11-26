@@ -33,6 +33,23 @@ from .config import ConfigError
 
 # --- validation ---------------------------------------------------------------
 
+# Whole-number settings the GUI and raw editor refuse to save out of range.
+_INT_RANGES = {
+    "daemon_port": (0, 65535),          # 0 = let the OS choose a port
+    "subagent_max_parallel": (1, 32),
+}
+
+
+def _check_range(key: str, value, label: str) -> None:
+    bounds = _INT_RANGES.get(key)
+    if bounds is None or isinstance(value, bool) or not isinstance(value, int):
+        return
+    low, high = bounds
+    if not low <= value <= high:
+        raise ConfigError(f"{label}: {key} must be a whole number from "
+                          f"{low} to {high}, got {value!r}")
+
+
 def validate_text(text: str, label: str = "config") -> tuple[dict, dict]:
     """Parse and check a config file's text with the loader's own rules.
     Returns (settings, profiles) or raises ConfigError with a readable message."""
@@ -42,11 +59,13 @@ def validate_text(text: str, label: str = "config") -> tuple[dict, dict]:
         raise ConfigError(f"invalid TOML: {e}") from e
     flat, profiles = config_mod._flatten(data, Path(label))
     for key, value in flat.items():
-        config_mod._coerce(key, value, Path(label))
+        value = config_mod._coerce(key, value, Path(label))
+        _check_range(key, value, label)
     for name, body in profiles.items():
         merged, _tier = config_mod._apply_preset(name, body, label)
         for key, value in merged.items():
-            config_mod._coerce(key, value, Path(label))
+            value = config_mod._coerce(key, value, Path(label))
+            _check_range(key, value, label)
     return flat, profiles
 
 

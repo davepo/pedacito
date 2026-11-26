@@ -776,25 +776,25 @@
           h('div', { class: 'prow-cal small-text ' + (hosted ? 'muted' : cal.calibrated ? (cal.calibrated_stale ? 'stale' : 'ok') : 'muted'),
             text: calLine(cal), title: calTitle(cal) })),
         h('span', { class: 'prow-actions' },
-          h('button', { class: 'small', text: isImg ? t('settings.profile.probe_image', null, 'Probe image') : 'Calibrate', disabled: hosted,
-            title: hosted ? 'Calibration disabled for hosted models'
+          h('button', { class: 'small', text: isImg ? t('settings.profile.probe_image', null, 'Probe image') : t('settings.profile.calibrate', null, 'Calibrate'), disabled: hosted,
+            title: hosted ? t('gui.menu.calibrate_hosted_disabled', null, 'Calibration disabled for hosted models')
                           : (isImg ? t('settings.profile.probe_image_title', null, 'Run a fast 1-call image check to verify endpoint readiness and latency')
-                                   : 'Measure this model and store the scores in its model card'),
+                                   : t('settings.profile.calibrate_title', null, 'Measure this model and store the scores in its model card')),
             onclick: function () { calibrate(n, 'quick'); } }),
-          n === defName ? h('button', { class: 'small ghost', disabled: true, text: 'Default' })
-            : h('button', { class: 'small', text: 'Set default', onclick: function () { setDefaultProfile(n); } }),
-          h('button', { class: 'small', text: 'Rename', title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(n); } }),
-          h('button', { class: 'small danger', text: 'Delete', onclick: function () { delProfileNamed(n); } })));
+          n === defName ? h('button', { class: 'small ghost', disabled: true, text: t('settings.profile.default', null, 'Default') })
+            : h('button', { class: 'small', text: t('settings.profile.set_default', null, 'Set default'), onclick: function () { setDefaultProfile(n); } }),
+          h('button', { class: 'small', text: t('gui.rename', null, 'Rename'), title: t('settings.profile.rename_title', null, 'Rename this profile (the default-profile and role references follow it)'), onclick: function () { renameProfileNamed(n); } }),
+          h('button', { class: 'small danger', text: t('gui.delete', null, 'Delete'), onclick: function () { delProfileNamed(n); } })));
       box.appendChild(row);
     });
     }
     box.appendChild(h('div', { class: 'row', style: 'margin-top:10px' },
-      h('button', { class: 'small', text: '+ New profile', onclick: newProfile }),
-      h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
-        title: 'Connect a hosted API key, verify it live, and import its models as profiles' }),
-      h('button', { class: 'small', text: 'Calibrate All Local Models\u2026', onclick: calibrateAll,
-        title: 'Calibrate every local profile in turn (hosted models are skipped)' }),
-      h('span', { class: 'muted small-text grow', text: 'Calibrating takes about a minute and streams to the Output tab.' })));
+      h('button', { class: 'small', text: t('settings.profile.new', null, '+ New profile'), onclick: newProfile }),
+      h('button', { class: 'small', text: t('settings.profile.add_hosted', null, '+ Add Hosted Provider\u2026'), onclick: openHostedDialog,
+        title: t('settings.profile.add_hosted_title', null, 'Connect a hosted API key, verify it live, and import its models as profiles') }),
+      h('button', { class: 'small', text: t('gui.menu.calibrate_all', null, 'Calibrate All Local Models\u2026'), onclick: calibrateAll,
+        title: t('settings.profile.calibrate_all_title', null, 'Calibrate every local profile in turn (hosted models are skipped)') }),
+      h('span', { class: 'muted small-text grow', text: t('settings.profile.calibrate_hint', null, 'Calibrating takes about a minute and streams to the Output tab.') })));
     return box;
   }
   // The calibration line under each profile row: when it was measured, the
@@ -845,7 +845,7 @@
     box.appendChild(h('div', { class: 'note-box' },
       'Find the models your local servers have loaded, then import only the ones you want. A scan reads nothing: nothing is written to the config until you press Import.',
       h('div', { class: 'row scan-controls', style: 'margin-top:8px' },
-        h('button', { class: 'primary', text: SCAN.busy ? 'Scanning\u2026' : (SCAN.rows.length ? 'Scan again' : 'Scan local servers'), disabled: SCAN.busy, onclick: doScan }),
+        h('button', { class: 'primary', text: SCAN.busy ? t('settings.scan.scanning', null, 'Scanning\u2026') : (SCAN.rows.length ? t('settings.scan.again', null, 'Scan again') : t('settings.scan.local', null, 'Scan local servers')), disabled: SCAN.busy, onclick: doScan }),
         url,
         h('label', { class: 'scan-vram' }, 'VRAM (GB)', vram)),
       // the hint gets its own line: inline in the row it competed with the
@@ -1154,9 +1154,9 @@
         hostedCount ? h('div', { class: 'muted small-text', style: 'margin-top:6px',
           text: hostedCount + ' hosted profile(s) excluded \u2014 hosted provider models use provider-table defaults automatically.' }) : null,
         progress);
-      var modal = PDC.modal('Calibrate All Local Models', body, [
-        { label: 'Cancel' },
-        { label: 'Calibrate ' + local.length + ' profile(s)', primary: true, stay: true,
+      var modal = PDC.modal(t('settings.calall.title', null, 'Calibrate All Local Models'), body, [
+        { label: t('gui.cal.cancel', null, 'Cancel') },
+        { label: t('settings.calall.run', { n: local.length }, 'Calibrate ' + local.length + ' profile(s)'), primary: true, stay: true,
           onclick: function () { start(); } }
       ], { onClose: function () { if (timer) clearTimeout(timer); } });
       var foot = modal.box.querySelector('.modal-foot');
@@ -1400,13 +1400,13 @@
     var side = h('div', {}, list, h('div', { class: 'row', style: 'margin-top:8px' },
       h('button', { class: 'small', text: '+ New', onclick: newProfile }),
       h('button', { class: 'small', text: 'Duplicate', disabled: !X.profile, onclick: dupProfile }),
-      h('button', { class: 'small', text: 'Rename', disabled: !X.profile, title: 'Rename this profile (the default-profile and role references follow it)', onclick: function () { renameProfileNamed(X.profile); } }),
-      h('button', { class: 'small danger', text: 'Delete', disabled: !X.profile, onclick: delProfile }),
+      h('button', { class: 'small', text: t('gui.rename', null, 'Rename'), disabled: !X.profile, title: t('settings.profile.rename_title', null, 'Rename this profile (the default-profile and role references follow it)'), onclick: function () { renameProfileNamed(X.profile); } }),
+      h('button', { class: 'small danger', text: t('gui.delete', null, 'Delete'), disabled: !X.profile, onclick: delProfile }),
       // The hosted-provider dialog lives right in this toolbar (it used to be
       // a card on top of both tabs): whoever manages profiles can connect a
       // hosted API and import its models without detouring anywhere.
-      h('button', { class: 'small', text: '+ Add Hosted Provider\u2026', onclick: openHostedDialog,
-        title: 'Connect a hosted API key, verify it live, and import its models as profiles' })));
+      h('button', { class: 'small', text: t('settings.profile.add_hosted', null, '+ Add Hosted Provider\u2026'), onclick: openHostedDialog,
+        title: t('settings.profile.add_hosted_title', null, 'Connect a hosted API key, verify it live, and import its models as profiles') })));
     return h('div', {},
       scoutSection(f),
       h('div', { class: 'set-layout' }, side,

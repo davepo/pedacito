@@ -246,9 +246,12 @@ def render_setting_answer(question: str, item: dict,
 
     key = item["key"]
     help_text = " ".join(how_index.setting_help(item, lang).split())
-    gui = item.get("gui", "⚙ Settings → All settings")
-    lines = [
-        f"**`{key}`** \u2014 {item.get('group') or t('setting_group_default')}",
+    gui = how_index.es_card_text(item.get("gui", "⚙ Settings → All settings"), lang)
+    group = how_index.es_card_text(
+        item.get("group") or t("setting_group_default"), lang)
+    lines = [] if lang != "es" else [t("banner"), ""]
+    lines += [
+        f"**`{key}`** \u2014 {group}",
         "",
         t("setting_what"),
         help_text or t("setting_nodoc"),

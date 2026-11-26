@@ -293,6 +293,9 @@ def plan_payload() -> dict:
 
 GET_ROUTES: dict = {}
 POST_ROUTES: dict = {}
+# A malformed JSON body is refused (400) on these routes instead of being
+# treated as an empty request that could still write or decide something.
+_STRICT_JSON_ROUTES = {"/api/settings/set", "/api/review/decide"}
 
 
 def get(path):
@@ -3332,9 +3335,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._discard_request_body()
                 self._json(413, {"ok": False, "detail": "Request too large."})
                 return
+            raw = self.rfile.read(n)
             try:
-                body = json.loads(self.rfile.read(n) or b"{}")
+                body = json.loads(raw) if raw.strip() else {}
             except ValueError:
+                if url.path in _STRICT_JSON_ROUTES:
+                    self._json(400, {"ok": False, "error": "invalid JSON body"})
+                    return
                 body = {}
             if not isinstance(body, dict):
                 body = {}

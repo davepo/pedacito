@@ -2137,30 +2137,42 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
     # Best-effort durable task journal (D7). Only apply-mode runs (which really
     # write to disk) journal: a dry run / review leaves the tree byte-identical
     # by contract, so it must not create `.pedacito/journal/...` either.
+    #
+    # R2-BUG-06: `loop.run_task` opens the task journal BEFORE delegating here,
+    # so when `cfg._task_journal` is already active we REUSE it instead of
+    # opening the same file again (which duplicated `task_start` and reset the
+    # sequence). Only the owner that created the journal closes it.
     journal = None
+    owns_journal = False
     if do_apply:
-        try:
-            from . import journal as journal_mod
-            sid = ""
+        journal = getattr(cfg, "_task_journal", None)
+        if journal is None:
+            sess = None
             try:
-                from . import session_ctx
-                sess = session_ctx.current_session()
-                if sess is not None:
-                    sid = str(sess.session_id)
+                from . import journal as journal_mod
+                sid = ""
+                try:
+                    from . import session_ctx
+                    sess = session_ctx.current_session()
+                    if sess is not None:
+                        sid = str(sess.session_id)
+                except Exception:
+                    pass
+                journal = journal_mod.TaskJournal(root, task, session_id=sid)
+                journal.append("task_start", task=(task or "")[:400])
+                owns_journal = True
+                try:
+                    cfg._task_journal = journal
+                except Exception:
+                    pass
+                try:
+                    if sess is not None:
+                        sess._task_journal = journal
+                except Exception:
+                    pass
             except Exception:
-                pass
-            journal = journal_mod.TaskJournal(root, task, session_id=sid)
-            journal.append("task_start", task=(task or "")[:400])
-            try:
-                cfg._task_journal = journal
-            except Exception:
-                pass
-            try:
-                sess._task_journal = journal
-            except Exception:
-                pass
-        except Exception:
-            journal = None
+                journal = None
+                owns_journal = False
     try:
         cfg._root = str(root)
     except Exception:
@@ -2189,11 +2201,13 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
                 if loop.result.changed_files:
                     journal.append("edit",
                                    files=loop.result.changed_files[:200])
-                journal.close(status="completed", ok=loop.result.ok)
+                if owns_journal:
+                    journal.close(status="completed", ok=loop.result.ok)
             except Exception:
                 pass
-            try:
-                cfg._task_journal = None
-            except Exception:
-                pass
+            if owns_journal:
+                try:
+                    cfg._task_journal = None
+                except Exception:
+                    pass
         ws.close()

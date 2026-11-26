@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
@@ -136,15 +137,30 @@ _PROMPT_ECHO_PHRASES = (
 )
 
 
+_ECHO_ZERO_WIDTH = ("\u200b", "\u200c", "\u200d", "\ufeff")
+_ECHO_WS = re.compile(r"\s+")
+
+
 def _is_prompt_echo_summary(text: str) -> bool:
     """True when a model "summary" is really the summariser prompt echoed back
     (or reasoning meta about it) rather than a one-sentence description of the
     code unit. An empty/whitespace text is also treated as echo -- there is
     nothing worth caching (BUG-10)."""
-    s = (text or "").strip()
-    if not s:
+    s = text or ""
+    if not s.strip():
         return True
-    low = s.lower()
+    # Normalise so whitespace/Unicode mutations cannot bypass the guard: NFKC
+    # compatibility folding collapses fullwidth/ligature forms, zero-width and
+    # format characters become word separators (a model can sprinkle `\u200b`
+    # between words to evade a substring match), and all runs of whitespace
+    # become a single space before the case-insensitive phrase match
+    # (R2-BUG-05).
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(" " if ch in _ECHO_ZERO_WIDTH or unicodedata.category(ch) == "Cf"
+                else ch for ch in s)
+    low = _ECHO_WS.sub(" ", s).strip().lower()
+    if not low:
+        return True
     return any(phrase in low for phrase in _PROMPT_ECHO_PHRASES)
 
 
@@ -1304,7 +1320,13 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
         try:
             rel = f.resolve().relative_to(root).as_posix()
         except ValueError:
-            rel = f.name
+            # BUG-02: an out-of-root file must never be indexed under a fake
+            # root-relative basename (`f.name`) -- that would leak foreign CWD
+            # files into root/.pedacito/index.json. Skip it cleanly.
+            if verbose:
+                print(f"  [skip] {f.name}: outside project root (not indexed)",
+                      file=sys.stderr)
+            continue
         if security.is_sensitive_path(rel):
             if verbose:
                 print(f"  [skip] {rel}: sensitive file (never indexed)",
@@ -1322,13 +1344,20 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
 
     chunks: list[Chunk] = []
     rels: list[str] = []
+    files_kept: list[Path] = []
     imports_by_file: dict[str, list[str]] = {}
     for f in files:
         try:
             rel = f.resolve().relative_to(root).as_posix()
         except ValueError:
-            rel = f.name
+            # Defense-in-depth: `files` is already filtered to in-root files,
+            # but never fall back to `f.name` for a file that escapes the root.
+            if verbose:
+                print(f"  [skip] {f.name}: outside project root (not indexed)",
+                      file=sys.stderr)
+            continue
         rels.append(rel)
+        files_kept.append(f)
         try:
             got, imps = _chunk_with_imports(rel, f, cfg)
             chunks.extend(got)
@@ -1337,7 +1366,7 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
             print(f"[skip] {rel}: syntax error line {e.lineno}", file=sys.stderr)
 
     idx = Index(root, chunks, file_imports=imports_by_file)
-    for rel, f in zip(rels, files):
+    for rel, f in zip(rels, files_kept):
         idx.file_hashes[rel] = file_hash(f)
         st = file_stat(f)
         if st is not None:

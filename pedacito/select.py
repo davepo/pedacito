@@ -297,15 +297,18 @@ def select(paths: list[str], root: Path, matcher: Matcher,
     model prompt (BUG-03)."""
     out: list[Path] = []
     seen: set[Path] = set()
+    root_r = Path(root).resolve()
 
     def keep(f: Path, explicit: bool) -> None:
         r = f.resolve()
         if r in seen:
             return
         try:
-            rel = r.relative_to(root).as_posix()
+            rel = r.relative_to(root_r).as_posix()
         except ValueError:
-            rel = f.name
+            # BUG-02: a file outside `root` must never be selected under a fake
+            # root-relative basename (`f.name`). Skip it cleanly.
+            return
         if not _selectable_suffix(f.name, f.suffix.lower(), exts):
             return
         # A secret/credential file is never selected, whatever the extension

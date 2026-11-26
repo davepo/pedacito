@@ -3976,6 +3976,74 @@ _ES_SUMMARIES = {
 }
 
 
+# Spanish step, note and title text for the highest-traffic permission, tools
+# and daemon cards, keyed by the English text they replace.
+_ES_CARD_TEXT = {
+    "Approve or deny a Permission requested dialog":
+        "Aprobar o denegar un diálogo de permiso solicitado",
+    "Read the badge, the action, the reason and the exact target shown in the dialog":
+        "Lee la insignia, la acción, el motivo y el destino exacto que muestra el diálogo",
+    "Allow Once: this single request only":
+        "Permitir una vez: solo esta solicitud",
+    "Allow for This Run: no more prompts for this kind of request until the run ends":
+        "Permitir durante esta ejecución: no vuelve a preguntar por este tipo de solicitud hasta que termine la ejecución",
+    "Always Allow: never asks again for that request. It is saved to your config when one exists. Web access flips enable_web, shell commands flip allow_shell":
+        "Permitir siempre: no vuelve a preguntar por esa solicitud. Se guarda en tu configuración si existe. El acceso web activa enable_web y los comandos de shell activan allow_shell",
+    "Allow '<pattern>' in this project (GUI) or p in the TUI: a shell command matching a narrow rule skips the prompt in that project only. The rule is saved to shell_allowlist_by_project; package installs, shells and chained commands are never covered":
+        "Permitir '<patrón>' en este proyecto (GUI) o p en la TUI: un comando de shell que coincida con una regla estrecha omite el aviso solo en ese proyecto. La regla se guarda en shell_allowlist_by_project; las instalaciones de paquetes, los shells y los comandos encadenados nunca quedan cubiertos",
+    "Deny & Redirect: refuses the request. The model is told to continue with local project files only. Stop, or letting the dialog time out, also denies":
+        "Denegar y redirigir: rechaza la solicitud y se le indica al modelo que continúe solo con los archivos locales del proyecto. Detener, o dejar que el diálogo expire, también deniega",
+    "The CLI has no dialog: a gated tool returns its 'disabled in config' error unless the matching setting is on":
+        "La CLI no tiene diálogo: una herramienta restringida devuelve su error 'disabled in config' salvo que el ajuste correspondiente esté activado",
+    "Allow shell, write, browser or screenshot tools":
+        "Permitir herramientas de shell, escritura, navegador o capturas de pantalla",
+    "⚙ Settings → All settings → search for allow_shell / allow_write / allow_browser / allow_screenshots":
+        "⚙ Ajustes → Todos los ajustes → busca allow_shell / allow_write / allow_browser / allow_screenshots",
+    "Apply to: Global (every profile), choose on, then Save":
+        "Aplicar a: Global (todos los perfiles), elige on y luego Guardar",
+    "Review the safety companions too: shell_allowlist, shell_deny, sandbox, sandbox_network":
+        "Revisa también los ajustes de seguridad relacionados: shell_allowlist, shell_deny, sandbox, sandbox_network",
+    "In a project's own .pedacito.toml these toggles stay ignored until you read that file and run pedacito trust PROJ; your user config and --config FILE need no approval":
+        "En el .pedacito.toml de un proyecto estos interruptores se ignoran hasta que leas ese archivo y ejecutes pedacito trust PROJ; tu configuración de usuario y --config FILE no necesitan aprobación",
+    "discovery file: the per-user state folder's daemon.json (0o600 where the platform honours it), removed on stop when its pid matches":
+        "archivo de descubrimiento: daemon.json en la carpeta de estado del usuario (0o600 donde la plataforma lo respete), se elimina al detener si coincide su pid",
+    "HTTP/SSE control surface: /v1/health, /v1/sessions, /v1/sessions/<id>/events, /v1/quiesce and /v1/shutdown":
+        "superficie de control HTTP/SSE: /v1/health, /v1/sessions, /v1/sessions/<id>/events, /v1/quiesce y /v1/shutdown",
+    "every request needs X-Pedacito-Token or Authorization: Bearer":
+        "cada solicitud necesita X-Pedacito-Token o Authorization: Bearer",
+    "remote/WAN binding is refused by construction (loopback only)":
+        "la vinculación remota o WAN se rechaza por diseño (solo bucle local)",
+}
+
+# Remaining English navigation words in Spanish card text (a fallback for the
+# GUI paths and setting groups that have no exact entry above).
+_ES_UI_TERMS = (
+    ("⚙ Settings", "⚙ Ajustes"),
+    ("All settings", "Todos los ajustes"),
+    ("→ search ", "→ buscar "),
+    ("Apply to:", "Aplicar a:"),
+    ("Profiles", "Perfiles"),
+    ("Unified policy engine", "Motor de políticas unificado"),
+    ("Connection & Capabilities", "Conexión y capacidades"),
+    ("Memory, skills, sub-agents, git", "Memoria, habilidades, subagentes y git"),
+    ("Agent loop", "Bucle del agente"),
+    ("Safety", "Seguridad"),
+)
+
+
+def es_card_text(text: str, lang: str = "en") -> str:
+    """Spanish text for an English card string (exact match first, then the
+    navigation terms); English text is returned unchanged."""
+    if i18n.normalize_lang(lang) != "es" or not text:
+        return text
+    if text in _ES_CARD_TEXT:
+        return _ES_CARD_TEXT[text]
+    out = text
+    for english, spanish in _ES_UI_TERMS:
+        out = out.replace(english, spanish)
+    return out
+
+
 def _card_summary(item: dict, lang: str = "en") -> str:
     if i18n.normalize_lang(lang) == "es":
         return str(item.get("summary_es") or item.get("summary") or "")
@@ -4043,12 +4111,12 @@ def render_answer(question: str, matches: dict, lang: str = "en") -> str:
     if gui:
         lines.append(t("gui_heading"))
         for item in gui[:2]:
-            lines.append(f"1. **{item['title']}**")
+            lines.append(f"1. **{es_card_text(item['title'], lang)}**")
             for step in item.get("steps", [])[:6]:
-                lines.append(f"   - {step}")
+                lines.append(f"   - {es_card_text(step, lang)}")
             if item.get("notes"):
                 for note in item["notes"][:3]:
-                    lines.append(f"   - {note}")
+                    lines.append(f"   - {es_card_text(note, lang)}")
         lines.append("")
     else:
         lines.append(t("gui_heading"))
@@ -4074,7 +4142,7 @@ def render_answer(question: str, matches: dict, lang: str = "en") -> str:
                 lines.append(f"  - {t('common_flags')}")
             if item.get("notes"):
                 for note in item["notes"][:4]:
-                    lines.append(f"  - {note}")
+                    lines.append(f"  - {es_card_text(note, lang)}")
             lines.append("")
     else:
         lines.append(t("cli_none"))

@@ -1840,7 +1840,10 @@ def redact_messages(messages, root=None):
 def _gitignore_patterns(root: Path) -> list[str]:
     path = Path(root) / ".gitignore"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # `utf-8-sig` drops a leading UTF-8 BOM (PowerShell `Set-Content
+        # -Encoding utf8` prepends one), so line 1 (`\ufeff.env`) still matches
+        # `.env` (R2-UI-06).
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
     return [ln.strip() for ln in text.splitlines()
@@ -1950,7 +1953,9 @@ def ensure_gitignore_entries(root, patterns=None) -> list[str]:
         return []
     path = base / ".gitignore"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # `utf-8-sig` drops a leading UTF-8 BOM so line 1 matches cleanly
+        # (R2-UI-06).
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         text = ""
     existing = {ln.strip() for ln in text.splitlines()

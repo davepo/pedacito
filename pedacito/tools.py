@@ -2830,6 +2830,14 @@ def tool_outline(index, cfg, file: str) -> str:
     def sensitive(rel: str) -> bool:
         return security.is_sensitive_path(Path(index.root) / rel)
 
+    # BUG-04: refuse a sensitive file BEFORE index lookup / adoption, so a
+    # secret on disk that is not (yet) indexed returns the same explicit
+    # refusal as `read` instead of the generic "not in the index ... use grep"
+    # hint (which `adopt_if_on_disk` returning None would otherwise trigger).
+    cand = _root_rel(index, file)
+    if cand and security.is_sensitive_path(Path(index.root) / cand):
+        return _sensitive_read_gate(cfg, cand)
+
     rel = index.resolve_file(file)
     if rel is None:
         rel = adopt_if_on_disk(index, cfg, file)

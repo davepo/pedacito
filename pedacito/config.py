@@ -1577,8 +1577,12 @@ def _read_utf8_toml(path: Path) -> dict:
         raise ConfigError(f"{path}: could not be read: {e}") from e
     head = raw[:256]
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in head:
+        # No "Config error: " prefix here: `cli.main` already formats a
+        # raised `ConfigError` that way, and `pedacito trust` prints this
+        # message directly (R2-BUG-07: it used to read "Config error:
+        # Config error: ...").
         raise ConfigError(
-            f"Config error: {path} appears to be UTF-16 (not UTF-8). "
+            f"{path} appears to be UTF-16 (not UTF-8). "
             "On Windows PowerShell, re-save as UTF-8 "
             "(e.g. Set-Content -Encoding utf8).")
     if raw.startswith(b"\xef\xbb\xbf"):

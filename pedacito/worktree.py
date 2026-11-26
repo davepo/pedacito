@@ -181,6 +181,17 @@ def list_paths(root) -> list[tuple[str, str]]:
     return entries
 
 
+def _dirty_in_worktree(dest: Path) -> bool:
+    """True when a worktree directory still has uncommitted user changes.
+
+    Used only to translate git's refusal into an actionable Pedacito message,
+    so any probe failure simply means "not known dirty"."""
+    try:
+        return dest.is_dir() and bool(dirty_files(dest))
+    except (WorktreeError, OSError):
+        return False
+
+
 def remove(root, name: str, force: bool = False,
            delete_branch: bool = True) -> bool:
     """Remove the worktree .pedacito/worktrees/<name>.
@@ -191,11 +202,27 @@ def remove(root, name: str, force: bool = False,
     was kept, absent, or could not be removed (best effort)."""
     root = _root(root)
     safe = _safe_name(name)
+    if not safe:
+        raise WorktreeError("worktree name is empty")
     dest = root / ".pedacito" / "worktrees" / safe
     args = ["worktree", "remove", str(dest)]
     if force:
         args.append("--force")
-    _git(root, args)
+    try:
+        _git(root, args)
+    except WorktreeError as e:
+        # A `--dirty carry_over` worktree (or any worktree edited in place)
+        # has uncommitted work git refuses to discard. Translate the raw
+        # `fatal: ... use --force` into an actionable Pedacito message --
+        # and never drop the branch, so the work is still recoverable
+        # (R2-BUG-03).
+        if not force and ("contains modified or untracked files" in str(e)
+                          or _dirty_in_worktree(dest)):
+            raise WorktreeError(
+                f"worktree '{safe}' has uncommitted changes (branch "
+                f"'pedacito/{safe}' preserved); commit them there or "
+                "pass --force to discard and remove.") from None
+        raise
     if not delete_branch:
         return False
     branch = f"pedacito/{safe}"

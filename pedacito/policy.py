@@ -132,14 +132,28 @@ def load_policy_file(root: Path | str, cfg: Any = None) -> dict[str, Any]:
     except Exception:
         return {}
     try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
+        raw = path.read_bytes()
+    except OSError:
+        return {}
+    # A UTF-16 file (the PowerShell `Out-File -Encoding Unicode` default) is
+    # refused cleanly rather than trusted; a UTF-8 BOM (PowerShell
+    # `Out-File -Encoding UTF8` / `Set-Content -Encoding utf8`) is stripped so
+    # a valid trusted policy still parses (R2-BUG-01).
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return {"_schema_error": f"{path.name} appears to be UTF-16 (not UTF-8); "
+                "re-save as UTF-8"}
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return {"_schema_error": f"invalid UTF-8 in {path.name}: {exc}"}
+    try:
+        data = tomllib.loads(text)
     except ValueError as exc:
         # A *trusted* policy.toml with a syntax error must fail closed rather
         # than silently dropping its deny rules.
         return {"_schema_error": f"invalid TOML in {path.name}: {exc}"}
-    except OSError:
-        return {}
     return data if isinstance(data, dict) else {"_schema_error": "policy root must be a table"}
 
 

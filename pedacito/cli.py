@@ -64,13 +64,14 @@ from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 def _add_common(p, paths_nargs="+", dest="paths"):
     """Register the flags shared by the project subcommands. `paths_nargs="?"`
     lets a command run from the current directory with no argument (rpc); the
-    `tui` command uses `dest="project"` so its positional reads naturally."""
-    if paths_nargs == "?":
-        default = "." if dest != "paths" else ["."]
-    else:
-        default = None
+    `tui` command uses `dest="project"` so its positional reads naturally.
+
+    An omitted optional positional stays `None` here and is filled in by
+    `_main`, which can tell it apart from an explicit "." -- with `--root A`
+    an omitted target means A, never the caller's current directory
+    (R2-BUG-02)."""
     p.add_argument(dest, nargs=paths_nargs,
-                   default=default,
+                   default=None,
                    help="files or directories to index")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="gitignore-style pattern to skip; repeatable "
@@ -175,6 +176,27 @@ def _root(args) -> Path:
     if isinstance(paths, str):
         paths = [paths]
     return index_mod.infer_root(list(paths))
+
+
+def _project_paths(args, root: Path) -> list[str]:
+    """Positional targets resolved against `root`, never the caller's CWD.
+
+    `_main` already fills an omitted optional positional with `[str(root)]`
+    and resolves explicit relative paths when `--root` is given; this helper
+    is the belt-and-braces for direct callers (`_get_index`/`_refresh`) so a
+    relative path can never make a run index the current directory's files
+    into a different project (R2-BUG-02)."""
+    paths = (getattr(args, "paths", None)
+             or getattr(args, "project", None) or [str(root)])
+    if isinstance(paths, str):
+        paths = [paths]
+    out: list[str] = []
+    for p in paths:
+        if isinstance(p, Path) or Path(str(p)).is_absolute():
+            out.append(str(p))
+        else:
+            out.append(str((root / str(p)).resolve()))
+    return out
 
 
 def _matcher(args, root: Path) -> Matcher:
@@ -365,7 +387,8 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
         exts |= set(REFERENCE_EXTS)
     exts |= {e if e.startswith(".") else "." + e for e in cfg.extra_extensions}
     on_disk = set()
-    for f in select(args.paths, root, _matcher(args, root), exts):
+    for f in select(_project_paths(args, root), root,
+                    _matcher(args, root), exts):
         try:
             on_disk.add(f.resolve().relative_to(root).as_posix())
         except ValueError:
@@ -455,7 +478,8 @@ def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
             return _refresh(existing, args, cfg, root)
     workspace.ensure(root, cfg.manage_gitignore, cfg.create_ignore_file)
     print("Indexing...", file=sys.stderr)
-    return index_mod.build(args.paths, cfg, client=client if summarise else None,
+    return index_mod.build(_project_paths(args, root), cfg,
+                           client=client if summarise else None,
                            root=root, summarise=summarise,
                            matcher=_matcher(args, root))
 
@@ -1553,6 +1577,8 @@ def _cmd_worktree(args) -> int:
             if dirty and policy == "carry_over":
                 print(f"Carried {len(dirty)} uncommitted file(s) into the "
                       "worktree; the original checkout is unchanged.")
+                print("Commit them there before removing it, or `pdc worktree "
+                      "remove` will need --force to discard them.")
             elif dirty and policy == "stash":
                 print(f"Stashed {len(dirty)} uncommitted file(s) before "
                       "creating the worktree.")
@@ -2841,14 +2867,24 @@ def _cmd_undo(args) -> int:
         print(f"undo: restored {len(restored)} file(s) from "
               f"{snapshot.name}", file=sys.stderr)
         return 0
-    for rel in result["restored"]:
+    # R2-BUG-08: `restore_checkpoint` copies every file in the snapshot and
+    # reports the whole snapshot total as "restored", while also listing the
+    # byte-identical files separately -- so a 2-file change in a 13-file
+    # project printed 13 "restored" lines and 13 "unchanged" lines. Only the
+    # genuinely changed paths deserve a line; unchanged files fold into the
+    # one-line summary.
+    identical = set(result.get("identical") or [])
+    restored = [rel for rel in result["restored"] if rel not in identical]
+    for rel in restored:
         print(f"  restored {rel}", file=sys.stderr)
     for rel in result["deleted"]:
         print(f"  deleted  {rel}", file=sys.stderr)
-    for rel in result.get("identical") or []:
-        print(f"  unchanged {rel} (already byte-identical on disk)", file=sys.stderr)
-    print(f"undo: back to {result['undone_to']} "
-          f"({result['files']} file(s) restored)", file=sys.stderr)
+    summary = f"undo: back to {result['undone_to']} " \
+              f"({len(restored)} file(s) restored"
+    if identical:
+        summary += f", {len(identical)} unchanged"
+    summary += ")"
+    print(summary, file=sys.stderr)
     if result.get("safety_id"):
         print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
     return 0
@@ -4966,16 +5002,37 @@ def _main(argv=None) -> int:
         if hasattr(args, "review_plan"):
             args.review_plan = False
         sys.stdout = sys.stderr
-    # A command whose positional is optional (`rpc`) parses it as one string;
-    # every consumer below expects a list of paths.
-    if isinstance(getattr(args, "paths", None), str):
-        args.paths = [args.paths]
+    # R2-BUG-02: resolve the project target exactly once, before any config
+    # or index work. An omitted optional positional (`rpc`/`acp`/`tui`) is
+    # NOT the same as an explicit ".": with `--root A` the target is A, never
+    # the caller's current directory. An explicit relative positional path is
+    # resolved against `--root` too, so `pdc rpc --root A` run from B can
+    # never index B's files into A's index.
+    root_arg = getattr(args, "root", None)
+    root_path = (Path(root_arg).expanduser().resolve()
+                 if root_arg else None)
     if getattr(args, "cmd", "") == "tui":
-        project = getattr(args, "project", ".") or "."
+        project = getattr(args, "project", None)
         if isinstance(project, (list, tuple)):
-            project = next((str(p) for p in project if p), ".")
+            project = next((str(p) for p in project if p), None)
+        if not project:
+            project = str(root_path) if root_path is not None else "."
+        elif root_path is not None and not Path(str(project)).is_absolute():
+            project = str((root_path / str(project)).resolve())
         args.project = str(project)
         args.paths = [args.project]
+    elif hasattr(args, "paths"):
+        # An optional positional (`rpc`/`acp`) parses as one string; every
+        # consumer below expects a list of paths.
+        paths = getattr(args, "paths", None)
+        if isinstance(paths, str):
+            paths = [paths]
+        if paths is None:
+            paths = [str(root_path)] if root_path is not None else ["."]
+        elif root_path is not None:
+            paths = [p if Path(str(p)).is_absolute()
+                     else str((root_path / str(p)).resolve()) for p in paths]
+        args.paths = paths
 
     # `pedacito rpc --describe` is a pure protocol-introspection command: no
     # model, config or index is needed (and none must be touched to print it).
