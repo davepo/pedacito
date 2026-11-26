@@ -96,6 +96,7 @@ def _child_env() -> dict[str, str]:
 def _git(root: Path, *args: str) -> str:
     proc_out = subprocess.run(
         ["git", "-C", str(root), *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
         timeout=60, check=True, shell=False)
     return proc_out.stdout.strip()
 
@@ -604,6 +605,7 @@ class TestGate07CrashRecovery:
         child = subprocess.Popen(
             [sys.executable, "-c", _CRASH_CHILD, str(REPO), str(root)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
             cwd=str(root), env=_child_env(), shell=False)
         try:
             line = child.stdout.readline().strip()
@@ -1037,9 +1039,11 @@ class TestGate12BilingualDocsAndI18nParity:
         for argv in (["--version"], ["rpc", "--describe"]):
             res = subprocess.run([sys.executable, "-m", "pedacito", *argv],
                                  capture_output=True, text=True, timeout=120,
+                                 encoding="utf-8", errors="replace",
                                  cwd=str(REPO), env=_child_env(), shell=False)
             assert res.returncode == 0, res.stderr
         described = subprocess.run([sys.executable, "-m", "pedacito", "rpc", "--describe"],
                                    capture_output=True, text=True, timeout=120,
+                                   encoding="utf-8", errors="replace",
                                    cwd=str(REPO), env=_child_env(), shell=False)
         assert json.loads(described.stdout)["protocol_version"] == "0.4.0"

@@ -404,7 +404,8 @@ def test_live_junction_not_relabeled_and_child_cannot_write_outside(tmp_path):
     (outside / "secret.txt").write_text("secret", encoding="utf-8")
     jn = proj / "jn"
     r = subprocess.run(["cmd", "/c", "mklink", "/J", str(jn), str(outside)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
     if r.returncode != 0 or not jn.exists():
         pytest.skip("cannot create NTFS junction (mklink unavailable)")
     env = dict(os.environ)

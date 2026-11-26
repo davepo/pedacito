@@ -782,12 +782,14 @@ def _run_nt(argv, *, cwd, env, timeout, idle_timeout, max_output,
     stopped = ""
     try:
         while True:
-            rc = child.poll()
-            if rc is not None:
-                break
+            # Cancellation wins over an already-reaped child: the caller may
+            # set the event and terminate the process between two polls.
             if cancel_event is not None and cancel_event.is_set():
                 child.terminate()
                 stopped = "cancelled"
+                break
+            rc = child.poll()
+            if rc is not None:
                 break
             now = time.monotonic()
             if timeout and now - started >= timeout:
@@ -801,6 +803,8 @@ def _run_nt(argv, *, cwd, env, timeout, idle_timeout, max_output,
                 stopped = "idle"
                 break
             time.sleep(0.02)
+        if not stopped and cancel_event is not None and cancel_event.is_set():
+            stopped = "cancelled"
         if not stopped:
             rc = child.wait(5.0)
             if rc is None:

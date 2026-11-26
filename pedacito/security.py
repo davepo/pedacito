@@ -345,7 +345,8 @@ def check_sensitive_write(
     if not (is_sensitive_path(target) or is_sensitive_path(raw_rel)
             or is_sensitive_path(resolved_rel)):
         return True, ""
-    message = f"refused to {action} sensitive file: {target or rel}"
+    message = (f"refused to {action} sensitive file "
+               f"(secrets/credentials): {target or rel}")
     if policy is None or not hasattr(policy, "evaluate"):
         return False, message
 

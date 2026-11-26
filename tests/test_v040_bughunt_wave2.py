@@ -226,7 +226,8 @@ def test_worktree_remove_deletes_the_branch_by_default(tmp_path, capsys):
 
     # Recreating starts from HEAD, not from a stale branch tip.
     clean = subprocess.run(["git", "status", "--porcelain"], cwd=root,
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
     assert clean.stdout.strip() == ""
     assert _create(root, "qa-wt") == 0
     assert "pedacito/qa-wt" in _branches(root)

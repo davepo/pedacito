@@ -300,12 +300,15 @@ def run(command, *, cwd, timeout: float | None = None,
     stopped = ""
     try:
         while True:
-            rc = p.poll()
-            if rc is not None:
-                break
+            # Cancellation wins over an already-dead child: SessionContext
+            # .cancel() sets the event AND terminates the subprocess, so the
+            # process can be reaped in the microseconds before this poll.
             if _cancel_requested_proc(cancel_event):
                 stopped = "cancelled"
                 terminate(p)
+                break
+            rc = p.poll()
+            if rc is not None:
                 break
             now = time.monotonic()
             if timeout and now - started >= timeout:
@@ -319,6 +322,9 @@ def run(command, *, cwd, timeout: float | None = None,
                 terminate(p)
                 break
             time.sleep(0.05)
+
+        if not stopped and _cancel_requested_proc(cancel_event):
+            stopped = "cancelled"
 
         try:
             rc = p.wait(timeout=10)

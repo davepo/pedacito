@@ -1,4 +1,4 @@
-﻿"""v0.4.0 bug-hunt wave 1 (WP-B4): TUI width wrapping, `/map` and `/files`,
+"""v0.4.0 bug-hunt wave 1 (WP-B4): TUI width wrapping, `/map` and `/files`,
 complete Spanish TUI strings, and Spanish deterministic `how` answers."""
 
 from __future__ import annotations

@@ -138,7 +138,8 @@ def test_crash_recovery_and_stale_lock_takeover(tmp_path):
     )
     p = subprocess.Popen(
         [sys.executable, "-c", code], cwd=str(repo),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace")
     try:
         line = p.stdout.readline() if p.stdout else ""
         assert "READY" in line
