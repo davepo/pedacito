@@ -2110,6 +2110,33 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
     do_apply = bool(apply) and not review
     cfg = agent.cfg
     root = agent.index.root
+    # Best-effort durable task journal (D7). Only apply-mode runs (which really
+    # write to disk) journal: a dry run / review leaves the tree byte-identical
+    # by contract, so it must not create `.pedacito/journal/...` either.
+    journal = None
+    if do_apply:
+        try:
+            from . import journal as journal_mod
+            sid = ""
+            try:
+                from . import session_ctx
+                sess = session_ctx.current_session()
+                if sess is not None:
+                    sid = str(sess.session_id)
+            except Exception:
+                pass
+            journal = journal_mod.TaskJournal(root, task, session_id=sid)
+            journal.append("task_start", task=(task or "")[:400])
+            try:
+                cfg._task_journal = journal
+            except Exception:
+                pass
+            try:
+                sess._task_journal = journal
+            except Exception:
+                pass
+        except Exception:
+            journal = None
     try:
         cfg._root = str(root)
     except Exception:
@@ -2122,9 +2149,27 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
                  on_event=on_event)
     try:
         loop.result.checkpoint_id = _take_checkpoint(checkpoint, ws, task)
+        if journal is not None and loop.result.checkpoint_id:
+            journal.append("checkpoint",
+                           checkpoint_id=loop.result.checkpoint_id)
         return loop.run()
     except Exception as exc:                      # the loop never raises
         loop.result.error = f"{type(exc).__name__}: {exc}"
         return loop._finalize(STOP_ERROR)
     finally:
+        if journal is not None:
+            try:
+                journal.append("step", turns=loop.result.turns,
+                               tool_calls=loop.result.tool_calls)
+                journal.append("model_call", calls=loop.model_calls)
+                if loop.result.changed_files:
+                    journal.append("edit",
+                                   files=loop.result.changed_files[:200])
+                journal.close(status="completed", ok=loop.result.ok)
+            except Exception:
+                pass
+            try:
+                cfg._task_journal = None
+            except Exception:
+                pass
         ws.close()

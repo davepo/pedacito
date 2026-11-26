@@ -45,6 +45,68 @@ from . import trajectories
 from .edits import Result, parse_edits
 from .llm import CancelledError, CircuitOpenError, LLMError
 
+
+# ---------------------------------------------------------------- task journal
+def _journal_open(root, cfg, task: str):
+    """Best-effort `TaskJournal` for this task, stored on ``cfg._task_journal``
+    (and on the bound session, so subprocess helpers can append too). Returns
+    the journal or None when the root is absent / read-only."""
+    try:
+        from . import journal as journal_mod
+        sid = ""
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                sid = str(sess.session_id)
+        except Exception:
+            pass
+        journal = journal_mod.TaskJournal(root, task, session_id=sid)
+        journal.append("task_start", task=(task or "")[:400])
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                sess._task_journal = journal
+        except Exception:
+            pass
+        return journal
+    except Exception:
+        return None
+
+
+def _journal_append(cfg, kind: str, **data) -> None:
+    """Append one journal record, silently swallowing any failure."""
+    journal = getattr(cfg, "_task_journal", None)
+    if journal is None:
+        return
+    try:
+        journal.append(kind, **data)
+    except Exception:
+        pass
+
+
+def _journal_close(cfg) -> None:
+    """Close (append task_end) and detach the task journal, best effort."""
+    journal = getattr(cfg, "_task_journal", None)
+    if journal is not None:
+        try:
+            journal.close(status="completed")
+        except Exception:
+            pass
+    try:
+        cfg._task_journal = None
+    except Exception:
+        pass
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None:
+            sess._task_journal = None
+    except Exception:
+        pass
+
+
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
 _TASK_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\]\s*(.*)$")
@@ -380,10 +442,15 @@ def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
         mode = checkpoint_mode(cfg)
         title = _task_title(task).strip()[:200] or "task"
         if phase == "pre":
-            return checkpoints_mod.ensure_pre_run_checkpoint(
+            entry = checkpoints_mod.ensure_pre_run_checkpoint(
                 root, f"baseline before {title}", mode=mode)
-        return checkpoints_mod.create_checkpoint(
-            root, title, mode=mode)
+        else:
+            entry = checkpoints_mod.create_checkpoint(
+                root, title, mode=mode)
+        if isinstance(entry, dict) and entry.get("id"):
+            _journal_append(cfg, "checkpoint", checkpoint_id=str(entry["id"]),
+                            phase=phase, mode=mode)
+        return entry
     except Exception as e:
         try:
             workspace.log_event(root, f"checkpoint skipped: {e}", "WARN")
@@ -1384,6 +1451,8 @@ def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
     rc, out, stopped, _ = proc_mod.run(
         command, cwd=root, timeout=timeout, shell=True, max_output=200_000,
         env=safety.child_env(cfg))
+    _journal_append(cfg, "subprocess", command=command, returncode=rc,
+                    stopped=stopped)
     if stopped == "timeout":
         return False, f"(verification timed out after {timeout}s)"
     if stopped == "error":
@@ -4514,6 +4583,16 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if images is not None:
         cfg._task_images = list(images)
     try:
+        journal = None
+        if bool(apply) and not review:
+            # A dry run / review leaves the tree byte-identical, so it must not
+            # create `.pedacito/journal/...` either.
+            journal = _journal_open(root, cfg, task)
+            if journal is not None:
+                try:
+                    cfg._task_journal = journal
+                except Exception:
+                    pass
         if _cancel_requested(cfg, client):
             _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
             raise CancelledError("Stopped by user; no further work was done.")
@@ -4651,6 +4730,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         _finish_capture(tr)
         return tr
     finally:
+        # Record the terminal journal entry before the deadline is cleared, so
+        # a task that ends (or crashes into this finally) is never left as an
+        # incomplete task for crash recovery.
+        _journal_close(cfg)
         # The task's wall-clock budget is over: clear the deadline so the next
         # task's (or a post-task summary refresh's) requests are not clamped
         # by a stale deadline.
@@ -5287,6 +5370,11 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
               + f", {stats['seconds']:.0f}s]", file=sys.stderr)
     _fire(cfg, root, "post_task", task=task[:300], applied=applied,
           files=changed, ok=ok_n, failed=len(results) - ok_n)
+    _journal_append(cfg, "step", steps=len(steps_log),
+                    title=_task_title(task)[:200])
+    if changed:
+        _journal_append(cfg, "edit", files=changed[:200])
+    _journal_append(cfg, "model_call", calls=int(stats.get("calls") or 0))
     return TaskResult(results, reply, applied, changed, idx, session,
                       steps_log, fabricated=fabricated_only,
                       backup_dir=backup_dir,

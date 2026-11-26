@@ -63,10 +63,42 @@ _DEFAULT_SERVERS = {
 }
 
 _CLIENTS_LOCK = threading.Lock()
-_CLIENTS: dict[tuple[str, str], LSPClient] = {}
+_CLIENTS: dict[tuple[str, str, str], LSPClient] = {}
 _EOF = object()
 _MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB frame cap
 _MAX_NOTES = 200
+_REGISTERED_SESSIONS: set[str] = set()
+
+
+def _sid() -> str:
+    """The bound session id ('' when no session is bound): the process-level
+    fallback key, so session-less callers share one client per (root, cmd)."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        return str(sess.session_id) if sess is not None else ""
+    except Exception:
+        return ""
+
+
+def _register_lsp_cleanup(sid: str) -> None:
+    """Register ONE lsp cleanup per session (idempotent), so cancelling a
+    session closes only ITS language-server clients."""
+    if not sid or sid in _REGISTERED_SESSIONS:
+        return
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return
+    if sess is None or sess.resource_registry is None:
+        return
+    _REGISTERED_SESSIONS.add(sid)
+    try:
+        sess.resource_registry.register(
+            "lsp", f"lsp:{sid}", lambda: close_session(sid))
+    except Exception:
+        _REGISTERED_SESSIONS.discard(sid)
 
 
 class LSPError(RuntimeError):
@@ -418,6 +450,22 @@ def close_all() -> None:
             pass
 
 
+def close_session(session_id: str) -> None:
+    """Close and forget every LSP client owned by one session, leaving the
+    clients of any sibling session untouched."""
+    sid = str(session_id)
+    with _CLIENTS_LOCK:
+        clients = [c for k, c in _CLIENTS.items() if k[0] == sid]
+        for key in [k for k in _CLIENTS if k[0] == sid]:
+            _CLIENTS.pop(key, None)
+    _REGISTERED_SESSIONS.discard(sid)
+    for c in clients:
+        try:
+            c.close()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 atexit.register(close_all)
 
 
@@ -428,7 +476,7 @@ def client_for(root, rel: str, cfg=None) -> LSPClient:
             f"no language server configured or found for {rel}. Install one "
             "(pyright-langserver/pylsp/typescript-language-server/"
             "rust-analyzer/gopls) or set lsp_servers in the profile.")
-    key = (str(Path(root).resolve()), " ".join(command))
+    key = (_sid(), str(Path(root).resolve()), " ".join(command))
     stale: LSPClient | None = None
     with _CLIENTS_LOCK:
         c = _CLIENTS.get(key)
@@ -452,6 +500,7 @@ def client_for(root, rel: str, cfg=None) -> LSPClient:
             prev.close()
         except (OSError, subprocess.SubprocessError):
             pass
+    _register_lsp_cleanup(key[0])
     return c
 
 

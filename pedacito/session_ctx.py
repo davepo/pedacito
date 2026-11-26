@@ -157,6 +157,12 @@ class SessionContext:
             self.root = Path(self.root)
         if not self.created_at:
             self.created_at = time.time()
+        if self.resource_registry is None:
+            # Lazy import: resources imports nothing from session_ctx, so this
+            # stays cycle-free even at first-import time.
+            from . import resources
+            self.resource_registry = resources.SessionResourceRegistry(
+                self.session_id)
 
     def cache(self, namespace: str) -> dict[Any, Any]:
         """Return a session-scoped cache dict for `namespace`."""
@@ -210,14 +216,24 @@ class SessionContext:
                     pass
 
         if registry is not None:
-            close_fn = getattr(registry, "close_all", None) or getattr(
-                registry, "close", None
-            )
-            if callable(close_fn):
+            # WP-4003: the deterministic cascade is `teardown_all` (priority
+            # grouped LIFO). Keep the WP-4001 `close_all`/`close` names as a
+            # fallback for any older or mocked registry.
+            teardown_fn = getattr(registry, "teardown_all", None)
+            if callable(teardown_fn):
                 try:
-                    report["resources_closed"] = close_fn()
+                    report["resources_closed"] = teardown_fn(reason=report["reason"])
                 except Exception:
                     pass
+            else:
+                close_fn = getattr(registry, "close_all", None) or getattr(
+                    registry, "close", None
+                )
+                if callable(close_fn):
+                    try:
+                        report["resources_closed"] = close_fn()
+                    except Exception:
+                        pass
 
         if bus is not None and not getattr(bus, "closed", False):
             emit_fn = getattr(bus, "emit", None)

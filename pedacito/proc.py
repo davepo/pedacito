@@ -138,18 +138,68 @@ def kill_tree(proc: subprocess.Popen) -> None:
     terminate(proc)
 
 
+def _register_subprocess(p: subprocess.Popen, command) -> str | None:
+    """Register the live Popen as a session `subprocess` resource (no-op when
+    no session is bound or the registry is absent). Returns the resource id."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return None
+    if sess is None or sess.resource_registry is None:
+        return None
+    label = " ".join(str(x) for x in command)[:120]
+    try:
+        return sess.resource_registry.register(
+            "subprocess", label, lambda: terminate(p))
+    except Exception:
+        return None
+
+
+def _unregister_subprocess(resource_id: str | None) -> None:
+    if not resource_id:
+        return
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None and sess.resource_registry is not None:
+            sess.resource_registry.unregister(resource_id)
+    except Exception:
+        pass
+
+
+def _cancel_requested_proc(cancel_event: threading.Event | None) -> bool:
+    """True when the explicit cancel_event or the bound session's is set."""
+    if cancel_event is not None and cancel_event.is_set():
+        return True
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None and sess.cancel_event.is_set():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def run(command, *, cwd, timeout: float | None = None,
         idle_timeout: float = 0, shell: bool = False,
         max_output: int = 8000, env: dict | None = None,
-        stdin_text: str | None = None
+        stdin_text: str | None = None,
+        cancel_event: threading.Event | None = None
         ) -> tuple[int | None, str, str, float]:
     """Run `command` and return (returncode, output, stopped, seconds).
 
     `timeout` is the hard wall-clock limit; `idle_timeout` stops the process
     after that many seconds with no output (0 disables it). `stopped` is one
-    of "", "idle", "timeout", or "error" (could not start). Output is combined
-    stdout+stderr, capped at about `max_output` characters by keeping the head
-    and the tail (test summaries and tracebacks end the output).
+    of "", "idle", "timeout", "cancelled", or "error" (could not start).
+    Output is combined stdout+stderr, capped at about `max_output` characters
+    by keeping the head and the tail (test summaries and tracebacks end the
+    output).
+
+    `cancel_event` is an optional ``threading.Event``; when it (or the bound
+    session's ``cancel_event``) is set the child is terminated and ``stopped``
+    reports "cancelled".
     """
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
@@ -169,6 +219,7 @@ def run(command, *, cwd, timeout: float | None = None,
             shell=shell, env=with_venv_path(env, cwd), **kwargs)
     except (OSError, ValueError) as e:
         return None, str(e), "error", time.monotonic() - started
+    resource_id = _register_subprocess(p, command)
     if stdin_text is not None and p.stdin is not None:
         def feed() -> None:
             try:
@@ -221,6 +272,10 @@ def run(command, *, cwd, timeout: float | None = None,
             rc = p.poll()
             if rc is not None:
                 break
+            if _cancel_requested_proc(cancel_event):
+                stopped = "cancelled"
+                terminate(p)
+                break
             now = time.monotonic()
             if timeout and now - started >= timeout:
                 stopped = "timeout"
@@ -244,6 +299,7 @@ def run(command, *, cwd, timeout: float | None = None,
                 rc = None
         reader.join(timeout=3)
     finally:
+        _unregister_subprocess(resource_id)
         if p.stdout is not None:
             try:
                 p.stdout.close()
