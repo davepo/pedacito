@@ -380,6 +380,13 @@ def _update_run(q, body=None):
                          "detail": "An upgrade is already running."}
         STATE.update_run["running"] = True
         info = STATE.update
+    root = _effective_root()
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="update", force=bool((body or {}).get("force")))
+    if not ok:
+        with STATE.lock:
+            STATE.update_run["running"] = False
+        return 409, {"ok": False, "detail": reason}
     started_worker = False
     try:
         if not update_mod.updates_enabled(cfg):
@@ -837,6 +844,10 @@ def _checkpoints_restore(q, body):
         files = [body.get("file")]
     if isinstance(files, str):
         files = [files]
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="restore", force=bool(body.get("force")))
+    if not ok:
+        return 409, {"ok": False, "detail": reason}
     try:
         workspace.acquire_lock(root)
     except workspace.ProjectBusy as e:
@@ -1412,6 +1423,11 @@ def _project_reset(q, body):
     dry_run = bool(body.get("dry_run"))
     keep_memory = bool(body.get("keep_memory"))
     keep_config = bool(body.get("keep_config"))
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="reset", force=bool(body.get("force")))
+        if not ok:
+            return 409, {"ok": False, "detail": reason}
     running = [str(r.get("name")) for r in processes.list_procs(root)
                if r.get("status") == "running"]
     stopped: list[str] = []
@@ -2059,6 +2075,11 @@ def _project_prune(q, body):
     keep_sessions = _int("keep_sessions", 0)
     keep_backups = _int("keep_backups", 0)
     dry_run = bool(body.get("dry_run"))
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="prune", force=bool(body.get("force")))
+        if not ok:
+            return 409, {"ok": False, "detail": reason}
     removed = workspace.prune(
         root, keep_sessions, keep_backups,
         int(getattr(cfg, "keep_events", 20) or 0),
@@ -2443,6 +2464,11 @@ def _rediff(q, body):
 
 @post("/api/restore")
 def _restore(q, body):
+    root = _effective_root()
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="restore", force=bool(body.get("force")))
+    if not ok:
+        return 409, {"ok": False, "detail": reason}
     ok, detail = jobs.restore_snapshot(str(body.get("snapshot", "")))
     return (200 if ok else 400), {"ok": ok, "detail": detail}
 

@@ -414,7 +414,9 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
         sleeper.kill()
         sleeper.wait()
     workspace.acquire_lock(tmp_path)            # holder is dead: taken over
-    assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
+    import json as _json
+    data = _json.loads(lock.read_text(encoding="utf-8"))
+    assert data["pid"] == os.getpid()
     workspace.release_lock(tmp_path)
     assert not lock.exists()
 

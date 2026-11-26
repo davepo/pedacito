@@ -18,10 +18,37 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 
 BOM = "\ufeff"
+
+# Windows transient `os.replace` failures (ERROR_ACCESS_DENIED=5 /
+# ERROR_SHARING_VIOLATION=32) come from an antivirus indexer or another
+# process holding a brief handle; a bounded exponential backoff retries them
+# instead of failing a write that would otherwise land cleanly.
+_OS_REPLACE_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.08)
+
+
+def _is_transient_replace_error(exc: OSError) -> bool:
+    if os.name != "nt":
+        return False
+    winerror = getattr(exc, "winerror", 0) or 0
+    return winerror in (5, 32) or exc.errno in (5, 32)
+
+
+def _os_replace(src: str | os.PathLike, dst: str | os.PathLike) -> None:
+    """``os.replace`` with a bounded retry on transient Windows errors."""
+    for delay in _OS_REPLACE_DELAYS:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if not _is_transient_replace_error(exc):
+                raise
+            time.sleep(delay)
+    os.replace(src, dst)   # final attempt; a real error propagates
 
 
 class TextStyle:
@@ -154,7 +181,7 @@ def write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = False,
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
         os.chmod(tmp, perm)
-        os.replace(tmp, p)
+        _os_replace(tmp, p)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -201,7 +228,7 @@ def copy_file_atomic(src: Path, dest: Path, *, follow_symlinks: bool = False) ->
     os.close(fd)
     try:
         shutil.copy2(str(src), tmp)
-        os.replace(tmp, p)
+        _os_replace(tmp, p)
     except BaseException:
         try:
             os.unlink(tmp)

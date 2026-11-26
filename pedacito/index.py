@@ -770,8 +770,8 @@ class Index:
             "chunks": [c.to_record() for c in self.chunks],
         }
         p = d / INDEX_FILE
-        fileio.write_bytes(
-            p, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        from . import workspace
+        workspace.atomic_update_json(p, lambda _old: payload, compact=True)
         return p
 
     @classmethod
@@ -889,15 +889,18 @@ def _load_cache(root: Path) -> dict:
 
 
 def _save_cache(root: Path, cache: dict) -> None:
-    """Persist the summary cache to .pedacito/summaries.json (atomic)."""
+    """Persist the summary cache to .pedacito/summaries.json (atomic, no lost
+    updates across concurrent summarisation workers)."""
     d = root / INDEX_DIR
     d.mkdir(exist_ok=True)
     p = _cache_path(root)
-    fileio.write_bytes(p, json.dumps(cache, indent=1).encode("utf-8"))
+    snapshot = dict(cache)
+    from . import workspace
+    workspace.atomic_update_json(p, lambda _old: snapshot)
     try:
         st = p.stat()
         with _cache_lock:
-            _cache_memo[str(p)] = ((st.st_mtime_ns, st.st_size), cache)
+            _cache_memo[str(p)] = ((st.st_mtime_ns, st.st_size), snapshot)
     except OSError:
         pass
 

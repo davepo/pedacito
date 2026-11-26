@@ -26,16 +26,17 @@ def test_restore_reports_only_snapshot_files(tmp_path):
 
 
 def test_acquire_lock_is_refcounted_across_threads(tmp_path):
-    """A lock held by one thread must not be unlinked by another thread in the
-    same process: the file survives until the LAST holder releases it."""
+    """A lock held by one thread (same session) must not be unlinked by
+    another thread in the same process: the file survives until the LAST
+    holder releases it."""
     lock = tmp_path / ".pedacito" / "run.lock"
     entered = threading.Barrier(2)
     release = threading.Barrier(2)
-    first = workspace.acquire_lock(tmp_path)
+    first = workspace.acquire_lock(tmp_path, session_id="ses-test")
     assert first == lock and lock.is_file()
 
     def second_thread():
-        workspace.acquire_lock(tmp_path)       # same process: refcount +1
+        workspace.acquire_lock(tmp_path, session_id="ses-test")  # same-session re-entry
         entered.wait()
         release.wait()
         workspace.release_lock(tmp_path)

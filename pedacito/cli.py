@@ -1864,6 +1864,11 @@ def _cmd_update(args) -> int:
         return 0
     if info["command"] is None:
         return 0                        # editable/source: instructions only
+    root = _root(args)
+    ok, reason = workspace.check_maintenance_safe(root, action="update")
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     print("Running: " + " ".join(info["command"]), file=sys.stderr)
     code = update_mod.run_upgrade(info["command"],
                                   on_line=lambda ln: print(ln, flush=True))
@@ -1955,13 +1960,20 @@ def _cmd_calibrate(args, cfg) -> int:
         print(modelcard.render(card))
         print(f"\nSaved to {path}.")
         return 0
-    client = LLMClient(cfg)
-    client.check()
-    _evict_other_local_servers(cfg)
-    client.warmup()
-    card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
-                               repeats=getattr(args, "repeats", None))
-    path = modelcard.save_card(card)
+    from . import leases
+    lease = leases.default_lease_manager().acquire(
+        "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+        priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
+    try:
+        client = LLMClient(cfg)
+        client.check()
+        _evict_other_local_servers(cfg)
+        client.warmup()
+        card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
+                                   repeats=getattr(args, "repeats", None))
+        path = modelcard.save_card(card)
+    finally:
+        lease.release()
     print()
     print(modelcard.render(card))
     print(f"\nSaved to {path}. Settings you left at their defaults now follow "
@@ -2029,6 +2041,10 @@ def _calibrate_all(args) -> int:
                 continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
+            from . import leases
+            lease = leases.default_lease_manager().acquire(
+                "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+                priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
             client = LLMClient(cfg)
             try:
                 client.check()
@@ -2048,6 +2064,7 @@ def _calibrate_all(args) -> int:
                       "  Skipping and continuing with remaining profiles.",
                       file=sys.stderr)
             finally:
+                lease.release()
                 llm_mod.unload_model(client)
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
@@ -2273,6 +2290,7 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     print(f"\nCalibrating {len(todo)} model(s) "
           f"({'quick' if quick else 'full'}); this can take a few minutes each.")
     done = 0
+    from . import leases
     try:
         for cfg in todo:
             if imagegen.profile_is_image_model(cfg):
@@ -2280,12 +2298,19 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
                 modelcard.save_card(card)
                 done += 1
                 continue
-            client = LLMClient(cfg)
-            client.check()
-            client.warmup()
-            card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
-            modelcard.save_card(card)
-            done += 1
+            lease = leases.default_lease_manager().acquire(
+                "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+                priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
+            try:
+                client = LLMClient(cfg)
+                client.check()
+                client.warmup()
+                card = modelcard.calibrate(client, cfg, verbose=True,
+                                           quick=quick)
+                modelcard.save_card(card)
+                done += 1
+            finally:
+                lease.release()
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
     except LLMError as e:
@@ -2499,6 +2524,11 @@ def _cmd_prune(args) -> int:
     """`pedacito prune`: retention for sessions, backups, events and log.txt."""
     root = _root(args)
     cfg = _light_config(args)
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="prune", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     keep_s = args.keep_sessions if args.keep_sessions is not None \
         else cfg.keep_sessions
     keep_b = args.keep_backups if args.keep_backups is not None \
@@ -2584,6 +2614,13 @@ def _cmd_reset(args) -> int:
     keep_memory = bool(getattr(args, "keep_memory", False))
     keep_config = bool(getattr(args, "keep_config", False))
     force = bool(getattr(args, "force", False))
+
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="reset", force=force)
+        if not ok:
+            print(f"ERROR: {reason}", file=sys.stderr)
+            return 2
 
     lock_held = False
     if not dry_run:
@@ -2701,6 +2738,11 @@ def _cmd_checkout(args) -> int:
     if not root.is_dir():
         print(f"checkout: no such project directory: {root}", file=sys.stderr)
         return 2
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="checkout", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     try:
         checkpoint_id = checkpoints_mod.resolve_id(root, args.id)
     except checkpoints_mod.CheckpointError as e:
@@ -2743,6 +2785,11 @@ def _cmd_undo(args) -> int:
         return 2
     if getattr(args, "list", False):
         return _cmd_checkpoints(args)
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="undo", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     result = checkpoints_mod.undo_last_run(root,
                                            force=bool(getattr(args, "force",
                                                               False)))
@@ -4823,6 +4870,14 @@ def _main(argv=None) -> int:
 
         if args.cmd == "restore":
             root = _root(args)
+            if not getattr(args, "list", False) \
+                    and not getattr(args, "dry_run", False):
+                ok, reason = workspace.check_maintenance_safe(
+                    root, action="restore",
+                    force=bool(getattr(args, "force", False)))
+                if not ok:
+                    print(f"ERROR: {reason}", file=sys.stderr)
+                    return 2
             cp_target = getattr(args, "checkpoint", None) \
                 or (getattr(args, "snapshot", None)
                     if str(getattr(args, "snapshot", None) or "").startswith("cp_")

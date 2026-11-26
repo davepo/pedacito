@@ -860,13 +860,21 @@ def _set_box(path: Path, task: str, box: str, notify=None) -> bool:
     a plan file the model edited mid-run still resolves. Returns False if the
     task could not be found. `notify(path, reason)`, when given, fires right
     after the file lands so a live GUI can refresh the checklist."""
-    lines = read_plan(path)
-    i = _find_unchecked(lines, task)
-    if i is None:
+    changed = [False]
+
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        i = _find_unchecked(lines, task)
+        if i is None:
+            return text
+        m = _TASK_LINE.match(lines[i])
+        lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
+        changed[0] = True
+        return "\n".join(lines)
+
+    workspace.atomic_update_text(path, updater)
+    if not changed[0]:
         return False
-    m = _TASK_LINE.match(lines[i])
-    lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
-    path.write_text("\n".join(lines), encoding="utf-8")
     if notify is not None:
         try:
             notify(path, "done" if box == "x" else "failed")
@@ -894,12 +902,20 @@ def insert_task_before(path: Path, task: str, new_title: str,
     first unchecked occurrence of ``task`` (the remediation path: the failed
     check stays unchecked and retries after the repair). Returns False when
     the anchor task is not found."""
-    lines = read_plan(path)
-    i = _find_unchecked(lines, task)
-    if i is None:
+    changed = [False]
+
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        i = _find_unchecked(lines, task)
+        if i is None:
+            return text
+        lines.insert(i, f"- [ ] {new_title}")
+        changed[0] = True
+        return "\n".join(lines)
+
+    workspace.atomic_update_text(path, updater)
+    if not changed[0]:
         return False
-    lines.insert(i, f"- [ ] {new_title}")
-    path.write_text("\n".join(lines), encoding="utf-8")
     if notify is not None:
         try:
             notify(path, "remediation")
@@ -995,7 +1011,7 @@ def write_plan(path: Path, goal: str, titles: list[str]) -> None:
         body += [f"> {ln}" if ln else ">" for ln in rest]
     body += ["", *(f"- [ ] {t}" for t in titles)]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    fileio.write_bytes(path, ("\n".join(body) + "\n").encode("utf-8"))
 
 
 def read_plan_goal(path: Path) -> str:
@@ -1213,19 +1229,22 @@ def order_by_dependencies(titles: list[str], deps: list[list[int]]) -> list[str]
 def replace_unchecked(path: Path, titles: list[str]) -> None:
     """Replace every still-unchecked task in a plan file with `titles`, keeping
     done/failed lines and the header (used when the planner revises the rest)."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    inserted = False
-    for ln in lines:
-        if _is_unchecked(ln):
-            if not inserted:
-                out += [f"- [ ] {t}" for t in titles]
-                inserted = True
-            continue
-        out.append(ln)
-    if not inserted:
-        out += [f"- [ ] {t}" for t in titles]
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        out: list[str] = []
+        inserted = False
+        for ln in lines:
+            if _is_unchecked(ln):
+                if not inserted:
+                    out += [f"- [ ] {t}" for t in titles]
+                    inserted = True
+                continue
+            out.append(ln)
+        if not inserted:
+            out += [f"- [ ] {t}" for t in titles]
+        return "\n".join(out) + "\n"
+
+    workspace.atomic_update_text(path, updater)
 
 
 def _titles_from(raw) -> list[str]:

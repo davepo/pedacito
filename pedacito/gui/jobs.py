@@ -811,10 +811,18 @@ def run_calibrate(job: Job, opts: dict) -> None:
     client.cancel_event = job.cancel_event
     with STATE.lock:
         job.client = client
-    client.check(warn=False)
-    client.warmup()
-    card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
-    path = modelcard.save_card(card)
+    from .. import leases as leases_mod
+    lease = leases_mod.default_lease_manager().acquire(
+        "gui-calibrate", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+        priority=leases_mod.LeasePriority.EXCLUSIVE, timeout_s=0.0,
+        cancel_event=job.cancel_event)
+    try:
+        client.check(warn=False)
+        client.warmup()
+        card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
+        path = modelcard.save_card(card)
+    finally:
+        lease.release()
     m = card.get("measured") or {}
     caps = ", ".join(
         f"{k[4:]}={'yes' if v else 'no' if v is False else '?'}"
@@ -901,6 +909,11 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
             client.cancel_event = job.cancel_event
             with STATE.lock:
                 job.client = client
+            from .. import leases as leases_mod
+            lease = leases_mod.default_lease_manager().acquire(
+                "gui-calibrate", cfg.base_url, cfg.model, cfg=cfg,
+                exclusive=True, priority=leases_mod.LeasePriority.EXCLUSIVE,
+                timeout_s=0.0, cancel_event=job.cancel_event)
             try:
                 client.check(warn=False)
                 client.warmup()
@@ -922,6 +935,7 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
                     f"{str(exc).splitlines()[0][:240]} \u2014 skipping and "
                     "continuing.", kind="error")
             finally:
+                lease.release()
                 llm_mod.unload_model(client)
     except (CancelledError, KeyboardInterrupt):
         pass                    # spawn's handler reports the stop
@@ -1224,6 +1238,13 @@ def run_task(job: Job, opts: dict) -> None:
     _set_pinned_refs(cfg, opts)
 
     _evict_other_servers(cfg)
+    sess = session_ctx.current_session()
+    sid = sess.session_id if sess is not None else "gui-default"
+    from .. import leases as leases_mod
+    lease = leases_mod.default_lease_manager().acquire(
+        sid, cfg.base_url, cfg.model, cfg=cfg,
+        priority=leases_mod.LeasePriority.NORMAL,
+        cancel_event=job.cancel_event)
     saved_steps = cfg.max_steps
     saved_creative = cfg.creative_mode
     saved_hybrid = (cfg.hybrid_routing, cfg.architect_provider,
@@ -1279,6 +1300,7 @@ def run_task(job: Job, opts: dict) -> None:
             feed.end_stream()
             _post_task_result(tr, client, reviewing)
     finally:
+        lease.release()
         cfg.max_steps = saved_steps
         cfg.creative_mode = saved_creative
         (cfg.hybrid_routing, cfg.architect_provider,
