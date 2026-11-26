@@ -1202,8 +1202,9 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
                           file=sys.stderr)
                 land(i, group, work(group))
         else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            from concurrent.futures import as_completed
+            from .session_ctx import ContextThreadPoolExecutor
+            with ContextThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(work, g): (i, g)
                         for i, g in enumerate(groups, 1)}
                 for fut in as_completed(futs):

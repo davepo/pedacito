@@ -38,7 +38,7 @@ from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir, suggest_context
 from . import jobs, settings_api
-from .core import (STATE, install_permission_broker, install_runner,
+from .core import (REGISTRY, STATE, install_permission_broker, install_runner,
                    install_tee, uninstall_permission_broker,
                    uninstall_runner, uninstall_tee)
 
@@ -2383,13 +2383,23 @@ def _answer(q, body):
 def _permission_decide(q, body):
     """Answer a live permission request: decision is one of allow_once,
     allow_run, allow_always, allow_project, deny. Unblocks the parked worker
-    thread."""
-    pid = str(body.get("id") or "")
+    thread. Accepts optional `session_id` (defaulting to the active GUI
+    session) and enforces `(session_id, request_id)` matching."""
+    pid = str(body.get("id") or body.get("request_id") or "")
     decision = str(body.get("decision") or "")
+    session_id = str(
+        body.get("session_id") or (q.get("session_id") or [""])[0] or ""
+    ).strip()
     if decision not in ("allow_once", "allow_run", "allow_always",
                         "allow_project", "deny"):
         return 400, {"ok": False, "detail": f"unknown decision {decision!r}"}
-    ok, detail = STATE.decide_permission(pid, decision)
+    if session_id:
+        target = REGISTRY.get(session_id, create=False)
+        if target is None:
+            return 409, {"ok": False, "detail": "session mismatch"}
+        ok, detail = target.decide_permission(pid, decision, session_id=session_id)
+    else:
+        ok, detail = STATE.decide_permission(pid, decision)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
@@ -3145,7 +3155,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             url = urlparse(self.path)
             query = parse_qs(url.query)
-            if url.path == "/events":
+            if url.path in ("/events", "/api/events"):
                 self._events(query)
                 return
             if url.path.startswith("/api/runner/preview/"):
@@ -3227,7 +3237,17 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(code, obj)
 
     def _events(self, query) -> None:
-        """Server-Sent Events: everything after `since` (or Last-Event-ID)."""
+        """Server-Sent Events: everything after `since` (or Last-Event-ID).
+        Accepts optional `?session_id=` (defaulting to the active GUI session)."""
+        session_id = str((query.get("session_id") or [""])[0] or "").strip()
+        if session_id:
+            target = REGISTRY.get(session_id, create=False)
+            if target is None:
+                self._json(404, {"ok": False, "detail": f"unknown session {session_id!r}"})
+                return
+            bus = target.bus
+        else:
+            bus = STATE.bus
         try:
             last = int(self.headers.get("Last-Event-ID")
                        or query.get("since", ["0"])[0])
@@ -3238,8 +3258,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._headers(200, "text/event-stream", None)
             self.wfile.write(b"retry: 1500\n\n")
             self.wfile.flush()
-            while not STATE.bus.closed:
-                events, resync = STATE.bus.wait(last, 15.0)
+            while not bus.closed:
+                events, resync = bus.wait(last, 15.0)
                 if resync:
                     self.wfile.write(b"event: resync\ndata: {}\n\n")
                     self.wfile.flush()

@@ -4047,15 +4047,26 @@ _PYTEST_EXIT_LABELS = {
 _RUN_TEST_RUNNER_CACHE: dict[str, list[str]] = {}
 
 
+def _test_runner_cache() -> dict[str, list[str]]:
+    """Session-scoped test-runner probe cache, with module fallback when no
+    SessionContext is bound."""
+    from . import session_ctx
+    sess = session_ctx.current_session()
+    if sess is not None:
+        return sess.cache("run_test_runner")
+    return _RUN_TEST_RUNNER_CACHE
+
+
 def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
     """Does this argv actually start pytest? Probed once per interpreter with
-    `--version` (a few milliseconds, capped and cached per root). A PATH
+    `--version` (a few milliseconds, capped and cached per session/root). A PATH
     `python -m pytest` from the repo's detected test command often points at
     a DIFFERENT interpreter than the one running pedacito -- typically a
     system python with no pytest installed -- so nothing is trusted sight
     unseen."""
+    cache = _test_runner_cache()
     key = str(Path(argv[0])) if argv else ""
-    hit = _RUN_TEST_RUNNER_CACHE.get(key)
+    hit = cache.get(key)
     if hit is not None:
         return True
     try:
@@ -4065,7 +4076,7 @@ def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
     except Exception:
         return False
     if rc == 0 and not stopped:
-        _RUN_TEST_RUNNER_CACHE[key] = argv
+        cache[key] = argv
         return True
     return False
 

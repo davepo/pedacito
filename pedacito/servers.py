@@ -45,13 +45,13 @@ import re
 import shlex
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 
 from . import safety
+from .session_ctx import ContextThreadPoolExecutor
 
 GIB = 1024 ** 3
 MEMINFO_PATH = Path("/proc/meminfo")
@@ -721,7 +721,7 @@ def list_server_states(config, timeout: float = PROBE_TIMEOUT) -> list[dict]:
     configured = configured_local_servers(config)
     if len(configured) <= 1:
         return [_probe_server(s, timeout=timeout) for s in configured]
-    with ThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
+    with ContextThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
         # executor.map yields results in submission order, not finish order.
         return list(pool.map(lambda s: _probe_server(s, timeout=timeout),
                              configured))

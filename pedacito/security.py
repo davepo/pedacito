@@ -58,9 +58,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable
 from urllib.parse import urlparse
 
-from . import fileio
+from . import fileio, session_ctx
 
 __all__ = [
     "CATEGORY_LABELS",
@@ -74,10 +75,12 @@ __all__ = [
     "DENIED_MESSAGE",
     "MCP_DENIED_MESSAGE",
     "OUTBOUND_MODES",
+    "PermissionRequest",
     "REDACTED_SECRET",
     "SensitiveFileFinding",
     "SecretFinding",
     "SecurityError",
+    "SessionPermissionBroker",
     "acknowledge_findings",
     "check_git_secret_hygiene",
     "clear_security_cache",
@@ -427,6 +430,327 @@ DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: Do not retry this action. "
 MCP_DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: MCP tool execution was "
                       "declined. Proceed using local repository tools only.]")
 
+@dataclass
+class PermissionRequest:
+    """One permission request scoped strictly to a single session."""
+
+    session_id: str
+    request_id: str
+    category: str
+    action_summary: str
+    detail: str
+    risk_level: str
+    reason: str
+    key: str
+    setting_key: str
+    suggested_pattern: str
+    project_root: str
+    created_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.request_id,
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "category": self.category,
+            "action_summary": self.action_summary,
+            "detail": self.detail,
+            "risk_level": self.risk_level,
+            "reason": self.reason,
+            "key": self.key,
+            "setting_key": self.setting_key,
+            "suggested_pattern": self.suggested_pattern,
+            "project_root": self.project_root,
+            "created_at": self.created_at,
+        }
+
+
+class SessionPermissionBroker:
+    """Isolated permission broker scoped strictly to one `session_id`.
+
+    Pending slots are keyed by `(session_id, request_id)`; `decide()` rejects
+    any mismatched `session_id` with `(False, "session mismatch")`.
+
+    When `approval_policy == "never"` or (`responder is None` and not
+    `interactive`), `request()` denies immediately without blocking and emits
+    a `permission_decision` event (`decision="deny"`,
+    `reason="non_interactive_or_policy_never"`).
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        responder: Callable[[PermissionRequest], tuple[bool, str] | None] | None = None,
+        timeout_s: float = 120.0,
+        approval_policy: str = "ask",  # "ask" | "never" | "auto-safe"
+        cancel_event: threading.Event | None = None,
+        event_bus: Any = None,
+        interactive: bool = False,
+    ) -> None:
+        self.session_id = str(session_id)
+        self._responder = responder
+        self.timeout_s = float(timeout_s)
+        self.approval_policy = str(approval_policy or "ask").strip().lower()
+        self._cancel_event = cancel_event
+        self._event_bus = event_bus
+        self._interactive = bool(interactive)
+        self._lock = threading.RLock()
+        self._slots: dict[tuple[str, str], dict[str, Any]] = {}
+        self._seq = 0
+        self._run_grants: set[tuple[str, str]] = set()
+        self._session_grants: set[tuple[str, str]] = set()
+
+    def _emit(self, kind: str, **fields: Any) -> None:
+        bus = self._event_bus
+        if bus is None:
+            sess = session_ctx.current_session()
+            if sess is not None and sess.session_id == self.session_id:
+                bus = sess.event_bus
+        if bus is not None:
+            emit_fn = getattr(bus, "emit", None)
+            if callable(emit_fn):
+                try:
+                    emit_fn(kind, **fields)
+                except Exception:
+                    pass
+
+    def _is_cancelled(self) -> bool:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            return True
+        sess = session_ctx.current_session()
+        if sess is not None and sess.session_id == self.session_id:
+            if sess.cancel_event.is_set():
+                return True
+        return False
+
+    def request(self, info: dict[str, Any]) -> tuple[bool, str]:
+        category = str(info.get("category") or CAT_SHELL)
+        detail = str(info.get("detail") or "")[:4000]
+        action_summary = str(info.get("action_summary") or "")
+        risk_level = str(info.get("risk_level") or "medium")
+        reason = str(info.get("reason") or "")
+        key = str(info.get("key") or detail or "")[:500]
+        setting_key = str(info.get("setting_key") or "")
+        suggested_pattern = str(info.get("suggested_pattern") or "")
+        if not suggested_pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
+            suggested_pattern = suggest_shell_pattern(detail)
+        project_root = normalize_project_root(info.get("project_root") or "")
+
+        with self._lock:
+            if (category, key) in self._run_grants or (category, key) in self._session_grants:
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id="",
+                    category=category,
+                    key=key,
+                    decision="allow",
+                    reason="cached_grant",
+                )
+                return True, ""
+
+        if self.approval_policy == "auto-safe" and risk_level.strip().lower() == "low":
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                category=category,
+                key=key,
+                decision="allow",
+                reason="policy_auto_safe",
+            )
+            return True, ""
+
+        if self.approval_policy == "never" or (
+            self._responder is None and not self._interactive
+        ):
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                category=category,
+                key=key,
+                decision="deny",
+                reason="non_interactive_or_policy_never",
+            )
+            return False, DENIED_MESSAGE
+
+        with self._lock:
+            self._seq += 1
+            request_id = f"perm-{self._seq}"
+            req = PermissionRequest(
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                action_summary=action_summary,
+                detail=detail,
+                risk_level=risk_level,
+                reason=reason,
+                key=key,
+                setting_key=setting_key,
+                suggested_pattern=suggested_pattern,
+                project_root=project_root,
+                created_at=time.time(),
+            )
+            slot_key = (self.session_id, request_id)
+            slot: dict[str, Any] = {
+                "event": threading.Event(),
+                "decision": "",
+                "message": "",
+                "req": req,
+            }
+            self._slots[slot_key] = slot
+
+        self._emit("permission_request", **req.to_dict())
+
+        if self._responder is not None:
+            try:
+                res = self._responder(req)
+            except Exception:
+                with self._lock:
+                    self._slots.pop(slot_key, None)
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    category=category,
+                    key=key,
+                    decision="deny",
+                    reason="responder_error",
+                )
+                return False, DENIED_MESSAGE
+            if res is not None:
+                with self._lock:
+                    self._slots.pop(slot_key, None)
+                allowed, message = bool(res[0]), str(res[1] or "")
+                if not allowed and not message:
+                    message = DENIED_MESSAGE
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    category=category,
+                    key=key,
+                    decision="allow" if allowed else "deny",
+                    reason="responder",
+                )
+                return allowed, message
+
+        deadline = time.monotonic() + max(0.0, self.timeout_s)
+        while not slot["event"].wait(0.05):
+            if self._is_cancelled() or time.monotonic() >= deadline:
+                break
+
+        with self._lock:
+            self._slots.pop(slot_key, None)
+            decision = str(slot.get("decision") or "").strip().lower()
+            message = str(slot.get("message") or "")
+
+        if decision in ("allow", "allow_once", "once"):
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+        if decision in ("allow_run", "run"):
+            with self._lock:
+                self._run_grants.add((category, key))
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+        if decision in ("allow_always", "allow_project", "always"):
+            with self._lock:
+                self._session_grants.add((category, key))
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+
+        deny_reason = (
+            "cancelled"
+            if (not decision and self._is_cancelled())
+            else ("timeout" if not decision else "denied")
+        )
+        self._emit(
+            "permission_decision",
+            session_id=self.session_id,
+            request_id=request_id,
+            category=category,
+            key=key,
+            decision="deny",
+            reason=deny_reason,
+        )
+        return False, message or DENIED_MESSAGE
+
+    def decide(
+        self, session_id: str, request_id: str, decision: str
+    ) -> tuple[bool, str]:
+        """Resolve a pending permission slot strictly matching `(session_id, request_id)`."""
+        if str(session_id) != self.session_id:
+            return False, "session mismatch"
+        slot_key = (self.session_id, str(request_id))
+        with self._lock:
+            slot = self._slots.get(slot_key)
+            if slot is None:
+                return False, "This permission request is no longer pending."
+            slot["decision"] = str(decision or "deny")
+            self._slots.pop(slot_key, None)
+        slot["event"].set()
+        return True, ""
+
+    def pending(self) -> list[dict[str, Any]]:
+        """Return currently pending requests for this session, oldest first."""
+        with self._lock:
+            ordered = sorted(
+                self._slots.values(), key=lambda s: s["req"].created_at
+            )
+            return [s["req"].to_dict() for s in ordered]
+
+    def deny_all(self, reason: str = "session closed") -> int:
+        """Deny and release every pending request in this session."""
+        with self._lock:
+            slots = list(self._slots.values())
+            self._slots.clear()
+        for slot in slots:
+            slot["decision"] = "deny"
+            slot["message"] = DENIED_MESSAGE
+            slot["event"].set()
+        if slots:
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                decision="deny",
+                reason=str(reason or "session closed"),
+                count=len(slots),
+            )
+        return len(slots)
+
+    def clear_run_grants(self) -> None:
+        """Clear run-scoped (`allow_run`) grants for this session."""
+        with self._lock:
+            self._run_grants.clear()
+
+
 _hook = None
 _hook_lock = threading.Lock()
 
@@ -453,7 +777,10 @@ def permission_handler():
 
 
 def permission_broker_active() -> bool:
-    """True while an interactive broker is installed (a GUI is listening)."""
+    """True while a session permission broker or legacy interactive hook is active."""
+    sess = session_ctx.current_session()
+    if sess is not None and sess.permission_broker is not None:
+        return True
     return _hook is not None
 
 
@@ -473,11 +800,9 @@ def request_permission(category: str, action_summary: str, detail: str = "",
     shell/test requests without an explicit suggestion get one derived from
     `detail` when it is safe to persist.
 
-    With no broker installed this answers `(False, DENIED_MESSAGE)` -- callers
-    check `permission_broker_active()` first and keep their own historical
-    error text for the CLI, so this fallback only fires on an uninstall race,
-    which must deny in the safe direction."""
-    hook = _hook
+    Consults `current_session().permission_broker` first, falling back to the
+    legacy global hook. With neither active this answers
+    `(False, DENIED_MESSAGE)`."""
     pattern = str(suggested_pattern or "")
     if not pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
         pattern = suggest_shell_pattern(detail)
@@ -490,6 +815,18 @@ def request_permission(category: str, action_summary: str, detail: str = "",
             "setting_key": str(setting_key or ""),
             "suggested_pattern": pattern,
             "project_root": normalize_project_root(project_root)}
+    sess = session_ctx.current_session()
+    if sess is not None and sess.permission_broker is not None:
+        try:
+            allowed, message = sess.permission_broker.request(info)
+        except Exception:
+            return False, DENIED_MESSAGE
+        allowed = bool(allowed)
+        message = str(message or "")
+        if not allowed and not message:
+            message = DENIED_MESSAGE
+        return allowed, message
+    hook = _hook
     if hook is None:
         return False, DENIED_MESSAGE
     try:
@@ -1104,7 +1441,17 @@ def _ack_key(root) -> str:
         return str(root)
 
 
-_SESSION_ACK: dict[str, set[str]] = {}
+def _session_ack_key(root) -> tuple[str, str] | str:
+    """Scope in-memory acknowledgments by `(session_id, resolved_root)` when a
+    `SessionContext` is active, falling back to `resolved_root` otherwise."""
+    root_key = _ack_key(root)
+    sess = session_ctx.current_session()
+    if sess is not None and sess.session_id:
+        return (sess.session_id, root_key)
+    return root_key
+
+
+_SESSION_ACK: dict[tuple[str, str] | str, set[str]] = {}
 _ACK_LOCK = threading.RLock()
 
 
@@ -1140,8 +1487,8 @@ def _read_ack_file(root) -> set[str]:
 
 
 def load_acknowledged_fingerprints(root) -> set[str]:
-    """Disk acknowledgments for `root` plus this process's session set."""
-    key = _ack_key(root)
+    """Disk acknowledgments for `root` plus this session's in-memory set."""
+    key = _session_ack_key(root)
     with _ACK_LOCK:
         session = set(_SESSION_ACK.get(key, set()))
     disk = _read_ack_file(root) if root is not None else set()
@@ -1153,10 +1500,10 @@ def acknowledge_findings(root, fingerprints) -> set[str]:
 
     Returns the workspace's full acknowledged set. A missing/unwritable
     `.pedacito` is non-fatal: the in-memory session set still suppresses
-    the warning for the rest of this process.
+    the warning for the rest of this session.
     """
     wanted = _normalise_fingerprints(fingerprints)
-    key = _ack_key(root)
+    key = _session_ack_key(root)
     # One lock covers the session set and the file so two threads answering
     # the same preflight cannot lose each other's fingerprints.
     with _ACK_LOCK:
