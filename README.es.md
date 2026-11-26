@@ -39,6 +39,19 @@ Primero inicia un servidor de modelos (LM Studio, Ollama, Lemonade o llama.cpp).
 > ¿Prefieres español? Usa el selector `EN | ES` en la barra superior de la GUI, presiona `F3` en la TUI o ejecuta
 > `pdc --lang es gui`. Consulta [Idioma y localización](docs/es/CONFIG.md#idioma-y-localización-language-llm_reply_language).
 
+## Novedades de la v0.4.0
+
+| Función | Qué obtienes | Más información |
+|---|---|---|
+| **Sesiones aisladas** | Las sesiones concurrentes de un mismo proceso no comparten configuración, índice, eventos, permisos ni presupuestos | [ARCHITECTURE.md](docs/es/ARCHITECTURE.md#aislamiento-de-sesiones-daemon-y-subagentes-paralelos-v040) |
+| **Modos de permisos y aprobaciones** | `permission_mode` (plan, ask, accept-edits, workspace-write, danger) y `approval_policy`; el `.pedacito/policy.toml` de un proyecto solo restringe, y solo si el proyecto es de confianza | [SECURITY.md](docs/es/SECURITY.md#higiene-de-artefactos-sensibles-confianza-de-política-y-aprobaciones-v040) |
+| **Sandbox de Windows** | Los comandos se ejecutan en un Job Object con token restringido (`win_restricted`); las ejecuciones desatendidas sin sandbox se rechazan | [SECURITY.md](docs/es/SECURITY.md#pilar-3-ejecución-con-mínimos-privilegios) |
+| **Daemon de sesiones** | `pedacito daemon` es un servicio de loopback protegido por token con repetición de eventos por sesión | [USAGE.md](docs/es/USAGE.md#la-cli-de-un-vistazo) |
+| **Subagentes paralelos** | `subagent_max_parallel` acota los subagentes concurrentes; los roles de solo lectura siguen siendo de solo lectura | [CONFIG.md](docs/es/CONFIG.md) |
+| **Manifiesto de paquete** | `pedacito-package.toml` declara lo que necesita un paquete de extensión o habilidad | [SKILLS_AND_TOOLS.md](docs/es/SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml) |
+
+Notas completas: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
+
 ## Novedades de la v0.3.3
 
 | Función | Qué obtienes | Más información |

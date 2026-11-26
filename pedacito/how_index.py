@@ -72,6 +72,12 @@ _ES_SYNONYMS = {
     "seguridad": ("security", "sandbox", "permissions"),
     "memoria": ("memory", "vram", "gpu", "context"),
     "lento": ("slow", "performance", "context"),
+    "politica": ("policy", "permission", "permissions", "permission_mode",
+                 "approval_policy", "sandbox", "security"),
+    "politicas": ("policy", "permission", "permissions", "policy_file"),
+    "permisos": ("permission", "permissions", "permission_mode"),
+    "permiso": ("permission", "permissions", "permission_mode"),
+    "aprobacion": ("approval", "approve", "approval_policy"),
 }
 
 
@@ -154,6 +160,10 @@ _PHRASE_HINTS = {
     "mention file": ("@", "files"),
     "small model": ("small", "budget"),
     "small models": ("small", "budget"),
+    "permission mode": ("permission_mode", "permission"),
+    "permission modes": ("permission_mode", "permission"),
+    "approval policy": ("approval_policy", "approval"),
+    "policy file": ("policy_file", "policy"),
 }
 
 
@@ -3606,11 +3616,13 @@ _SETTING_KEYWORDS = {
     "sandbox": ["sandbox", "bubblewrap", "safety", "isolated commands"],
     "permission_mode": ["permission mode", "policy", "approval mode",
                         "capability", "read only mode", "plan mode",
-                        "accept edits", "workspace write", "danger"],
+                        "accept edits", "workspace write", "danger",
+                        "permission", "permissions", "politica"],
     "approval_policy": ["approval policy", "approval", "auto-safe",
-                        "auto safe", "never ask", "unattended"],
+                        "auto safe", "never ask", "unattended", "headless",
+                        "approve"],
     "policy_file": ["policy file", "policy.toml", "capability policy",
-                    "permission policy", "trust"],
+                    "permission policy", "trust", "politica"],
     "subagent_max_parallel": ["parallel subagents", "subagent parallel",
                               "subagent concurrency"],
     "daemon_port": ["daemon port", "background daemon port"],

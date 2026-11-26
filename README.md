@@ -39,6 +39,19 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 > Prefer Spanish? Use the `EN | ES` switcher in the GUI top bar, press `F3` in the TUI, or run
 > `pdc --lang es gui`. See [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language).
 
+## What's new in v0.4.0
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Isolated sessions** | Concurrent sessions in one process share no config, index, events, permissions or budgets | [ARCHITECTURE.md](docs/ARCHITECTURE.md#v040-session-isolation-daemon-and-parallel-subagents) |
+| **Permission modes & approvals** | `permission_mode` (plan, ask, accept-edits, workspace-write, danger) and `approval_policy`; a project's `.pedacito/policy.toml` only narrows, and only when trusted | [SECURITY.md](docs/SECURITY.md#sensitive-artifacts-policy-trust-and-approvals-v040) |
+| **Windows sandbox** | Commands run in a Job Object with a restricted token (`win_restricted`); unattended runs without a sandbox are refused | [SECURITY.md](docs/SECURITY.md#pillar-3-least-privilege-execution) |
+| **Session daemon** | `pedacito daemon` is a token-protected loopback service with per-session event replay | [USAGE.md](docs/USAGE.md#the-cli-at-a-glance) |
+| **Parallel subagents** | `subagent_max_parallel` bounds concurrent subagents; read-only roles stay read-only | [CONFIG.md](docs/CONFIG.md) |
+| **Package manifest** | `pedacito-package.toml` declares what an extension or skill package needs | [SKILLS_AND_TOOLS.md](docs/SKILLS_AND_TOOLS.md#package-manifests-pedacito-packagetoml) |
+
+Full notes: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
+
 ## What's new in v0.3.3
 
 | Feature | What you get | Read more |

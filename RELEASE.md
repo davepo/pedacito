@@ -4,13 +4,13 @@ This is the checklist for cutting a Pedacito (`pdc`) release. It covers the
 two-file version contract, the pre-flight gates, and the merge → tag → build →
 publish sequence.
 
-## Current release: v0.3.3
+## Current release: v0.4.0
 
 | Item | State |
 |---|---|
-| Release branch | `v0.3.3-dev` (all v0.3.3 work packages merged; docs and locales synced, release verification pending) |
-| Version in the tree | `0.3.3` in `pyproject.toml` and `pedacito/__init__.py` |
-| CHANGELOG | `## v0.3.3 — 2026-11-25` lists every v0.3.3 feature and fix |
+| Release branch | `v0.4.0-dev` (Session Foundation, isolation contract, policy engine, Windows sandbox, daemon, parallel subagents and package manifest; the acceptance gates in `tests/test_v040_acceptance_gates.py` and the bilingual docs are complete, release verification pending) |
+| Version in the tree | `0.4.0` in `pyproject.toml` and `pedacito/__init__.py` |
+| CHANGELOG | `## v0.4.0 — 2026-11-26` lists every v0.4.0 feature |
 | Merged to `main`, tagged, built for upload, or published | No. Each of these happens only after the release is approved (steps 1, 5, 6 and 9 below) |
 
 Check PyPI and `git tag --list` before quoting what is published. This file

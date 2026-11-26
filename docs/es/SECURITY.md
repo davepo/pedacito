@@ -297,7 +297,24 @@ Los comandos que el modelo hace ejecutar (`run`, y los comandos de prueba usados
 |---|---|---|
 | Linux | `bwrap` (bubblewrap) | Espacios de nombres de usuario sin privilegios, sin ayudante setuid |
 | macOS | `sandbox-exec` (Seatbelt) | Un perfil generado aplicado al proceso hijo |
-| Windows | ninguno | Los comandos se ejecutan sin sandbox, con un solo aviso |
+| Windows | `win_restricted` (Job Object + token restringido) | Integrado desde v0.4.0; ver abajo |
+
+**Sandbox de Windows (`win_restricted`, v0.4.0).** `pedacito/sandbox_win.py` ejecuta el
+proceso hijo dentro de un Job Object de Windows y de un token restringido con integridad
+baja (`ctypes`, cargado de forma diferida tras `os.name == "nt"`; sin paquetes de terceros).
+El job está configurado para terminar todos los procesos al cerrarse, así que un comando
+cancelado, con tiempo agotado o caído se lleva consigo todo su árbol de procesos, y Pedacito
+espera al hijo antes de borrar cualquier directorio temporal. Al arrancar, Pedacito prueba el
+backend con un proceso hijo real que no hace nada; si fallan el Job Object, el token
+restringido o el lanzamiento del hijo, el backend figura como `unavailable` y nunca se
+anuncia como activo. `sandbox.status()` devuelve `active`, `unavailable` u `off`. La red sigue
+a `sandbox_network`, y `sandbox = false` desactiva por completo el envoltorio.
+
+**Puerta dura para ejecución desatendida (D14).** Los modos `workspace-write` y `danger`
+desatendidos, las tareas en segundo plano y `approval_policy = "never"` con `sandbox`
+activo deben ejecutarse dentro de un sandbox del sistema operativo activo. Si no hay backend,
+lanzan `SandboxRefused` y el comando no se ejecuta. Las ejecuciones interactivas `ask` no
+quedan bloqueadas por la puerta, pero sí usan el sandbox cuando existe.
 
 Los argumentos de `bwrap` en Linux ofrecen las siguientes garantías:
 
@@ -625,6 +642,39 @@ credencial sin forma conocida aún puede sobrevivir a la redacción: el mismo
 - [ ] `record_trajectories` está activado solo donde estés dispuesto a conservar localmente los prompts completos.
 - [ ] Nunca ejecutas Pedacito como root.
 
+## Higiene de artefactos sensibles, confianza de política y aprobaciones (v0.4.0)
+
+**Higiene de artefactos sensibles (D10).** El material de credenciales nunca sale del proyecto por
+los almacenes propios de Pedacito. La puerta compartida, `security.check_sensitive_write`, rechaza
+variantes de `.env`, `id_rsa*`, `*.pem`, `*.key`, `*.p12`, `credentials.json` y los demás nombres de
+`security.SENSITIVE_NAMES` y `SENSITIVE_PATTERNS`, además de los directorios tipo `~/.ssh`. Se aplica en
+ambos motores: el motor de dos fases (`edits.apply_edits`, `tools.tool_write`) y el motor intercalado
+(`workspace_overlay.VirtualWorkspace`) rechazan las mismas escrituras con el mismo mensaje. Ninguno de
+estos almacenes contiene nunca los bytes de un archivo sensible:
+
+- checkpoints, instantáneas de ratchet y copias de respaldo (`fileio.backup_copy` rechaza y no crea nada);
+- espejos de ejecución en seco (`VirtualWorkspace.exec_root`);
+- diffs de revisión, páginas de revisión y vistas previas JSON de la GUI. Los tokens incrustados se
+  redactan como `[REDACTED]` en el HTML y las filas de revisión, pero el texto que se aplica no cambia.
+
+Los nombres de plantilla y de clave pública siguen siendo utilizables: `.env.example`, `.env.sample`,
+`.env.template` e `id_rsa.pub` no se tratan como secretos.
+
+**Confianza del archivo de política (`.pedacito/policy.toml`).** El archivo de política de un proyecto
+puede restringir lo que el agente puede hacer, pero no ampliarlo. El archivo solo se lee si el proyecto
+es de confianza (`pedacito trust PROYECTO`). Un archivo no confiable se ignora por completo, así que su
+`permission_mode` o `approval_policy` nunca surte efecto. El motor de políticas (`pedacito/policy.py`)
+resuelve cada capacidad según el modo de permisos y la política de aprobación, y un subagente recibe un
+`child_policy()` que solo puede intersectar con su padre, nunca añadir.
+
+**Modos de permisos y aprobaciones.** `permission_mode` es uno de `plan` (solo lectura), `ask` (cada
+capacidad que muta pide aprobación), `accept-edits` (las escrituras de archivos son automáticas y el resto
+pide aprobación), `workspace-write` (escrituras y ejecuciones automáticas dentro del sandbox) y `danger`
+(todo es automático). `approval_policy` es `ask`, `never` (una solicitud se deniega de inmediato, con un
+evento `permission_decision`) o `auto-safe` (`pytest`, `ruff`, `git status` y `git diff` se aprueban; lo
+demás pide aprobación). Las sesiones en segundo plano y sin interfaz se deniegan de forma determinista en
+lugar de esperar a una persona.
+
 ## Límites conocidos y brechas
 
 Estos son límites reales. Léelos antes de depender de Pedacito para código no confiable.
@@ -647,8 +697,11 @@ Estos son límites reales. Léelos antes de depender de Pedacito para código no
 - **Los servidores de desarrollo, el navegador, LSP y los servidores MCP no están en sandbox.** Reciben un
   entorno depurado, rutas protegidas, listas permitidas y avisos de confianza. Un servidor que configuras es un
   programa que elegiste ejecutar.
-- **Windows no tiene sandbox.** Los comandos se ejecutan sin sandbox tras un aviso, o se rechazan con
-  `sandbox_strict = true`.
+- **El sandbox de Windows es a nivel de proceso, no un contenedor.** `win_restricted` usa un Job Object
+  y un token restringido de integridad baja. No aísla el sistema de archivos como lo haría una VM o un
+  AppContainer, así que un comando aún puede leer lo que el usuario puede leer. Cuando el backend no está
+  disponible, los comandos interactivos se ejecutan sin sandbox tras un aviso, y las ejecuciones desatendidas
+  se rechazan (ver la puerta dura de arriba).
 - **Los entornos de contenedores y CI pueden deshabilitar el sandbox.** Si los espacios de nombres de usuario están desactivados,
   Pedacito recurre a la alternativa descrita en el Pilar 3.
 - **Los checkpoints no son a prueba de manipulación evidente.** Consulta el Pilar 4.

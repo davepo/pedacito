@@ -951,6 +951,105 @@ respaldos y archivos de eventos más recientes y recorta `log.txt`.
   recomendaciones se buscan con `i18n.t`, así que `pedacito --lang es profiles` imprime etiquetas en
   español. El inglés sigue siendo el predeterminado.
 
+## Aislamiento de sesiones, daemon y subagentes paralelos (v0.4.0)
+
+v0.4.0 permite que varias sesiones se ejecuten en un mismo proceso, o detrás de `pedacito daemon`,
+sin compartir estado de ejecución. El contrato siguiente reúne las reglas que los criterios de
+aceptación de `tests/test_v040_acceptance_gates.py` demuestran de extremo a extremo.
+
+### El contrato de aislamiento de sesiones
+
+| ID | Regla | Dónde vive |
+|---|---|---|
+| D5 | Los servidores de modelos locales se comparten mediante arrendamientos; nunca se desalojan bajo una sesión activa | `leases.py` |
+| D6 / D15 | El estado del proyecto está protegido por un bloqueo, y el mantenimiento espera a las sesiones y daemons activos | `workspace.py` |
+| D7 | Cada tarea escribe un diario de escritura anticipada (WAL) duradero que sobrevive a un fallo | `journal.py` |
+| D8 | Una sesión que usa un worktree tiene su propia rama y directorio; un árbol sucio se rechaza, se transporta o se guarda en stash, nunca se mezcla en silencio | `worktree.py` |
+| D9 | El enrutamiento de revisiones y la cola de revisión pertenecen a una sola sesión | `review.py`, `session_ctx.py` |
+| D10 | Los artefactos sensibles nunca llegan a checkpoints, ratchet, copias de respaldo, espejos ni revisiones | `security.py`, `edits.py`, `workspace_overlay.py` |
+| D11-D12 | El protocolo de sesión lleva su versión y sus funciones por sesión | `rpc.py`, `daemon.py` |
+| D13 | Cancelar una sesión ejecuta una cascada determinista solo sobre sus propios recursos | `resources.py`, `session_ctx.py` |
+| D14 | La ejecución desatendida se realiza dentro de un sandbox del sistema operativo o se rechaza | `sandbox.py`, `sandbox_win.py` |
+
+Dos notas sobre la numeración. Los números D son las etiquetas de paquete de trabajo que usan el
+código y las pruebas; algunos (D1-D4) los usan otras áreas de prueba para trabajo no relacionado y no
+forman parte de este contrato. La suite de criterios es la definición ejecutable del contrato.
+
+### SessionContext y propagación de contexto
+
+Un `SessionContext` (`session_ctx.py`) posee todo lo que modifica una sesión: su clon de `cfg`, `idx`,
+`client`, `event_bus`, `permission_broker`, `model_lease`, `budget_ledger`, `worktree`, `policy`,
+`review_queue`, `resource_registry`, `run_telemetry` y los espacios de `tool_caches`. El contexto activo
+es un valor de `contextvars`. `use_session(ctx)` lo enlaza para un bloque,
+`spawn_thread_with_context(...)` inicia un hilo con una copia del contexto del llamador, y
+`ContextThreadPoolExecutor` copia el contexto en cada `submit`. Los hilos iniciados desde una sesión
+ven solo esa sesión, y las tareas concurrentes nunca compiten por el presupuesto, la telemetría o la caché
+de otra.
+
+### Eventos, permisos y el daemon
+
+`SessionEventBus` (`events.py`) es un flujo monótono por sesión con `replay(after_seq)` acotado. Cada
+envoltorio lleva su `session_id` y su `seq`. Los eventos también se escriben en el registro JSONL de la
+raíz, en `<raíz>/.pedacito/events/`, etiquetados de la misma forma. `SessionPermissionBroker`
+(`security.py`) indexa las solicitudes pendientes por `(session_id, request_id)`: una decisión de otra
+sesión se rechaza con `session mismatch`. Una solicitud no interactiva o con `approval_policy = "never"`
+se deniega de inmediato y emite un evento `permission_decision`.
+
+`DaemonServer` (`daemon.py`) es un servicio HTTP/SSE solo de loopback que posee `WorkspaceSession`s
+aisladas. Cada ruta está limitada a un id de sesión: `/v1/sessions/<id>/events`, `/prompt`, `/cancel`,
+`/permission` y `/review`. Cada solicitud necesita el token portador de la ejecución. El hook `quiesce`
+del daemon hace que `check_maintenance_safe` rechace `reset` y `prune` mientras una sesión del daemon esté
+activa.
+
+### ModelLeaseManager
+
+Los modelos locales son un recurso compartido y costoso. `ModelLeaseManager` (`leases.py`) concede un
+arrendamiento por `(servidor, modelo)`. Un arrendamiento marca su modelo como en uso: `can_evict()` es
+False mientras haya algún arrendamiento activo, y `servers.evict_other_local_servers()` omite los modelos
+arrendados, así que el modelo de una sesión nunca se descarga bajo ella. Una sesión que necesita otro
+modelo local espera en cola. Un arrendamiento `exclusive=True` (por ejemplo `calibrate`, con
+`LeasePriority.EXCLUSIVE`) vacía primero los arrendamientos activos y luego se ejecuta, sin desplazar a una
+sesión que ya está en marcha. Los endpoints alojados no pasan por el grupo.
+
+### ProjectLockManager y mantenimiento
+
+`ProjectLockManager` (`workspace.py`) mantiene un solo escritor por raíz de proyecto. Una segunda
+reclamación exclusiva desde otra sesión lanza `ProjectBusy`, y las reclamaciones compartidas coexisten.
+`atomic_update_json` realiza lectura-modificación-escritura bajo un bloqueo de archivo, así que las
+actualizaciones concurrentes no se pierden. `check_maintenance_safe(root, action=...)` devuelve
+`(False, motivo)` mientras un hook de quiesce registrado informe sesiones activas o el bloqueo de
+ejecución esté tomado, y `force=True` es la única anulación.
+
+### TaskJournal (WAL)
+
+`TaskJournal` (`journal.py`) añade una línea JSON por paso y, por defecto, hace fsync. Una última línea
+truncada se ignora. `find_incomplete_tasks` lista las tareas que empezaron y nunca terminaron, y
+`rollback_incomplete_task` registra la reversión. Un `run.lock` obsoleto que dejó un proceso muerto lo
+toma `acquire_lock`.
+
+### SessionResourceRegistry y cancelación
+
+Todo lo que inicia una sesión registra una limpieza en su `SessionResourceRegistry` (`resources.py`):
+servidores de desarrollo, clientes LSP y MCP, espejos temporales, worktrees efímeros y servidores de
+revisión. `SessionContext.cancel()` deniega las solicitudes pendientes, libera el arrendamiento del modelo,
+ejecuta `teardown_all` en orden inverso y despierta cualquier revisión que la sesión esté esperando. Solo se
+tocan los recursos de esa sesión. Un hijo de `proc.run` se detiene mediante el evento de cancelación de la
+sesión, y su árbol de procesos se recoge antes de que termine la cancelación.
+
+### Subagentes paralelos acotados
+
+`subagent_max_parallel` (por defecto 3) limita cuántos subagentes se ejecutan a la vez. Se ejecutan en un
+`ContextThreadPoolExecutor`, así que cada uno tiene su propio contexto. A un hijo se le da un
+`PolicyEngine.child_policy(role=...)` que solo puede intersectar con su padre. Los roles de solo lectura
+(`explore`, `verifier`) se fuerzan al modo `plan`.
+
+### Manifiestos de paquete
+
+Una extensión, una habilidad, un conjunto de comandos o un paquete de modelos se declara en un
+`pedacito-package.toml` en su raíz: su `kind`, las `capabilities` que solicita y la versión mínima de
+Pedacito que necesita. `pkg_manifest.py` valida el archivo, y una persona lo revisa antes de que se ejecute
+nada del paquete. Ver [SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml).
+
 ## Límites conocidos
 
 Estos son los límites reales. Las funciones faltantes del arnés no están en esta lista:
