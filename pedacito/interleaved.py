@@ -1246,6 +1246,20 @@ class _ToolRunner:
                 "it. `read` the file first, then edit it; creating new files "
                 "is always allowed.")
 
+    def _policy_deny(self, capability: str, target: str) -> str:
+        """'' when the unified policy engine allows/asks (or is inactive),
+        else the refusal text for a hard-deny."""
+        try:
+            from . import policy as policy_mod
+            root = getattr(self.ws, "root", None) or getattr(
+                self.cfg, "_root", None)
+            d = policy_mod.enforce(self.cfg, capability, target, root=root)
+        except Exception:
+            return ""
+        if d is not None and d.decision == "deny":
+            return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
+        return ""
+
     def _t_edit_file(self, args: dict) -> ToolOutcome:
         file = _as_text(_arg(args, "file", "path", "filename")).strip()
         search = _as_text(_arg(args, "search", "old", "old_string"))
@@ -1268,6 +1282,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("write", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         first = last = None
         if not symbol and anchored:
             first = _as_int(start, 0) or None
@@ -1287,6 +1304,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("write", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         self.gates.prepare_frontend(file)
         snap = self.ws.snapshot()
         res = self.ws.write(file, _as_text(args.get("content")))
@@ -1299,6 +1319,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("delete", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         snap = self.ws.snapshot()
         res = self.ws.delete(file)
         return self._after_mutation(res, snap)

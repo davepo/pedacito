@@ -1214,6 +1214,19 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
     task_text = str(getattr(cfg, "_task_text", "") or "")
     policy = getattr(cfg, "policy", None)
 
+    # ---- unified policy engine (WP-4005) -----------------------------------
+    try:
+        from . import policy as policy_mod
+        for rel in list(groups):
+            d = policy_mod.enforce(cfg, "write", rel, root=root_resolved)
+            if d is not None and d.decision == "deny":
+                results.append(Result(
+                    False, rel,
+                    f"denied by policy ({d.matched_rule}): {d.reason}"))
+                del groups[rel]
+    except Exception:
+        pass
+
     # ---- protected paths (.git/, .pedacito/, the plan file, config) --------
     for rel in list(groups):
         why = safety.is_protected(rel, cfg)

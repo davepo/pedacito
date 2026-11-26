@@ -380,7 +380,8 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     rc, out, stopped, _el = proc.run(
         argv, cwd=Path(root), timeout=timeout, idle_timeout=0,
         max_output=int(getattr(cfg, "max_shell_output_chars", 8000) or 8000) * 2,
-        env=safety.child_env(cfg))
+        env=safety.child_env(cfg),
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if box and rc not in (0, None) and not stopped:
         out += (f"\n[ran in a sandbox ({box}); a failure from a blocked write "
                 "outside the project or no network is the sandbox, not the "

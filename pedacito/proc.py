@@ -182,11 +182,30 @@ def _cancel_requested_proc(cancel_event: threading.Event | None) -> bool:
     return False
 
 
+def _run_windows_sandboxed(command, *, cwd, timeout, idle_timeout, max_output,
+                           env, stdin_text, cancel_event):
+    """Run `command` through the Windows Job Object + restricted-token sandbox
+    and map the result onto `run()`'s (rc, output, stopped, seconds) shape."""
+    from . import sandbox_win
+    started = time.monotonic()
+    full_env = with_venv_path(env, cwd)
+    try:
+        rc, out, _err, _elapsed, stopped = sandbox_win._run_nt(
+            list(command), cwd=Path(cwd), env=full_env,
+            timeout=timeout or None, idle_timeout=idle_timeout,
+            max_output=max_output, stdin_text=stdin_text,
+            cancel_event=cancel_event)
+    except Exception as exc:            # sandbox unavailable at dispatch time
+        return None, str(exc), "error", time.monotonic() - started
+    return rc, out, stopped, time.monotonic() - started
+
+
 def run(command, *, cwd, timeout: float | None = None,
         idle_timeout: float = 0, shell: bool = False,
         max_output: int = 8000, env: dict | None = None,
         stdin_text: str | None = None,
-        cancel_event: threading.Event | None = None
+        cancel_event: threading.Event | None = None,
+        windows_sandbox: bool = False
         ) -> tuple[int | None, str, str, float]:
     """Run `command` and return (returncode, output, stopped, seconds).
 
@@ -200,7 +219,15 @@ def run(command, *, cwd, timeout: float | None = None,
     `cancel_event` is an optional ``threading.Event``; when it (or the bound
     session's ``cancel_event``) is set the child is terminated and ``stopped``
     reports "cancelled".
+
+    `windows_sandbox` (Windows only) runs the child under the built-in Job
+    Object + restricted-token sandbox instead of a plain `Popen`.
     """
+    if windows_sandbox and os.name == "nt":
+        return _run_windows_sandboxed(
+            command, cwd=cwd, timeout=timeout, idle_timeout=idle_timeout,
+            max_output=max_output, env=env, stdin_text=stdin_text,
+            cancel_event=cancel_event)
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
     cap = max(200, int(max_output or 8000))

@@ -96,6 +96,22 @@ def child_config(cfg):
     for scratch in ("_backup_dir", "_task_reads", "_task_allowlist",
                     "_task_mutations", "_task_preexisting", "_agent"):
         child.__dict__.pop(scratch, None)
+    # WP-4005: a subagent can only ever NARROW the parent's capabilities. The
+    # parent's policy (cfg.policy or the bound session's) is intersected into a
+    # read-only child policy; the `task` action is always the "explore" role.
+    try:
+        from . import session_ctx
+        parent_policy = getattr(cfg, "policy", None)
+        if parent_policy is None:
+            sess = session_ctx.current_session()
+            if sess is not None:
+                parent_policy = getattr(sess, "policy", None)
+        if parent_policy is not None and hasattr(parent_policy, "child_policy"):
+            child.policy = parent_policy.child_policy(role="explore")
+        else:
+            child.policy = parent_policy
+    except Exception:
+        child.policy = getattr(cfg, "policy", None)
     return child
 
 

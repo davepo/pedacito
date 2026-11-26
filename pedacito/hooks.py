@@ -84,6 +84,15 @@ def fire(cfg, root, event: str, **fields) -> HookResult:
     cmds = _commands(cfg, event)
     if not cmds:
         return result
+    try:
+        from . import policy as policy_mod
+        decision = policy_mod.enforce(cfg, "hook", event, root=root)
+    except Exception:
+        decision = None
+    if decision is not None and decision.decision == "deny":
+        return HookResult("deny",
+                          f"denied by policy ({decision.matched_rule}): "
+                          f"{decision.reason}")
     payload = {"event": event, "cwd": str(root), **fields}
     stdin = json.dumps(payload, default=str)
     timeout = max(1, int(getattr(cfg, "hook_timeout", 10) or 10))

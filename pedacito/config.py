@@ -983,6 +983,36 @@ class Config:
     browser_eval_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1",
                                            "0.0.0.0")
 
+    # --- Unified policy engine (WP-4005, §1.2) -------------------------------
+    # Capability-decision mode for the unified policy engine. The normative
+    # five-mode matrix, most restrictive first:
+    #   "plan"            read-only (read + read-only subagents only)
+    #   "ask"             prompt for every mutation/execution (the default)
+    #   "accept-edits"    auto-approve workspace writes/edits; still ask to run
+    #   "workspace-write" sandboxed run + configured hooks/subagents auto-approved
+    #   "danger"          everything the deny rules, safe-path and budget guards allow
+    permission_mode: str = "ask"
+    # How an "ask" decision from the policy engine is resolved:
+    #   "ask"       ask the human (permission broker / legacy prompts)
+    #   "never"     refuse every "ask" (unattended-safe: a background or
+    #               headless run can never be upgraded to allow)
+    #   "auto-safe" auto-approve known safe read-only/test commands (pytest,
+    #               ruff, git status, git diff, or a trusted [commands].allow)
+    approval_policy: str = "ask"
+    # Path (relative to the project root) of the trust-gated capability policy
+    # file. Its [paths]/[commands]/[network]/[mcp]/[budget] rules only apply
+    # after `pedacito trust`; an untrusted file can never widen permissions.
+    policy_file: str = ".pedacito/policy.toml"
+    # Loopback port for the optional background daemon (WP-4006); 0 = an
+    # ephemeral loopback port chosen by the OS. The daemon is never spawned
+    # from a project config (see daemon_auto_start in the execution fields).
+    daemon_port: int = 0
+    # Auto-start the background daemon for this run. An execution switch: a
+    # project's own `.pedacito.toml` cannot turn it on until `pedacito trust`.
+    daemon_auto_start: bool = False
+    # Cap on subagents that may run in parallel (WP-4006); 3 by default.
+    subagent_max_parallel: int = 3
+
     # --- Verification and tests ----------------------------------------------
     # Check an edit reply before/while applying it: "off", "deterministic"
     # (free: dry-apply, placeholder / stale-reference / unread-citation
@@ -1254,6 +1284,9 @@ _ENUM_FIELDS = {
     "language": ("en", "es"),
     "llm_reply_language": ("match_ui", "auto", "en", "es"),
     "modality": ("", "text", "image", "audio", "embedding"),
+    "permission_mode": ("plan", "ask", "accept-edits", "workspace-write",
+                        "danger"),
+    "approval_policy": ("ask", "never", "auto-safe"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode", "modality")
 
@@ -1595,7 +1628,9 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_fetch", "fetch_allowed_hosts",
                "enable_web", "wrap_observations", "redact_secrets",
                "security_outbound_mode", "protected_paths", "auto_plan_file",
-               "allow_image_gen")
+               "allow_image_gen",
+               "permission_mode", "approval_policy", "policy_file",
+               "daemon_auto_start")
 TRUST_FILE = "trusted_projects.json"
 
 

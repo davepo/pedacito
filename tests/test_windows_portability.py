@@ -560,6 +560,9 @@ def test_atomic_writes_close_handles_before_replace(tmp_path, monkeypatch):
 def test_sandbox_degrades_cleanly_on_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(sandbox, "_noticed", set())
+    # WP-4005: Windows now has a Job Object sandbox when the probe succeeds, so
+    # force it unavailable to exercise the degradation path deterministically.
+    monkeypatch.setattr(sandbox, "_win_ready", lambda: False)
     cfg = Config()
 
     state, detail = sandbox.status(cfg, root=tmp_path)

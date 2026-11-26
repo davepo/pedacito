@@ -3036,6 +3036,9 @@ def tool_diagnose(index, cfg, file: str = "") -> str:
             return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
                     "Enable allow_shell to let Pedacito run the project's linter/"
                     "typechecker, or run the check yourself.")
+    policy_err = _policy_denied(cfg, "run", "diagnose", root=index.root)
+    if policy_err:
+        return policy_err
     from . import diagnostics
     rel = ""
     if _as_text(file).strip():
@@ -3101,6 +3104,9 @@ def tool_serve(index, cfg, symbol: str = "", command: str = "",
             return f"ERROR: could not parse command ({e})."
         if not argv:
             return "ERROR: serve start needs a command."
+        policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+        if policy_err:
+            return policy_err
         denied = _allowlist_error(cfg, argv)
         if denied:
             return denied
@@ -3132,6 +3138,10 @@ def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
         return "ERROR: MCP is disabled (config allow_mcp = false)."
     from . import mcp
     target = _as_text(symbol).strip()
+    policy_err = _policy_denied(cfg, "mcp", target or "mcp",
+                                root=getattr(index, "root", None))
+    if policy_err:
+        return policy_err
     args = {}
     raw = _as_text(content).strip()
     if raw:
@@ -3163,6 +3173,10 @@ def tool_mcp_call(index, cfg, server: str, tool_name: str,
     if not sname or not tname:
         return ("ERROR: mcp_call needs the server name and the tool name "
                 "from the MCP TOOLS block.")
+    policy_err = _policy_denied(cfg, "mcp", f"{sname}/{tname}",
+                                root=getattr(index, "root", None))
+    if policy_err:
+        return policy_err
     spec = servers.get(sname)
     if spec is None:
         return (f"ERROR: MCP server '{sname[:100]}' is not configured "
@@ -3315,6 +3329,19 @@ def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
             "change it; creating new files is always allowed.")
 
 
+def _policy_denied(cfg, capability: str, target: str, root=None) -> str:
+    """The refusal text when the unified policy engine hard-denies this
+    capability, or "" when it is allowed/asked (legacy flow) or inactive."""
+    try:
+        from . import policy as policy_mod
+        d = policy_mod.enforce(cfg, capability, target, root=root)
+    except Exception:
+        return ""
+    if d is not None and d.decision == "deny":
+        return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
+    return ""
+
+
 def tool_write(index, cfg, file: str, content: str,
                append: bool = False) -> str:
     """Replace a whole file with `content` (or append it when `append` is
@@ -3349,6 +3376,9 @@ def tool_write(index, cfg, file: str, content: str,
         return f"ERROR: refusing to write outside the project root: {file}"
     if path.is_dir():
         return f"ERROR: {rel} is a directory, not a file."
+    policy_err = _policy_denied(cfg, "write", rel, root=index.root)
+    if policy_err:
+        return policy_err
     allowed, sensitive_error = security.check_sensitive_write(
         root, rel, action=verb, policy=getattr(cfg, "policy", None))
     if not allowed:
@@ -3489,6 +3519,10 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         return f"ERROR: refusing to move outside the project root: {file} -> {to}"
     if not src.is_file():
         return f"ERROR: {src_rel} is not an existing file."
+    policy_err = _policy_denied(cfg, "write", src_rel, root=index.root) \
+        or _policy_denied(cfg, "write", dst_rel, root=index.root)
+    if policy_err:
+        return policy_err
     policy = getattr(cfg, "policy", None)
     for label in (src_rel, dst_rel):
         allowed, sensitive_error = security.check_sensitive_write(
@@ -3595,6 +3629,9 @@ def tool_delete(index, cfg, file: str) -> str:
         return f"ERROR: refusing to delete outside the project root: {file}"
     if not path.is_file():
         return f"ERROR: {rel} is not an existing file."
+    policy_err = _policy_denied(cfg, "delete", rel, root=index.root)
+    if policy_err:
+        return policy_err
     allowed, sensitive_error = security.check_sensitive_write(
         root, rel, action="delete", policy=getattr(cfg, "policy", None))
     if not allowed:
@@ -3640,6 +3677,9 @@ def tool_undo(index, cfg, file: str = "") -> str:
     if not getattr(cfg, "backup", False):
         return ("ERROR: `undo` needs backups (config backup = false): there "
                 "is no pre-task snapshot of this task's changes.")
+    policy_err = _policy_denied(cfg, "write", "", root=index.root)
+    if policy_err:
+        return policy_err
     muts = list(getattr(cfg, "_task_mutations", None) or ())
     if not muts:
         return "Nothing to undo: this task has not mutated any file yet."
@@ -3847,6 +3887,10 @@ def tool_run(index, cfg, command: str) -> str:
     if not argv:
         return "ERROR: run needs a `command`."
 
+    policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+    if policy_err:
+        return policy_err
+
     # `run` executes argv WITHOUT a shell: `&` reaches the program as a
     # literal argument, and `nohup`-style wrappers do not detach -- a quiet
     # server started this way just idles until the idle-kill stops it. Long
@@ -3912,7 +3956,8 @@ def tool_run(index, cfg, command: str) -> str:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
 
@@ -4244,7 +4289,8 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run the Node tests: {str(out)[:300]}"
     try:
@@ -4406,7 +4452,8 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run the tests: {str(out)[:300]}"
     try:
@@ -4526,6 +4573,10 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
     filt = _as_text(k_filter).strip()[:160]
     preview = (f"{tgt}" if tgt else "the whole suite") \
         + (f" -k {filt}" if filt else "")
+    policy_err = _policy_denied(cfg, "run", f"run_test {preview}",
+                                root=index.root)
+    if policy_err:
+        return policy_err
     if not bool(getattr(cfg, "enable_run_test_in_gather", True)):
         # A scoped project rule ("pytest *" in this project) is the human's
         # standing answer for exactly this: run without asking.
@@ -4638,7 +4689,8 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run pytest: {str(out)[:300]}"
 
@@ -5344,6 +5396,14 @@ def fetch_url(cfg, url: str) -> str:
     raw = str(url or "").strip().strip("`\"'")
     if not raw:
         return "ERROR: fetch_url needs a url (an http:// or https:// address)."
+    try:
+        domain = urllib.parse.urlparse(raw).hostname or raw
+    except Exception:
+        domain = raw
+    policy_err = _policy_denied(cfg, "network", domain,
+                                root=getattr(cfg, "_root", None))
+    if policy_err:
+        return policy_err
     allowed_hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
     blocked = security.ssrf_error(raw, allowed_hosts)
     if blocked:
@@ -5438,6 +5498,10 @@ def web_search(cfg, query: str) -> str:
     q = " ".join(str(query or "").split())
     if not q:
         return "ERROR: web_search needs a query."
+    policy_err = _policy_denied(cfg, "network", "web_search",
+                                root=getattr(cfg, "_root", None))
+    if policy_err:
+        return policy_err
     if not getattr(cfg, "enable_web", False) \
             and not _web_ask_broker(f"Web search: {q}", q):
         return WEB_DENIED_MESSAGE

@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 # Directories under $HOME that hold credentials; hidden inside the sandbox.
@@ -44,13 +45,51 @@ GUARDED = (".git", ".pedacito", ".pedacito.toml", "pedacito.toml",
 _probe_cache: dict[tuple[str, bool], tuple[bool, str]] = {}
 _noticed: set[str] = set()
 
+# Windows Job Object sandbox probe: probed once, cached, reset by tests.
+_win_probe_lock = threading.Lock()
+_win_probed = False
+_win_available = False
+
+
+def _win_ready() -> bool:
+    """True when the built-in Windows Job Object sandbox is usable here."""
+    global _win_probed, _win_available
+    with _win_probe_lock:
+        if not _win_probed:
+            try:
+                from . import sandbox_win
+                _win_available = bool(sandbox_win.probe().available)
+            except Exception:
+                _win_available = False
+            _win_probed = True
+        return _win_available
+
+
+def reset_win_probe() -> None:
+    """Forget the cached Windows probe result (tests)."""
+    global _win_probed, _win_available
+    with _win_probe_lock:
+        _win_probed = False
+        _win_available = False
+
 
 def backend_name() -> str:
+    if sys.platform == "win32" and _win_ready():
+        return "win_restricted"
     if sys.platform.startswith("linux") and shutil.which("bwrap"):
         return "bwrap"
     if sys.platform == "darwin" and shutil.which("sandbox-exec"):
         return "seatbelt"
     return ""
+
+
+def windows_sandbox_active(cfg=None) -> bool:
+    """True when a wrapped command runs under the Windows Job Object sandbox
+    (so `proc.run` should dispatch to `sandbox_win.run_sandboxed`). Respects
+    `cfg.sandbox`, so a config with `sandbox = false` never sandboxes."""
+    if cfg is not None and not getattr(cfg, "sandbox", True):
+        return False
+    return backend_name() == "win_restricted"
 
 
 def _home() -> Path:
@@ -176,8 +215,11 @@ def status(cfg, root=None) -> tuple[str, str]:
     if not backend:
         why = ("no sandbox backend on this system "
                "(Linux: install bubblewrap; macOS: sandbox-exec ships with the OS; "
-               "Windows has none)")
+               "Windows: the built-in Job Object sandbox is unavailable here)")
         return "unavailable", why
+    if backend == "win_restricted":
+        return "active", ("win_restricted: Job Object + restricted token "
+                          f"(Low Integrity); network {'on' if net else 'off'}")
     ok, why = _probe(backend, net)
     if not ok:
         return "unavailable", f"{backend} cannot start here ({why})"
@@ -188,6 +230,34 @@ def status(cfg, root=None) -> tuple[str, str]:
 class SandboxRefused(RuntimeError):
     """The command could not be sandboxed (`sandbox_strict`, or an argv the
     sandbox backend could misread as its own flags)."""
+
+
+def enforce_unattended_gate(cfg, *, permission_mode: str = "",
+                            approval_policy: str = "",
+                            background: bool = False) -> None:
+    """Refuse unattended execution that has no OS sandbox behind it.
+
+    The hard gate (D14): unattended `workspace-write`, `danger`, or
+    `background=True` command execution must run inside an active OS sandbox.
+    Raises `SandboxRefused` when `backend_name()` is empty AND
+    (`sandbox_strict` is true OR (`approval_policy == "never"` and `sandbox`
+    is true)).
+    """
+    mode = str(permission_mode
+               or getattr(cfg, "permission_mode", "ask") or "ask").lower()
+    approval = str(approval_policy
+                   or getattr(cfg, "approval_policy", "ask") or "ask").lower()
+    unattended = background or mode in ("workspace-write", "danger")
+    if not unattended:
+        return
+    if backend_name():
+        return                      # an OS sandbox is active
+    if bool(getattr(cfg, "sandbox_strict", False)) or (
+            approval == "never" and bool(getattr(cfg, "sandbox", False))):
+        raise SandboxRefused(
+            "unattended execution (permission_mode="
+            f"{mode!r}, background={background}) requires an OS sandbox, but "
+            "no backend is active here")
 
 
 def wrap(argv: list[str], cfg, root) -> tuple[list[str], str]:
@@ -221,4 +291,8 @@ def wrap(argv: list[str], cfg, root) -> tuple[list[str], str]:
             f"refusing to sandbox a command whose program name starts with '-' "
             f"({head!r}); pass an explicit existing path instead")
     backend = backend_name()
+    if backend == "win_restricted":
+        # The Job Object + restricted token are applied inside
+        # proc.run -> sandbox_win.run_sandboxed (no argv prefix).
+        return argv, detail
     return _prefix(backend, root, net, extra) + argv, detail

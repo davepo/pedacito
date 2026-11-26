@@ -785,6 +785,62 @@ allow_image_gen = true       # expone la acción generate_image del agente
   en lugar de las sondas de texto; el botón **Probe image** de la GUI hace lo mismo. Consulta la
   [guía de modelos](../../MODEL_GUIDE.es.md#modelos-de-imagen-modality--image).
 
+## Política unificada y sandbox de capacidades (`permission_mode`, `approval_policy`, `policy_file`)
+
+Toda decisión de capacidad — `run`, `write`, `delete`, hooks, MCP, red y la
+herencia de subagentes — pasa por un único motor de políticas
+(`pedacito/policy.py`). Dos claves fijan la postura por defecto, y un archivo
+de política por proyecto puede endurecerla:
+
+| Ajuste | Valores | Por defecto | Significado |
+|---|---|---|---|
+| `permission_mode` | `"plan"` \| `"ask"` \| `"accept-edits"` \| `"workspace-write"` \| `"danger"` | `"ask"` | La matriz de capacidades de cinco modos. `plan` es de solo lectura (lecturas + subagentes de solo lectura); `ask` pide confirmación para cada mutación/ejecución; `accept-edits` aprueba automáticamente escrituras/ediciones del espacio de trabajo pero aún pregunta para ejecutar; `workspace-write` añade `run` en sandbox y hooks/subagentes configurados; `danger` permite todo lo que las reglas de denegación, las rutas seguras y los presupuestos sigan permitiendo. |
+| `approval_policy` | `"ask"` \| `"never"` \| `"auto-safe"` | `"ask"` | Cómo se resuelve un veredicto `ask`: preguntar al humano, rechazar (seguro sin supervisión), o aprobar automáticamente comandos seguros de solo lectura/test conocidos (`pytest`, `ruff`, `git status`, `git diff`, o un `[commands].allow` de confianza). |
+| `policy_file` | una ruta | `.pedacito/policy.toml` | El archivo de política de capacidades con puerta de confianza. Sus reglas `[policy]`, `[paths]`, `[commands]`, `[network]`, `[mcp]` y `[budget]` solo se aplican después de `pedacito trust`; un archivo no confiable nunca puede ampliar los permisos. |
+| `daemon_port` | entero | `0` | Puerto de bucle invertido para el daemon en segundo plano opcional; `0` deja que el sistema elija uno efímero. |
+| `daemon_auto_start` | bool | false | Iniciar automáticamente el daemon en segundo plano para una ejecución. Es un interruptor de ejecución: la configuración de un proyecto no puede activarlo hasta `pedacito trust`. |
+| `subagent_max_parallel` | entero | `3` | Límite de subagentes que pueden ejecutarse en paralelo. |
+
+Los cinco modos forman una retícula estricta: `plan` ⊂ `ask` ⊂ `accept-edits` ⊂
+`workspace-write` ⊂ `danger`, y un subagente solo puede *intersectar* (nunca
+ampliar) las capacidades de su padre. `approval_policy = "never"` convierte cada
+`ask` en un `deny`, de modo que una ejecución en segundo plano o sin cabeza
+nunca puede ser ampliada sin un humano. En Windows, la ejecución de comandos en
+`workspace-write`/`danger` es una **puerta dura**: corre bajo el sandbox
+integrado de Job Object + token restringido (integridad baja), y `sandbox_strict`
+(o `approval_policy = "never"` con `sandbox` activo) la rechaza de plano cuando
+no hay un sandbox del sistema activo.
+
+Un `.pedacito/policy.toml` tiene este aspecto:
+
+```toml
+[policy]
+permission_mode = "ask"               # plan | ask | accept-edits | workspace-write | danger
+approval_policy = "ask"               # ask | never | auto-safe
+subagent_inheritance = "narrow_only"  # narrow_only | inherit_readonly
+
+[paths]
+allow = ["src/**", "tests/**"]
+deny = [".env*", "**/*.pem", "secrets/**"]
+
+[commands]
+allow = ["pytest *", "ruff *"]
+deny = ["git push*", "rm -rf *", "curl *"]
+
+[network]
+allow_domains = ["127.0.0.1", "localhost"]
+deny_domains = ["*"]
+
+[mcp]
+allow_servers = []
+deny_servers = ["*"]
+
+[budget]
+max_cost_usd = 0.0
+max_tokens = 0
+max_steps = 0
+```
+
 ## Referencia de configuración
 
 `pedacito config` lista cada ajuste con su valor y origen; `pedacito
