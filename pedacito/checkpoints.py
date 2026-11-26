@@ -394,7 +394,13 @@ def create_checkpoint(root, label: str, mode: str = "task",
             "mode": mode,
             "label": label,
             "files_changed": changed,
-            "file_count": len(copied),
+            # BUG-14: `file_count` used to mean "files in the snapshot", so a
+            # 14-file project with 3 changed files looked like "14 files
+            # changed". Keep `file_count` as the changed count and name both
+            # totals explicitly.
+            "file_count": len(changed),
+            "changed_file_count": len(changed),
+            "snapshot_file_count": len(copied),
         }
         data["checkpoints"].append(entry)
         data["head_id"] = cp_id

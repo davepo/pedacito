@@ -1022,8 +1022,9 @@ def run_cli(args) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             print(result["answer"])
-            print(f"[how: {'model synthesis' if result['used_model'] else 'deterministic reference'}]",
-                  file=sys.stderr)
+            # BUG-18: an informational tag, not an error -- keep it on stdout
+            # so Windows PowerShell 5.1 does not paint it as a red error.
+            print(f"[how: {'model synthesis' if result['used_model'] else 'deterministic reference'}]")
 
     question = _read_question(args)
     if question:

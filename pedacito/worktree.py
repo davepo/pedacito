@@ -82,22 +82,84 @@ def _root(root) -> Path:
         raise WorktreeError(f"{root} is not inside a git repository") from e
 
 
-def create(root, name: str, base: str = "HEAD") -> Path:
-    """Create (or reuse) a worktree at .pedacito/worktrees/<name>."""
+def branch_name(name: str) -> str:
+    """The branch a worktree create/remove pair uses for `name`."""
+    safe = _safe_name(name)
+    if not safe:
+        raise WorktreeError("worktree name is empty")
+    return f"pedacito/{safe}"
+
+
+def branch_exists(root, name: str) -> bool:
+    """True when the `pedacito/<name>` branch exists in this repository."""
+    root = _root(root)
+    return bool(_git(root, ["branch", "--list",
+                            branch_name(name)]).strip())
+
+
+def create(root, name: str, base: str = "HEAD",
+           dirty_policy: str = "ignore") -> Path:
+    """Create (or reuse) a worktree at .pedacito/worktrees/<name>.
+
+    ``dirty_policy`` decides what happens to uncommitted user changes before
+    the worktree is cut from ``base``: ``ignore`` (the historical behaviour,
+    which silently leaves them behind), ``refuse`` (raise with the dirty file
+    list), ``carry_over`` (apply the tracked diff and copy untracked files into
+    the new worktree, leaving the root untouched), or ``stash`` (stash them
+    first, so the root is clean and the worktree starts from committed HEAD).
+    """
     root = _root(root)
     safe = _safe_name(name)
     if not safe:
         raise WorktreeError("worktree name is empty")
+    policy = str(dirty_policy or "ignore").strip().lower()
+    if policy not in ("ignore", "refuse", "carry_over", "stash"):
+        raise WorktreeError(
+            f"unknown dirty_policy {dirty_policy!r}; choose ignore, refuse, "
+            "carry_over, or stash")
     dest = root / ".pedacito" / "worktrees" / safe
     if (dest / ".git").exists():
         return dest
+
+    carried_diff = ""
+    carried_untracked: list[str] = []
+    if policy != "ignore" and is_dirty(root):
+        files = dirty_files(root)
+        if policy == "refuse":
+            raise WorktreeError(
+                "the working tree has uncommitted changes; commit or stash "
+                "them first (or pass --dirty carry_over/stash). Dirty files: "
+                + ", ".join(files[:20])
+                + (f" (+{len(files) - 20} more)" if len(files) > 20 else ""))
+        if policy == "carry_over":
+            carried_diff = _git_raw(root, ["diff", "HEAD"])
+            carried_untracked = _untracked_files(root)
+        else:                          # stash
+            _git(root, ["stash", "push", "-u", "-m",
+                        f"pedacito:worktree:{safe}"])
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     branch = f"pedacito/{safe}"
     branches = _git(root, ["branch", "--list", branch])
-    if branches.strip():
-        _git(root, ["worktree", "add", str(dest), branch])
-    else:
-        _git(root, ["worktree", "add", "-b", branch, str(dest), base])
+    created_branch = not branches.strip()
+    try:
+        if branches.strip():
+            _git(root, ["worktree", "add", str(dest), branch])
+        else:
+            _git(root, ["worktree", "add", "-b", branch, str(dest), base])
+        if carried_diff or carried_untracked:
+            _apply_patch(dest, carried_diff)
+            for rel in carried_untracked:
+                src = root / rel
+                if not src.is_file():
+                    continue
+                dst = dest / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                fileio.copy_file_atomic(src, dst)
+    except BaseException:
+        # Never delete a branch that existed before this call.
+        _cleanup_partial(root, dest, branch if created_branch else "")
+        raise
     return dest
 
 
@@ -119,14 +181,31 @@ def list_paths(root) -> list[tuple[str, str]]:
     return entries
 
 
-def remove(root, name: str, force: bool = False) -> None:
-    """Remove the worktree .pedacito/worktrees/<name>."""
+def remove(root, name: str, force: bool = False,
+           delete_branch: bool = True) -> bool:
+    """Remove the worktree .pedacito/worktrees/<name>.
+
+    With ``delete_branch`` (the default) the matching ``pedacito/<name>``
+    branch is deleted too, so a later ``create`` cannot silently start from a
+    stale branch tip. Returns True when that branch was deleted, False when it
+    was kept, absent, or could not be removed (best effort)."""
     root = _root(root)
-    dest = root / ".pedacito" / "worktrees" / _safe_name(name)
+    safe = _safe_name(name)
+    dest = root / ".pedacito" / "worktrees" / safe
     args = ["worktree", "remove", str(dest)]
     if force:
         args.append("--force")
     _git(root, args)
+    if not delete_branch:
+        return False
+    branch = f"pedacito/{safe}"
+    if not _git(root, ["branch", "--list", branch]).strip():
+        return False
+    try:
+        _git(root, ["branch", "-D", branch])
+        return True
+    except WorktreeError:
+        return False
 
 
 # ---------------------------------------------------------------------------

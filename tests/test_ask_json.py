@@ -212,7 +212,7 @@ def test_verify_cmd_overrides_auto_verify_without_touching_config(
                         + 'auto_verify = "false"\n', encoding="utf-8")
     before = cfg_file.read_bytes()
     code = _run(project, cfg_file, monkeypatch, "--apply", "--json",
-                "--verify-cmd", "true")
+                "--verify-cmd", f'"{sys.executable}" --version')
     captured = capsys.readouterr()
     assert code == 0
     obj = _one_object(captured.out)

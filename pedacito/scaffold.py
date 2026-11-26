@@ -22,13 +22,16 @@ answer system prompt and the tool schema.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import apicheck, checkpoints as checkpoints_mod, fileio, workspace
 from . import index as index_mod
@@ -215,7 +218,7 @@ Rules:
      defines, with real flags and plausible argument values taken from the CLI
      SOURCE below (never invented flags or subcommands).
   3. "Running Tests" -- the exact command that runs the generated suite
-     (e.g. `python3 -m unittest -v` for unittest tests, `python3 -m pytest -q`
+     (e.g. `python -m unittest -v` for unittest tests, `python -m pytest -q`
      for pytest tests), matching the test files that actually exist.
 - A docs page covers its stated purpose.
 - Concise and accurate. No TODOs, no placeholder text, no marketing filler.
@@ -788,6 +791,134 @@ def _header(rel: str, purpose: str) -> str:
     if ext == ".json":
         return '{\n  "_comment": "' + safe.replace('"', "'") + '"\n}\n'
     return f"{rel}\n{safe}\n"
+
+
+def _has_main_guard(tree: ast.AST) -> bool:
+    """True when the module already has a top-level __main__ guard."""
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.If):
+            continue
+        for test in ast.walk(node.test):
+            if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.Eq)):
+                continue
+            sides = [test.left, *test.comparators]
+            has_name = any(isinstance(x, ast.Name) and x.id == "__name__"
+                           for x in sides)
+            has_main = any(isinstance(x, ast.Constant)
+                           and x.value == "__main__" for x in sides)
+            if has_name and has_main:
+                return True
+    return False
+
+
+def _python_entry_candidates(root: Path, spec: Any = None) -> list[str]:
+    """Root-level .py files that can carry the CLI entry guard, in priority."""
+    names: list[str] = []
+
+    def add(rel: str) -> None:
+        rel = str(rel or "").replace("\\", "/")
+        if (rel.endswith(".py") and "/" not in rel and rel not in names
+                and not rel.startswith(".")):
+            names.append(rel)
+
+    for f in getattr(spec, "files", None) or []:
+        add(getattr(f, "path", ""))
+    for rel in ("main.py", "cli.py", "app.py", "__main__.py"):
+        add(rel)
+    try:
+        for path in sorted(root.glob("*.py")):
+            if (path.name.startswith("test_") or path.name in
+                    ("setup.py", "conftest.py", "__init__.py", "__main__.py")):
+                continue
+            add(path.name)
+    except OSError:
+        pass
+    return names
+
+
+def _ensure_python_cli_entrypoint(root: Path, spec: Any = None) -> bool:
+    """Append `if __name__ == "__main__": main()` to a CLI module that lacks it.
+
+    A generated `main.py` often defines `def main()` but no guard, so
+    `python main.py` exits 0 with no output while the tests pass by importing
+    main directly (BUG-05). The repair is deterministic and idempotent: only a
+    file that parses cleanly, defines a top-level `main`, and has no guard is
+    touched. Returns True when at least one file was repaired.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return False
+    changed = False
+    for rel in _python_entry_candidates(root, spec):
+        path = root / rel
+        if not path.is_file():
+            continue
+        try:
+            text, style = fileio.read(path)
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        defines_main = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "main"
+            for node in tree.body)
+        if not defines_main or _has_main_guard(tree):
+            continue
+        new_text = text
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += '\nif __name__ == "__main__":\n    main()\n'
+        try:
+            fileio.write(path, new_text, style)
+        except OSError:
+            continue
+        changed = True
+    return changed
+
+
+def _normalize_python_commands(root: Path, rel: str) -> bool:
+    """Rewrite `python3 ...` commands in generated docs to `python ...`.
+
+    Windows has no `python3` executable (the launcher is `python`/`py`), so a
+    README the model writes with `python3 main.py` is wrong on the very
+    platform `pdc new` was run on (BUG-17). `python` also works inside a venv
+    on macOS/Linux. Only command-shaped `python3` tokens are rewritten;
+    `python3.12` or prose is left alone. Returns True when the file changed."""
+    path = Path(root) / rel
+    if path.suffix.lower() not in (".md", ".markdown"):
+        return False
+    try:
+        text, style = fileio.read(path)
+    except OSError:
+        return False
+    new_text = re.sub(r"(?<![\w.])python3(?=\s|$)", "python", text)
+    if new_text == text:
+        return False
+    try:
+        fileio.write(path, new_text, style)
+    except OSError:
+        return False
+    return True
+
+
+def _ensure_git_repo(root: Path) -> bool:
+    """Initialise a git repo in a freshly applied scaffold (best effort)."""
+    root = Path(root)
+    if (root / ".git").exists() or not root.is_dir():
+        return False
+    if not shutil.which("git"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "init"], cwd=str(root), shell=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and (root / ".git").exists()
 
 
 def _readme_run_command(plan: Plan) -> str:
@@ -1479,6 +1610,10 @@ def build_docs(client, cfg, idx, plan: Plan, verbose: bool = True,
             done.append(t.path)
             # Docs are not code: they contribute no chunks to the index, so
             # there is nothing to reindex (and .md is not a chunkable ext).
+            # BUG-17: the model often writes `python3 ...`; make the commands
+            # work on Windows too before the file is reported as done.
+            for r in ok:
+                _normalize_python_commands(idx.root, r.file)
         if bad:
             failed.append((t.path, "; ".join(r.message for r in bad)[:200]))
             if verbose:
@@ -2143,6 +2278,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                             verbose=verbose, auto_install=auto_install,
                             design=design_doc is not None,
                             started=run_started)
+        if _ensure_git_repo(root) and verbose:
+            print("  initialized git repository (.git)", file=sys.stderr)
         _new_checkpoint(f"new: {plan.project_name}")
         return code
 
@@ -2196,6 +2333,11 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
               file=sys.stderr)
     print("\n" + summarise_result(summary))
 
+    # BUG-05: the per-file build can leave `def main()` without the __main__
+    # guard even though the plan asked for it; repair before the test/smoke
+    # passes so `python main.py` really runs.
+    _ensure_python_cli_entrypoint(root, plan)
+
     if apply:
         web_errors = _web_contract_gate(root, cfg, client, idx, plan,
                                         backup_dir, verbose=verbose)
@@ -2242,6 +2384,14 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                       "them\"", file=sys.stderr)
                 if not summary["failed"]:
                     tests_failed = True
+        # A repair round may have rewritten the entry point without its guard.
+        _ensure_python_cli_entrypoint(root, plan)
+
+    if apply:
+        # BUG-17: a freshly applied scaffold is a real project; give it a git
+        # repository so `git status`/checkpoints/worktrees work immediately.
+        if _ensure_git_repo(root) and verbose:
+            print("  initialized git repository (.git)", file=sys.stderr)
 
     if review and summary["done"]:
         results = _review_build(root, plan, summary, cfg, backup_dir, when)
@@ -2334,6 +2484,9 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     if has_py:
         when = workspace.stamp()
         fix_backup = workspace.new_backup_dir(root, when) if cfg.backup else None
+        # BUG-05: fresh contexts can write `def main()` without the guard; the
+        # smoke run below would otherwise pass with no output.
+        _ensure_python_cli_entrypoint(root, plan)
         err = _first_import_error(root, plan)
         missing = loop.missing_modules(err or "", root=root)
         if missing:
@@ -2435,6 +2588,8 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                                         "ERROR")
                     if code == 0:
                         code = 1
+            # A repair round may have rewritten main.py without its guard.
+            _ensure_python_cli_entrypoint(root, plan)
 
     # The loop implemented the sources in fresh contexts; the planned docs
     # (the README) are still skeleton stubs. Describe the real project with

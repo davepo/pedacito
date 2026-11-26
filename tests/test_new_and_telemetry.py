@@ -554,7 +554,8 @@ def test_build_docs_replaces_the_stub_with_a_real_readme(tmp_path):
     for section in ("## Overview & Architecture", "## Quick Start",
                     "## Running Tests"):
         assert section in readme
-    assert "python3 -m unittest -v" in readme
+    assert "python -m unittest -v" in readme
+    assert "python3 " not in readme        # BUG-17: Windows-friendly commands
     # every example flag is a REAL flag of the generated cli.py
     assert "--priority" in CLI_SOURCE and "--priority" in readme
     assert "--limit" in CLI_SOURCE and "--limit" in readme
@@ -573,7 +574,7 @@ def test_docs_and_build_prompts_mandate_the_usability_contract():
                     "Running Tests"):
         assert section in scaffold.DOCS_SYSTEM
     assert "EVERY CLI subcommand" in scaffold.DOCS_SYSTEM
-    assert "python3 -m unittest -v" in scaffold.DOCS_SYSTEM
+    assert "python -m unittest -v" in scaffold.DOCS_SYSTEM
     # zero-arg CLI prints help instead of crashing -- in BOTH build paths
     assert "parser.print_help()" in scaffold.BUILD_SYSTEM
     assert "parser.print_help()" in scaffold.AUTO_IMPLEMENT_SYSTEM
@@ -613,7 +614,8 @@ def test_complex_build_documents_the_extra_readme_too(tmp_path, monkeypatch):
     readme = (root / "README.md").read_text(encoding="utf-8")
     assert readme != stub
     assert "## Quick Start" in readme
-    assert "python3 -m unittest -v" in readme
+    assert "python -m unittest -v" in readme
+    assert "python3 " not in readme
     assert client.calls, "the extra README never reached the docs pass"
 
 

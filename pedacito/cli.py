@@ -1535,10 +1535,28 @@ def _cmd_worktree(args) -> int:
             if not args.name:
                 print("worktree create needs a NAME", file=sys.stderr)
                 return 2
-            dest = worktree.create(root, args.name, base=args.base)
+            policy = str(getattr(args, "dirty", "refuse") or "refuse")
+            dirty = worktree.dirty_files(root)
+            if dirty and policy == "refuse":
+                listed = ", ".join(dirty[:20])
+                if len(dirty) > 20:
+                    listed += f" (+{len(dirty) - 20} more)"
+                print("worktree create: the working tree has uncommitted "
+                      f"changes: {listed}\n"
+                      "  Commit or stash them first, or pass --dirty "
+                      "carry_over (copy them into the worktree) or --dirty "
+                      "stash (stash them first).", file=sys.stderr)
+                return 2
+            dest = worktree.create(root, args.name, base=args.base,
+                                   dirty_policy=policy)
             print(f"Worktree: {dest}")
-            print(f"Run there with:  cd {dest} && pedacito auto ...",
-                  file=sys.stderr)
+            if dirty and policy == "carry_over":
+                print(f"Carried {len(dirty)} uncommitted file(s) into the "
+                      "worktree; the original checkout is unchanged.")
+            elif dirty and policy == "stash":
+                print(f"Stashed {len(dirty)} uncommitted file(s) before "
+                      "creating the worktree.")
+            print(f"Run there with:  cd {dest} && pedacito auto ...")
             return 0
         if args.action == "list":
             entries = worktree.list_paths(root)
@@ -1549,8 +1567,18 @@ def _cmd_worktree(args) -> int:
             if not args.name:
                 print("worktree remove needs a NAME", file=sys.stderr)
                 return 2
-            worktree.remove(root, args.name, force=args.force)
-            print(f"Removed worktree {args.name}", file=sys.stderr)
+            branch = worktree.branch_name(args.name)
+            deleted = worktree.remove(root, args.name, force=args.force,
+                                      delete_branch=not args.keep_branch)
+            print(f"Removed worktree {args.name}")
+            if args.keep_branch:
+                print(f"Kept branch {branch}")
+            elif deleted:
+                print(f"Deleted branch {branch}")
+            elif worktree.branch_exists(root, args.name):
+                print(f"Kept branch {branch} (still checked out elsewhere)")
+            else:
+                print(f"Branch {branch} was not present; nothing to delete")
             return 0
         print(f"unknown worktree action: {args.action}", file=sys.stderr)
         return 2
@@ -1637,8 +1665,7 @@ def _cmd_commit(args) -> int:
         return 1
     sha = str(result.get("commit") or "")
     print(f"Committed {sha[:12]}: {result['message']}")
-    print("Nothing was pushed; push the branch yourself when ready.",
-          file=sys.stderr)
+    print("Nothing was pushed; push the branch yourself when ready.")
     return 0
 
 
@@ -4135,8 +4162,16 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                       help="the repository (default: current directory)")
     p_wt.add_argument("--base", default="HEAD",
                       help="commit/branch for a new worktree (default: HEAD)")
+    p_wt.add_argument("--dirty", choices=["refuse", "carry_over", "stash"],
+                      default="refuse",
+                      help="with create: what to do with uncommitted changes "
+                           "(default: refuse; carry_over copies them in, "
+                           "stash stashes them first)")
     p_wt.add_argument("--force", action="store_true",
                       help="with remove: discard modified/untracked files")
+    p_wt.add_argument("--keep-branch", dest="keep_branch",
+                      action="store_true",
+                      help="with remove: keep the pedacito/<name> branch")
 
     p_commit = sub.add_parser(
         "commit", help="review the staged diff and create a local git commit")
@@ -4919,6 +4954,13 @@ def _main(argv=None) -> int:
     # start, reusing the same redirect the --jsonl path uses further down.
     json_stdout = sys.stdout
     if ask_json:
+        # BUG-15: only an EXPLICIT --review is a conflict worth naming; the
+        # `--json` contract already implies --no-review, and the config's
+        # `review = true` stays silent because the caller never asked for the
+        # page. stdout stays valid JSON, so the note goes to stderr.
+        if getattr(args, "review", False):
+            print("Note: --json disables interactive --review; omit --json "
+                  "to open the review page.", file=sys.stderr)
         args.no_review = True
         args.review = False
         if hasattr(args, "review_plan"):

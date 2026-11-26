@@ -250,12 +250,84 @@ def stage_files(root, paths) -> dict:
     return {"ok": True, "staged": rels}
 
 
+def _is_malformed_windows_path(path: str) -> bool:
+    """True for an NTFS-invalid repo-relative name (trailing space/dot, ADS)."""
+    if os.name != "nt":
+        return False
+    rel = str(path).replace("\\", "/")
+    for part in rel.split("/"):
+        if not part:
+            continue
+        if part != part.rstrip(" ."):
+            return True
+        if ":" in part:
+            return True
+    return False
+
+
+def _malformed_paths(root: Path) -> list[str]:
+    """Dirty/untracked paths git cannot stage on Windows (best effort)."""
+    if os.name != "nt":
+        return []
+    proc = _git(root, "status", "--porcelain=v1", "-z")
+    if proc.returncode != 0:
+        return []
+    entries = (proc.stdout or "").split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if not entry or len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if code[0] in "RC" or code[1] in "RC":
+            i += 1                   # the rename/copy source follows in -z
+        if _is_malformed_windows_path(path) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _paths_from_git_error(text: str) -> list[str]:
+    """Malformed paths named by git's own `open("...")` / `stat("...")` error."""
+    found: list[str] = []
+    for match in re.finditer(r'(?:open|stat|lstat)\("([^"]+)"\)',
+                             text or ""):
+        path = match.group(1)
+        if _is_malformed_windows_path(path) and path not in found:
+            found.append(path)
+    return found
+
+
+def _malformed_stage_error(paths: list[str]) -> GitOpsError:
+    listed = ", ".join(repr(p) for p in paths[:10])
+    more = f" (+{len(paths) - 10} more)" if len(paths) > 10 else ""
+    return GitOpsError(
+        f"cannot stage malformed Windows filename(s): {listed}{more}.\n"
+        "  A name with a trailing space or dot (or an NTFS stream ':') cannot "
+        "be added by git.\n"
+        "  Remove the offending file, or add it to .gitignore, then retry.")
+
+
 def stage_all_files(root) -> dict:
     """Stage every change (including deletions) in the repository."""
     resolved = _require_repo(root)
+    malformed = _malformed_paths(resolved)
+    if malformed:
+        raise _malformed_stage_error(malformed)
     proc = _git(resolved, "add", "-A", "--", ".")
     if proc.returncode != 0:
-        raise GitOpsError(_output(proc) or "`git add -A` failed.")
+        output = _output(proc)
+        malformed = _paths_from_git_error(output) or _malformed_paths(resolved)
+        if malformed:
+            raise _malformed_stage_error(malformed)
+        if "adding files failed" in output.lower():
+            raise GitOpsError(
+                "cannot stage every change: git refused a file (often a "
+                "malformed Windows name with a trailing space or dot).\n"
+                "  Run `git status` and remove or ignore the offending path, "
+                "then retry.")
+        raise GitOpsError(output or "`git add -A` failed.")
     return {"ok": True}
 
 

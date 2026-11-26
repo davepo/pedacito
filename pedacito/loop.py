@@ -1181,7 +1181,7 @@ exactly one task that writes a real README.md, placed AFTER the code tasks so
 it documents what was actually built. That README must contain an Overview &
 Architecture section, a Quick Start with exact copy-pasteable commands for
 every CLI subcommand (concrete example arguments and the real flags), and a
-Running Tests section with the exact test command (e.g. `python3 -m unittest
+Running Tests section with the exact test command (e.g. `python -m unittest
 -v`). Any command-line entry point must print its help (`parser.print_help()`)
 when run with no arguments instead of crashing with a traceback."""
 
