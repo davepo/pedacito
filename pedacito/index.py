@@ -115,6 +115,38 @@ FILE_SUMMARY_SYSTEM = (
     "would come here to do. Do not list the functions back. No markdown, no preamble."
 )
 
+# Phrasings a small local model echoes back from the summariser system/user
+# prompt (or its reasoning meta) instead of producing a real summary. All
+# matched case-insensitively on the whole summary text (BUG-10).
+_PROMPT_ECHO_PHRASES = (
+    "you summarise source code",
+    "you summarize source code",
+    "summarise source code for",
+    "summarize source code for",
+    "given one unit of code",
+    "reply with one sentence",
+    "reply with one sentence (two at most)",
+    "one sentence (two at most)",
+    "we need to respond to user",
+    "we need answer user",
+    "we need to answer the user",
+    "the user wants me to summarize",
+    "lookup index. one sentence",
+    "lookup index. one sentence (two at most)",
+)
+
+
+def _is_prompt_echo_summary(text: str) -> bool:
+    """True when a model "summary" is really the summariser prompt echoed back
+    (or reasoning meta about it) rather than a one-sentence description of the
+    code unit. An empty/whitespace text is also treated as echo -- there is
+    nothing worth caching (BUG-10)."""
+    s = (text or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    return any(phrase in low for phrase in _PROMPT_ECHO_PHRASES)
+
 
 class Index:
     """A project's chunk collection plus derived summaries, with query and
@@ -1011,10 +1043,15 @@ def _ask(client, cfg, system: str, prompt: str, label: str,
         return ""
     breaker.ok()
     if max_tokens:
-        return s
+        # A batched reply is parsed by the caller; still refuse a whole-reply
+        # prompt echo up front.
+        return "" if _is_prompt_echo_summary(s) else s
     s = s.replace("\n", " ")
     if len(s) > 400:
         s = s[:400].rsplit(" ", 1)[0] + "..."
+    # BUG-10: never store a prompt echo as a summary.
+    if _is_prompt_echo_summary(s):
+        return ""
     return s
 
 
@@ -1187,7 +1224,10 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
     def land(i: int, group: list[Chunk], texts: list[str]) -> None:
         nonlocal done
         for c, text in zip(group, texts):
-            if text:
+            # BUG-10: a prompt-echo summary (or an empty one) is rejected and
+            # falls back to the deterministic AST/docline fallback -- it is
+            # never cached in summaries.json or index.json.
+            if text and not _is_prompt_echo_summary(text):
                 c.summary = text
                 idx.stale_summaries.discard(c.key)
                 _put(cache, c.sha, text, cfg.model)
@@ -1255,6 +1295,23 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     matcher = matcher if matcher is not None else Matcher.from_files(root)
 
     files = select(paths, root, matcher, indexable_exts(cfg))
+    # BUG-03: `select()` already drops sensitive files, but `build` re-checks
+    # so a caller passing a hand-built file list (or an explicitly named path)
+    # can never fold a secret into `.pedacito/index.json`.
+    from . import security
+    kept: list[Path] = []
+    for f in files:
+        try:
+            rel = f.resolve().relative_to(root).as_posix()
+        except ValueError:
+            rel = f.name
+        if security.is_sensitive_path(rel):
+            if verbose:
+                print(f"  [skip] {rel}: sensitive file (never indexed)",
+                      file=sys.stderr)
+            continue
+        kept.append(f)
+    files = kept
     if not files:
         if verbose:
             print("  no indexable files yet; writing an empty index "
@@ -1291,7 +1348,9 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     cache = {} if resummarise else _load_cache(root)
     for c in chunks:
         if c.sha in cache:
-            c.summary = _entry(cache[c.sha])[0]
+            text = _entry(cache[c.sha])[0]
+            if text and not _is_prompt_echo_summary(text):
+                c.summary = text
     skeletons: dict[str, tuple[str, str]] = {}   # rel -> (skeleton, cache key)
     for rel in idx.files:
         # same skip condition as the summarise loop below
@@ -1301,7 +1360,9 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
         key = "file:" + hashlib.sha256(skel.encode()).hexdigest()[:16]
         skeletons[rel] = (skel, key)
         if key in cache:
-            idx.file_summaries[rel] = _entry(cache[key])[0]
+            text = _entry(cache[key])[0]
+            if text and not _is_prompt_echo_summary(text):
+                idx.file_summaries[rel] = text
 
     if not (summarise and client is not None):
         idx.save()

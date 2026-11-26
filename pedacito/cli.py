@@ -3107,27 +3107,54 @@ def _cmd_memory(args) -> int:
 
 
 def _cmd_trust(args) -> int:
-    """`pedacito trust`: approve this project's `.pedacito.toml` to set
-    execution-capable settings (hooks, mcp_servers, auto_verify, test_command)."""
-    from .config import EXEC_FIELDS, trust_project
+    """`pedacito trust`: approve this project's `.pedacito.toml` (execution-
+    capable settings: hooks, mcp_servers, auto_verify, test_command) and/or its
+    `.pedacito/policy.toml` (the trust-gated capability policy)."""
+    from . import policy as policy_mod
+    from .config import EXEC_FIELDS, trust_project, validate_utf8_toml
     root = _root(args)
-    path = find_project_config(root)
-    if path is None:
-        print(f"No .pedacito.toml / pedacito.toml in {root}; nothing to trust.")
+    cfg_path = find_project_config(root)
+    pol_path = policy_mod.policy_path(root)
+    if not pol_path.is_file():
+        pol_path = None
+    if cfg_path is None and pol_path is None:
+        print(f"No .pedacito.toml / pedacito.toml and no "
+              f".pedacito/policy.toml in {root}; nothing to trust.")
         return 0
-    print(f"{path}:\n")
-    print(path.read_text(encoding="utf-8", errors="replace"))
-    print(f"\nSettings that can run commands: {', '.join(EXEC_FIELDS)}.")
+
+    # BUG-04: validate UTF-8 + TOML syntax BEFORE pinning either file as
+    # trusted. A UTF-16 (PowerShell `Out-File -Encoding Unicode`) or broken
+    # file is refused with exit code 2, never trusted.
+    for path in (cfg_path, pol_path):
+        if path is None:
+            continue
+        err = validate_utf8_toml(path)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 2
+
     if not args.yes:
+        for path in (cfg_path, pol_path):
+            if path is None:
+                continue
+            print(f"{path}:\n")
+            print(path.read_text(encoding="utf-8", errors="replace"))
+            print()
+        if cfg_path is not None:
+            print(f"Settings that can run commands: {', '.join(EXEC_FIELDS)}.")
         try:
-            ans = input("Trust this file as written? [y/N] ").strip().lower()
+            ans = input("Trust these file(s) as written? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = ""
         if ans not in ("y", "yes"):
             print("Not trusted.")
             return 1
-    trust_project(path)
-    print("Trusted (until the file changes).")
+
+    for path in (cfg_path, pol_path):
+        if path is None:
+            continue
+        trust_project(path)
+        print(f"Trusted {path} (until the file changes).")
     return 0
 
 
@@ -3486,6 +3513,55 @@ def _cmd_rename(args) -> int:
             state["dir"] = workspace.new_backup_dir(root, unique=True)
         fileio.backup_copy(path, state["dir"] / rel)
         return None
+
+    # BUG-02: `rename --apply` is a write. Plan mode (`permission_mode =
+    # "plan"`), `approval_policy = "never"`, and trusted `[paths].deny` rules
+    # must all block it BEFORE anything is written -- the deterministic rename
+    # engine otherwise sailed straight past the policy engine that `ask
+    # --apply` already honours.
+    cfg = None
+    if args.apply:
+        try:
+            cfg = load_config(root=root, explicit=getattr(args, "config", None),
+                              profile=getattr(args, "profile", None),
+                              require_hardware=False, warn_budgets=False,
+                              upgrade_user_config=False)
+        except ConfigError as e:
+            print(f"rename refused: cannot load config to check policy: {e}",
+                  file=sys.stderr)
+            return 1
+        from . import policy as policy_mod
+
+        def _denied(target: str) -> str | None:
+            try:
+                d = policy_mod.enforce(cfg, "write", target, root=root)
+            except Exception as e:
+                return f"denied by policy (policy:error): policy evaluation error: {e}"
+            if d is not None and d.decision == "deny":
+                return f"denied by policy ({d.matched_rule}): {d.reason}"
+            return None
+
+        coarse = _denied(args.old)
+        if coarse is not None:
+            print(coarse, file=sys.stderr)
+            return 1
+
+        # Plan first (dry run) so `[paths].deny` can gate every candidate file
+        # path before a single byte is written, not just the coarse target.
+        plan = refactor.rename_symbol_across_project(
+            root, args.old, args.new, scope_file=args.file or None,
+            dry_run=True,
+            include_strings=bool(getattr(args, "strings", False)),
+            include_labels=bool(getattr(args, "include_labels", False)))
+        if not plan["ok"]:
+            print(f"rename refused: {plan.get('error', 'unknown failure')}",
+                  file=sys.stderr)
+            return 2
+        for rel in plan.get("files_modified", []):
+            denied = _denied(rel)
+            if denied is not None:
+                print(denied, file=sys.stderr)
+                return 1
 
     if args.apply:
         # Record the exact pre-rename workspace so `pedacito undo` restores it

@@ -2820,8 +2820,16 @@ def _compact_outline(index, rel: str) -> str:
 def tool_outline(index, cfg, file: str) -> str:
     """Return a compact table of contents for one file (classes, methods and
     functions with exact start-end lines), or, when `file` names a directory
-    or glob, the file cards under it."""
+    or glob, the file cards under it.
+
+    A sensitive file is refused outright (matching `read`): even a stale index
+    that predates the sensitive-file exclusion must never reveal its
+    doclines/content through an outline (BUG-03)."""
     file = _as_text(file)
+
+    def sensitive(rel: str) -> bool:
+        return security.is_sensitive_path(Path(index.root) / rel)
+
     rel = index.resolve_file(file)
     if rel is None:
         rel = adopt_if_on_disk(index, cfg, file)
@@ -2834,10 +2842,12 @@ def tool_outline(index, cfg, file: str) -> str:
         # A directory or glob lists file cards; "." lists the whole project.
         name = fileio.normalise_rel(file or "").strip()
         if name in (".", "./"):
-            return _outline_dir(index, ".", list(index.files))
+            return _outline_dir(index, ".", [f for f in index.files
+                                             if not sensitive(f)])
         if name:
             matches, note = _grep_scope(index, name)
             if not note and matches:
+                matches = [m for m in matches if not sensitive(m)]
                 # No note means `name` resolved; a miss falls through to the
                 # file-not-found hint instead of dumping every card.
                 if len(matches) == 1:
@@ -2846,6 +2856,8 @@ def tool_outline(index, cfg, file: str) -> str:
                     return _outline_dir(index, name, matches)
     if rel is None:
         return _file_hint(index, file)
+    if sensitive(rel):
+        return _sensitive_read_gate(cfg, rel)
     return _compact_outline(index, rel)
 
 

@@ -3177,8 +3177,12 @@ class _Handler(BaseHTTPRequestHandler):
         CSP forbids -- a previewed page must be embeddable by the same origin
         and may run its own inline scripts/styles. Sensitive files are never
         previewed. Relative asset links inside the page resolve back through
-        /preview/ as well."""
-        self._serve_project_asset(rel)
+        /preview/ as well.
+
+        The iframe's opaque origin sends `Origin: null` on its module-script
+        fetches, so that one origin is answered with `ACAO: null` (never `*`,
+        which would let any website read project files from this port)."""
+        self._serve_project_asset(rel, opaque_cors=True)
 
     def _runner_preview(self, rel: str) -> None:
         """The Run tab's preview endpoint, with the same path-traversal gate
@@ -3186,7 +3190,7 @@ class _Handler(BaseHTTPRequestHandler):
         images, fonts, JSON, wasm and media all load from the project root."""
         self._serve_project_asset(rel)
 
-    def _serve_project_asset(self, rel: str) -> None:
+    def _serve_project_asset(self, rel: str, opaque_cors: bool = False) -> None:
         root = STATE.root
         if root is None:
             self._send(404, b"no project open", "text/plain")
@@ -3232,6 +3236,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "SAMEORIGIN")
             self.send_header("Content-Security-Policy", PREVIEW_CSP)
+            if opaque_cors:
+                self.send_header("Vary", "Origin")
+                if (self.headers.get("Origin") or "") == "null":
+                    self.send_header("Access-Control-Allow-Origin", "null")
             self.end_headers()
             self.wfile.write(data)
         except _CLIENT_DISCONNECT:

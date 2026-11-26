@@ -18,6 +18,7 @@ import re
 import unicodedata
 from functools import lru_cache
 
+from . import i18n
 from .config import Config
 
 # ------------------------------------------------------------------ tokenising
@@ -3936,33 +3937,111 @@ def _first_sentence(text: str, limit: int = 280) -> str:
     return cut.rstrip() + "…"
 
 
-def _flag_text(doc: dict, limit: int = 8) -> str:
+_ES_SUMMARIES = {
+    "gui:permission-dialog": "Cuando el modelo pide algo que requiere permiso (acceso web, instalar un paquete, un comando de shell no aprobado o un archivo sensible), la ejecución se pausa hasta que respondas.",
+    "gui:set-up-config": "Usa el asistente de configuración de la primera ejecución en Ajustes, o crea y prueba una configuración mínima desde la CLI.",
+    "gui:find-settings": "Todos los ajustes es un formulario con búsqueda para cada clave de configuración, aplicado globalmente o a un solo perfil.",
+    "gui:language-switch": "La GUI, la TUI y la CLI funcionan en inglés y español. Cambia el idioma en vivo en la GUI o la TUI, por ejecución en la CLI, o de forma permanente con el ajuste language; llm_reply_language controla por separado el idioma de las respuestas del modelo.",
+    "gui:plan-only": "Marca Solo plan en las opciones de Auto, u omite --apply en la CLI; edita la lista de tareas en el panel Plan.",
+    "gui:run-auto": "Dale a Auto un objetivo; escribe una lista de tareas y las trabaja una por una, con verificación opcional de cada tarea.",
+    "gui:switch-model": "Elige otro perfil en la barra superior y pulsa Cambiar; el proyecto abierto se recarga con ese modelo.",
+    "gui:reset-config": "Restablece la configuración del usuario a los valores recomendados de Pedacito; antes se respalda el archivo anterior.",
+    "gui:undo-run": "Cada escritura se guarda antes en una instantánea; restaura la más reciente o una elegida desde el panel Espacio de trabajo.",
+    "gui:allow-tools": "Son ajustes de confianza opcionales en Todos los ajustes; permiten que el modelo ejecute comandos o escriba durante la fase de recopilación.",
+    "gui:web-access": "El acceso web está desactivado por defecto. fetch_url y web_search se ejecutan si enable_web está activo, o si apruebas cada llamada en el diálogo de permisos.",
+    "gui:api-key-hosted": "Pon la URL del servidor, el modelo y la clave de API en el perfil; para APIs alojadas usa api_key_env para que el secreto no quede en el archivo.",
+    "gui:index-project": "El botón Indexar de la barra superior construye el mapa; Mayús+clic crea un índice rápido sin resúmenes del modelo.",
+    "gui:install-pedacito": "Instala desde PyPI con `pip install pedacito` (o `pipx install pedacito` para una CLI aislada); se requiere Python 3.11+. Ambos dejan `pedacito` y el alias corto `pdc` en tu PATH.",
+    "gui:verify-tests": "El modo Auto puede ejecutar un comando de verificación tras cada tarea; Task/Edit puede correr las pruebas del proyecto tras las ediciones aplicadas.",
+    "gui:green-ratchet": "Auto guarda una instantánea antes de cada paso. Un paso que sigue fallando tras sus rondas de reparación se deshace, así el siguiente paso parte del último estado que pasaba.",
+    "gui:execution-mode": "two_phase recopila contexto y luego responde con bloques de edición; interleaved ejecuta una conversación agéntica donde el modelo lee, edita, ejecuta pruebas y corrige hasta terminar; auto elige interleaved cuando corresponde.",
+    "gui:live-telemetry": "Un pie bajo el espacio de trabajo de la GUI muestra la ventana de contexto, los tokens del turno y de la sesión, la velocidad de generación, los aciertos de caché KV y los pliegues mientras corre una tarea; la CLI imprime los mismos números en una línea.",
+    "gui:cli-gui-cheatsheet": "La GUI y la CLI usan el mismo motor; usa la que te quede más cerca de la tarea.",
+    "gui:named-mcp-servers": "Las tablas [mcp_servers.<nombre>] describen un servidor stdio (command + args) o uno Streamable HTTP (url). La fase de recopilación solo muestra al modelo las herramientas que coinciden con la tarea actual.",
+    "cli:daemon": "Daemon sin interfaz y solo de loopback: un índice caliente y concesiones de modelo compartidas por sesiones de espacio de trabajo aisladas. Cada endpoint exige el token de portador de cada ejecución y nada queda expuesto fuera de 127.0.0.1.",
+    "cli:config": "Muestra cada ajuste resuelto y de dónde viene; crea, prueba, imprime o añade opciones documentadas al archivo de configuración.",
+    "cli:trust": "Aprueba el .pedacito.toml de este proyecto para que sus hooks, servidores MCP y comandos de verificación puedan ejecutarse.",
+    "cli:how": "Pregunta cómo usar Pedacito. Busca en la referencia integrada de la CLI, la GUI y los ajustes; funciona sin modelo con --offline.",
+    "cli:tui": "Interfaz de terminal dividida: panel de transcripción, barra lateral de actividad y plan, pie de telemetría y desplazamiento con PgUp/PgDn o la rueda del ratón.",
+    "cli:index": "Construye o actualiza el índice del proyecto (mapa y resúmenes) que usan ask, explain y auto.",
+    "cli:map": "Imprime el índice o mapa exactamente como lo recibiría el modelo.",
+    "cli:files": "Muestra qué archivos se indexarían y por qué, incluidos los archivos ignorados y sus motivos.",
+    "cli:ask": "Ejecuta una tarea de código de principio a fin. Sin --apply es una ejecución de prueba que imprime las ediciones propuestas.",
+    "cli:auto": "Convierte un objetivo en una lista de tareas y luego implementa cada una en un contexto nuevo. Sin --apply solo escribe o imprime el plan.",
+    "cli:reset": "Borra el estado de Pedacito de este proyecto (índice, planes, cachés, sesiones y respaldos); el código y los archivos de configuración no se tocan. No es un restablecimiento de la configuración.",
+    "cli:undo": "Deshace la última ejecución: restaura el espacio de trabajo al estado anterior al checkpoint activo (o a la instantánea de respaldo más reciente en proyectos antiguos).",
+    "cli:gui": "Abre el panel de control local en el navegador (solo 127.0.0.1).",
+    "cli:calibrate": "Mide el modelo configurado (elección de herramientas, formato de edición, honestidad, contexto largo y sondas de especialidad) y guarda una tarjeta de modelo que ajusta los valores por defecto.",
+    "cli:rpc": "JSONL-RPC interactivo por stdin/stdout para editores y otros agentes: una petición JSON por línea; cada línea de stdout es un marco JSON y los diagnósticos humanos van a stderr.",
+}
+
+
+def _card_summary(item: dict, lang: str = "en") -> str:
+    if i18n.normalize_lang(lang) == "es":
+        return str(item.get("summary_es") or item.get("summary") or "")
+    return str(item.get("summary") or "")
+
+
+def setting_help(item: dict, lang: str = "en") -> str:
+    if i18n.normalize_lang(lang) == "es":
+        return str(item.get("help_es") or item.get("help") or "")
+    return str(item.get("help") or "")
+
+
+def localize_matches(matches: dict, lang: str = "es",
+                     setting_help: dict[str, str] | None = None) -> None:
+    """Attach Spanish card text to the (copied) items of a `search()` result.
+
+    `setting_help` maps a setting key to its Spanish description from the
+    Spanish configuration reference; English text stays as the fallback."""
+    if i18n.normalize_lang(lang) != "es":
+        return
+    for item in matches.get("gui") or []:
+        summary = _ES_SUMMARIES.get(f"gui:{item.get('id')}")
+        if summary:
+            item["summary_es"] = summary
+    for item in matches.get("cli") or []:
+        summary = _ES_SUMMARIES.get(f"cli:{item.get('name')}")
+        if summary:
+            item["summary_es"] = summary
+    for item in matches.get("settings") or []:
+        text = (setting_help or {}).get(item.get("key"))
+        if text:
+            item["help_es"] = text
+
+
+def _flag_text(doc: dict, limit: int = 8, lang: str = "en") -> str:
     flags = [f['flag'] for f in doc.get("flags", [])]
     if not flags:
         return ""
     shown = ", ".join(f"`{f}`" for f in flags[:limit])
     if len(flags) > limit:
-        shown += f", … ({len(flags) - limit} more; run `pedacito " \
-                 f"{doc['name']} --help`)"
+        shown += i18n.t("how.flags_more", lang=lang,
+                        n=len(flags) - limit, name=doc["name"])
     return shown
 
 
-def render_answer(question: str, matches: dict) -> str:
+def render_answer(question: str, matches: dict, lang: str = "en") -> str:
     """Format retrieved facts without a model. Always returns useful text."""
+    lang = i18n.normalize_lang(lang)
+
+    def t(key: str, **kw) -> str:
+        return i18n.t(f"how.{key}", lang=lang, **kw)
+
     gui = matches.get("gui") or []
     cli = matches.get("cli") or []
     settings = matches.get("settings") or []
     lines: list[str] = []
-    lines.append("**Built-in reference**: no model or project needed.")
+    lines.append(t("banner"))
     lines.append("")
-    best = (gui[0]["summary"] if gui else
-            cli[0]["summary"] if cli else
-            "I could not match that question to the built-in reference.")
+    best = (_card_summary(gui[0], lang) if gui else
+            _card_summary(cli[0], lang) if cli else
+            t("cant_match"))
     if best:
         lines.append(best)
         lines.append("")
     if gui:
-        lines.append("**In the GUI**")
+        lines.append(t("gui_heading"))
         for item in gui[:2]:
             lines.append(f"1. **{item['title']}**")
             for step in item.get("steps", [])[:6]:
@@ -3972,16 +4051,15 @@ def render_answer(question: str, matches: dict) -> str:
                     lines.append(f"   - {note}")
         lines.append("")
     else:
-        lines.append("**In the GUI**")
-        lines.append("- No dedicated control matches this question; use the "
-                     "CLI or edit `config.toml`.")
+        lines.append(t("gui_heading"))
+        lines.append(t("gui_none"))
         lines.append("")
-    lines.append("**In the Terminal (CLI)**")
+    lines.append(t("cli_heading"))
     if cli:
         for item in cli[:2]:
             lines.append(f"- **`pedacito {item['name']}`**: "
-                         f"{_first_sentence(item['summary'], 220)}")
-            lines.append(f"  - Usage: `{item['usage']}`")
+                         f"{_first_sentence(_card_summary(item, lang), 220)}")
+            lines.append(f"  - {t('usage_label')}: `{item['usage']}`")
             examples = item.get("examples") or []
             if examples:
                 lines.append("")
@@ -3989,31 +4067,27 @@ def render_answer(question: str, matches: dict) -> str:
                 for example in examples[:3]:
                     lines.append(f"  {example}")
                 lines.append("  ```")
-            flags = _flag_text(item)
+            flags = _flag_text(item, lang=lang)
             if flags:
-                lines.append(f"  - Flags: {flags}")
+                lines.append(f"  - {t('flags_label')}: {flags}")
             if item.get("common"):
-                lines.append("  - Common project flags: `--exclude`, "
-                             "`--include`, `--ext`, `--url`, `--model`, "
-                             "`--profile`, `--steps`, `--role`, `--record`, "
-                             "`--replay`, `--jsonl`, `--max-cost` "
-                             "(see `--help`).")
+                lines.append(f"  - {t('common_flags')}")
             if item.get("notes"):
                 for note in item["notes"][:4]:
                     lines.append(f"  - {note}")
             lines.append("")
     else:
-        lines.append("- No CLI command is needed for this; the GUI setting is "
-                     "the direct route.")
+        lines.append(t("cli_none"))
         lines.append("")
-    lines.append("**Relevant Settings (`config.toml`)**")
+    lines.append(t("settings_heading"))
     if settings:
         for item in settings[:4]:
             default = item.get("default_text", "")
-            lines.append(f"- **`{item['key']}`** (default: `{default}`): "
-                         f"{_first_sentence(item.get('help', ''), 240)}")
+            lines.append(f"- **`{item['key']}`** ({t('default_label')}: "
+                         f"`{default}`): "
+                         f"{_first_sentence(setting_help(item, lang), 240)}")
             if item.get("gui"):
-                lines.append(f"  - Where: {item['gui']}")
+                lines.append(f"  - {t('where_label')}: {item['gui']}")
             if item.get("toml"):
                 lines.append("")
                 lines.append("    ```toml")
@@ -4022,11 +4096,9 @@ def render_answer(question: str, matches: dict) -> str:
                 lines.append("    ```")
             lines.append("")
     else:
-        lines.append("- No specific setting is required; use the GUI control "
-                     "or CLI command above.")
+        lines.append(t("settings_none"))
     lines.append("")
-    lines.append("_Ask with `--offline` (CLI) or turn off “Use model” in the "
-                 "How tab for this deterministic answer every time._")
+    lines.append(t("footer"))
     return "\n".join(lines).rstrip() + "\n"
 
 

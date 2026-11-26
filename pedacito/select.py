@@ -44,7 +44,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import fileio
+from . import fileio, security
 
 # Directories and files excluded from every project by default.
 DEFAULT_IGNORE = [
@@ -57,7 +57,8 @@ DEFAULT_IGNORE = [
     # Secret-bearing files are never indexed (so never sent to a model).
     # Re-include one deliberately with `!.env` in .pedacitoignore, or by
     # naming it on the command line.
-    ".env", ".env.*", "!.env.example", "!.env.sample", "!.env.template",
+    ".env", ".env.*", "*.env", "!.env.example", "!.env.sample",
+    "!.env.template",
     "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "id_rsa*", "id_dsa*",
     "id_ecdsa*", "id_ed25519*", "!*.pub", ".npmrc", ".pypirc", ".netrc",
     ".git-credentials", "credentials.json", "secrets.json", "secrets.yaml",
@@ -288,9 +289,12 @@ def select(paths: list[str], root: Path, matcher: Matcher,
            exts: set[str]) -> list[Path]:
     """Expand files/directories into a filtered, deduplicated file list.
 
-    Directory walks keep files whose extension is in `exts` and that `matcher`
-    does not exclude; a file named explicitly is exempt from ignore rules.
-    """
+    Directory walks keep files whose extension is in `exts` (plus the
+    non-sensitive env-template and public-key carve-outs of BUG-19) and that
+    `matcher` does not exclude; a file named explicitly is exempt from ignore
+    rules. A sensitive file (secret/credential material) is NEVER selected --
+    not even when named explicitly -- so no secret can reach the index or a
+    model prompt (BUG-03)."""
     out: list[Path] = []
     seen: set[Path] = set()
 
@@ -298,13 +302,17 @@ def select(paths: list[str], root: Path, matcher: Matcher,
         r = f.resolve()
         if r in seen:
             return
-        if f.suffix.lower() not in exts:
+        try:
+            rel = r.relative_to(root).as_posix()
+        except ValueError:
+            rel = f.name
+        if not _selectable_suffix(f.name, f.suffix.lower(), exts):
+            return
+        # A secret/credential file is never selected, whatever the extension
+        # filter or a `!.env` style re-inclusion says.
+        if security.is_sensitive_path(rel):
             return
         if not explicit:
-            try:
-                rel = r.relative_to(root).as_posix()
-            except ValueError:
-                rel = f.name
             if matcher.excluded(rel):
                 return
         seen.add(r)
@@ -318,6 +326,21 @@ def select(paths: list[str], root: Path, matcher: Matcher,
             for f in _walk(path, matcher, root):
                 keep(f, explicit=False)
     return out
+
+
+def _selectable_suffix(name: str, suffix: str, exts: set[str]) -> bool:
+    """Whether a file named `name` with `suffix` may be selected even when its
+    extension is not in `exts`: the documented env templates (`.env.example`,
+    `.env.sample`, `.env.template`, `.env.dist`, `.env.defaults`) and public
+    keys (`*.pub`) that are NOT sensitive (BUG-19)."""
+    if suffix in exts:
+        return True
+    low = name.lower()
+    if low in security.ENV_TEMPLATE_NAMES:
+        return True
+    if suffix == ".pub" and not security.is_sensitive_path(low):
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------

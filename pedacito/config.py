@@ -1561,14 +1561,54 @@ def _coerce(name: str, value, path: Path | None = None):
     return value
 
 
-def _read(path: Path) -> tuple[dict, dict]:
-    """Parse one TOML config file into (settings, profiles)."""
+def _read_utf8_toml(path: Path) -> dict:
+    """Read `path` as a UTF-8 TOML document, raising `ConfigError` on any
+    decode or parse problem.
+
+    The bytes are read raw first so a UTF-16 file -- the default
+    `Out-File -Encoding Unicode` on Windows PowerShell writes a `\\xff\\xfe`
+    BOM and NUL bytes -- is refused with a clear message instead of crashing
+    with an unhandled `UnicodeDecodeError` (BUG-04). A UTF-8 BOM is stripped
+    cleanly. Shared by `load` and by `pedacito trust`'s pre-trust validation.
+    """
     try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
+        raw = path.read_bytes()
+    except OSError as e:
+        raise ConfigError(f"{path}: could not be read: {e}") from e
+    head = raw[:256]
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in head:
+        raise ConfigError(
+            f"Config error: {path} appears to be UTF-16 (not UTF-8). "
+            "On Windows PowerShell, re-save as UTF-8 "
+            "(e.g. Set-Content -Encoding utf8).")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"{path}: not valid UTF-8: {e}") from e
+    try:
+        return tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: invalid TOML: {e}") from e
-    return _flatten(data, path)
+
+
+def validate_utf8_toml(path: Path) -> str | None:
+    """`None` when `path` is valid UTF-8 TOML, else a one-line error message.
+
+    `pedacito trust` calls this BEFORE pinning a `.pedacito.toml` or
+    `.pedacito/policy.toml` as trusted, so a UTF-16 or syntactically broken
+    file is refused (exit code 2) rather than trusted (BUG-04)."""
+    try:
+        _read_utf8_toml(path)
+    except ConfigError as e:
+        return str(e)
+    return None
+
+
+def _read(path: Path) -> tuple[dict, dict]:
+    """Parse one TOML config file into (settings, profiles)."""
+    return _flatten(_read_utf8_toml(path), path)
 
 
 def find_project_config(root: Path) -> Path | None:

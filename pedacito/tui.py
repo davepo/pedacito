@@ -88,6 +88,10 @@ _ALT_SCREEN_OFF = ("\x1b[?2004l\x1b[?2026l\x1b[0m\x1b[r\x1b[?1007l\x1b[?1000l"
 _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
 MAX_PROMPT_ROWS = 6
+_MAP_FILE_LIMIT = 40
+_MAP_SYMBOL_LIMIT = 4
+_MAP_SYMBOL_KINDS = ("function", "class", "classheader", "method")
+_FILES_LIMIT = 60
 _MOUSE_SGR_ON = "\x1b[?1007l\x1b[?1000h\x1b[?1006h"
 _MOUSE_SGR_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?1007h"
 _SYNC_ON = "\x1b[?2026h"
@@ -285,6 +289,8 @@ Pedacito TUI commands
   /collapse [N|all]         collapse tool-call card N (or all)
   /mouse [on|off]           SGR mouse wheel capture (F2); off keeps native
                             text selection and OS copy/paste
+  /map                      compact project map: indexed files and top symbols
+  /files                    indexed files, with skipped and hidden counts
   /clear                    clear the transcript pane
   /quit  /exit              leave and restore the terminal
 
@@ -378,6 +384,8 @@ Comandos de Pedacito TUI
   /expand [N|all]           expandir tarjeta de herramienta N (o todas)
   /collapse [N|all]         contraer tarjeta de herramienta N (o todas)
   /mouse [on|off]           captura de rueda del ratón SGR (F2)
+  /map                      mapa compacto del proyecto: archivos y símbolos principales
+  /files                    archivos indexados, con conteos de omitidos y ocultos
   /clear                    limpiar el panel de transcripción
   /quit  /exit              salir y restaurar la terminal
 
@@ -588,6 +596,22 @@ def _fit(text: str, width: int) -> str:
     cut = _truncate_visible(str(text), width)
     pad = width - _display_width(cut)
     return cut + (" " * max(0, pad))
+
+
+def _headless_rows(label: str, text, width: int) -> list[str]:
+    """Plain `label: text` rows for headless output, wrapped to `width`.
+    Continuation rows keep the label and the source line's indentation."""
+    width = max(20, int(width or 80))
+    prefix = f"{label}: "
+    rows: list[str] = []
+    for raw in str(text).splitlines() or [""]:
+        indent = min(len(raw) - len(raw.lstrip(" ")), width // 4)
+        rows.extend(textwrap.wrap(
+            prefix + raw, width=width,
+            subsequent_indent=" " * (len(prefix) + indent),
+            replace_whitespace=False, break_long_words=True,
+            break_on_hyphens=False) or [prefix.rstrip()])
+    return rows
 
 
 def _compact_tokens(n) -> str:
@@ -1568,8 +1592,8 @@ class TuiSession:
         if not self.transcript:
             source = [
                 ("banner", f"Pedacito TUI \u2014 {self.root}"),
-                ("system", "Type a coding task, or /help for commands."),
-                ("system", "PgUp/PgDn or the mouse wheel scrolls the log."),
+                ("system", i18n.t("tui.welcome", lang=self.lang)),
+                ("system", i18n.t("tui.scroll_hint", lang=self.lang)),
             ]
         else:
             source = self.transcript
@@ -1914,18 +1938,21 @@ class TuiSession:
             self._headless_activity_sent = len(self.activity)
             chunks: list[str] = []
             if new_rows:
-                def _fmt_headless(kind: str, text: str) -> str:
+                def _fmt_headless(kind: str, text: str) -> list[str]:
                     if kind == "tool_card":
                         m = re.match(r"^__TOOL_CARD__:(\d+)$", str(text).strip())
                         card = self.get_tool_card(int(m.group(1))) if m else None
                         if card is not None:
-                            return f"tool_card: {self._render_tool_card_text(card)}"
-                    return f"{kind}: {text}"
-                chunks.append("\n".join(_fmt_headless(kind, text)
-                                        for kind, text in new_rows))
+                            return _headless_rows(
+                                "tool_card", self._render_tool_card_text(card),
+                                width)
+                    return _headless_rows(kind, text, width)
+                chunks.append("\n".join(row for kind, text in new_rows
+                                        for row in _fmt_headless(kind, text)))
             if new_activity:
-                chunks.append("\n".join(f"activity: {row}"
-                                        for row in new_activity))
+                chunks.append("\n".join(
+                    row for item in new_activity
+                    for row in _headless_rows("activity", item, width)))
             if chunks:
                 with self._write_lock:
                     self._write("\n" + "\n".join(chunks) + "\n")
@@ -4089,17 +4116,100 @@ class TuiSession:
                     goal, roles_mod.client_for(self.cfg, "planner", client),
                     self.cfg, root=self.root)
             except Exception as exc:
-                self._append(f"plan generation failed: {exc}", "error")
+                self._append(i18n.t("tui.plan.failed", lang=self.lang,
+                                    error=exc), "error")
                 return
             loop.write_plan(self._plan_path(), goal, titles)
-            self._append(f"wrote {self._plan_path()}", "system")
+            self._append(i18n.t("tui.plan.wrote", lang=self.lang,
+                                path=self._plan_path()), "system")
         items = self.plan_items()
         if not items:
-            self._append(f"No plan tasks at {self._plan_path()}. "
-                         "Use /plan <goal> or /auto <goal>.", "system")
+            self._append(i18n.t("tui.plan.none", lang=self.lang,
+                                path=self._plan_path()), "system")
             return
         for checked, text in items:
             self._append(f"[{'x' if checked else ' '}] {text}", "system")
+
+    def _index_for_view(self):
+        """The loaded project index, read from disk when no task has built it."""
+        if self.idx is not None:
+            return self.idx
+        try:
+            return index_mod.Index.load(self.root)
+        except Exception:
+            return None
+
+    def _map_command(self) -> None:
+        """`/map`: indexed files with their top symbols; sensitive files hidden."""
+        idx = self._index_for_view()
+        if idx is None:
+            self._append(i18n.t("tui.map.not_indexed", lang=self.lang), "system")
+            return
+        files = list(idx.files)
+        visible = [f for f in files if not security.is_sensitive_path(f)]
+        if not visible:
+            self._append(i18n.t("tui.map.empty", lang=self.lang), "system")
+            return
+        allowed = set(visible)
+        symbols: dict[str, list[str]] = {}
+        for chunk in idx.chunks:
+            rel = str(getattr(chunk, "file", "") or "")
+            qual = str(getattr(chunk, "qualname", "") or "").strip()
+            kind = str(getattr(chunk, "kind", "") or "")
+            if (rel not in allowed or not qual or kind not in _MAP_SYMBOL_KINDS
+                    or int(getattr(chunk, "part", 1) or 1) != 1):
+                continue
+            names = symbols.setdefault(rel, [])
+            if qual not in names:
+                names.append(qual)
+        total = sum(len(names) for names in symbols.values())
+        lines = [i18n.t("tui.map.title", lang=self.lang,
+                        files=len(visible), symbols=total)]
+        for rel in visible[:_MAP_FILE_LIMIT]:
+            names = symbols.get(rel, [])
+            if not names:
+                lines.append(i18n.t("tui.map.row_plain", lang=self.lang,
+                                    file=rel))
+                continue
+            shown = ", ".join(names[:_MAP_SYMBOL_LIMIT])
+            if len(names) > _MAP_SYMBOL_LIMIT:
+                shown += f", +{len(names) - _MAP_SYMBOL_LIMIT}"
+            lines.append(i18n.t("tui.map.row", lang=self.lang, file=rel,
+                                n=len(names), symbols=shown))
+        if len(visible) > _MAP_FILE_LIMIT:
+            lines.append(i18n.t("tui.map.more", lang=self.lang,
+                                n=len(visible) - _MAP_FILE_LIMIT))
+        hidden = len(files) - len(visible)
+        if hidden:
+            lines.append(i18n.t("tui.map.hidden", lang=self.lang, n=hidden))
+        self._append("\n".join(lines), "system")
+
+    def _files_command(self) -> None:
+        """`/files`: indexed files, plus counts of unindexed and hidden files."""
+        idx = self._index_for_view()
+        indexed = list(idx.files) if idx is not None else []
+        try:
+            workspace = select_mod._workspace_files(self.root, idx)
+        except Exception:
+            workspace = []
+        indexed_set = set(indexed)
+        known = indexed_set | set(workspace)
+        hidden = sum(1 for f in known if security.is_sensitive_path(f))
+        visible = [f for f in indexed if not security.is_sensitive_path(f)]
+        skipped = sum(1 for f in workspace if f not in indexed_set
+                      and not security.is_sensitive_path(f))
+        if not visible:
+            self._append(i18n.t("tui.files.none", lang=self.lang), "system")
+            return
+        lines = [i18n.t("tui.files.title", lang=self.lang, n=len(visible))]
+        lines += visible[:_FILES_LIMIT]
+        if len(visible) > _FILES_LIMIT:
+            lines.append(i18n.t("tui.files.more", lang=self.lang,
+                                n=len(visible) - _FILES_LIMIT))
+        lines.append(i18n.t("tui.files.skipped", lang=self.lang, n=skipped))
+        if hidden:
+            lines.append(i18n.t("tui.files.hidden", lang=self.lang, n=hidden))
+        self._append("\n".join(lines), "system")
 
     # ------------------------------------------------------------- commands
     def handle_line(self, line: str) -> bool:
@@ -4109,7 +4219,7 @@ class TuiSession:
             return not self._quit
         if text.lower() in ("quit", "exit", "q"):
             self._quit = True
-            self._append("Goodbye.", "system")
+            self._append(i18n.t("tui.goodbye", lang=self.lang), "system")
             return False
         if text.startswith("/"):
             self._slash(text)
@@ -4125,13 +4235,19 @@ class TuiSession:
 
         if cmd in ("quit", "exit", "q"):
             self._quit = True
-            self._append("Goodbye.", "system")
+            self._append(i18n.t("tui.goodbye", lang=self.lang), "system")
             return
         if cmd in ("help", "h", "?"):
             self._append(help_text(self.lang), "system")
             return
         if cmd == "keys":
             self._append(keys_text(self.lang), "system")
+            return
+        if cmd == "map":
+            self._map_command()
+            return
+        if cmd == "files":
+            self._files_command()
             return
         if cmd == "lang":
             self._lang_command(arg)
@@ -4286,10 +4402,11 @@ class TuiSession:
         if cmd == "sidebar":
             self.sidebar = not self.sidebar
             shown = self.sidebar and self._size()[0] >= 100
-            self._append(f"Sidebar: {'on' if shown else 'off'}", "system")
+            self._append(i18n.t("tui.sidebar.on" if shown else "tui.sidebar.off",
+                                lang=self.lang), "system")
             if self.sidebar and not shown:
-                self._append("(the activity pane needs a terminal at least "
-                             "100 columns wide)", "system")
+                self._append(i18n.t("tui.sidebar.needs_width", lang=self.lang),
+                             "system")
             self._dirty = True
             return
         if cmd == "clear":
@@ -4300,10 +4417,12 @@ class TuiSession:
             self.scroll_offset = 0
             self._scroll_seen_total = 0
             self._scroll_seen_width = 0
-            self._append("Transcript cleared.", "system")
+            self._append(i18n.t("tui.transcript_cleared", lang=self.lang),
+                         "system")
             self._dirty = True
             return
-        self._append(f"Unknown command '/{cmd}'. Try /help.", "error")
+        self._append(i18n.t("tui.unknown_command", lang=self.lang, cmd=cmd),
+                     "error")
 
     def status_report(self) -> str:
         t = self.telemetry()
@@ -5757,7 +5876,8 @@ class TuiSession:
                     self.cursor_pos = 0
                     self._dirty = True
                 else:
-                    self._append("cancelled (the session stays open)", "error")
+                    self._append(i18n.t("tui.cancelled", lang=self.lang),
+                                 "error")
                 if self._dirty:
                     self._redraw()
                 continue

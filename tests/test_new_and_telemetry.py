@@ -831,7 +831,7 @@ def test_tui_new_switches_root_before_scaffolding(tmp_path, monkeypatch):
     monkeypatch.setattr(scaffold, "run_new", fake_run_new)
     out = io.StringIO()
     session = tui_mod.TuiSession(tmp_path, cfg, client=client, headless=True,
-                                 stdout=out)
+                                 width=240, stdout=out)
     try:
         session.handle_line(f"/new {target} a tiny demo cli")
         assert session.root == target.resolve()
