@@ -134,9 +134,13 @@ def load_policy_file(root: Path | str, cfg: Any = None) -> dict[str, Any]:
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-    except (OSError, ValueError):
+    except ValueError as exc:
+        # A *trusted* policy.toml with a syntax error must fail closed rather
+        # than silently dropping its deny rules.
+        return {"_schema_error": f"invalid TOML in {path.name}: {exc}"}
+    except OSError:
         return {}
-    return data if isinstance(data, dict) else {}
+    return data if isinstance(data, dict) else {"_schema_error": "policy root must be a table"}
 
 
 def _effective(root: Path | str | None, cfg: Any) -> tuple[str, str]:
@@ -329,7 +333,7 @@ def _norm_command(command: str) -> tuple[list[str], str, str]:
     tokens = _command_tokens(command)
     if not tokens:
         return [], "", ""
-    if tokens[0].lower().rstrip(".exe") == "env":
+    if tokens[0].lower().removesuffix(".exe") == "env":
         rest = [t for t in tokens[1:] if "=" not in t]
         if rest:
             tokens = rest
@@ -396,6 +400,8 @@ def _validate_policy_doc(doc: dict[str, Any]) -> list[str]:
     """Schema errors in a trusted `policy.toml`, or []. A malformed table or a
     non-list-of-strings field is an error the engine must fail closed on."""
     errors: list[str] = []
+    if "_schema_error" in doc and doc["_schema_error"]:
+        errors.append(str(doc["_schema_error"]))
     for table in _POLICY_TABLES:
         if table not in doc:
             continue

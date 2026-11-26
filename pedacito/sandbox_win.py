@@ -311,6 +311,18 @@ def _configure_advapi32(a):
     a.SetTokenInformation.restype = wintypes.BOOL
     a.SetTokenInformation.argtypes = [
         wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    a.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    a.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD)]
+    a.GetSecurityDescriptorSacl.restype = wintypes.BOOL
+    a.GetSecurityDescriptorSacl.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+    a.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    a.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 
 
 # --------------------------------------------------------------------------- #
@@ -403,17 +415,92 @@ def _entry_is_reparse(entry) -> bool:
         return True
 
 
-def _icacls_setintegrity(target: str, level: str) -> bool:
-    """`icacls <target> /setintegritylevel <level> /L /Q` -- never `/T`.
+_SE_FILE_OBJECT = 1
+_LABEL_SECURITY_INFORMATION = 0x00000010
+_SDDL_REVISION_1 = 1
+_LABELED_CACHE: dict[str, str] = {}
+_LABELED_LOCK = threading.Lock()
+_SACL_CACHE: dict[str, tuple[ctypes.c_void_p, ctypes.c_void_p]] = {}
 
-    `/T` would follow NTFS junctions/reparse points and relabel `.git/hooks`,
-    `.pedacito` and `.pedacito.toml`; the non-recursive form touches exactly
-    one object. `level` is ``"L"`` (Low) or ``"M"`` (Medium)."""
+
+def _get_label_sacl(level: str) -> ctypes.c_void_p | None:
+    """Build and cache an in-process mandatory integrity SACL (`L` or `M`)."""
+    if os.name != "nt":
+        return None
+    with _LABELED_LOCK:
+        cached = _SACL_CACHE.get(level)
+        if cached is not None:
+            return cached[1]
+        sddl = "S:(ML;;NW;;;LW)" if level == "L" else "S:(ML;;NW;;;ME)"
+        try:
+            a = _advapi32()
+            sd = ctypes.c_void_p()
+            if not a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl, _SDDL_REVISION_1, ctypes.byref(sd), None):
+                return None
+            present = wintypes.BOOL()
+            sacl = ctypes.c_void_p()
+            defaulted = wintypes.BOOL()
+            if not a.GetSecurityDescriptorSacl(
+                    sd, ctypes.byref(present), ctypes.byref(sacl),
+                    ctypes.byref(defaulted)) or not present.value:
+                _kernel32().LocalFree(sd)
+                return None
+            # Keep `sd` alive for the lifetime of the process since `sacl`
+            # points inside it.
+            _SACL_CACHE[level] = (sd, sacl)
+            return sacl
+        except Exception:
+            return None
+
+
+def _win32_setintegrity(target: str, level: str) -> bool | None:
+    """Fast in-process `SetNamedSecurityInfoW` integrity relabel (~0.05ms per
+    entry vs ~25ms per `icacls.exe` spawn). Returns None when unavailable so
+    callers may fall back to `_icacls_setintegrity`."""
+    if os.name != "nt":
+        return None
+    sacl = _get_label_sacl(level)
+    if sacl is None:
+        return None
+    try:
+        rc = _advapi32().SetNamedSecurityInfoW(
+            target, _SE_FILE_OBJECT, _LABEL_SECURITY_INFORMATION,
+            None, None, None, sacl)
+        return rc == 0
+    except Exception:
+        return None
+
+
+def _icacls_setintegrity(target: str, level: str) -> bool:
+    """Non-recursive integrity label (`L` or `M`) on one object -- never `/T`.
+
+    Uses in-process `SetNamedSecurityInfoW` on Windows for sub-millisecond
+    labeling (avoiding spawning `icacls.exe` per file), with an in-process
+    cache so repeat commands on the same project skip already-labeled paths.
+    Falls back to `icacls <target> /setintegritylevel <level> /L /Q` only when
+    Win32 API is unavailable."""
+    cache_key = os.path.normcase(target)
+    with _LABELED_LOCK:
+        if _LABELED_CACHE.get(cache_key) == level:
+            return True
+    win_res = _win32_setintegrity(target, level)
+    if win_res is not None:
+        if win_res:
+            with _LABELED_LOCK:
+                if len(_LABELED_CACHE) > 20000:
+                    _LABELED_CACHE.clear()
+                _LABELED_CACHE[cache_key] = level
+        return win_res
     try:
         r = subprocess.run(
             ["icacls", target, "/setintegritylevel", level, "/L", "/Q"],
             capture_output=True, timeout=30)
-        return r.returncode == 0
+        ok = r.returncode == 0
+        if ok:
+            with _LABELED_LOCK:
+                _LABELED_CACHE[cache_key] = level
+        return ok
     except Exception:
         return False
 
