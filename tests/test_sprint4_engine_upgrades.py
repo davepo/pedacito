@@ -11,6 +11,7 @@ hardlinks backed by fileio.write's atomic replacement.
 """
 from __future__ import annotations
 
+import errno
 import stat
 import types
 
@@ -430,11 +431,26 @@ def test_fileio_write_is_atomic(tmp_path):
     assert not list(tmp_path.glob("*.pedacito-tmp"))
 
 
+def _symlink_unsupported(exc):
+    """True only when the OS cannot create symlinks (WinError 1314 or an
+    unsupported filesystem); any other OSError is a real defect."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 1314
+        or exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP))
+
+
 def test_fileio_write_through_symlink_updates_target(tmp_path):
     target = tmp_path / "real.txt"
     target.write_text("v1", encoding="utf-8")
     link = tmp_path / "link.txt"
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        if not _symlink_unsupported(exc):
+            raise
+        pytest.skip("symlinks unavailable on this platform")
     fileio.write(link, "v2", follow_symlinks=True)
     assert target.read_text(encoding="utf-8") == "v2"
     assert link.is_symlink()

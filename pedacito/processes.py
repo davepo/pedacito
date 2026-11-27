@@ -11,13 +11,18 @@ The registry lives under `.pedacito/procs/`: one JSON record per process and a
 `.log` file with its combined stdout/stderr. PIDs are process-group leaders, so
 `stop` reaps descendants too; on Windows, which has no process groups, the child
 is spawned SUSPENDED and put in a named job object before it runs (see
-`_job_wrap`), so every descendant it later spawns inherits membership. When a
-job cannot be created -- CI runners wrap every step in a job that refuses
-nested assignment, and older Windows refuses it outright -- `stop` falls back
-to `taskkill /T` plus a process-snapshot walk that reaches descendants even
-after their leader exited (`_windows_descendants`). This is deliberately a
-small, local-first manager: no daemon, no sockets -- just enough to start a
-server, find its printed URL, read its log, and stop it later.
+`_job_wrap`), so every descendant it later spawns inherits membership. The job
+handle is retained for the server's lifetime (`_JOB_HANDLES`): a named job's
+name disappears the instant its last handle closes -- even while members still
+run -- so `_job_kill` terminates through the retained handle, or reopens it by
+name from another pedacito process while this one still holds one. When a job
+cannot be created -- CI runners wrap every step in a job that refuses nested
+assignment -- `stop` falls back to a live snapshot walk (`_windows_descendants`)
+and the descendant identities `start` captured while the launcher chain was
+still alive, each killed only after its exact creation time is re-validated on
+the terminating handle. This is deliberately a small, local-first
+manager: no daemon, no sockets -- just enough to start a server, find its
+printed URL, read its log, and stop it later.
 """
 
 from __future__ import annotations
@@ -100,6 +105,16 @@ def _write_record(root: Path, rec: dict) -> None:
 _CHILDREN_LOCK = threading.Lock()
 _CHILDREN: dict[int, subprocess.Popen] = {}
 _START_LOCK = threading.Lock()
+# Live kernel handles to the job objects THIS process created, keyed by job
+# name. A named kernel object's name is removed from the namespace the moment
+# its last handle is closed -- even while member processes still run -- so
+# dropping the handle also drops the name, and a later OpenJobObjectW finds
+# nothing (ERROR_FILE_NOT_FOUND). Retaining the handle is what keeps the job
+# terminable: `_job_kill` terminates through it directly (same process), and
+# the still-registered name lets another pedacito process open it too -- but
+# only while THIS process stays alive to hold the handle.
+_JOB_LOCK = threading.Lock()
+_JOB_HANDLES: dict[str, int] = {}
 
 
 def _current_session_id() -> str:
@@ -263,6 +278,7 @@ def start(root, command, *, name: str = "", cfg=None,
     p = None
     job = job_note = ""
     born = 0.0
+    born_ft = 0
     try:
         with log.open("ab") as fh:
             p = proc.spawn(argv, cwd=root, env=env,
@@ -278,7 +294,8 @@ def start(root, command, *, name: str = "", cfg=None,
             if k is not None:
                 ft = _process_created(k, p.pid)
                 if ft:
-                    born = ft / 10_000_000 - 11644473600
+                    born_ft = ft
+                    born = _ft_to_unix(ft)
         elif sys.platform == "linux":
             born = _linux_proc_start_ticks(p.pid)
         job, job_note = _job_wrap(p.pid, name)
@@ -300,7 +317,8 @@ def start(root, command, *, name: str = "", cfg=None,
             if k is not None:
                 ft = _process_created(k, p.pid)
                 if ft:
-                    born = ft / 10_000_000 - 11644473600
+                    born_ft = ft
+                    born = _ft_to_unix(ft)
             job, job_note = _job_wrap(p.pid, name)
     except (OSError, ValueError) as e:
         rec = {"name": name, "command": command_text, "pid": 0,
@@ -314,6 +332,11 @@ def start(root, command, *, name: str = "", cfg=None,
            "job_note": job_note, "born": born,
            "started": time.time(), "status": "running",
            "session_id": _current_session_id()}
+    if born_ft:
+        rec["born_ft"] = born_ft
+    # Windows fallback: retain descendant identities while the launcher chain
+    # is still alive, so `stop` can reach them after the intermediates exit.
+    win_desc: list[list[int, int]] = _merge_descendants([], p.pid, born_ft)
     _write_record(root, rec)
     resource_id = _register_dev_server(root, name)
     if resource_id:
@@ -322,6 +345,7 @@ def start(root, command, *, name: str = "", cfg=None,
     # `wait` is a ceiling, and a command that exits is reported immediately.
     deadline = time.monotonic() + max(0.0, float(wait or 0))
     while time.monotonic() < deadline:
+        win_desc = _merge_descendants(win_desc, p.pid, born_ft)
         if p.poll() is not None:
             rec["status"] = "exited"
             rec["returncode"] = p.returncode
@@ -333,6 +357,9 @@ def start(root, command, *, name: str = "", cfg=None,
             rec["url"] = url
             break
         time.sleep(0.1)
+    win_desc = _merge_descendants(win_desc, p.pid, born_ft)
+    if win_desc:
+        rec["descendants"] = win_desc
     _write_record(root, rec)
     return rec
 
@@ -396,6 +423,12 @@ def list_procs(root) -> list[dict]:
                 _pid_matches_born(pid, born) and _alive(pid)):
             rec["status"] = "exited"
             stale = True
+            # The leader exiting is exactly when orphans may still be members:
+            # release the job handle only once the job is provably empty, so a
+            # later `stop` can still terminate the survivors through it.
+            job = str(rec.get("job") or "")
+            if _job_active_count(job) == 0:
+                _forget_job(job)
         if _refresh_url(rec, root):
             stale = True
         if stale:
@@ -481,12 +514,14 @@ def _group_alive(pgid: int) -> bool:
 # first (`npm run dev` spawning the real server, a wrapper script, a re-exec)
 # leaves its child holding the port forever while `stop` reports success. A
 # named kernel job object fixes exactly that: every process the server later
-# spawns inherits membership, and TerminateJobObject reaps them all -- from any
-# pedacito process, because the object lives as long as it has members.
+# spawns inherits membership, and TerminateJobObject reaps them all. The job's
+# name is gone the moment its last handle closes (even while members run), so
+# the handle is retained for the server's lifetime -- see `_JOB_HANDLES`.
 _JOB_TERMINATE = 0x0008
 _SYNCHRONIZE = 0x00100000
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _K32: object | None = None
 _K32_STATE = "unloaded"
@@ -520,6 +555,16 @@ def _kernel32():
             k.OpenProcess.restype = wintypes.HANDLE
             k.CloseHandle.argtypes = [wintypes.HANDLE]
             k.CloseHandle.restype = wintypes.BOOL
+            # Terminating a verified process by handle (no taskkill /T, which
+            # could reach descendants we never validated) and counting a job's
+            # live members so a dead leader's handle is only released once the
+            # job is provably empty.
+            k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k.TerminateProcess.restype = wintypes.BOOL
+            k.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.c_void_p]
+            k.QueryInformationJobObject.restype = wintypes.BOOL
             # Resuming the suspended child: Popen closes the initial thread
             # handle, so the thread is found in the system snapshot by owner.
             k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD,
@@ -600,13 +645,186 @@ def _win_structs() -> tuple:
     return _WIN_STRUCTS
 
 
+def _remember_job(name: str, handle: int) -> None:
+    """Take ownership of a live job handle so `_job_kill` can terminate it."""
+    with _JOB_LOCK:
+        _JOB_HANDLES[name] = int(handle)
+
+
+def _take_job(name: str) -> int:
+    """Remove and return this process's live handle for `name`, or 0."""
+    with _JOB_LOCK:
+        return _JOB_HANDLES.pop(name, 0)
+
+
+def _forget_job(name: str) -> None:
+    """Close and drop the live handle for `name` (server stopped or exited)."""
+    if not name:
+        return
+    with _JOB_LOCK:
+        handle = _JOB_HANDLES.pop(name, 0)
+    if handle:
+        _close_handle(_kernel32(), handle)
+
+
+def _ft_to_unix(ft: int) -> float:
+    """FILETIME (100ns since 1601) -> Unix seconds; 0 stays 0 (unknown)."""
+    return ft / 10_000_000 - 11644473600 if ft else 0.0
+
+
+def _peek_job(name: str) -> int:
+    """The live handle for `name` without taking ownership, or 0."""
+    with _JOB_LOCK:
+        return _JOB_HANDLES.get(name, 0)
+
+
+_JOB_ACCOUNTING_STRUCT: type | None = None
+
+
+def _job_accounting_struct():
+    """JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, built once (pure ctypes)."""
+    global _JOB_ACCOUNTING_STRUCT
+    if _JOB_ACCOUNTING_STRUCT is None:
+        class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+        _JOB_ACCOUNTING_STRUCT = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    return _JOB_ACCOUNTING_STRUCT
+
+
+def _job_active_count(name: str) -> int:
+    """Number of live processes in job `name`, or -1 when unknown.
+
+    Peeked, not taken: the handle stays retained. -1 (handle gone or query
+    failed) means the caller must keep the handle -- treating it as empty
+    here would destroy a job whose members we could no longer reach.
+    """
+    if not name:
+        return -1
+    k = _kernel32()
+    if k is None:
+        return -1
+    handle = _peek_job(name)
+    if not handle:
+        return -1
+    info = _job_accounting_struct()()
+    try:
+        if not k.QueryInformationJobObject(handle, 1, ctypes.byref(info),
+                                           ctypes.sizeof(info), None):
+            return -1
+        return int(info.ActiveProcesses)
+    except Exception:                       # pragma: no cover - best effort
+        return -1
+
+
+def _pid_currently_alive(pid: int) -> bool:
+    """True when a process with `pid` can be opened right now."""
+    k = _kernel32()
+    if k is None or pid <= 0:
+        return False
+    h = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    _close_handle(k, h)
+    return True
+
+
+def _open_validated(pid: int, expected_ft: int) -> int:
+    """Open a handle to `pid` only after proving it was born at `expected_ft`.
+
+    The creation time is read on this SAME handle, so a returned handle is
+    guaranteed to refer to the process whose identity matched. 0 when the pid
+    cannot be opened or the identity does not match -- both fail closed. The
+    caller owns the returned handle.
+    """
+    if not expected_ft or pid <= 0:
+        return 0
+    k = _kernel32()
+    if k is None:
+        return 0
+    h = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_TERMINATE,
+                      False, pid)
+    if not h:
+        return 0
+    if _process_created_from_handle(k, h) != expected_ft:
+        _close_handle(k, h)
+        return 0
+    return h
+
+
+def _terminate_verified(pid: int, expected_ft: int) -> str:
+    """Kill `pid` only after proving it is the process born at `expected_ft`.
+
+    Opens ONE handle, reads the creation time on that SAME handle (so the
+    check and the kill cannot straddle a pid-reuse window), compares EXACTLY,
+    and terminates through that handle. Never `taskkill`/`/T`, which could
+    reach descendants we never validated. Returns "reaped", "gone" (the pid
+    no longer resolves to any process), or "unverified" (unknown birth, an
+    unreadable creation time, a mismatch, or a failed kill -- all fail closed).
+    """
+    if not expected_ft or pid <= 0:
+        return "unverified"
+    h = _open_validated(pid, expected_ft)
+    if not h:
+        return "gone" if not _pid_currently_alive(pid) else "unverified"
+    k = _kernel32()
+    try:
+        return "reaped" if k.TerminateProcess(h, 1) else "unverified"
+    except Exception:                       # pragma: no cover - best effort
+        return "unverified"
+    finally:
+        _close_handle(k, h)
+
+
+def _reap_leader_and_tree(pid: int, born_ft: int, notes: list[str]) -> None:
+    """Reap a validated leader and its live descendants, race-free.
+
+    The leader is opened and validated FIRST; its tree is walked while that
+    handle is still open (so the leader pid is still provably ours -- walking
+    after the kill could see a pid reused by a stranger), and only then is the
+    leader terminated, followed by each descendant re-validated on its own
+    handle. When the leader cannot be validated the traversal is skipped and
+    the caller's non-exhaustive note stands.
+    """
+    h = _open_validated(pid, born_ft)
+    if not h:
+        if _pid_currently_alive(pid):
+            notes.append(f"leader pid {pid} not verified; left alone")
+        return
+    k = _kernel32()
+    try:
+        descendants = _windows_walk(pid, born_ft)  # while the leader is ours
+        k.TerminateProcess(h, 1)
+    finally:
+        _close_handle(k, h)
+    for dpid, dft in descendants:
+        if _terminate_verified(dpid, dft) == "unverified":
+            notes.append(f"descendant pid {dpid} not verified; left alone")
+
+
 def _job_wrap(pid: int, name: str) -> tuple[str, str]:
     """Put the just-spawned (suspended) child in its own named job.
 
     Returns (job_name, "") on success, ("", reason) when any step failed --
     the reason lands in the registry record so a stop that cannot reap the
     tree says WHY instead of failing silently. Every step is best effort:
-    without a job, `stop` still gets `taskkill /T` plus the orphan walk.
+    without a job, `stop` still gets the validated captured-identity fallback
+    plus the live snapshot walk.
+
+    On success the job handle is RETAINED (registered in `_JOB_HANDLES`), not
+    closed: a named job's name vanishes the moment its last handle closes --
+    even while members still run -- so the old "close it, reopen it by name
+    later" plan made `_job_kill` a no-op (ERROR_FILE_NOT_FOUND) and leaked the
+    orphan. The leader is a member by the time we return, and its descendants
+    inherit membership at creation.
     """
     k = _kernel32()
     if k is None or pid <= 0:
@@ -616,6 +834,7 @@ def _job_wrap(pid: int, name: str) -> tuple[str, str]:
     # from that same session.
     job = f"Local\\pedacito-{_safe_name(name)}-{pid}-{uuid.uuid4().hex[:8]}"
     hjob = hproc = None
+    remembered = False
     try:
         hjob = k.CreateJobObjectW(None, job)
         if not hjob:
@@ -632,14 +851,17 @@ def _job_wrap(pid: int, name: str) -> tuple[str, str]:
                          "nested assignment (CI runners wrap every step in "
                          "one) -- stop falls back to the orphan walk")
             return "", note
+        _remember_job(job, hjob)
+        remembered = True
         return job, ""
     except Exception as e:                  # pragma: no cover - best effort
         return "", f"job setup raised {type(e).__name__}: {str(e)[:80]}"
     finally:
-        # Dropping our own handles is safe: membership alone keeps the kernel
-        # object (and its name) alive, and the leader is a member by now.
+        # hjob ownership transfers to `_JOB_HANDLES` only on success; every
+        # other path closes it here. The process handle is always transient.
+        if not remembered:
+            _close_handle(k, hjob)
         _close_handle(k, hproc)
-        _close_handle(k, hjob)
 
 
 def _resume_child(p) -> bool:
@@ -686,15 +908,23 @@ def _resume_child(p) -> bool:
 
 
 def _job_kill(job: str) -> bool:
-    """Terminate every member of a job object created by `_job_wrap`."""
+    """Terminate every member of a job object created by `_job_wrap`.
+
+    Prefers this process's retained handle (which keeps the job -- and its
+    name -- alive); without one, opens it by name, which only works while the
+    process that created it still holds its own handle. A returned handle is
+    always closed here, so the registry never leaks a handle.
+    """
     k = _kernel32()
     if k is None or not job:
         return False
-    handle = None
+    handle = _take_job(job)
     try:
-        handle = k.OpenJobObjectW(_JOB_TERMINATE | _SYNCHRONIZE, False, job)
         if not handle:
-            return False            # gone with its last member, or other session
+            handle = k.OpenJobObjectW(_JOB_TERMINATE | _SYNCHRONIZE, False, job)
+            if not handle:
+                # Name gone (the starter process exited) or another session.
+                return False
         return bool(k.TerminateJobObject(handle, 1))
     except Exception:                   # pragma: no cover - best effort
         return False
@@ -702,27 +932,31 @@ def _job_kill(job: str) -> bool:
         _close_handle(k, handle)
 
 
+def _process_created_from_handle(k, h) -> int:
+    """Creation time (100ns since 1601) of the process `h` refers to; 0 unknown."""
+    born = wintypes.FILETIME()
+    rest = wintypes.FILETIME()
+    if not k.GetProcessTimes(h, ctypes.byref(born), ctypes.byref(rest),
+                             ctypes.byref(rest), ctypes.byref(rest)):
+        return 0
+    return (born.dwHighDateTime << 32) | born.dwLowDateTime
+
+
 def _process_created(k, pid: int) -> int:
     """A process's creation time as 100ns intervals since 1601 (0 unknown)."""
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    h = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not h:
         return 0
     try:
-        born = wintypes.FILETIME()
-        rest = wintypes.FILETIME()
-        if not k.GetProcessTimes(h, ctypes.byref(born), ctypes.byref(rest),
-                                 ctypes.byref(rest), ctypes.byref(rest)):
-            return 0
-        return (born.dwHighDateTime << 32) | born.dwLowDateTime
+        return _process_created_from_handle(k, h)
     except Exception:                       # pragma: no cover - best effort
         return 0
     finally:
         _close_handle(k, h)
 
 
-def _windows_descendants(pid: int, since: float) -> list[int]:
-    """Descendants of `pid` from the process snapshot, orphans included.
+def _windows_walk(pid: int, since_ft: int) -> list[tuple[int, int]]:
+    """Descendants of `pid` as (child_pid, creation FILETIME) pairs.
 
     Windows keeps a process's ParentProcessId after its parent dies (there is
     no reparenting), so the chain outlives the leader -- unlike `taskkill /T`,
@@ -731,11 +965,19 @@ def _windows_descendants(pid: int, since: float) -> list[int]:
     nested assignment, so the registry's own job is exactly what is missing
     there, and the launcher that exited first is exactly the case it leaves.
 
+    The walk only reaches a descendant while the WHOLE intermediate chain is
+    still alive: the snapshot holds live processes only, so a launcher that
+    already exited hides everything below it. `start` therefore captures the
+    identities it can while the chain is alive and retains them in the record;
+    this function walks what is still reachable at the moment it is called.
+
     A pid can be reused after its holder exits, so a candidate only counts as
-    a child when it was created AFTER its parent. For the (possibly dead)
-    root, `since` -- the leader's creation time recorded at start -- stands in
-    for the parent's creation time. Best effort throughout: an unreadable
-    snapshot yields no descendants, never an exception.
+    a child when it was created AFTER its parent; descendants whose creation
+    time cannot be read are still traversed (to reach deeper) but NOT returned
+    -- an unverifiable identity must never be handed back as if it were safe.
+    `since_ft` is the leader's creation FILETIME, standing in for the (dead)
+    root's own time. Best effort throughout: an unreadable snapshot yields no
+    descendants, never an exception.
     """
     k = _kernel32()
     if k is None or pid <= 0:
@@ -761,9 +1003,7 @@ def _windows_descendants(pid: int, since: float) -> list[int]:
         children: dict[int, list[int]] = {}
         for cpid, ppid in procs:
             children.setdefault(ppid, []).append(cpid)
-        # FILETIME epoch (1601) vs Unix epoch (1970), in 100ns intervals.
-        since_ft = int((max(0.0, float(since or 0.0)) + 11644473600)
-                       * 10_000_000)
+        since_ft = int(since_ft or 0)
         born: dict[int, int] = {}
 
         def created(p: int) -> int:
@@ -771,7 +1011,7 @@ def _windows_descendants(pid: int, since: float) -> list[int]:
                 born[p] = _process_created(k, p)
             return born[p]
 
-        out: list[int] = []
+        out: list[tuple[int, int]] = []
         queue = [(pid, since_ft)]
         seen = {pid}
         while queue:
@@ -783,44 +1023,91 @@ def _windows_descendants(pid: int, since: float) -> list[int]:
                 child_born = created(child)
                 if child_born and parent_born and child_born < parent_born:
                     continue        # pid reuse: "child" predates its parent
-                out.append(child)
+                if child_born:
+                    out.append((child, child_born))
                 queue.append((child, child_born or parent_born))
         return out
     except Exception:                       # pragma: no cover - best effort
         return []
 
 
+def _windows_descendants(pid: int, since_ft: int) -> list[int]:
+    """Pids of `_windows_walk` -- see that function for the guarantees."""
+    return [p for p, _ in _windows_walk(pid, since_ft)]
+
+
+def _windows_descendant_identities(pid: int, since_ft: int) -> list[list[int, int]]:
+    """`_windows_walk` as JSON-ready `[pid, FILETIME]` pairs for the registry."""
+    return [[p, ft] for p, ft in _windows_walk(pid, since_ft)]
+
+
+def _merge_descendants(acc: list[list[int, int]], pid: int,
+                       born_ft: int) -> list[list[int, int]]:
+    """Union the identities reachable from `pid` right now into `acc`.
+
+    Called repeatedly while `start` waits, because the launcher chain forms
+    over a few milliseconds and the snapshot only sees the part whose
+    intermediates are still alive at the moment of each walk. The union is
+    what survives when the intermediates later exit. No-op off Windows.
+    """
+    if os.name != "nt" or pid <= 0:
+        return acc
+    for entry in _windows_descendant_identities(pid, born_ft):
+        if entry not in acc:
+            acc.append(entry)
+    return acc
+
+
 def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
-                   born: float = 0.0) -> None:
+                   born: float = 0.0, born_ft: int = 0,
+                   win_descendants: list | None = None) -> str:
+    """Terminate `pid` and its descendants; "" when clean, else a note.
+
+    The note names what could not be verified or reaped, so `stop` can say
+    "partial" instead of claiming a successful stop. Never kills a pid whose
+    identity cannot be proven ours (exact FILETIME match on the terminating
+    handle); `taskkill /T` is not used here because it could reach unchecked
+    descendants.
+    """
     if os.name == "nt":
-        # The job reaches the descendants its leader already orphaned; taskkill
-        # is the fallback for records written without one.
+        # The job reaps every member (including descendants spawned after
+        # start); no identity check is needed -- membership IS the identity.
         if job and _job_kill(job):
-            return
-        if pid > 0:
+            return ""
+        notes: list[str] = []
+        # Captured descendant identities (exact FILETIME), each validated on
+        # the very handle that terminates it, so a recycled pid is never hit.
+        for entry in (win_descendants or ()):
             try:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                               capture_output=True, timeout=10, check=False)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            # taskkill /T only walks LIVE parents: when the leader already
-            # exited (a launcher that spawned the real server and left), the
-            # orphans need the snapshot walk. `born` is the leader's creation
-            # time; `started` is the fallback for records written before it.
-            for dpid in _windows_descendants(pid, born or started):
-                try:
-                    subprocess.run(["taskkill", "/F", "/PID", str(dpid)],
-                                   capture_output=True, timeout=10,
-                                   check=False)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-        return
+                dpid, dft = int(entry[0]), int(entry[1])
+            except (TypeError, ValueError, IndexError):
+                notes.append("an unreadable descendant identity was skipped")
+                continue
+            if _terminate_verified(dpid, dft) == "unverified":
+                notes.append(f"descendant pid {dpid} not verified; left alone")
+        # Leader, then its live tree -- gated on the leader's exact identity
+        # and walked BEFORE the leader is terminated (see
+        # `_reap_leader_and_tree`). Without `born_ft` the leader cannot be
+        # proven ours, so nothing is killed by pid (old records fail closed).
+        if pid > 0:
+            if born_ft:
+                _reap_leader_and_tree(pid, born_ft, notes)
+            elif _pid_currently_alive(pid):
+                notes.append(f"leader pid {pid} has no recorded birth time; "
+                             "left alone")
+            # Without a successful job termination the fallback is never
+            # exhaustive: a descendant behind a dead intermediate (spawned
+            # after start, never captured) cannot be proven absent, so this is
+            # always reported partial rather than a clean stop.
+            notes.append("job termination unavailable; the process tree was "
+                         "not provably fully reaped")
+        return "; ".join(notes)
     if pid <= 0:
-        return
+        return ""
     # On Linux, verify start-time ticks when `born` was recorded so a recycled
     # PID is never killed. Legacy records without `born` keep existing behavior.
     if not _pid_matches_born(pid, born):
-        return
+        return ""
     # `proc.spawn` makes the child a session/group leader, so its pid IS the
     # pgid. If the leader already exited, `getpgid(pid)` fails but orphaned
     # descendants still belong to that group: signal the group by the id we
@@ -839,7 +1126,7 @@ def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         if not _alive(pid) and not _group_alive(pgid):
-            return
+            return ""
         time.sleep(0.05)
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -854,19 +1141,42 @@ def _terminate_pid(pid: int, job: str = "", started: float = 0.0,
             child.wait(timeout=2)
         except (OSError, subprocess.SubprocessError):
             pass
+    return ""
 
 
 def stop(root, name: str) -> str:
-    """Stop one background process and its descendants."""
+    """Stop one background process and its descendants.
+
+    A clean stop reaps the child, drops the cleanup registration and records
+    `stopped`. A partial stop (job termination unavailable and the tree not
+    provably reaped) keeps the cleanup registration and child tracking so a
+    later `stop` -- or session teardown -- can retry, and records
+    `stop_incomplete` plus `stop_note`, never a clean `stopped`.
+    """
     root = Path(root).resolve()
     rec = _find(root, name)
     if rec is None:
         known = ", ".join(str(r.get("name")) for r in list_procs(root)) or "(none)"
         return f"ERROR: no background process named '{name}'. Known: {known}"
     pid = int(rec.get("pid") or 0)
-    _terminate_pid(pid, str(rec.get("job") or ""),
-                   started=float(rec.get("started") or 0.0),
-                   born=float(rec.get("born") or 0.0))
+    kw: dict = {}
+    if rec.get("born_ft"):
+        kw["born_ft"] = int(rec["born_ft"])
+    if rec.get("descendants"):
+        kw["win_descendants"] = rec["descendants"]
+    note = _terminate_pid(pid, str(rec.get("job") or ""),
+                          started=float(rec.get("started") or 0.0),
+                          born=float(rec.get("born") or 0.0), **kw)
+    name = str(rec.get("name"))
+    if note:
+        # Partial/unverified: the tree was not provably reaped. Keep the
+        # cleanup registration (resource_id) and child tracking so a retry can
+        # re-attempt, and record a distinct incomplete status + note instead of
+        # a clean `stopped` (no `stopped` timestamp either).
+        rec["status"] = "stop_incomplete"
+        rec["stop_note"] = note
+        _write_record(root, rec)
+        return f"stopped {name} (pid {pid}) [incomplete: {note}]"
     _unregister_dev_server(rec.get("resource_id"))
     child = _get_child(pid)
     if child is not None:
@@ -878,7 +1188,7 @@ def stop(root, name: str) -> str:
     rec["status"] = "stopped"
     rec["stopped"] = time.time()
     _write_record(root, rec)
-    return f"stopped {rec.get('name')} (pid {pid})"
+    return f"stopped {name} (pid {pid})"
 
 
 _BASE_SUFFIX_RE = re.compile(r"-\d+$")

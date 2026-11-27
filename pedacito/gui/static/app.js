@@ -601,10 +601,14 @@ Term.prototype.reset = function (text) {
   if (text) this.write(text);
 };
 let term = null;
+// A snapshot can resolve before WorkspacePane's mount effect has created the
+// Term. Keep its terminal text (and any early SSE bytes) until that effect
+// runs, otherwise a reload silently drops the recovered terminal.
+let pendingTermText = null;
 let termBuf = '', termQueued = false;
 function termFeed(text) {                 // batch raw SSE terminal traffic
   termBuf += text;
-  if (termQueued) return;
+  if (!term || termQueued) return;
   termQueued = true;
   requestAnimationFrame(() => { termQueued = false; if (term && termBuf) { term.write(termBuf); termBuf = ''; } });
 }
@@ -944,6 +948,7 @@ function loadSnapshot() {
     lastFilesSig = status.files_sig || '';
     applyStatus(status);
     if (term) term.reset(snap.term || '');
+    else pendingTermText = snap.term || '';
     connect(snap.seq || 0);
     loadReview();
     loadPlan();
@@ -6077,7 +6082,14 @@ function WorkspacePane() {
   const s = S.status, j = s.job;
   const termRef = useRef(null);
   useEffect(() => {
-    if (termRef.current && !term) term = new Term(termRef.current);
+    if (termRef.current && !term) {
+      term = new Term(termRef.current);
+      if (pendingTermText !== null) {
+        term.reset(pendingTermText);
+        pendingTermText = null;
+      }
+      if (termBuf) { term.write(termBuf); termBuf = ''; }
+    }
   }, []);
   const tabs = [['files', PDC.t('gui.panel.files', null, 'Files')], ['runner', '\u25B6 ' + PDC.t('gui.run', null, 'Run')]]
     .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 ' + PDC.t('gui.panel.preview', null, 'Preview')]] : [])

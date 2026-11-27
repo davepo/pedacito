@@ -28,6 +28,7 @@ J. Static scan: shell=True exists only in the user's own auto_verify
    (loop.run_verify); the MCP launcher is explicitly shell=False.
 """
 import contextlib
+import errno
 import http.client
 import io
 import json
@@ -1137,6 +1138,16 @@ def _project_skill(root, rel, text):
     return path
 
 
+def _symlink_unsupported(exc):
+    """True only when the OS cannot create symlinks (WinError 1314 or an
+    unsupported filesystem); any other OSError is a real defect."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 1314
+        or exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP))
+
+
 def test_symlinked_skill_cannot_leak_files_outside_the_project(iso_home, tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -1144,13 +1155,18 @@ def test_symlinked_skill_cannot_leak_files_outside_the_project(iso_home, tmp_pat
     secret.write_text("TOP-SECRET-VALUE", encoding="utf-8")
     skills_dir = proj / ".pedacito" / "skills"
     skills_dir.mkdir(parents=True)
-    (skills_dir / "leak.md").symlink_to(secret)
-    (skills_dir / "leak-folder").mkdir()
-    (skills_dir / "leak-folder" / "SKILL.md").symlink_to(secret)
     _project_skill(proj, "ok.md", "---\nname: ok\ndescription: fine\n---\nHELLO-SKILL\n")
 
     text, info = skills_mod.load(proj, None, "ok")
     assert info is not None and "HELLO-SKILL" in text
+    (skills_dir / "leak-folder").mkdir()
+    try:
+        (skills_dir / "leak.md").symlink_to(secret)
+        (skills_dir / "leak-folder" / "SKILL.md").symlink_to(secret)
+    except (OSError, NotImplementedError) as exc:
+        if not _symlink_unsupported(exc):
+            raise
+        pytest.skip("symlinks unavailable on this platform")
     for name in ("leak", "leak-folder"):
         text, info = skills_mod.load(proj, None, name)
         assert info is None and "TOP-SECRET-VALUE" not in text
@@ -1161,7 +1177,12 @@ def test_sensitive_target_skill_is_not_read_even_from_user_folder(iso_home, tmp_
     user_skills.mkdir(parents=True)
     key = tmp_path / "id_rsa"
     key.write_text("PRIVATE-KEY-BODY", encoding="utf-8")
-    (user_skills / "keylink.md").symlink_to(key)
+    try:
+        (user_skills / "keylink.md").symlink_to(key)
+    except (OSError, NotImplementedError) as exc:
+        if not _symlink_unsupported(exc):
+            raise
+        pytest.skip("symlinks unavailable on this platform")
     text, info = skills_mod.load(tmp_path, None, "keylink")
     assert info is None and "PRIVATE-KEY-BODY" not in text
 

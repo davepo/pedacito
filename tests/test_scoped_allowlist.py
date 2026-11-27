@@ -228,7 +228,7 @@ def test_run_project_rule_skips_allowlist_and_broker(tmp_path):
     security.set_permission_handler(
         lambda info: (calls.append(info), (False, "denied"))[1])
     try:
-        out = tools.tool_run(idx, cfg, f'{sys.executable} -c "print(42)"')
+        out = tools.tool_run(idx, cfg, f'"{sys.executable}" -c "print(42)"')
     finally:
         security.set_permission_handler(None)
     assert "42" in out and "EXIT: 0" in out
@@ -242,13 +242,13 @@ def test_run_project_rule_is_scoped_and_deny_still_wins(tmp_path):
     # A rule for ANOTHER project does not apply here.
     cfg = _run_cfg(tmp_path, shell_allowlist_by_project={
         str(other): ("python *",)})
-    out = tools.tool_run(idx, cfg, f'{sys.executable} -c "print(42)"')
+    out = tools.tool_run(idx, cfg, f'"{sys.executable}" -c "print(42)"')
     assert "not in shell_allowlist" in out
     # The right project's rule applies, but shell_deny is a hard block.
     cfg = _run_cfg(tmp_path,
                    shell_allowlist_by_project={str(tmp_path): ("python *",)},
                    shell_deny=("python *",))
-    out = tools.tool_run(idx, cfg, f'{sys.executable} -c "print(42)"')
+    out = tools.tool_run(idx, cfg, f'"{sys.executable}" -c "print(42)"')
     assert "shell_deny" in out
 
 

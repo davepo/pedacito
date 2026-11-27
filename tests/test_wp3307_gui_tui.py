@@ -134,10 +134,20 @@ def test_gui_reload_after_terminal_output_does_not_crash_and_meets_narrow_layout
                 page.on("pageerror", lambda err: page_errors.append(str(err)))
                 page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_selector("#term .tl", state="attached", timeout=10000)
-                # Reload after terminal output is already in snapshot.term:
-                # loadSnapshot() runs term.reset(snap.term) -> connect() -> loadReview()
+                # Reload after terminal output is already in snapshot.term.
+                # The snapshot can resolve before WorkspacePane mounts, so the
+                # page must retain the text and render it once the pane exists.
                 page.reload(wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_selector("#reviewBar", timeout=10000)
+                # The snapshot is applied asynchronously after reload; wait for
+                # the restored terminal text rather than sampling a possibly
+                # pre-effect DOM. This is bounded and still asserts the text.
+                page.wait_for_function(
+                    "() => { const el = document.querySelector('#term'); "
+                    "if (!el) return false; const text = el.innerText || ''; "
+                    "return text.includes('hello from terminal') "
+                    "&& text.includes('line two'); }",
+                    timeout=10000)
                 assert page_errors == [], f"Uncaught page errors on reload: {page_errors}"
                 term_text = page.locator("#term").inner_text()
                 assert "hello from terminal" in term_text

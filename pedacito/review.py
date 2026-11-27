@@ -43,6 +43,29 @@ CONTEXT = 4          # unchanged lines kept either side of a change
 COLLAPSE_OVER = 10   # runs of unchanged lines longer than this get folded
 TOKEN_RE = re.compile(r"\w+|\s+|.")
 MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
+# A request body is read in bounded slices against a deadline. On Windows a
+# handler that answers before consuming the body makes the kernel reset the
+# connection, so the client sees WinError 10053 instead of our 403/404/413.
+# Refused/GET bodies are streamed away within this explicit byte cap and a
+# short deadline; accepted bodies get an I/O deadline that scales with their
+# declared size (8 MiB/s, capped at 30 s) so the documented 60 MiB GUI body
+# remains practical without allowing a stalled client to hang a worker.
+MAX_DISCARD_BYTES = 64 * 1024 * 1024
+BODY_DISCARD_TIMEOUT = 1.0
+BODY_READ_BASE_TIMEOUT = 1.0
+BODY_READ_MAX_TIMEOUT = 30.0
+BODY_READ_BYTES_PER_SEC = 8 * 1024 * 1024
+_BODY_CHUNK = 64 * 1024
+_CLIENT_DISCONNECT = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+
+class RequestBodyError(Exception):
+    """A request body that must be refused, with the HTTP status to answer."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = int(status)
+        self.detail = str(detail)
 
 
 @dataclass
@@ -1361,16 +1384,164 @@ def request_allowed(handler, post: bool) -> bool:
     return ctype.strip().lower() == "application/json"
 
 
+def _declared_body_length(handler) -> int | None:
+    """The exact non-negative Content-Length, 0 when absent, None when invalid.
+
+    A present-but-invalid or negative length is not "no body": it must fail
+    closed, otherwise a request could be dispatched with an empty body while
+    bytes remain unread."""
+    get_all = getattr(handler.headers, "get_all", None)
+    if get_all is not None:
+        values = get_all("Content-Length") or []
+    else:
+        raw = handler.headers.get("Content-Length")
+        values = [] if raw is None else [raw]
+    if not values:
+        return 0
+    texts = {str(value).strip() for value in values}
+    if len(texts) != 1:
+        return None
+    text = texts.pop()
+    if not text.isdigit():       # rejects negatives, signs, spaces, units
+        return None
+    return int(text)
+
+
+def _expects_continue(handler) -> bool:
+    return "100-continue" in (handler.headers.get("Expect") or "").lower()
+
+
+def _body_read_timeout(declared: int) -> float:
+    """Deadline for a complete body, scaled by size with a hard ceiling."""
+    if declared <= 0:
+        return BODY_READ_BASE_TIMEOUT
+    return min(BODY_READ_MAX_TIMEOUT,
+               BODY_READ_BASE_TIMEOUT
+               + declared / float(BODY_READ_BYTES_PER_SEC))
+
+
+def _read_bounded_body(handler, *, limit: int, timeout: float,
+                       collect: bool = True,
+                       allow_continue: bool = False) -> tuple[bytes, bool]:
+    """Read up to `limit` body bytes within `timeout`; report completeness.
+
+    `allow_continue` is only set for an authorized body we intend to accept:
+    a refused request must not be prompted to send a body with 100 Continue.
+    When an Expect header is refused, nothing is read and the connection is
+    closed after the final answer. Incomplete bodies (a slow, truncated or
+    disconnected client) stop at the deadline rather than hanging."""
+    declared = _declared_body_length(handler)
+    if declared is None:
+        return b"", False
+    if declared == 0:
+        return b"", True
+    if _expects_continue(handler):
+        if not allow_continue:
+            return b"", False
+        # The client is waiting for an interim response before sending.
+        try:
+            handler.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            handler.wfile.flush()
+        except (OSError, ValueError):
+            return b"", False
+    want = min(declared, max(0, int(limit)))
+    if want == 0:
+        return b"", False
+
+    buf = bytearray()
+    total = 0
+    sock = getattr(handler, "connection", None)
+    previous = None
+    if sock is not None:
+        try:
+            previous = sock.gettimeout()
+        except OSError:
+            sock = None
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    try:
+        while total < want:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if sock is not None:
+                try:
+                    sock.settimeout(left)
+                except OSError:
+                    sock = None
+            try:
+                reader = getattr(handler.rfile, "read1", handler.rfile.read)
+                chunk = reader(min(_BODY_CHUNK, want - total))
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            total += len(chunk)
+            if collect:
+                buf.extend(chunk)
+    finally:
+        if sock is not None:
+            try:
+                sock.settimeout(previous)
+            except OSError:
+                pass
+    return bytes(buf), total == declared
+
+
+def read_request_body(handler, *, limit: int = MAX_JSON_BODY_BYTES,
+                      timeout: float | None = None) -> bytes:
+    """The complete request body, or raise `RequestBodyError`.
+
+    There is no partial success: an invalid/negative Content-Length, a body
+    larger than `limit`, or a shorter/slower body than declared raises before
+    the caller can parse or dispatch anything. An absent body is b"". The
+    connection is marked for closing whenever it cannot be left in a clean
+    request/response state."""
+    declared = _declared_body_length(handler)
+    if declared is None:
+        handler.close_connection = True
+        raise RequestBodyError(400, "invalid Content-Length")
+    if declared > limit:
+        # Rejecting, so no 100 Continue; drain only within the shared cap and
+        # deadline so a Windows client still sees the 413 when viable.
+        discard_request_body(handler, limit=MAX_DISCARD_BYTES,
+                             timeout=BODY_DISCARD_TIMEOUT)
+        raise RequestBodyError(413, "Request body too large.")
+    deadline = (_body_read_timeout(declared) if timeout is None
+                else max(0.0, float(timeout)))
+    data, complete = _read_bounded_body(handler, limit=max(0, int(limit)),
+                                        timeout=deadline, collect=True,
+                                        allow_continue=True)
+    if not complete:
+        handler.close_connection = True
+        raise RequestBodyError(400, "incomplete or timed-out request body")
+    return data
+
+
+def discard_request_body(handler, *, limit: int = MAX_DISCARD_BYTES,
+                         timeout: float = BODY_DISCARD_TIMEOUT) -> bool:
+    """Consume a body we are refusing, within an explicit byte cap + deadline.
+
+    Answering with unread request bytes still in the socket makes Windows
+    abort the connection before the client can read the 403/404/413 response.
+    Reading the body first avoids that reset on every platform. `limit` and
+    `timeout` are both mandatory protections, so a hostile Content-Length, a
+    slow client or an `Expect: 100-continue` header cannot hold the handler.
+    Returns True only when the declared body was fully consumed."""
+    _data, complete = _read_bounded_body(handler, limit=limit, timeout=timeout,
+                                         collect=False, allow_continue=False)
+    if not complete:
+        handler.close_connection = True
+    return complete
+
+
 def read_json_body(handler) -> dict:
-    """Parse the request body as a JSON object; {} when absent, oversized, or malformed."""
+    """Parse the request body as a JSON object; {} when absent or malformed.
+
+    Raises `RequestBodyError` for an invalid, truncated or oversized body so
+    the caller refuses it instead of dispatching a route with a partial body."""
+    raw = read_request_body(handler, limit=MAX_JSON_BODY_BYTES)
     try:
-        n = max(0, int(handler.headers.get("Content-Length") or 0))
-    except ValueError:
-        return {}
-    if n > MAX_JSON_BODY_BYTES:
-        return {}
-    try:
-        body = json.loads(handler.rfile.read(n) or b"{}")
+        body = json.loads(raw or b"{}")
     except (ValueError, UnicodeDecodeError):
         return {}
     return body if isinstance(body, dict) else {}
@@ -1428,33 +1599,55 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except _CLIENT_DISCONNECT:
+            return
 
     def do_GET(self):
+        # A GET may carry a body too (some clients send `{}` unconditionally).
+        # Refusals consume it best-effort; an accepted GET must be complete,
+        # otherwise it is rejected before the page is served.
         if not request_allowed(self, post=False):
+            discard_request_body(self)
             self._send(403, b"forbidden", "text/plain")
             return
         if self.path.split("?")[0] != "/":
+            discard_request_body(self)
             self._send(404, b"not found", "text/plain")
+            return
+        try:
+            read_request_body(self)
+        except RequestBodyError as e:
+            self._send(e.status, e.detail.encode("utf-8"),
+                       "text/plain; charset=utf-8")
             return
         self._send(200, self.server.page.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):
         if not request_allowed(self, post=True):
+            discard_request_body(self)
             self._send(403, b'{"ok":false}', "application/json")
             return
         path = self.path.split("?")[0]
         if path not in ("/apply", "/cancel"):
+            discard_request_body(self)
             self._send(404, b'{"ok":false}', "application/json")
             return
-        body = read_json_body(self)
+        try:
+            body = read_json_body(self)
+        except RequestBodyError as e:
+            self._send(e.status, json.dumps({
+                "ok": False, "detail": e.detail}).encode(),
+                "application/json")
+            return
 
         raw_nonce = body.get("nonce")
         expected_nonce = getattr(self.server, "nonce", None)

@@ -3249,35 +3249,30 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
     def _discard_request_body(self) -> None:
-        """Consume a POST body we refuse before parsing it.
+        """Consume a request body we refuse before parsing it.
 
         A handler that answers and closes while the client is still sending a
         body makes Windows abort the connection (WinError 10053) before the
         client reads the 403/404/413 response. Draining the body first keeps
-        the refusal graceful on every platform; the cap matches MAX_BODY so a
-        hostile Content-Length cannot make us read forever."""
-        try:
-            n = max(0, int(self.headers.get("Content-Length") or 0))
-        except ValueError:
-            return
-        if (self.headers.get("Expect") or "").lower() == "100-continue":
-            # The client is waiting for a 100 before sending; closing with the
-            # refusal is already graceful and reading here would block.
-            return
-        remaining = min(n, MAX_BODY)
-        while remaining > 0:
-            try:
-                chunk = self.rfile.read(min(65536, remaining))
-            except OSError:
-                return
-            if not chunk:
-                return
-            remaining -= len(chunk)
+        the refusal graceful on every platform; `review.discard_request_body`
+        streams it away within an explicit byte cap and deadline, and never
+        sends 100 Continue to a request we have already refused."""
+        review_mod.discard_request_body(self)
 
     def do_GET(self):
         try:
             if not review_mod.request_allowed(self, post=False):
+                self._discard_request_body()
                 self._json(403, {"ok": False})
+                return
+            # GET bodies are unusual but legal, and clients that send `{}` on
+            # every request would otherwise leave unread bytes. Validate the
+            # declared body first: a short/invalid body is refused, never
+            # treated as a successful empty GET.
+            try:
+                review_mod.read_request_body(self, limit=MAX_BODY)
+            except review_mod.RequestBodyError as e:
+                self._json(e.status, {"ok": False, "detail": e.detail})
                 return
             url = urlparse(self.path)
             query = parse_qs(url.query)
@@ -3328,14 +3323,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(404, {"ok": False})
                 return
             try:
-                n = max(0, int(self.headers.get("Content-Length") or 0))
-            except ValueError:
-                n = 0
-            if n > MAX_BODY:
-                self._discard_request_body()
-                self._json(413, {"ok": False, "detail": "Request too large."})
+                raw = review_mod.read_request_body(self, limit=MAX_BODY)
+            except review_mod.RequestBodyError as e:
+                # A short, timed-out, invalid-length or oversized body is
+                # refused before the route sees anything: partial JSON that
+                # happens to parse must never reach a mutating handler.
+                self._json(e.status, {"ok": False, "detail": e.detail})
                 return
-            raw = self.rfile.read(n)
             try:
                 body = json.loads(raw) if raw.strip() else {}
             except ValueError:

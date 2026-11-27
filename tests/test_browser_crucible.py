@@ -8,6 +8,7 @@ instead of hanging the loop forever.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -23,6 +24,23 @@ from pedacito import browser, tools
 from pedacito.local_server import LocalHTTPServer
 from pedacito.config import Config
 from pedacito.index import Index
+
+
+@pytest.fixture(autouse=True)
+def _real_playwright_browsers(monkeypatch):
+    """The suite-wide isolation redirects LOCALAPPDATA, which hides an
+    installed Playwright browser cache. Pin the real cache when it exists so
+    the live browser checks run instead of skipping (if no browser is
+    installed the tests still skip explicitly)."""
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return
+    if os.name == "nt":
+        real = (Path(os.path.expanduser("~")) / "AppData" / "Local"
+                / "ms-playwright")
+    else:
+        real = Path(os.path.expanduser("~")) / ".cache" / "ms-playwright"
+    if real.is_dir():
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(real))
 
 
 # --------------------------------------------------------------------- scanners
@@ -223,12 +241,30 @@ def test_live_capture_records_404_console_error_and_held_key(
         live_page, tmp_path):
     if not browser.available():
         pytest.skip("Playwright is not installed")
-    ok, info = browser.run(
-        live_page, actions="hold ArrowRight 0.3; eval window.__ticks",
-        wait=0.2, out=tmp_path / "shot.png", timeout=15)
-    if not ok and ("Chromium" in str(info) or "executable doesn't exist"
-                   in str(info).lower()):
-        pytest.skip(str(info))
+    # A real headless browser can take a moment to schedule its first frame
+    # when the machine is loaded. The pre-roll wait lets the page's animation
+    # loop actually run before the key goes down; a low tick count is then
+    # observed again (bounded retries) rather than accepted or skipped. The
+    # short hold still asserts that a held key spans multiple real frames.
+    attempts = 3
+    info = None
+    ticks = -1
+    for _ in range(attempts):
+        ok, info = browser.run(
+            live_page,
+            actions="wait 0.5; hold ArrowRight 0.5; eval window.__ticks",
+            wait=0.2, out=tmp_path / "shot.png", timeout=15)
+        if not ok:
+            if ("Chromium" in str(info) or "executable doesn't exist"
+                    in str(info).lower()):
+                pytest.skip(str(info))
+            continue                   # transient launch/action failure
+        evals = [a for a in info["actions"]
+                 if a.startswith("eval'd window.__ticks")]
+        ticks = (int(re.search(r"->\s*(\d+)", evals[0]).group(1))
+                 if evals else -1)
+        if ticks >= 3:
+            break
     assert ok, info
     assert info["method"].startswith("Playwright")
     assert info["canvas"] == "320x120"

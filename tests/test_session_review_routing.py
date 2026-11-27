@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -141,14 +142,83 @@ def test_session_cancel_isolates_sibling_review():
 # --------------------------------------------------------------- GUI routing ---
 
 
-def _req(port, method, path, body=None):
+def _req(port, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     conn.request(method, path, body=json.dumps(body or {}),
-                 headers={"Content-Type": "application/json"})
+                 headers={"Content-Type": "application/json",
+                          **(headers or {})})
     resp = conn.getresponse()
     data = resp.read()
     conn.close()
     return resp.status, data
+
+
+def _raw_reply(port, path, declared: bytes, body: bytes = b"") -> bytes:
+    """POST with a chosen Content-Length, then half-close and read the reply."""
+    payload = (b"POST " + path.encode() + b" HTTP/1.1\r\nHost: 127.0.0.1:"
+               + str(port).encode()
+               + b"\r\nContent-Type: application/json\r\nContent-Length: "
+               + declared + b"\r\n\r\n" + body)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=6)
+    chunks = []
+    try:
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, OSError):
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    return b"".join(chunks)
+
+
+def test_gui_rejects_mismatched_and_invalid_bodies_without_a_decision():
+    sid = "ses_gui_prefix_guard"
+    state = gui_core.REGISTRY.get_or_create(sid)
+    calls = []
+
+    def writer(accepted):
+        calls.append(dict(accepted))
+        return True, "ok"
+
+    staged = state.review_queue.stage(
+        task="prefix", diffs=_two_file_review(), writer=writer)
+
+    srv = LocalHTTPServer(("127.0.0.1", 0), gui_server._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    path = "/api/review/decide"
+    try:
+        body = json.dumps({"session_id": sid,
+                           "review_id": staged.review_id,
+                           "action": "apply"}).encode()
+        # The entire body is valid JSON, but it is shorter than declared. It
+        # must never reach the route (which would apply the review).
+        reply = _raw_reply(port, path, str(len(body) + 64).encode(), body)
+        assert b"400" in reply.split(b"\r\n", 1)[0], reply
+        assert calls == [] and staged.outcome == ""
+        assert not staged.done.is_set()
+
+        for bad in (b"-1", b"abc", b"", b"+7", b"1.5"):
+            reply = _raw_reply(port, path, bad)
+            assert b"400" in reply.split(b"\r\n", 1)[0], (bad, reply)
+            assert calls == [] and staged.outcome == "", bad
+
+        # The review is still pending and can be decided normally afterwards.
+        status, _ = _req(port, "POST", path,
+                         {"session_id": sid, "review_id": staged.review_id,
+                          "action": "reject"})
+        assert status == 200 and staged.outcome == "cancelled"
+        assert calls == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        gui_core.REGISTRY.remove(sid)
 
 
 def test_gui_routes_reviews_by_session_and_review_id():
@@ -178,6 +248,16 @@ def test_gui_routes_reviews_by_session_and_review_id():
         assert meta["review_id"] == ra.review_id
         assert meta["session_id"] == sid_a
         assert [f["rel"] for f in meta["files"]] == ["a.py", "b.py"]
+
+        # GET bodies are drained on both the accepted and refused paths, so a
+        # Windows reset never hides the 403/404.
+        status, _ = _req(
+            port, "GET",
+            f"/api/review?session_id={sid_a}&review_id={ra.review_id}",
+            {"unused": True}, headers={"Host": "evil.example"})
+        assert status == 403
+        status, _ = _req(port, "POST", "/api/nope", {"unused": True})
+        assert status == 404
 
         # A review id from another session is not visible / is rejected.
         status, _ = _req(

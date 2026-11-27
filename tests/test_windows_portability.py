@@ -622,13 +622,18 @@ class _FakeKernel32:
     """The job-object entry points `processes` uses, recording every call."""
 
     def __init__(self, *, create_ok=True, assign_ok=True, open_ok=True,
-                 assign_error=0, processes=(), threads=(), resume_ok=True):
+                 assign_error=0, processes=(), threads=(), resume_ok=True,
+                 dead_pids=(), active_processes=0):
         self.calls: list[tuple] = []
         self.create_ok = create_ok
         self.assign_ok = assign_ok
         self.open_ok = open_ok
         self.assign_error = assign_error
         self.resume_ok = resume_ok
+        # Pids OpenProcess must refuse (modeling already-exited processes).
+        self.dead_pids = set(dead_pids)
+        # Answer to QueryInformationJobObject for ActiveProcesses.
+        self.active_processes = active_processes
         # The Win32 error behind the last failed call. `_pretend_windows`
         # points `_last_error` here, because ctypes' get/set_last_error only
         # exist on Windows and these fakes run on every platform.
@@ -665,6 +670,10 @@ class _FakeKernel32:
         return handle
 
     def OpenProcess(self, access, _inherit, pid):
+        if pid in self.dead_pids:
+            self.last_error = 87           # ERROR_INVALID_PARAMETER: no process
+            self.calls.append(("open_process", 0, access, pid))
+            return 0
         handle = self._handle(self.create_ok)
         if not handle:
             self.last_error = 5
@@ -689,6 +698,19 @@ class _FakeKernel32:
 
     def TerminateJobObject(self, hjob, code):
         self.calls.append(("terminate", hjob, code))
+        return 1
+
+    def TerminateProcess(self, handle, code):
+        self.calls.append(("terminate_process", handle, code))
+        return 1
+
+    def QueryInformationJobObject(self, handle, cls, info_ptr, size, _retlen):
+        import ctypes
+        info = ctypes.cast(
+            info_ptr,
+            ctypes.POINTER(processes._job_accounting_struct())).contents
+        info.ActiveProcesses = self.active_processes
+        self.calls.append(("query_job", handle, cls))
         return 1
 
     def CloseHandle(self, handle):
@@ -775,6 +797,9 @@ def _pretend_windows(monkeypatch, k32):
     # error code instead, so the diagnostics are testable on every platform.
     monkeypatch.setattr(processes, "_last_error",
                         lambda k: getattr(k, "last_error", 0))
+    # A fresh job-handle registry per test: `_job_wrap` now RETAINS the job
+    # handle it created, and that state must not leak between tests.
+    monkeypatch.setattr(processes, "_JOB_HANDLES", {})
     # pathlib chooses WindowsPath from os.name; keep the REAL filesystem's
     # path class so registry records still land in tmp_path. `state_dir`
     # re-wraps its root with index's own Path, and fileio re-wraps the final
@@ -792,7 +817,12 @@ def _pretend_windows(monkeypatch, k32):
     return runs
 
 
-def test_job_wrap_assigns_the_leader_and_leaves_no_handles_behind(monkeypatch):
+def test_job_wrap_assigns_the_leader_and_retains_the_job_handle(monkeypatch):
+    """The job handle is OWNED, not closed: a named job's name vanishes the
+    moment its last handle closes -- even while members still run -- so the
+    old "close it, reopen it by name later" plan made `stop` a no-op
+    (ERROR_FILE_NOT_FOUND) and leaked the orphan. Only the transient process
+    handle is closed; the job handle is retained for `_job_kill`."""
     k32 = _FakeKernel32()
     _pretend_windows(monkeypatch, k32)
 
@@ -800,13 +830,37 @@ def test_job_wrap_assigns_the_leader_and_leaves_no_handles_behind(monkeypatch):
 
     assert note == ""
     assert job.startswith("Local\\pedacito-web-4242-"), job
+    # create + open_process + assign, then only the process handle closes.
     assert [c[0] for c in k32.calls] == [
-        "create", "open_process", "assign", "close", "close"], k32.calls
+        "create", "open_process", "assign", "close"], k32.calls
     # OpenProcess asks for exactly SET_QUOTA|TERMINATE, the rights
     # AssignProcessToJobObject requires; anything less fails on the runner.
     access = [c for c in k32.calls if c[0] == "open_process"][0][2]
     assert access == processes._PROCESS_SET_QUOTA | processes._PROCESS_TERMINATE
+    # The job handle is retained, not leaked: it is registered for later
+    # termination and has not been closed.
+    retained = processes._JOB_HANDLES.get(job)
+    assert retained, "the job handle was not retained for later termination"
+    assert retained not in k32.closed, "the retained handle was closed"
+    # `_job_kill` terminates through the retained handle and then closes it.
+    assert processes._job_kill(job) is True
+    assert job not in processes._JOB_HANDLES
     assert not k32.leaked, "job/process handles were not closed"
+
+
+def test_job_kill_reopens_by_name_only_when_no_handle_is_held(monkeypatch):
+    """Cross-process stop (no retained handle) still opens the job by name --
+    which works while the starting process still holds its own handle."""
+    k32 = _FakeKernel32()
+    _pretend_windows(monkeypatch, k32)
+
+    assert processes._job_kill("Local\\pedacito-web-4242-abcd1234") is True
+
+    opened = [c for c in k32.calls if c[0] == "open_job"]
+    assert opened, "no open-by-name attempt was made"
+    assert opened[0][3] == "Local\\pedacito-web-4242-abcd1234"
+    assert opened[0][2] == processes._JOB_TERMINATE | processes._SYNCHRONIZE
+    assert not k32.leaked
 
 
 def test_job_wrap_is_a_no_op_when_the_api_refuses(monkeypatch):
@@ -864,15 +918,17 @@ def test_stop_reaps_the_orphaned_tree_through_the_job_on_windows(monkeypatch):
     assert not k32.leaked
 
 
-def test_stop_falls_back_to_taskkill_without_a_job(monkeypatch):
-    """Records from before job objects (or a foreign logon session)."""
+def test_stop_without_a_job_and_no_birth_time_kills_nothing(monkeypatch):
+    """Old records carry no exact birth time: without provable identity the
+    fallback must not kill the leader (or anything) by pid -- it reports an
+    honest partial note instead."""
     k32 = _FakeKernel32(open_ok=False)       # OpenJobObjectW: ERROR_FILE_NOT_FOUND
-    runs = _pretend_windows(monkeypatch, k32)
+    _pretend_windows(monkeypatch, k32)
 
-    processes._terminate_pid(4242, "Local\\pedacito-web-4242-abcd1234")
-    assert runs == [["taskkill", "/F", "/T", "/PID", "4242"]], runs
-    processes._terminate_pid(4242, "")       # a record with no job at all
-    assert len(runs) == 2, runs
+    note = processes._terminate_pid(4242, "Local\\pedacito-web-4242-abcd1234")
+
+    assert "no recorded birth time" in note, note
+    assert not _terminated_pids(k32), "an unverifiable leader was killed"
     assert not k32.leaked
 
 
@@ -926,6 +982,149 @@ def test_stop_hands_the_creation_time_to_the_terminator(monkeypatch, tmp_path):
     assert seen == [{"pid": 4242, "job": "", "started": 100.0, "born": 99.5}], seen
 
 
+def test_stop_hands_exact_identity_and_descendants_to_the_terminator(
+        monkeypatch, tmp_path):
+    """`stop` passes the exact FILETIME (`born_ft`) and the captured
+    `[pid, FILETIME]` descendants, which the fail-closed fallback needs."""
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        processes, "_terminate_pid",
+        lambda pid, job="", **kw: seen.append({"pid": pid, "job": job, **kw}))
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+    root = tmp_path / "proj"
+    root.mkdir()
+    ft = 133000000000000000
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / "web.log"), "url": "",
+        "job": "", "started": 100.0, "born": 99.5, "born_ft": ft,
+        "descendants": [[5000, ft + 1]],
+        "status": "running"})
+
+    processes.stop(root, "web")
+
+    assert seen == [{"pid": 4242, "job": "", "started": 100.0, "born": 99.5,
+                     "born_ft": ft, "win_descendants": [[5000, ft + 1]]}], seen
+
+
+def test_stop_reports_partial_when_descendants_cannot_be_verified(
+        monkeypatch, tmp_path):
+    """`stop` must not claim success when a descendant could not be reaped: it
+    returns an honest incomplete note and persists `stop_incomplete` (not a
+    clean `stopped`) with the note."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN)),               # leader still ours
+        (5000, 1, _ft(_ORPHAN_BORN + 9999)),        # captured pid now reused
+    ])
+    _pretend_windows(monkeypatch, k32)
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+    root = tmp_path / "proj"
+    root.mkdir()
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": "", "started": _ORPHAN_BORN, "born": _ORPHAN_BORN,
+        "born_ft": _ft(_ORPHAN_BORN),
+        "descendants": [[5000, _ft(_ORPHAN_BORN + 10)]],
+        "status": "running"})
+
+    out = processes.stop(root, "web")
+
+    assert out.startswith("stopped web (pid 4242) [incomplete:"), out
+    assert "descendant pid 5000 not verified" in out, out
+    rec = processes._read_record(root / ".pedacito" / "procs" / "web.json")
+    assert rec["status"] == "stop_incomplete", rec
+    assert rec["stop_note"], rec
+    assert "stopped" not in rec, "no clean `stopped` timestamp on partial"
+
+
+def test_stop_partial_keeps_cleanup_and_child_and_supports_retry(
+        monkeypatch, tmp_path):
+    """A still-live but unverified leader must not be recorded as cleanly
+    stopped: keep the cleanup registration and child tracking, persist
+    `stop_incomplete` + `stop_note` (no `stopped` timestamp), and let a later
+    stop re-attempt safely."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN + 9999)),   # leader alive but not ours
+    ])
+    _pretend_windows(monkeypatch, k32)
+    monkeypatch.setattr(processes, "_alive", lambda _pid: True)
+
+    unregistered: list = []
+    monkeypatch.setattr(processes, "_unregister_dev_server",
+                        lambda rid: unregistered.append(rid))
+
+    class Child:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(processes, "_CHILDREN", {4242: Child()})
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": "", "started": _ORPHAN_BORN, "born": _ORPHAN_BORN,
+        "born_ft": _ft(_ORPHAN_BORN), "resource_id": "dev-server-web",
+        "status": "running"})
+
+    out = processes.stop(root, "web")
+
+    assert out.startswith("stopped web (pid 4242) [incomplete:"), out
+    rec = processes._read_record(root / ".pedacito" / "procs" / "web.json")
+    assert rec["status"] == "stop_incomplete", rec
+    assert rec["stop_note"], rec
+    assert "stopped" not in rec, "no clean `stopped` timestamp on partial"
+    assert not unregistered, "cleanup registration was dropped on partial"
+    assert 4242 in processes._CHILDREN, "child tracking was dropped on partial"
+
+    # A retry re-attempts safely and stays incomplete while the leader is
+    # still unverified.
+    out2 = processes.stop(root, "web")
+    assert out2.startswith("stopped web (pid 4242) [incomplete:"), out2
+    rec2 = processes._read_record(root / ".pedacito" / "procs" / "web.json")
+    assert rec2["status"] == "stop_incomplete", rec2
+
+
+def test_stop_complete_unregisters_and_forgets_child(monkeypatch, tmp_path):
+    """A clean stop preserves the existing complete bookkeeping: it drops the
+    cleanup registration, reaps/forgets the child, and records `stopped`."""
+    monkeypatch.setattr(processes, "_terminate_pid", lambda *a, **k: "")
+    monkeypatch.setattr(processes, "_alive", lambda _pid: True)
+    unregistered: list = []
+    monkeypatch.setattr(processes, "_unregister_dev_server",
+                        lambda rid: unregistered.append(rid))
+
+    class Child:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(processes, "_CHILDREN", {4242: Child()})
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": "Local\\x", "started": 1.0, "born": 1.0,
+        "resource_id": "dev-server-web", "status": "running"})
+
+    out = processes.stop(root, "web")
+
+    assert out == "stopped web (pid 4242)", out
+    rec = processes._read_record(root / ".pedacito" / "procs" / "web.json")
+    assert rec["status"] == "stopped", rec
+    assert rec["stopped"], rec
+    assert "stop_note" not in rec
+    assert unregistered == ["dev-server-web"], unregistered
+    assert 4242 not in processes._CHILDREN
+
+
 # The runner's refusal leaves no job, and the launcher exits first: the walk
 # below is the ONLY thing that reaches the orphaned server there.
 _ORPHAN_BORN = 1_700_000_000.0
@@ -934,6 +1133,12 @@ _ORPHAN_BORN = 1_700_000_000.0
 def _ft(secs: float) -> int:
     """Unix seconds -> the FILETIME the snapshot reports (100ns since 1601)."""
     return int((secs + 11644473600) * 10_000_000)
+
+
+def _terminated_pids(k32) -> list[int]:
+    """Pids the fake was asked to TerminateProcess, in call order."""
+    h2pid = {c[1]: c[3] for c in k32.calls if c[0] == "open_process" and c[1]}
+    return [h2pid[c[1]] for c in k32.calls if c[0] == "terminate_process"]
 
 
 def _orphan_proc_table():
@@ -955,30 +1160,272 @@ def test_windows_descendants_walk_past_a_dead_leader(monkeypatch):
     k32 = _FakeKernel32(processes=_orphan_proc_table())
     _pretend_windows(monkeypatch, k32)
 
-    assert processes._windows_descendants(4242, _ORPHAN_BORN) == [5000, 5001]
+    assert processes._windows_descendants(4242, _ft(_ORPHAN_BORN)) == [5000, 5001]
     assert not k32.leaked, "snapshot/process handles were not closed"
 
 
-def test_stop_without_a_job_kills_the_orphans_the_snapshot_finds(monkeypatch):
-    """The runner case end to end: no job could be created, leader gone.
-    `taskkill /T` alone kills nothing; the walk must finish the job without
-    touching unrelated processes or the reused pid."""
+def test_windows_descendant_identities_returns_exact_filetimes(monkeypatch):
+    """`start` stores `[pid, FILETIME]` pairs -- exact, not a lossy float --
+    so `stop` can later tell a recycled pid from the real descendant."""
     k32 = _FakeKernel32(processes=_orphan_proc_table())
-    runs = _pretend_windows(monkeypatch, k32)
+    _pretend_windows(monkeypatch, k32)
 
-    processes._terminate_pid(4242, "", started=_ORPHAN_BORN - 5,
-                             born=_ORPHAN_BORN)
+    ids = processes._windows_descendant_identities(4242, _ft(_ORPHAN_BORN))
 
-    assert runs == [
-        ["taskkill", "/F", "/T", "/PID", "4242"],   # live-leader attempt
-        ["taskkill", "/F", "/PID", "5000"],         # the orphaned server
-        ["taskkill", "/F", "/PID", "5001"],         # its worker
-    ], runs
+    assert ids == [
+        [5000, _ft(_ORPHAN_BORN + 10)],
+        [5001, _ft(_ORPHAN_BORN + 20)],
+    ], ids
+    assert not k32.leaked
 
-    runs.clear()                                    # record without `born`
-    processes._terminate_pid(4242, "", started=_ORPHAN_BORN)
-    assert runs[1:] == [["taskkill", "/F", "/PID", "5000"],
-                        ["taskkill", "/F", "/PID", "5001"]], runs
+
+def test_stop_with_a_live_leader_reaps_only_its_walk_found_orphans(monkeypatch):
+    """No job, leader alive and proven ours: the live walk reaches its real
+    descendants and reaps each by a validated handle, leaving an unrelated
+    process and a pid that predates the leader untouched."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN)),           # the live leader (ours)
+        (5000, 4242, _ft(_ORPHAN_BORN + 10)),   # its server
+        (5001, 5000, _ft(_ORPHAN_BORN + 20)),   # its worker
+        (6000, 1, _ft(_ORPHAN_BORN + 30)),      # unrelated
+        (7000, 4242, _ft(_ORPHAN_BORN - 10)),   # pid reuse: predates leader
+    ])
+    _pretend_windows(monkeypatch, k32)
+
+    note = processes._terminate_pid(4242, "", born_ft=_ft(_ORPHAN_BORN))
+
+    assert note and "not provably fully reaped" in note, note
+    assert _terminated_pids(k32) == [4242, 5000, 5001]
+    assert not k32.leaked
+
+
+def test_stop_kills_captured_descendants_through_vanished_intermediates(
+        monkeypatch):
+    """The venvlauncher chain: leader 4242 -> launcher 4243 -> real server.
+    By stop time 4242 and 4243 are DEAD, so the live walk finds nothing -- the
+    identities captured at start, while the chain was alive, are the only
+    thing that reaches the survivors, and only after an exact re-validation."""
+    k32 = _FakeKernel32(processes=[
+        (5000, 4243, _ft(_ORPHAN_BORN + 10)),   # the orphaned server
+        (5001, 5000, _ft(_ORPHAN_BORN + 20)),   # its worker
+        (6000, 1, _ft(_ORPHAN_BORN + 30)),      # unrelated: another parent
+    ], dead_pids={4242, 4243})
+    _pretend_windows(monkeypatch, k32)
+
+    note = processes._terminate_pid(
+        4242, "", born_ft=_ft(_ORPHAN_BORN),
+        win_descendants=[[5000, _ft(_ORPHAN_BORN + 10)],
+                         [5001, _ft(_ORPHAN_BORN + 20)]])
+
+    assert note and "not provably fully reaped" in note, note
+    assert _terminated_pids(k32) == [5000, 5001]
+    assert not k32.leaked
+
+
+def test_stop_rejects_a_pid_reused_within_one_second(monkeypatch):
+    """The old 1-second tolerance could kill a stranger whose pid was reused
+    almost immediately; the exact FILETIME compare must reject it."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN)),             # our leader, still valid
+        (5000, 1, _ft(_ORPHAN_BORN + 10) + 1),    # reused: 100ns off
+    ])
+    _pretend_windows(monkeypatch, k32)
+
+    note = processes._terminate_pid(
+        4242, "", born_ft=_ft(_ORPHAN_BORN),
+        win_descendants=[[5000, _ft(_ORPHAN_BORN + 10)]])
+
+    assert "descendant pid 5000 not verified" in note, note
+    assert _terminated_pids(k32) == [4242]     # leader only; 5000 rejected
+    assert not k32.leaked
+
+
+def test_stop_skips_a_stale_leader_whose_pid_was_reused(monkeypatch):
+    """A stale record whose leader pid now belongs to a stranger: the leader
+    fails exact validation, its walk is skipped, and nothing is killed."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN + 9999)),        # unrelated now
+        (5000, 4242, _ft(_ORPHAN_BORN + 10000)),    # its (unrelated) child
+    ])
+    _pretend_windows(monkeypatch, k32)
+
+    note = processes._terminate_pid(4242, "", born_ft=_ft(_ORPHAN_BORN))
+
+    assert "leader pid 4242 not verified" in note, note
+    assert not _terminated_pids(k32), "a stale leader's tree was killed"
+    assert not k32.leaked
+
+
+def test_stop_reports_partial_when_leader_vanished_with_no_captured_descendants(
+        monkeypatch):
+    """A vanished leader with no captured identities cannot prove the tree is
+    empty (an uncaptured descendant behind a dead intermediate may remain), so
+    the fallback must report partial, not a clean stop."""
+    k32 = _FakeKernel32(processes=[
+        (6000, 1, _ft(_ORPHAN_BORN + 30)),   # unrelated
+    ], dead_pids={4242})
+    _pretend_windows(monkeypatch, k32)
+
+    note = processes._terminate_pid(4242, "", born_ft=_ft(_ORPHAN_BORN))
+
+    assert note and "not provably fully reaped" in note, note
+    assert not _terminated_pids(k32)
+    assert not k32.leaked
+
+
+def test_leader_is_walked_before_it_is_terminated(monkeypatch):
+    """The live walk must capture descendants while the validated leader handle
+    is still open (before TerminateProcess), so a pid reused after the kill
+    cannot masquerade as our tree."""
+    k32 = _FakeKernel32(processes=[
+        (4242, 1, _ft(_ORPHAN_BORN)),           # the live leader
+        (5000, 4242, _ft(_ORPHAN_BORN + 10)),   # its child
+    ])
+    _pretend_windows(monkeypatch, k32)
+
+    processes._terminate_pid(4242, "", born_ft=_ft(_ORPHAN_BORN))
+
+    h2pid = {c[1]: c[3] for c in k32.calls if c[0] == "open_process" and c[1]}
+    leader_handle = next(h for h, pid in h2pid.items() if pid == 4242)
+    snap_idx = next(i for i, c in enumerate(k32.calls) if c[0] == "snapshot")
+    term_idx = next(i for i, c in enumerate(k32.calls)
+                    if c[0] == "terminate_process" and c[1] == leader_handle)
+    assert snap_idx < term_idx, (
+        "the snapshot walk must happen before the leader is terminated; "
+        f"calls={k32.calls}")
+    assert _terminated_pids(k32) == [4242, 5000]
+    assert not k32.leaked
+
+
+def test_terminate_verified_refuses_unknown_birth(monkeypatch):
+    k32 = _FakeKernel32(processes=[(5000, 1, _ft(_ORPHAN_BORN + 10))])
+    _pretend_windows(monkeypatch, k32)
+
+    assert processes._terminate_verified(5000, 0) == "unverified"
+    assert not _terminated_pids(k32)
+
+
+def test_terminate_verified_refuses_unreadable_creation_time(monkeypatch):
+    k32 = _FakeKernel32(processes=[(5000, 1, 0)])  # unreadable creation time
+    _pretend_windows(monkeypatch, k32)
+
+    assert processes._terminate_verified(
+        5000, _ft(_ORPHAN_BORN + 10)) == "unverified"
+    assert not _terminated_pids(k32)
+
+
+def test_terminate_verified_validates_and_kills_on_one_handle(monkeypatch):
+    """The check and the kill share ONE handle, so a pid-reuse window cannot
+    be straddled: GetProcessTimes and TerminateProcess both target the handle
+    that OpenProcess returned, and nothing else is opened."""
+    k32 = _FakeKernel32(processes=[(5000, 1, _ft(_ORPHAN_BORN + 10))])
+    _pretend_windows(monkeypatch, k32)
+
+    assert processes._terminate_verified(
+        5000, _ft(_ORPHAN_BORN + 10)) == "reaped"
+
+    opens = [c for c in k32.calls if c[0] == "open_process"]
+    assert len(opens) == 1, k32.calls
+    h = opens[0][1]
+    assert opens[0][2] == (processes._PROCESS_QUERY_LIMITED_INFORMATION
+                           | processes._PROCESS_TERMINATE)
+    times = [c for c in k32.calls if c[0] == "times"]
+    assert times and times[0][1] == h and times[0][2] == _ft(_ORPHAN_BORN + 10)
+    terms = [c for c in k32.calls if c[0] == "terminate_process"]
+    assert terms == [("terminate_process", h, 1)], terms
+    assert h in k32.closed
+    assert not k32.leaked
+
+
+def test_forget_job_closes_the_retained_handle(monkeypatch):
+    k32 = _FakeKernel32()
+    _pretend_windows(monkeypatch, k32)
+
+    processes._JOB_HANDLES["Local\\pedacito-x"] = 101
+    processes._forget_job("Local\\pedacito-x")
+
+    assert "Local\\pedacito-x" not in processes._JOB_HANDLES
+    assert 101 in k32.closed
+
+
+def test_list_procs_closes_the_job_handle_only_when_the_job_is_empty(
+        monkeypatch, tmp_path):
+    """A fully-exited server (empty job) releases its handle; a leader that
+    exited while descendants remain must keep it (see the next test)."""
+    k32 = _FakeKernel32(active_processes=0)
+    _pretend_windows(monkeypatch, k32)
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    job = "Local\\pedacito-web-4242-x"
+    processes._JOB_HANDLES[job] = 101
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": job, "started": 1.0, "born": 1.0, "status": "running"})
+
+    recs = processes.list_procs(root)
+
+    assert recs and recs[0]["status"] == "exited"
+    assert job not in processes._JOB_HANDLES
+    assert 101 in k32.closed
+
+
+def test_list_procs_keeps_the_job_handle_while_members_remain(
+        monkeypatch, tmp_path):
+    """The leader exiting is exactly when orphans may still be members: the
+    handle must survive list_procs so a later stop can still terminate them."""
+    k32 = _FakeKernel32(active_processes=2)
+    _pretend_windows(monkeypatch, k32)
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    job = "Local\\pedacito-web-4242-x"
+    processes._JOB_HANDLES[job] = 101
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": job, "started": 1.0, "born": 1.0, "status": "running"})
+
+    recs = processes.list_procs(root)
+
+    assert recs and recs[0]["status"] == "exited"
+    assert job in processes._JOB_HANDLES      # members remain: keep it
+    assert 101 not in k32.closed
+
+
+def test_list_procs_then_stop_uses_the_retained_job_handle(
+        monkeypatch, tmp_path):
+    """After list_procs reconciles a dead leader (job non-empty), a later stop
+    terminates through the retained handle -- not an open-by-name that would
+    fail once the starter process is gone."""
+    k32 = _FakeKernel32(active_processes=2)
+    _pretend_windows(monkeypatch, k32)
+    monkeypatch.setattr(processes, "_alive", lambda _pid: False)
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    job = "Local\\pedacito-web-4242-x"
+    processes._JOB_HANDLES[job] = 101
+    processes._write_record(root, {
+        "name": "web", "command": "npm run dev", "pid": 4242,
+        "cwd": str(root), "log": str(root / ".pedacito" / "procs" / "web.log"),
+        "url": "", "job": job, "started": 1.0, "born": 1.0,
+        "status": "running"})
+
+    processes.list_procs(root)
+    assert job in processes._JOB_HANDLES
+
+    out = processes.stop(root, "web")
+
+    assert out.startswith("stopped web"), out
+    terminated = [c for c in k32.calls if c[0] == "terminate"]
+    assert terminated and terminated[0][1] == 101, k32.calls
+    assert not [c for c in k32.calls if c[0] == "open_job"]
+    assert job not in processes._JOB_HANDLES
+    assert not k32.leaked
 
 
 def test_resume_child_resumes_only_the_suspended_childs_threads(monkeypatch):
@@ -1106,10 +1553,9 @@ def test_start_respawns_running_when_the_suspended_child_cannot_resume(
 
 
 def test_browser_resolves_a_mocked_windows_chrome_path(tmp_path, monkeypatch):
-    win_path = (r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-    fake = tmp_path / win_path
-    # On Windows the absolute win_path wins over tmp_path, so the parent must
-    # exist -- don't assume Chrome is already installed at exactly this path.
+    # Joined under tmp_path: an absolute C:\ string would escape tmp_path on
+    # native Windows and create real Program Files directories.
+    fake = tmp_path / "Program Files" / "Google" / "Chrome" / "Application" / "chrome.exe"
     fake.parent.mkdir(parents=True, exist_ok=True)
     fake.write_text("", encoding="utf-8")
 

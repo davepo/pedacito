@@ -18,6 +18,7 @@ never serving sensitive files."""
 # ruff: noqa: F811  (the `gui` fixture is re-exported from test_gui)
 from __future__ import annotations
 
+import errno
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -445,16 +446,38 @@ def test_preview_serves_pages_with_framing_headers_and_mime(gui, tmp_path):
     assert _headers(css)["content-type"] == "text/css; charset=utf-8"
 
 
-def test_preview_refuses_traversal_symlinks_and_absolute_paths(gui, tmp_path):
+def _symlink_unsupported(exc):
+    """True only when the OS cannot create symlinks (WinError 1314 or an
+    unsupported filesystem); any other OSError is a real defect."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 1314
+        or exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP))
+
+
+def test_preview_refuses_traversal_and_absolute_paths(gui, tmp_path):
+    _preview_project(tmp_path)
+    outside = tmp_path / "outside.html"
+    outside.write_text("<p>outside</p>", encoding="utf-8")
+    for path in ("/preview/../outside.html",
+                 "/preview/%2e%2e%2foutside.html",
+                 "/preview//etc/passwd"):
+        assert gui.req("GET", path)[0] == 404, path
+    assert outside.read_text(encoding="utf-8") == "<p>outside</p>"
+
+
+def test_preview_refuses_symlinks(gui, tmp_path):
     root = _preview_project(tmp_path)
     outside = tmp_path / "outside.html"
     outside.write_text("<p>outside</p>", encoding="utf-8")
-    (root / "link.html").symlink_to(outside)
-    for path in ("/preview/../outside.html",
-                 "/preview/%2e%2e%2foutside.html",
-                 "/preview/link.html",
-                 "/preview//etc/passwd"):
-        assert gui.req("GET", path)[0] == 404, path
+    try:
+        (root / "link.html").symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        if not _symlink_unsupported(exc):
+            raise
+        pytest.skip("symlinks unavailable on this platform")
+    assert gui.req("GET", "/preview/link.html")[0] == 404
     assert outside.read_text(encoding="utf-8") == "<p>outside</p>"
 
 

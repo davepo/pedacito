@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -341,6 +342,56 @@ def test_stop_walk_reaps_orphans_when_no_job_could_be_created(tmp_path):
     finally:
         if processes._alive(grandchild_pid):
             processes._terminate_pid(grandchild_pid)
+
+
+_LATE_ORPHAN = r'''
+import os, subprocess, sys, time
+# Let start() return (URL printed) before the grandchild exists, so it is
+# NEVER in the identities captured while the launcher chain was alive.
+print("Listening on http://127.0.0.1:9/ (Press CTRL+C to quit)", flush=True)
+time.sleep(0.5)
+p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "grandchild.pid"), "w", encoding="utf-8") as fh:
+    fh.write(str(p.pid))
+time.sleep(0.2)   # then exit, orphaning the grandchild
+'''
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows-only")
+def test_stop_reaps_a_descendant_spawned_after_start_via_the_retained_job(
+        tmp_path):
+    """The job must outlive the leader AND a list_procs reconcile: a descendant
+    spawned after start returned (so never captured) is still a job member and
+    is reaped by the retained handle. `list_procs` must not release the handle
+    just because the leader exited."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    script = _write(root, "late_orphan.py", _LATE_ORPHAN)
+    rec = processes.start(root, _cmd(script), name="late", wait=5)
+    grandchild_pid = int(_wait_file(
+        root / "grandchild.pid",
+        log=processes._log_path(root, "late")).strip())
+    try:
+        assert _wait_dead(int(rec["pid"]), 3.0)
+        assert processes._alive(grandchild_pid)
+        # Reconcile the dead leader: the job still has members, so the handle
+        # must survive list_procs.
+        listed = processes.list_procs(root)
+        assert listed and listed[0]["name"] == "late"
+        assert listed[0]["status"] == "exited"
+        assert processes._alive(grandchild_pid)
+
+        out = processes.stop(root, "late")
+        assert out.startswith("stopped late"), out
+        assert _wait_dead(grandchild_pid), (
+            "a descendant spawned after start returned survived stop "
+            f"(job={rec.get('job')!r}, job_note={rec.get('job_note')!r})")
+    finally:
+        if processes._alive(grandchild_pid):
+            subprocess.run(["taskkill", "/F", "/T", "/PID",
+                            str(grandchild_pid)], capture_output=True,
+                           check=False)
 
 
 _CRASH = r'''

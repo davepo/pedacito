@@ -6,6 +6,7 @@ the path-containment guarantees (resolve_safe_path, .git/, secrets).
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import sys
 from pathlib import Path
@@ -336,21 +337,41 @@ def test_traversal_is_refused_everywhere(proj, apply, bad):
     assert tree(proj) == before
 
 
+def _symlink_unsupported(exc):
+    """True only when the OS cannot create symlinks (WinError 1314 or an
+    unsupported filesystem); any other OSError is a real defect."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 1314
+        or exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP))
+
+
 @pytest.mark.parametrize("apply", [False, True])
 def test_absolute_and_symlink_escapes_are_refused(proj, tmp_path, apply):
     secret = tmp_path / "elsewhere.txt"
     secret.write_text("top secret\n", encoding="utf-8")
-    (proj / "link.txt").symlink_to(secret)
-    (proj / "dirlink").symlink_to(tmp_path, target_is_directory=True)
+    try:
+        (proj / "link.txt").symlink_to(secret)
+        (proj / "dirlink").symlink_to(tmp_path, target_is_directory=True)
+        targets = (str(secret), "link.txt", "dirlink/elsewhere.txt",
+                   "dirlink/new.py")
+        symlinks = True
+    except (OSError, NotImplementedError) as exc:
+        if not _symlink_unsupported(exc):
+            raise
+        targets = (str(secret),)
+        symlinks = False
     ws = VirtualWorkspace(proj, apply=apply, backup_dir=proj.parent / "bk")
-    for target in (str(secret), "link.txt", "dirlink/elsewhere.txt",
-                   "dirlink/new.py"):
+    for target in targets:
         with pytest.raises(PathRefused):
             ws.read(target)
         assert not ws.write(target, "overwritten\n").ok
         assert not ws.delete(target).ok
     assert secret.read_text(encoding="utf-8") == "top secret\n"
     assert not (tmp_path / "new.py").exists()
+    if not symlinks:
+        pytest.skip("symlinks unavailable; absolute-path escape checked only")
 
 
 @pytest.mark.parametrize("apply", [False, True])

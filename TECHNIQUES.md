@@ -2053,28 +2053,72 @@ job -- so the registry's own job silently failed to create, `stop` fell back to
 reproduce the refusal (it allows the nesting), which is why the bug only showed
 on the runner.
 
-**The fix has three parts.** *Spawn suspended, wrap, resume:* on Windows the
-child is created with `CREATE_SUSPENDED` (0x4 -- subprocess does not export the
-flag), put in a named job, then its initial thread resumed via a toolhelp
+**The fix has three parts.** *Spawn suspended, wrap, retain, resume:* on Windows
+the child is created with `CREATE_SUSPENDED` (0x4 -- subprocess does not export
+the flag), put in a named job, and its initial thread resumed via a toolhelp
 snapshot (Popen drops the thread handle). Job membership is inherited only at
 CREATION, so a child that runs before assignment can spawn descendants that
 escape the job forever; freezing it closes that race. If the resume fails the
-child is killed and respawned running, never left frozen. *An orphan-aware
-fallback:* when no job could be created, `stop` walks the process snapshot by
-`ParentProcessId` -- which Windows keeps after the parent dies, unlike taskkill's
-live chain -- and kills each descendant; a creation-time guard
-(`GetProcessTimes` vs the leader's recorded birth) rejects PID reuse, since a
-"child" created before its parent is a stranger wearing the same pid.
-*Diagnostics, not silence:* `_job_wrap` returns `(job, note)` and the record
-carries `job_note` (the Win32 error, naming the runner's error-5 refusal) and
-`born` (the leader's creation time), so a stop that cannot reap the tree says why.
+child is killed and respawned running, never left frozen. Crucially, the job
+handle is RETAINED for the server's lifetime (`_JOB_HANDLES`): a named kernel
+object's name is removed from the namespace the moment its last handle closes --
+even while member processes still run -- so the first version's "create the job,
+close the handle, reopen it by name on stop" plan made `_job_kill` a no-op
+(`OpenJobObjectW` -> `ERROR_FILE_NOT_FOUND`) and leaked the orphan. `_job_kill`
+terminates through the retained handle (same process), or reopens it by name
+from another pedacito process while the starter still holds its handle. The
+handle is released only on explicit `stop` or once `QueryInformationJobObject`
+proves the job has no live members -- a leader exiting is exactly when orphans
+may still be members, so `list_procs` must not drop the handle just then.
+
+*An orphan-aware, fail-closed fallback:* when no job could be created, `stop`
+walks the live snapshot by `ParentProcessId` (which Windows keeps after the
+parent dies) and reaps each descendant it finds; but the snapshot holds live
+processes only, so a launcher that already exited hides everything below it --
+the venvlauncher -> real Python -> venvlauncher -> real Python chain collapses
+at both launchers. `start` therefore captures the exact descendant identities
+(`[pid, creation FILETIME]`) while the chain is still alive and retains them in
+the record (`descendants`). Every kill is fail-closed: open ONE handle, read the
+creation time on that SAME handle, compare EXACTLY, and terminate through that
+handle -- never `taskkill /T`, which could reach unchecked descendants. A pid
+whose identity is unknown, unreadable or mismatched (reused, even within a
+second) is left alone, and the leader and the live walk are guarded by the
+leader's exact `born_ft` the same way; records without a provable identity kill
+nothing by pid. The live walk is captured WHILE the validated leader handle is
+still open and BEFORE the leader is terminated, so a pid reused after the kill
+can never masquerade as our tree.
+
+*Diagnostics, not silence:* `_job_wrap` returns `(job, note)`; the record carries
+`job_note` (the Win32 error, naming the runner's error-5 refusal), `born_ft`
+(the leader's exact creation FILETIME) and `descendants`. `stop` records a clean
+`stopped` (with its timestamp, and the usual reaping + cleanup-registration
+drop) ONLY when job termination succeeded. Every fallback stop is instead
+persisted as `status: "stop_incomplete"` with `stop_note` and NO `stopped`
+timestamp, and the cleanup registration and child tracking are KEPT so a later
+`stop` (or session teardown) can retry safely; the incomplete entry is shown as
+such by `procs list` and the GUI, never collapsed as if cleanly stopped.
+
+**Limits, stated honestly.** A job object is process-local: the retained handle
+dies with the pedacito process that started the server, and with it the job's
+name. A server started by one CLI process and stopped by ANOTHER is reaped by
+job only while the starter stays alive; after the starter exits (or after a
+restart), `stop` relies on the captured identities and the live walk, which
+reach descendants that outlived their leader but not a chain of already-exited
+launchers whose identities were never captured. A descendant spawned after
+`start` returned is reaped only by the job (it is never in the captured set) --
+without a job it cannot be reached safely, and that is the best Windows offers
+without a persistent supervisor.
 
 **Prevention.** The Win32 sequence is pinned by fake-kernel32 tests that run on
 every platform (`tests/test_windows_portability.py`): refusal + error note, the
 orphan walk with a reuse trap, resume-only-own-threads, spawn-wrap-resume order,
-and respawn-on-resume-failure. A Windows-only crucible test puts the test process
-itself inside a job (the runner's shape) and runs the orphan scenario. Two
-portability traps the fakes cannot see, caught only by running on a real `nt`
+respawn-on-resume-failure, the retained-handle lifetime (wrap -> kill -> close,
+job-empty release), the exact-FILETIME validate-then-terminate-on-one-handle
+semantics, unknown/unreadable/reused-identity fail-closed behaviour, and the
+honest partial `stop` status. Windows-only crucible tests put the test process
+inside a job (the runner's shape), run the orphan scenario, and spawn a
+descendant after `start` returns to prove the retained job -- not the capture --
+reaps it. Two portability traps the fakes cannot see, caught only on a real `nt`
 interpreter (Wine): `subprocess.CREATE_SUSPENDED` does not exist, and the
 thread-snapshot API is `Thread32First`/`Thread32Next` -- there is NO wide variant
 (only the process snapshots have `W`). Covered by
@@ -2185,7 +2229,7 @@ task, and the setting is off by default so existing reactive behaviour is unchan
 | Cargo test narrowing (integration-only changes) | §48 | No flag; fires only when provably safe (`test_command` wins) | `cargo test --test NAME` in the post-edit hook and `pedacito tests` output |
 | Strategy shift when no `escalate` role exists | §49 | `auto_escalate = false` | `strategy_shift` event; one same-model retry with the edit style flipped after an escalation reason |
 | Specialist auto-routing + clean VRAM handoff | §50 | `auto_route_specialties = false` (default), or `--no-auto-route` per run | `specialist_routed` / `model_swap` events; **✦ Auto-route** in the GUI top bar; Specialties column in `pedacito profiles` |
-| Windows process-tree reaping (suspended job wrap + orphan walk) | §51 | None (always on; it is the Windows `stop` path) | `job_note` / `born` in `.pedacito/procs/*.json`; the orphan crucible + fake-kernel32 portability tests |
+| Windows process-tree reaping (suspended job wrap + retained handle + orphan walk) | §51 | None (always on; it is the Windows `stop` path) | `job_note` / `born_ft` / `descendants` / `stop_note` / `stop_incomplete` in `.pedacito/procs/*.json`; the orphan crucible + fake-kernel32 portability tests |
 
 ## Techniques that exist but are not a good fit
 

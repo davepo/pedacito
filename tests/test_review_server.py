@@ -1,7 +1,10 @@
 """Loopback review/GUI servers: request guards and the apply/cancel flow."""
 import http.client
+import io
 import json
+import socket
 import threading
+import time
 
 import pytest
 
@@ -34,6 +37,69 @@ def _req(port, method, path, body=None, headers=None):
     data = r.read()
     conn.close()
     return r.status, data
+
+
+def _raw_http(port, payload, timeout=6.0, half_close=False):
+    """Send raw bytes and read until the server closes; (reply, elapsed)."""
+    started = time.monotonic()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    chunks = []
+    try:
+        sock.sendall(payload)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, OSError):
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    return b"".join(chunks), time.monotonic() - started
+
+
+def _status_line(reply: bytes) -> bytes:
+    return reply.split(b"\r\n", 1)[0]
+
+
+class _FakeBodyHandler:
+    """Minimal handler surface for the shared body helpers."""
+
+    def __init__(self, headers, body=b""):
+        self.headers = headers
+        self.rfile = io.BytesIO(body)
+        self.close_connection = False
+
+
+def test_request_body_helpers_fail_closed_on_bad_lengths_and_cap_refusals():
+    partial = _FakeBodyHandler({"Content-Length": "100"}, b"{}")
+    with pytest.raises(review.RequestBodyError) as exc:
+        review.read_request_body(partial, timeout=0.2)
+    assert exc.value.status == 400
+    assert partial.close_connection
+
+    for bad in ("-1", "abc", "", "+5", "1.5", "0x10"):
+        handler = _FakeBodyHandler({"Content-Length": bad}, b"{}")
+        with pytest.raises(review.RequestBodyError) as exc:
+            review.read_request_body(handler, timeout=0.2)
+        assert exc.value.status == 400, bad
+        assert handler.close_connection, bad
+        assert handler.rfile.tell() == 0, bad      # never read a bad body
+
+    # A refusal is capped: it consumes only the explicit limit and reports
+    # that the body was not fully drained.
+    capped = _FakeBodyHandler({"Content-Length": "4096"}, b"x" * 4096)
+    assert review.discard_request_body(capped, limit=1024, timeout=0.2) is False
+    assert capped.rfile.tell() == 1024
+    assert capped.close_connection
+
+    # The normal reader accepts a body at its limit and returns it whole.
+    whole = _FakeBodyHandler({"Content-Length": "2"}, b"{}")
+    assert review.read_request_body(whole, limit=2, timeout=0.2) == b"{}"
+    assert not whole.close_connection
 
 
 def test_review_server_rejects_foreign_host_and_cross_site_post():
@@ -216,6 +282,267 @@ def test_gui_handler_guards_and_stale_review_ids():
         core.STATE.review = None
         assert _req(port, "POST", "/api/review/decide",
                     {"id": 0, "action": "apply"})[0] == 409
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_review_server_drains_get_body_and_rejection_paths():
+    """Every refusal (and a GET that carries a body) is answered only after the
+    body is consumed: Windows otherwise resets the connection (10053) and the
+    client never sees the 403/404."""
+    t, result, port = _serve(lambda: (True, "ok"))
+    try:
+        assert _req(port, "GET", "/", {"unused": True})[0] == 200
+        assert _req(port, "GET", "/", {"unused": True},
+                    headers={"Host": "evil.example"})[0] == 403
+        assert _req(port, "GET", "/missing", {"unused": True})[0] == 404
+        assert _req(port, "POST", "/missing", {"nonce": "tok"})[0] == 404
+        assert _req(port, "POST", "/apply", {"nonce": "tok"},
+                    headers={"Content-Type": "text/plain"})[0] == 403
+        assert _req(port, "POST", "/apply", {"nonce": "tok"},
+                    headers={"Origin": "http://evil.example"})[0] == 403
+        assert t.is_alive()
+        assert _req(port, "POST", "/cancel", {"nonce": "tok"})[0] == 200
+    finally:
+        t.join(10)
+    assert result["out"][0] == "cancelled"
+
+
+def test_review_server_bounds_incomplete_and_oversized_bodies(monkeypatch):
+    monkeypatch.setattr(review, "MAX_JSON_BODY_BYTES", 64 * 1024)
+    t, result, port = _serve(lambda: (True, "ok"))
+    host = f"127.0.0.1:{port}"
+
+    def post(headers: bytes, body: bytes = b"",
+             host_header: str | None = None) -> tuple[bytes, float]:
+        payload = (b"POST /cancel HTTP/1.1\r\nHost: "
+                   + (host_header or host).encode()
+                   + b"\r\nContent-Type: application/json\r\n" + headers
+                   + b"\r\n" + body)
+        return _raw_http(port, payload)
+
+    try:
+        # An incomplete body is refused (400) at the deadline, not parsed as
+        # an empty/partial request.
+        reply, elapsed = post(b"Content-Length: 400\r\n", b'{"nonce":')
+        assert b"400" in _status_line(reply), reply
+        assert elapsed < 4.0, elapsed
+
+        # A body just over the JSON cap is drained within the explicit cap and
+        # deadline, and gets the real 413.
+        cap = review.MAX_JSON_BODY_BYTES
+        big = f"Content-Length: {cap + 17}\r\n".encode()
+        reply, elapsed = post(big, b"x" * (cap + 17))
+        assert b"413" in _status_line(reply), reply
+        assert elapsed < 3.0, elapsed
+
+        # Expect: 100-continue on an accepted route is granted, then the
+        # missing body is still bounded and refused.
+        reply, elapsed = post(b"Content-Length: 100\r\n"
+                              b"Expect: 100-continue\r\n")
+        assert b"100 Continue" in reply and b"400" in reply, reply
+        assert elapsed < 2.0, elapsed
+
+        # A rejected request must not be invited to send its body.
+        reply, elapsed = post(b"Content-Length: 100\r\n"
+                              b"Expect: 100-continue\r\n",
+                              host_header="evil.example")
+        assert b"403" in _status_line(reply), reply
+        assert b"100 Continue" not in reply, reply
+        assert elapsed < 2.0, elapsed
+
+        assert t.is_alive()
+        assert _req(port, "POST", "/cancel", {"nonce": "tok"})[0] == 200
+    finally:
+        t.join(10)
+    assert result["out"][0] == "cancelled"
+
+
+def test_review_server_rejects_mismatched_and_invalid_lengths_without_mutation():
+    calls = []
+
+    def writer():
+        calls.append(1)
+        return True, "ok"
+
+    t, result, port = _serve(writer)
+    host = f"127.0.0.1:{port}"
+
+    def post(declared: bytes, body: bytes = b"") -> bytes:
+        payload = (b"POST /apply HTTP/1.1\r\nHost: " + host.encode()
+                   + b"\r\nContent-Type: application/json\r\nContent-Length: "
+                   + declared + b"\r\n\r\n" + body)
+        reply, _elapsed = _raw_http(port, payload, half_close=True)
+        return reply
+
+    try:
+        # Fully valid JSON, but the declared length says more follows. The old
+        # reader returned this prefix on EOF and applied the review anyway.
+        body = b'{"nonce":"tok"}'
+        declared = str(len(body) + 50).encode()
+        assert b"400" in _status_line(post(declared, body))
+        assert calls == [] and "out" not in result
+
+        for bad in (b"-1", b"12abc", b"", b"+5", b"1.5"):
+            assert b"400" in _status_line(post(bad)), bad
+            assert calls == [] and "out" not in result, bad
+
+        # The server is still usable and a complete request applies once.
+        assert _req(port, "POST", "/apply", {"nonce": "tok"})[0] == 200
+    finally:
+        t.join(10)
+    assert result["out"] == ("applied", "ok")
+    assert calls == [1]
+
+
+def test_review_server_survives_a_client_disconnect_mid_body():
+    t, result, port = _serve(lambda: (True, "ok"))
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(
+            f"POST /cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 200\r\n\r\n"
+            '{"nonce":'.encode())
+        sock.close()                    # vanish before the body completes
+        time.sleep(0.1)
+        assert _req(port, "POST", "/cancel", {"nonce": "tok"})[0] == 200
+    finally:
+        t.join(10)
+    assert result["out"][0] == "cancelled"
+
+
+def test_gui_handler_drains_get_body_and_rejection_paths():
+    from pedacito.gui import server
+    from pedacito.local_server import LocalHTTPServer
+    srv = LocalHTTPServer(("127.0.0.1", 0), server._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        assert _req(port, "GET", "/api/state", {"unused": True})[0] == 200
+        assert _req(port, "GET", "/api/state", {"unused": True},
+                    headers={"Host": "evil.example"})[0] == 403
+        assert _req(port, "GET", "/api/nope", {"unused": True})[0] == 404
+        assert _req(port, "POST", "/api/nope", {"unused": True})[0] == 404
+        assert _req(port, "POST", "/api/run", {"mode": "task"},
+                    headers={"Content-Type": "text/plain"})[0] == 403
+        assert _req(port, "GET", "/api/state")[0] == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_gui_handler_bounds_incomplete_and_oversized_bodies(monkeypatch):
+    from pedacito.gui import server
+    from pedacito.local_server import LocalHTTPServer
+    monkeypatch.setattr(server, "MAX_BODY", 64 * 1024)
+    srv = LocalHTTPServer(("127.0.0.1", 0), server._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    host = f"127.0.0.1:{port}"
+    try:
+        # A GET body shorter than its declared length is refused, not treated
+        # as an empty successful GET.
+        reply, elapsed = _raw_http(
+            port,
+            (f"GET /api/state HTTP/1.1\r\nHost: {host}\r\n"
+             "Content-Length: 100\r\n\r\n{").encode())
+        assert b"400" in _status_line(reply), reply
+        assert elapsed < 4.0, elapsed
+
+        # POST over MAX_BODY is drained within the cap/deadline and gets 413.
+        cap = server.MAX_BODY
+        body = b"x" * (cap + 17)
+        reply, elapsed = _raw_http(
+            port,
+            (f"POST /api/run HTTP/1.1\r\nHost: {host}\r\n"
+             "Content-Type: application/json\r\n"
+             f"Content-Length: {len(body)}\r\n\r\n").encode() + body)
+        assert b"413" in _status_line(reply), reply
+        assert elapsed < 3.0, elapsed
+
+        # Malformed/incomplete JSON on a strict route is a 400, not a hang.
+        reply, elapsed = _raw_http(
+            port,
+            (f"POST /api/review/decide HTTP/1.1\r\nHost: {host}\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: 200\r\n\r\n{\"id\"").encode())
+        assert b"400" in _status_line(reply), reply
+        assert elapsed < 4.0, elapsed
+
+        # Expect: 100-continue on an accepted route is granted; the missing
+        # body is still bounded and refused.
+        reply, elapsed = _raw_http(
+            port,
+            (f"POST /api/run HTTP/1.1\r\nHost: {host}\r\n"
+             "Content-Type: application/json\r\n"
+             "Expect: 100-continue\r\nContent-Length: 100\r\n\r\n").encode())
+        assert b"100 Continue" in reply and b"400" in reply, reply
+        assert elapsed < 2.0, elapsed
+
+        # A rejected (foreign Host) Expect request gets no 100 Continue.
+        reply, elapsed = _raw_http(
+            port,
+            (b"POST /api/run HTTP/1.1\r\nHost: evil.example\r\n"
+             b"Content-Type: application/json\r\n"
+             b"Expect: 100-continue\r\nContent-Length: 100\r\n\r\n"))
+        assert b"403" in _status_line(reply), reply
+        assert b"100 Continue" not in reply, reply
+        assert elapsed < 2.0, elapsed
+
+        assert _req(port, "GET", "/api/state")[0] == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_gui_accepts_a_large_complete_body_without_truncation(monkeypatch):
+    from pedacito.gui import server
+    from pedacito.local_server import LocalHTTPServer
+    route = "/api/__test_body_echo"
+    monkeypatch.setitem(
+        server.POST_ROUTES, route,
+        lambda q, body: (200, {"ok": True, "n": len(body.get("payload", ""))}))
+    srv = LocalHTTPServer(("127.0.0.1", 0), server._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    host = f"127.0.0.1:{port}"
+    try:
+        size = 4 * 1024 * 1024
+        body = json.dumps({"payload": "x" * size}).encode()
+        reply, elapsed = _raw_http(
+            port,
+            (f"POST {route} HTTP/1.1\r\nHost: {host}\r\n"
+             "Content-Type: application/json\r\n"
+             f"Content-Length: {len(body)}\r\n\r\n").encode() + body,
+            timeout=20)
+        assert b"200" in _status_line(reply), reply[:200]
+        assert f'"n": {size}'.encode() in reply
+        assert elapsed < 10.0, elapsed
+
+        # The documented 60 MiB GUI body gets a practical, finite deadline.
+        assert review._body_read_timeout(server.MAX_BODY) >= 8.0
+        assert review._body_read_timeout(server.MAX_BODY) <= \
+            review.BODY_READ_MAX_TIMEOUT
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_gui_handler_survives_a_client_disconnect_mid_body():
+    from pedacito.gui import server
+    from pedacito.local_server import LocalHTTPServer
+    srv = LocalHTTPServer(("127.0.0.1", 0), server._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(
+            f"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Content-Length: 200\r\n\r\n{".encode())
+        sock.close()
+        time.sleep(0.1)
+        assert _req(port, "GET", "/api/state")[0] == 200
     finally:
         srv.shutdown()
         srv.server_close()
