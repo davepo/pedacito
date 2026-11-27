@@ -34,7 +34,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import how_index, llm, profiler, skills
+from pedacito import __version__, how_index, llm, profiler, skills
 from pedacito.cli import build_parser
 from pedacito.config import Config
 
@@ -642,3 +642,61 @@ def test_readmes_and_changelog_list_v0_3_1_highlights():
     for needle in ("anthropic_native", "--image", "/attach", "Lemonade",
                    "bracketed paste"):
         assert needle in section
+
+
+# ------------------------------------------------------------------ v0.4.0 ---
+
+V040_ES_DOCS = ("README.es.md", "docs/es/*.md")
+V040_EN_DOCS = ("README.md", "docs/*.md")
+
+
+def _v040_corpus(patterns: tuple[str, ...]) -> str:
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(sorted(ROOT.glob(pattern)))
+    return "\n\n".join(p.read_text(encoding="utf-8") for p in paths)
+
+
+@pytest.mark.parametrize("needle,feature", [
+    ("pedacito daemon", "the session daemon command"),
+    ("permission_mode", "the permission mode setting"),
+    ("approval_policy", "the approval policy setting"),
+    ("pedacito-package.toml", "the package manifest"),
+    ("win_restricted", "the Windows sandbox backend"),
+    ("sandbox_win", "the Windows sandbox module"),
+    ("policy.toml", "the trust-gated policy file"),
+    ("SessionContext", "the session context"),
+    ("ModelLeaseManager", "the model lease manager"),
+    ("ProjectLockManager", "the project lock manager"),
+    ("TaskJournal", "the write-ahead task journal"),
+    ("SessionResourceRegistry", "the session resource registry"),
+    ("DaemonServer", "the daemon server"),
+    ("D14", "the unattended hard gate"),
+])
+@pytest.mark.parametrize("patterns", [V040_EN_DOCS, V040_ES_DOCS],
+                         ids=["en", "es"])
+def test_v040_features_are_documented_in_both_languages(patterns, needle, feature):
+    assert needle in _v040_corpus(patterns), f"missing {feature}: {needle!r}"
+
+
+@pytest.mark.parametrize("rel", ["docs/SECURITY.md", "docs/es/SECURITY.md",
+                                 "README.md", "README.es.md"])
+def test_stale_no_windows_sandbox_claim_is_gone(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    assert "Windows has no sandbox" not in text
+    assert "Windows no tiene sandbox" not in text
+
+
+@pytest.mark.parametrize("rel", ["docs/ARCHITECTURE.md", "docs/es/ARCHITECTURE.md"])
+def test_architecture_documents_the_isolation_contract_rows(rel):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    for row in ("| D5 |", "| D7 |", "| D8 |", "| D10 |", "| D11-D12 |",
+                "| D13 |", "| D14 |"):
+        assert row in text, f"{rel} is missing the contract row {row}"
+
+
+def test_changelog_has_a_section_for_the_package_version():
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert re.search(rf"^## v{re.escape(__version__)}\b", changelog, re.M)
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert f'version = "{__version__}"' in pyproject

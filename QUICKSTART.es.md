@@ -1153,6 +1153,7 @@ solo el mapa está desactualizado.
 | `pedacito diag [PROJ]` | Alias corto de `diagnose` |
 | `pedacito parsers prefetch [--languages ...]` | Precarga las gramáticas de tree-sitter para que la herramienta funcione sin conexión o aislada; informa ok o failed por lenguaje |
 | `pedacito acp [PROJ]` | Protocolo Agent Client Protocol (JSON-RPC 2.0) por stdin/stdout para editores y hosts de agentes; texto, recursos `@file`, imágenes, actualizaciones en streaming y avisos de permiso |
+| `pedacito daemon [start\|stop\|status\|sessions]` | Daemon de sesiones headless solo en loopback con un índice compartido caliente; `status` funciona sin conexión y sale con 0 cuando no hay daemon |
 | `pedacito commit [--all] [-m MSG] [-y]` | Escanea el diff preparado en busca de secretos y luego crea un commit local. Nunca hace push; `--no-model` redacta sin conexión y `--allow-secrets` es la excepción explícita |
 | `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Redacta título y cuerpo del PR a partir del diff y los commits de la rama, y luego lo abre con `gh`. Nunca hace push de la rama |
 | `pedacito prune PROJ` | Elimina sesiones, respaldos y eventos antiguos |

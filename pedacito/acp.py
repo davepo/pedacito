@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TextIO
 
 from . import __version__
-from . import rpc, security
+from . import rpc, security, session_ctx
 
 JSONRPC = "2.0"
 PROTOCOL_VERSION = 1
@@ -151,11 +151,13 @@ class AcpServer:
         set_execution_mode: Optional[Callable[[str], Any]] = None,
         on_images: Optional[Callable[[list], None]] = None,
         version: str = __version__,
+        base_cfg: Any = None,
     ):
         self.server = server
         self._in = input_stream if input_stream is not None else sys.stdin
         self._out = output_stream if output_stream is not None else sys.stdout
         self.version = str(version)
+        self._base_cfg = base_cfg
         self.project_root = (Path(project_root).expanduser().resolve()
                              if project_root is not None else None)
         self._set_profile = set_profile
@@ -226,6 +228,10 @@ class AcpServer:
     # ------------------------------------------------------------------ #
     def _initialize(self, params: dict) -> dict:
         self._initialized = True
+        pedacito_meta = {
+            "protocolVersion": rpc.PROTOCOL_VERSION,
+            "capabilities": dict(rpc.CAPABILITIES),
+        }
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "agentInfo": {"name": "pedacito", "version": self.version},
@@ -241,6 +247,11 @@ class AcpServer:
                 "mcpCapabilities": {"http": False, "sse": False},
                 "streaming": True,
                 "permissionRequests": True,
+                "experimental": {"pedacito": pedacito_meta},
+            },
+            "_meta": {
+                "pedacitoProtocolVersion": rpc.PROTOCOL_VERSION,
+                "capabilities": dict(rpc.CAPABILITIES),
             },
         }
 
@@ -258,29 +269,136 @@ class AcpServer:
             if not candidate.is_dir():
                 raise AcpError(-32602, f"cwd is not a directory: {cwd}")
             if root is not None and candidate != root:
+                # One project per stdio process: even a directory nested in
+                # the bound tree is a different project boundary here. Use
+                # `pedacito daemon` for concurrent workspace sessions.
                 raise AcpError(
                     -32002,
-                    f"this agent is bound to {root}; start another "
-                    f"`pedacito acp` process for {candidate}")
+                    f"this agent is bound to {root} and speaks one "
+                    f"project per process; {candidate} is a different "
+                    "workspace. Use `pedacito daemon` (multiple workspace "
+                    "sessions) or start another `pedacito acp` process for "
+                    "that project")
             root = candidate
         if root is None:
             root = Path.cwd().resolve()
 
         profile = str(params.get("profile") or "").strip()
-        if profile:
-            self._apply_profile(profile)
         mode = str(params.get("executionMode")
                    or params.get("execution_mode") or "").strip().lower()
         if mode:
-            self._apply_execution_mode(mode)
+            allowed = ("two_phase", "interleaved", "auto")
+            if mode not in allowed:
+                raise AcpError(-32602,
+                               f"executionMode must be one of {list(allowed)}")
 
         sid = uuid.uuid4().hex
+        ctx = self._new_session_context(sid, root, profile, mode)
+        # Apply profile/mode only to THIS session's cloned cfg. The callback
+        # runs inside the session context so `pedacito acp` can resolve a
+        # profile without touching another session's (or process-global) cfg.
+        # When a base cfg was supplied the clone is authoritative and the
+        # legacy callback is not invoked at all: a caller-owned callback can
+        # never mutate the shared config.
+        if self._base_cfg is None:
+            with session_ctx.use_session(ctx):
+                if profile:
+                    self._apply_profile(profile)
+                if mode:
+                    self._apply_execution_mode(mode)
+        elif profile and ctx.cfg is not None:
+            profiles = getattr(ctx.cfg, "profiles", {}) or {}
+            if profiles and profile not in profiles:
+                have = ", ".join(sorted(profiles)) or "none"
+                raise AcpError(
+                    -32602, f"unknown profile {profile!r}; available: {have}")
+        if ctx.cfg is not None:
+            try:
+                if profile:
+                    ctx.cfg.active_profile = profile
+                if mode:
+                    ctx.cfg.execution_mode = mode
+            except Exception:
+                pass
         with self._lock:
-            self._sessions[sid] = {"id": sid, "root": root,
-                                   "profile": profile or None,
-                                   "execution_mode": mode or None}
+            self._sessions[sid] = {
+                "id": sid,
+                "root": root,
+                "profile": profile or None,
+                "execution_mode": mode or None,
+                "ctx": ctx,
+                "session_ctx": ctx,
+                "cfg": ctx.cfg,
+                "policy": ctx.policy,
+                "permission_broker": ctx.permission_broker,
+                "event_bus": ctx.event_bus,
+            }
             self._last_session = sid
-        return {"sessionId": sid}
+        return {"sessionId": sid, "_meta": {"pedacitoProtocolVersion":
+                                           rpc.PROTOCOL_VERSION}}
+
+    def _new_session_context(self, sid: str, root: Path, profile: str,
+                             mode: str) -> session_ctx.SessionContext:
+        """Build one session's isolated runtime state (cloned cfg + services)."""
+        from . import events as events_mod
+        from . import policy as policy_mod
+
+        cfg = session_ctx.clone_config(self._base_cfg)
+        if cfg is None:
+            try:
+                cfg = session_ctx.clone_config(
+                    getattr(self.server, "_cfg", None))
+            except Exception:
+                cfg = None
+        if cfg is None:
+            try:
+                from . import config as config_mod
+                cfg = config_mod.Config()
+            except Exception:
+                cfg = None
+        ctx = session_ctx.SessionContext(
+            session_id=sid, root=root, cfg=cfg,
+            idx=getattr(self.server, "_index", None),
+            client=getattr(self.server, "_client", None),
+            mode="acp",
+        )
+        log = None
+        try:
+            log = events_mod.get(root, cfg)
+            if not hasattr(log, "_emit_direct"):
+                log = getattr(log, "_log", None)
+        except Exception:
+            log = None
+        ctx.event_bus = events_mod.SessionEventBus(sid, sink=log)
+        approval = str(getattr(cfg, "approval_policy", "ask") or "ask").lower()
+        ctx.permission_broker = security.SessionPermissionBroker(
+            sid, approval_policy=approval,
+            cancel_event=ctx.cancel_event, event_bus=ctx.event_bus,
+            interactive=approval != "never")
+        if cfg is not None:
+            ctx.policy = policy_mod.PolicyEngine(
+                cfg, root=root, event_bus=ctx.event_bus,
+                budget_ledger=ctx.budget_ledger)
+        if profile and cfg is not None:
+            profiles = getattr(cfg, "profiles", {}) or {}
+            entry = profiles.get(profile) if isinstance(profiles, dict) else None
+            if isinstance(entry, dict):
+                for key, value in entry.items():
+                    if hasattr(cfg, key):
+                        try:
+                            setattr(cfg, key, value)
+                        except Exception:
+                            pass
+            try:
+                cfg.active_profile = profile
+            except Exception:
+                pass
+        if mode and cfg is not None:
+            try:
+                cfg.execution_mode = mode
+            except Exception:
+                pass
+        return ctx
 
     def _apply_profile(self, profile: str) -> None:
         if self._set_profile is None:

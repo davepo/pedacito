@@ -373,6 +373,15 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     if not argv:
         return False, "(empty test command)"
     timeout = int(timeout or getattr(cfg, "test_timeout", 300) or 300)
+    # D14: the unattended-execution gate runs BEFORE the sandbox wrap (same
+    # contract as tools.tool_run).
+    try:
+        from . import tools as tools_mod
+        gate_err = tools_mod._run_gate(cfg, command, root)
+    except Exception as exc:
+        gate_err = f"ERROR: denied by policy: policy evaluation error: {exc}"
+    if gate_err:
+        return False, gate_err
     try:
         argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
@@ -380,7 +389,8 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     rc, out, stopped, _el = proc.run(
         argv, cwd=Path(root), timeout=timeout, idle_timeout=0,
         max_output=int(getattr(cfg, "max_shell_output_chars", 8000) or 8000) * 2,
-        env=safety.child_env(cfg))
+        env=safety.child_env(cfg),
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if box and rc not in (0, None) and not stopped:
         out += (f"\n[ran in a sandbox ({box}); a failure from a blocked write "
                 "outside the project or no network is the sandbox, not the "

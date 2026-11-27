@@ -102,6 +102,52 @@ _CHILDREN: dict[int, subprocess.Popen] = {}
 _START_LOCK = threading.Lock()
 
 
+def _current_session_id() -> str:
+    """The bound session id, or '' when no session is bound."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        return str(sess.session_id) if sess is not None else ""
+    except Exception:
+        return ""
+
+
+def _stop_quiet(root, name: str) -> None:
+    """`stop`, but never raises (teardown cleanup must stay best effort)."""
+    try:
+        stop(root, name)
+    except Exception:
+        pass
+
+
+def _register_dev_server(root, name: str) -> str | None:
+    """Register `stop(root, name)` as the session's dev_server cleanup."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return None
+    if sess is None or sess.resource_registry is None:
+        return None
+    try:
+        return sess.resource_registry.register(
+            "dev_server", str(name), lambda: _stop_quiet(root, name))
+    except Exception:
+        return None
+
+
+def _unregister_dev_server(resource_id: str | None) -> None:
+    if not resource_id:
+        return
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None and sess.resource_registry is not None:
+            sess.resource_registry.unregister(resource_id)
+    except Exception:
+        pass
+
+
 def _forget_child(pid: int) -> None:
     with _CHILDREN_LOCK:
         _CHILDREN.pop(int(pid or 0), None)
@@ -211,6 +257,7 @@ def start(root, command, *, name: str = "", cfg=None,
             "name": name, "command": command_text, "pid": 0,
             "cwd": str(root), "log": str(log), "url": "", "job": "",
             "started": time.time(), "status": "starting",
+            "session_id": _current_session_id(),
         })
     env = safety.child_env(cfg)
     p = None
@@ -265,8 +312,12 @@ def start(root, command, *, name: str = "", cfg=None,
     rec = {"name": name, "command": command_text, "pid": p.pid,
            "cwd": str(root), "log": str(log), "url": "", "job": job,
            "job_note": job_note, "born": born,
-           "started": time.time(), "status": "running"}
+           "started": time.time(), "status": "running",
+           "session_id": _current_session_id()}
     _write_record(root, rec)
+    resource_id = _register_dev_server(root, name)
+    if resource_id:
+        rec["resource_id"] = resource_id
     # Give a dev server a moment to print its URL. Never block a run for long:
     # `wait` is a ceiling, and a command that exits is reported immediately.
     deadline = time.monotonic() + max(0.0, float(wait or 0))
@@ -816,6 +867,7 @@ def stop(root, name: str) -> str:
     _terminate_pid(pid, str(rec.get("job") or ""),
                    started=float(rec.get("started") or 0.0),
                    born=float(rec.get("born") or 0.0))
+    _unregister_dev_server(rec.get("resource_id"))
     child = _get_child(pid)
     if child is not None:
         try:

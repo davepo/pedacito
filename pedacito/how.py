@@ -32,6 +32,7 @@ import sysconfig
 import unicodedata
 from collections import Counter
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 from . import config as config_mod
@@ -211,70 +212,112 @@ _WHEN_MARKERS = (
 )
 
 
-def _setting_when(item: dict) -> str:
+def _setting_when(item: dict, lang: str = "en") -> str:
     """A deterministic "why/when to change it" line from the setting's own
     documentation, with a type-aware fallback."""
-    help_text = " ".join(str(item.get("help") or "").split())
-    for sentence in re.split(r"(?<=[.!?])\s+", help_text):
-        if sentence and any(mark in sentence.lower() for mark in _WHEN_MARKERS):
-            return sentence
+    lang = i18n.normalize_lang(lang)
+    help_text = " ".join(how_index.setting_help(item, lang).split())
+    if lang == "en":
+        for sentence in re.split(r"(?<=[.!?])\s+", help_text):
+            if sentence and any(mark in sentence.lower() for mark in _WHEN_MARKERS):
+                return sentence
     choices = item.get("choices")
     if choices:
         shown = ", ".join(f"`{c}`" for c in choices if c != "")
-        return ("Choose the value that matches this project; leave the "
-                f"default unless you specifically need one of {shown}.")
+        return i18n.t("how.when_choices", lang=lang, choices=shown)
     kind = item.get("type")
     if kind == "bool":
-        return ("Leave it on unless the behaviour costs you time or tokens; "
-                "turn it off when the default path is more predictable for "
-                "this project.")
+        return i18n.t("how.when_bool", lang=lang)
     if kind in ("int", "float"):
-        return ("Raise it when a task needs more headroom; lower it to spend "
-                "fewer tokens/time. The built-in default suits most projects.")
-    return ("Change it when the built-in default does not match this "
-            "project's server, hardware or workflow; otherwise leave it "
-            "unset.")
+        return i18n.t("how.when_number", lang=lang)
+    return i18n.t("how.when_other", lang=lang)
 
 
 def render_setting_answer(question: str, item: dict,
-                          matches: dict | None = None) -> str:
+                          matches: dict | None = None,
+                          lang: str = "en") -> str:
     """A direct setting card: what it does, when to change it, the default,
     the exact config.toml syntax and the GUI path (the GUI's How tab renders
     the same item with its Open in Settings button)."""
+    lang = i18n.normalize_lang(lang)
+
+    def t(key: str, **kw) -> str:
+        return i18n.t(f"how.{key}", lang=lang, **kw)
+
     key = item["key"]
-    help_text = " ".join(str(item.get("help") or "").split())
-    lines = [
-        f"**`{key}`** \u2014 {item.get('group') or 'setting'}",
+    help_text = " ".join(how_index.setting_help(item, lang).split())
+    gui = how_index.es_card_text(item.get("gui", "⚙ Settings → All settings"), lang)
+    group = how_index.es_card_text(
+        item.get("group") or t("setting_group_default"), lang)
+    lines = [] if lang != "es" else [t("banner"), ""]
+    lines += [
+        f"**`{key}`** \u2014 {group}",
         "",
-        "**What it does**",
-        help_text or "No documentation text is available for this setting.",
+        t("setting_what"),
+        help_text or t("setting_nodoc"),
         "",
-        "**Why / when to change it**",
-        _setting_when(item),
+        t("setting_when"),
+        _setting_when(item, lang),
         "",
-        f"**Default:** `{item.get('default_text', '')}` "
-        f"(type: {item.get('type', 'str')})",
+        t("setting_default_line", value=item.get("default_text", ""),
+          type=item.get("type", "str")),
         "",
-        "**In the GUI**",
-        f"- {item.get('gui', '⚙ Settings → All settings')}",
-        f"- Open in Settings: {item.get('gui', '⚙ Settings → All settings')}",
+        t("gui_heading"),
+        f"- {gui}",
+        f"- {t('setting_open', gui=gui)}",
         "",
-        "**In the Terminal (CLI)**",
-        "- Add the line below to `config.toml`, then run "
-        "`pedacito config --check` to validate it.",
+        t("cli_heading"),
+        f"- {t('setting_cli_line')}",
         "",
-        "**Relevant Settings (`config.toml`)**",
+        t("settings_heading"),
         "",
         "```toml",
         str(item.get("toml") or f"{key} = ..."),
         "```",
     ]
     if item.get("profile_gui"):
-        lines += ["", f"In a profile: {item['profile_gui']}"]
-    lines += ["", "_Deterministic setting reference; no model needed. In the "
-                  "GUI, open **How ?** and the same card carries an "
-                  "**Open in Settings** button._"]
+        lines += ["", t("setting_profile", gui=item["profile_gui"])]
+    lines += ["", t("setting_footer")]
     return "\n".join(lines).rstrip() + "\n"
+
+
+_ES_CONFIG_KEY_RE = re.compile(r"`([a-z_][a-z0-9_]*)`")
+
+
+@lru_cache(maxsize=4)
+def _parse_spanish_settings(path: str) -> dict[str, str]:
+    """Setting key -> Spanish description, from the setting tables of the
+    Spanish configuration reference (`docs/es/CONFIG.md`)."""
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = re.split(r"(?<!\\)\|", line)
+        if len(cells) < 4:
+            continue
+        meaning = cells[-2].strip().replace("\\|", "|")
+        if not meaning:
+            continue
+        for key in _ES_CONFIG_KEY_RE.findall(cells[1]):
+            out.setdefault(key, meaning)
+    return out
+
+
+def spanish_setting_help() -> dict[str, str]:
+    """Spanish setting descriptions from the bundled Spanish reference; an
+    empty mapping when the Spanish guide is not installed."""
+    try:
+        root = find_docs_root()
+    except HowError:
+        return {}
+    path = root / DOCS_DIR / "es" / "CONFIG.md"
+    if not path.is_file():
+        return {}
+    return _parse_spanish_settings(str(path))
 
 
 class HowError(RuntimeError):
@@ -783,23 +826,30 @@ def _model_synthesis(question: str, matches: dict, cfg: Config,
 
 
 def answer_structured(question: str, cfg: Config | None = None,
-                      use_model: bool = False, client=None) -> dict:
+                      use_model: bool = False, client=None,
+                      lang: str | None = None) -> dict:
     """Retrieve CLI/GUI/setting facts and answer from them.
 
     `use_model=False` is the deterministic, instant path. With a reachable,
     fast model the answer is a grounded rewrite; any failure falls back to the
-    formatted structured cards instead of surfacing an error.
+    formatted structured cards instead of surfacing an error. `lang` (default:
+    the `--lang`/config/env language) localizes the deterministic cards.
     """
     question = " ".join((question or "").split())
     if not question:
         raise HowError("No question given.")
+    lang = i18n.normalize_lang(lang or i18n.detect_lang(cfg=cfg))
     matches = how_index.search(question)
     pinned = _pin_named_setting(question, matches)
-    reference = (render_setting_answer(question, pinned, matches) if pinned
-                 else how_index.render_answer(question, matches))
+    if lang == "es":
+        how_index.localize_matches(matches, lang, spanish_setting_help())
+    reference = (render_setting_answer(question, pinned, matches, lang=lang)
+                 if pinned
+                 else how_index.render_answer(question, matches, lang=lang))
     result = {
         "ok": True,
         "query": question,
+        "lang": lang,
         "mode": "deterministic",
         "used_model": False,
         "model_error": "",
@@ -963,8 +1013,11 @@ def run_cli(args) -> int:
 
     as_json = bool(getattr(args, "json", False))
 
+    lang = i18n.detect_lang(getattr(args, "lang", None), cfg=cfg)
+
     def respond(question: str) -> None:
-        result = answer_structured(question, cfg=cfg, use_model=not offline)
+        result = answer_structured(question, cfg=cfg, use_model=not offline,
+                                   lang=lang)
         if result.get("model_error") and not offline:
             print(f"[how] model synthesis skipped: {result['model_error']}; "
                   "showing the built-in reference.", file=sys.stderr)
@@ -972,8 +1025,9 @@ def run_cli(args) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             print(result["answer"])
-            print(f"[how: {'model synthesis' if result['used_model'] else 'deterministic reference'}]",
-                  file=sys.stderr)
+            # BUG-18: an informational tag, not an error -- keep it on stdout
+            # so Windows PowerShell 5.1 does not paint it as a red error.
+            print(f"[how: {'model synthesis' if result['used_model'] else 'deterministic reference'}]")
 
     question = _read_question(args)
     if question:

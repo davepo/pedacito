@@ -213,6 +213,7 @@ def launch_server(argv: list[str], *, cwd, env: dict | None = None,
                        stderr=subprocess.STDOUT)
     except OSError as e:
         return None, "", str(e)
+    _register_browser(p, " ".join(str(a) for a in argv)[:120])
     reader = _OutputReader(p.stdout)
     deadline = time.monotonic() + max(1, int(wait_seconds or 1))
     url = ""
@@ -226,6 +227,22 @@ def launch_server(argv: list[str], *, cwd, env: dict | None = None,
     if url:
         _wait_until_listening(url)
     return p, url, reader.text()
+
+
+def _register_browser(p, label: str) -> str | None:
+    """Register a live browser/serve process as a session `browser` resource."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return None
+    if sess is None or sess.resource_registry is None:
+        return None
+    try:
+        return sess.resource_registry.register(
+            "browser", label, lambda: proc.terminate(p))
+    except Exception:
+        return None
 
 
 def _wait_until_listening(url: str, timeout: float = 3.0) -> None:

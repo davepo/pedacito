@@ -64,13 +64,14 @@ from .select import CODE_EXTS, REFERENCE_EXTS, Matcher, is_venv_dir, select
 def _add_common(p, paths_nargs="+", dest="paths"):
     """Register the flags shared by the project subcommands. `paths_nargs="?"`
     lets a command run from the current directory with no argument (rpc); the
-    `tui` command uses `dest="project"` so its positional reads naturally."""
-    if paths_nargs == "?":
-        default = "." if dest != "paths" else ["."]
-    else:
-        default = None
+    `tui` command uses `dest="project"` so its positional reads naturally.
+
+    An omitted optional positional stays `None` here and is filled in by
+    `_main`, which can tell it apart from an explicit "." -- with `--root A`
+    an omitted target means A, never the caller's current directory
+    (R2-BUG-02)."""
     p.add_argument(dest, nargs=paths_nargs,
-                   default=default,
+                   default=None,
                    help="files or directories to index")
     p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
                    help="gitignore-style pattern to skip; repeatable "
@@ -88,6 +89,9 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--model", help="model id/name as the server reports it")
     p.add_argument("--root", default=None,
                    help="project root (default: inferred from the paths given)")
+    p.add_argument("--attach-daemon", action="store_true",
+                   default=argparse.SUPPRESS,
+                   help="opt in to a running loopback daemon for this run")
     p.add_argument("--config", metavar="FILE", help="use this config file as well")
     p.add_argument("--profile", metavar="NAME",
                    help="apply a [profiles.NAME] block from your config")
@@ -172,6 +176,27 @@ def _root(args) -> Path:
     if isinstance(paths, str):
         paths = [paths]
     return index_mod.infer_root(list(paths))
+
+
+def _project_paths(args, root: Path) -> list[str]:
+    """Positional targets resolved against `root`, never the caller's CWD.
+
+    `_main` already fills an omitted optional positional with `[str(root)]`
+    and resolves explicit relative paths when `--root` is given; this helper
+    is the belt-and-braces for direct callers (`_get_index`/`_refresh`) so a
+    relative path can never make a run index the current directory's files
+    into a different project (R2-BUG-02)."""
+    paths = (getattr(args, "paths", None)
+             or getattr(args, "project", None) or [str(root)])
+    if isinstance(paths, str):
+        paths = [paths]
+    out: list[str] = []
+    for p in paths:
+        if isinstance(p, Path) or Path(str(p)).is_absolute():
+            out.append(str(p))
+        else:
+            out.append(str((root / str(p)).resolve()))
+    return out
 
 
 def _matcher(args, root: Path) -> Matcher:
@@ -362,7 +387,8 @@ def _refresh(idx, args, cfg, root: Path, verbose: bool = True):
         exts |= set(REFERENCE_EXTS)
     exts |= {e if e.startswith(".") else "." + e for e in cfg.extra_extensions}
     on_disk = set()
-    for f in select(args.paths, root, _matcher(args, root), exts):
+    for f in select(_project_paths(args, root), root,
+                    _matcher(args, root), exts):
         try:
             on_disk.add(f.resolve().relative_to(root).as_posix())
         except ValueError:
@@ -452,7 +478,8 @@ def _get_index(args, cfg, client, rebuild: bool, summarise: bool = True):
             return _refresh(existing, args, cfg, root)
     workspace.ensure(root, cfg.manage_gitignore, cfg.create_ignore_file)
     print("Indexing...", file=sys.stderr)
-    return index_mod.build(args.paths, cfg, client=client if summarise else None,
+    return index_mod.build(_project_paths(args, root), cfg,
+                           client=client if summarise else None,
                            root=root, summarise=summarise,
                            matcher=_matcher(args, root))
 
@@ -1532,10 +1559,30 @@ def _cmd_worktree(args) -> int:
             if not args.name:
                 print("worktree create needs a NAME", file=sys.stderr)
                 return 2
-            dest = worktree.create(root, args.name, base=args.base)
+            policy = str(getattr(args, "dirty", "refuse") or "refuse")
+            dirty = worktree.dirty_files(root)
+            if dirty and policy == "refuse":
+                listed = ", ".join(dirty[:20])
+                if len(dirty) > 20:
+                    listed += f" (+{len(dirty) - 20} more)"
+                print("worktree create: the working tree has uncommitted "
+                      f"changes: {listed}\n"
+                      "  Commit or stash them first, or pass --dirty "
+                      "carry_over (copy them into the worktree) or --dirty "
+                      "stash (stash them first).", file=sys.stderr)
+                return 2
+            dest = worktree.create(root, args.name, base=args.base,
+                                   dirty_policy=policy)
             print(f"Worktree: {dest}")
-            print(f"Run there with:  cd {dest} && pedacito auto ...",
-                  file=sys.stderr)
+            if dirty and policy == "carry_over":
+                print(f"Carried {len(dirty)} uncommitted file(s) into the "
+                      "worktree; the original checkout is unchanged.")
+                print("Commit them there before removing it, or `pdc worktree "
+                      "remove` will need --force to discard them.")
+            elif dirty and policy == "stash":
+                print(f"Stashed {len(dirty)} uncommitted file(s) before "
+                      "creating the worktree.")
+            print(f"Run there with:  cd {dest} && pedacito auto ...")
             return 0
         if args.action == "list":
             entries = worktree.list_paths(root)
@@ -1546,8 +1593,18 @@ def _cmd_worktree(args) -> int:
             if not args.name:
                 print("worktree remove needs a NAME", file=sys.stderr)
                 return 2
-            worktree.remove(root, args.name, force=args.force)
-            print(f"Removed worktree {args.name}", file=sys.stderr)
+            branch = worktree.branch_name(args.name)
+            deleted = worktree.remove(root, args.name, force=args.force,
+                                      delete_branch=not args.keep_branch)
+            print(f"Removed worktree {args.name}")
+            if args.keep_branch:
+                print(f"Kept branch {branch}")
+            elif deleted:
+                print(f"Deleted branch {branch}")
+            elif worktree.branch_exists(root, args.name):
+                print(f"Kept branch {branch} (still checked out elsewhere)")
+            else:
+                print(f"Branch {branch} was not present; nothing to delete")
             return 0
         print(f"unknown worktree action: {args.action}", file=sys.stderr)
         return 2
@@ -1634,8 +1691,7 @@ def _cmd_commit(args) -> int:
         return 1
     sha = str(result.get("commit") or "")
     print(f"Committed {sha[:12]}: {result['message']}")
-    print("Nothing was pushed; push the branch yourself when ready.",
-          file=sys.stderr)
+    print("Nothing was pushed; push the branch yourself when ready.")
     return 0
 
 
@@ -1864,6 +1920,11 @@ def _cmd_update(args) -> int:
         return 0
     if info["command"] is None:
         return 0                        # editable/source: instructions only
+    root = _root(args)
+    ok, reason = workspace.check_maintenance_safe(root, action="update")
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     print("Running: " + " ".join(info["command"]), file=sys.stderr)
     code = update_mod.run_upgrade(info["command"],
                                   on_line=lambda ln: print(ln, flush=True))
@@ -1955,13 +2016,20 @@ def _cmd_calibrate(args, cfg) -> int:
         print(modelcard.render(card))
         print(f"\nSaved to {path}.")
         return 0
-    client = LLMClient(cfg)
-    client.check()
-    _evict_other_local_servers(cfg)
-    client.warmup()
-    card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
-                               repeats=getattr(args, "repeats", None))
-    path = modelcard.save_card(card)
+    from . import leases
+    lease = leases.default_lease_manager().acquire(
+        "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+        priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
+    try:
+        client = LLMClient(cfg)
+        client.check()
+        _evict_other_local_servers(cfg)
+        client.warmup()
+        card = modelcard.calibrate(client, cfg, verbose=True, quick=args.quick,
+                                   repeats=getattr(args, "repeats", None))
+        path = modelcard.save_card(card)
+    finally:
+        lease.release()
     print()
     print(modelcard.render(card))
     print(f"\nSaved to {path}. Settings you left at their defaults now follow "
@@ -2029,6 +2097,10 @@ def _calibrate_all(args) -> int:
                 continue
             print(f"\n=== calibrating profile '{n}' ({cfg.model}) ===",
                   file=sys.stderr)
+            from . import leases
+            lease = leases.default_lease_manager().acquire(
+                "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+                priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
             client = LLMClient(cfg)
             try:
                 client.check()
@@ -2048,6 +2120,7 @@ def _calibrate_all(args) -> int:
                       "  Skipping and continuing with remaining profiles.",
                       file=sys.stderr)
             finally:
+                lease.release()
                 llm_mod.unload_model(client)
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
@@ -2273,6 +2346,7 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
     print(f"\nCalibrating {len(todo)} model(s) "
           f"({'quick' if quick else 'full'}); this can take a few minutes each.")
     done = 0
+    from . import leases
     try:
         for cfg in todo:
             if imagegen.profile_is_image_model(cfg):
@@ -2280,12 +2354,19 @@ def _scan_calibrate(models: list[dict], quick: bool) -> None:
                 modelcard.save_card(card)
                 done += 1
                 continue
-            client = LLMClient(cfg)
-            client.check()
-            client.warmup()
-            card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
-            modelcard.save_card(card)
-            done += 1
+            lease = leases.default_lease_manager().acquire(
+                "cli", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+                priority=leases.LeasePriority.EXCLUSIVE, timeout_s=0.0)
+            try:
+                client = LLMClient(cfg)
+                client.check()
+                client.warmup()
+                card = modelcard.calibrate(client, cfg, verbose=True,
+                                           quick=quick)
+                modelcard.save_card(card)
+                done += 1
+            finally:
+                lease.release()
     except KeyboardInterrupt:
         print(f"\nInterrupted: kept the {done} card(s) finished so far.")
     except LLMError as e:
@@ -2499,6 +2580,11 @@ def _cmd_prune(args) -> int:
     """`pedacito prune`: retention for sessions, backups, events and log.txt."""
     root = _root(args)
     cfg = _light_config(args)
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="prune", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     keep_s = args.keep_sessions if args.keep_sessions is not None \
         else cfg.keep_sessions
     keep_b = args.keep_backups if args.keep_backups is not None \
@@ -2584,6 +2670,13 @@ def _cmd_reset(args) -> int:
     keep_memory = bool(getattr(args, "keep_memory", False))
     keep_config = bool(getattr(args, "keep_config", False))
     force = bool(getattr(args, "force", False))
+
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="reset", force=force)
+        if not ok:
+            print(f"ERROR: {reason}", file=sys.stderr)
+            return 2
 
     lock_held = False
     if not dry_run:
@@ -2701,6 +2794,11 @@ def _cmd_checkout(args) -> int:
     if not root.is_dir():
         print(f"checkout: no such project directory: {root}", file=sys.stderr)
         return 2
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="checkout", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     try:
         checkpoint_id = checkpoints_mod.resolve_id(root, args.id)
     except checkpoints_mod.CheckpointError as e:
@@ -2743,6 +2841,11 @@ def _cmd_undo(args) -> int:
         return 2
     if getattr(args, "list", False):
         return _cmd_checkpoints(args)
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="undo", force=bool(getattr(args, "force", False)))
+    if not ok:
+        print(f"ERROR: {reason}", file=sys.stderr)
+        return 2
     result = checkpoints_mod.undo_last_run(root,
                                            force=bool(getattr(args, "force",
                                                               False)))
@@ -2764,16 +2867,173 @@ def _cmd_undo(args) -> int:
         print(f"undo: restored {len(restored)} file(s) from "
               f"{snapshot.name}", file=sys.stderr)
         return 0
-    for rel in result["restored"]:
+    # R2-BUG-08: `restore_checkpoint` copies every file in the snapshot and
+    # reports the whole snapshot total as "restored", while also listing the
+    # byte-identical files separately -- so a 2-file change in a 13-file
+    # project printed 13 "restored" lines and 13 "unchanged" lines. Only the
+    # genuinely changed paths deserve a line; unchanged files fold into the
+    # one-line summary.
+    identical = set(result.get("identical") or [])
+    restored = [rel for rel in result["restored"] if rel not in identical]
+    for rel in restored:
         print(f"  restored {rel}", file=sys.stderr)
     for rel in result["deleted"]:
         print(f"  deleted  {rel}", file=sys.stderr)
-    for rel in result.get("identical") or []:
-        print(f"  unchanged {rel} (already byte-identical on disk)", file=sys.stderr)
-    print(f"undo: back to {result['undone_to']} "
-          f"({result['files']} file(s) restored)", file=sys.stderr)
+    summary = f"undo: back to {result['undone_to']} " \
+              f"({len(restored)} file(s) restored"
+    if identical:
+        summary += f", {len(identical)} unchanged"
+    summary += ")"
+    print(summary, file=sys.stderr)
     if result.get("safety_id"):
         print(f"  safety snapshot: {result['safety_id']}", file=sys.stderr)
+    return 0
+
+
+def _cmd_daemon(args) -> int:
+    """`pedacito daemon [start|stop|status|sessions]` (loopback-only)."""
+    from . import daemon as daemon_mod
+
+    action = str(getattr(args, "action", "status") or "status").lower()
+    json_out = bool(getattr(args, "json", False))
+    state_dir = getattr(args, "state_dir", None)
+    if action == "status":
+        status = daemon_mod.daemon_status(state_dir)
+        status.pop("token", None)
+        info = status.get("info")
+        if isinstance(info, dict):
+            info.pop("token", None)
+        if json_out:
+            print(json.dumps(status, default=str))
+            return 0
+        if not status.get("running"):
+            print("daemon not running")
+            return 0
+        health = status.get("health") or {}
+        print(f"daemon running at {info.get('url') if info else ''} "
+              f"(pid {info.get('pid') if info else '?'}, "
+              f"sessions {health.get('sessions', 0)}, "
+              f"protocol {status.get('protocol_version')})")
+        return 0
+    if action == "stop":
+        info = daemon_mod.read_daemon_info(state_dir)
+        if info is None:
+            if json_out:
+                print(json.dumps({"ok": True, "running": False}))
+            else:
+                print("daemon not running")
+            return 0
+        code, body = daemon_mod.daemon_request(
+            "POST", "/v1/shutdown", {}, state_dir=state_dir, timeout=3.0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if daemon_mod.read_daemon_info(state_dir) is None:
+                break
+            time.sleep(0.05)
+        stopped = daemon_mod.read_daemon_info(state_dir) is None
+        if json_out:
+            print(json.dumps({"ok": stopped and code in (200, 202),
+                              "running": not stopped, "response": body}))
+        else:
+            print("daemon stopped" if stopped
+                  else f"daemon stop requested (status {code})")
+        return 0 if stopped or code in (200, 202) else 1
+    if action == "sessions":
+        if daemon_mod.read_daemon_info(state_dir) is None:
+            if json_out:
+                print(json.dumps({"sessions": []}))
+            else:
+                print("daemon not running")
+            return 0
+        code, body = daemon_mod.daemon_request(
+            "GET", "/v1/sessions", state_dir=state_dir, timeout=3.0)
+        if json_out:
+            print(json.dumps(body, default=str))
+            return 0 if code == 200 else 1
+        if code != 200:
+            print(f"daemon error: {body.get('error') or code}",
+                  file=sys.stderr)
+            return 1
+        sessions = body.get("sessions") or []
+        if not sessions:
+            print("no active sessions")
+            return 0
+        for ws in sessions:
+            branch = ws.get("worktree_branch") or ""
+            extra = f" worktree={branch}" if branch else ""
+            print(f"{ws.get('session_id')}  {ws.get('state')}  "
+                  f"{ws.get('root')}{extra}")
+        return 0
+
+    if action != "start":
+        print(f"unknown daemon action: {action}", file=sys.stderr)
+        return 2
+    if daemon_mod.read_daemon_info(state_dir) is not None:
+        status = daemon_mod.daemon_status(state_dir)
+        info = status.get("info") or {}
+        if json_out:
+            info.pop("token", None)
+            print(json.dumps({"ok": True, "already_running": True,
+                              **status}, default=str))
+        else:
+            print(f"daemon already running at {info.get('url')}")
+        return 0
+    port = int(getattr(args, "port", 0) or 0)
+    if not getattr(args, "foreground", False):
+        import subprocess
+        cmd = [sys.executable, "-m", "pedacito", "daemon", "start",
+               "--foreground"]
+        if port:
+            cmd += ["--port", str(port)]
+        if state_dir:
+            cmd += ["--state-dir", str(state_dir)]
+        kwargs: dict = {"shell": False, "stdin": subprocess.DEVNULL,
+                        "stdout": subprocess.DEVNULL,
+                        "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kwargs["creationflags"] = (0x00000008 | 0x00000200)  # detached
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except OSError as exc:
+            print(f"daemon start failed: {exc}", file=sys.stderr)
+            return 1
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            info = daemon_mod.read_daemon_info(state_dir)
+            if info is not None:
+                info = dict(info)
+                info.pop("token", "")   # the discovery file is the token carrier
+                if json_out:
+                    print(json.dumps({"ok": True, "running": True, **info},
+                                     default=str))
+                else:
+                    print(f"daemon started at {info.get('url')} "
+                          f"(pid {info.get('pid')})")
+                return 0
+            time.sleep(0.1)
+        print("daemon start timed out; no discovery file appeared",
+              file=sys.stderr)
+        return 1
+
+    server = daemon_mod.DaemonServer(port=port, state_dir=state_dir)
+    info = server.start()
+    if json_out:
+        payload = dict(info)
+        payload.pop("token", None)
+        print(json.dumps(payload, default=str))
+    else:
+        print(f"daemon listening at {info['url']} (pid {info['pid']})")
+        print("the bearer token is in the discovery file (daemon.json)")
+        print("Ctrl-C stops it.")
+    try:
+        while not server._stopped.wait(0.5):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
     return 0
 
 
@@ -2910,27 +3170,54 @@ def _cmd_memory(args) -> int:
 
 
 def _cmd_trust(args) -> int:
-    """`pedacito trust`: approve this project's `.pedacito.toml` to set
-    execution-capable settings (hooks, mcp_servers, auto_verify, test_command)."""
-    from .config import EXEC_FIELDS, trust_project
+    """`pedacito trust`: approve this project's `.pedacito.toml` (execution-
+    capable settings: hooks, mcp_servers, auto_verify, test_command) and/or its
+    `.pedacito/policy.toml` (the trust-gated capability policy)."""
+    from . import policy as policy_mod
+    from .config import EXEC_FIELDS, trust_project, validate_utf8_toml
     root = _root(args)
-    path = find_project_config(root)
-    if path is None:
-        print(f"No .pedacito.toml / pedacito.toml in {root}; nothing to trust.")
+    cfg_path = find_project_config(root)
+    pol_path = policy_mod.policy_path(root)
+    if not pol_path.is_file():
+        pol_path = None
+    if cfg_path is None and pol_path is None:
+        print(f"No .pedacito.toml / pedacito.toml and no "
+              f".pedacito/policy.toml in {root}; nothing to trust.")
         return 0
-    print(f"{path}:\n")
-    print(path.read_text(encoding="utf-8", errors="replace"))
-    print(f"\nSettings that can run commands: {', '.join(EXEC_FIELDS)}.")
+
+    # BUG-04: validate UTF-8 + TOML syntax BEFORE pinning either file as
+    # trusted. A UTF-16 (PowerShell `Out-File -Encoding Unicode`) or broken
+    # file is refused with exit code 2, never trusted.
+    for path in (cfg_path, pol_path):
+        if path is None:
+            continue
+        err = validate_utf8_toml(path)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 2
+
     if not args.yes:
+        for path in (cfg_path, pol_path):
+            if path is None:
+                continue
+            print(f"{path}:\n")
+            print(path.read_text(encoding="utf-8", errors="replace"))
+            print()
+        if cfg_path is not None:
+            print(f"Settings that can run commands: {', '.join(EXEC_FIELDS)}.")
         try:
-            ans = input("Trust this file as written? [y/N] ").strip().lower()
+            ans = input("Trust these file(s) as written? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = ""
         if ans not in ("y", "yes"):
             print("Not trusted.")
             return 1
-    trust_project(path)
-    print("Trusted (until the file changes).")
+
+    for path in (cfg_path, pol_path):
+        if path is None:
+            continue
+        trust_project(path)
+        print(f"Trusted {path} (until the file changes).")
     return 0
 
 
@@ -3290,6 +3577,55 @@ def _cmd_rename(args) -> int:
         fileio.backup_copy(path, state["dir"] / rel)
         return None
 
+    # BUG-02: `rename --apply` is a write. Plan mode (`permission_mode =
+    # "plan"`), `approval_policy = "never"`, and trusted `[paths].deny` rules
+    # must all block it BEFORE anything is written -- the deterministic rename
+    # engine otherwise sailed straight past the policy engine that `ask
+    # --apply` already honours.
+    cfg = None
+    if args.apply:
+        try:
+            cfg = load_config(root=root, explicit=getattr(args, "config", None),
+                              profile=getattr(args, "profile", None),
+                              require_hardware=False, warn_budgets=False,
+                              upgrade_user_config=False)
+        except ConfigError as e:
+            print(f"rename refused: cannot load config to check policy: {e}",
+                  file=sys.stderr)
+            return 1
+        from . import policy as policy_mod
+
+        def _denied(target: str) -> str | None:
+            try:
+                d = policy_mod.enforce(cfg, "write", target, root=root)
+            except Exception as e:
+                return f"denied by policy (policy:error): policy evaluation error: {e}"
+            if d is not None and d.decision == "deny":
+                return f"denied by policy ({d.matched_rule}): {d.reason}"
+            return None
+
+        coarse = _denied(args.old)
+        if coarse is not None:
+            print(coarse, file=sys.stderr)
+            return 1
+
+        # Plan first (dry run) so `[paths].deny` can gate every candidate file
+        # path before a single byte is written, not just the coarse target.
+        plan = refactor.rename_symbol_across_project(
+            root, args.old, args.new, scope_file=args.file or None,
+            dry_run=True,
+            include_strings=bool(getattr(args, "strings", False)),
+            include_labels=bool(getattr(args, "include_labels", False)))
+        if not plan["ok"]:
+            print(f"rename refused: {plan.get('error', 'unknown failure')}",
+                  file=sys.stderr)
+            return 2
+        for rel in plan.get("files_modified", []):
+            denied = _denied(rel)
+            if denied is not None:
+                print(denied, file=sys.stderr)
+                return 1
+
     if args.apply:
         # Record the exact pre-rename workspace so `pedacito undo` restores it
         # (a stale head would otherwise make Undo revert to before an earlier
@@ -3582,19 +3918,38 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
         events=getattr(args, "events", "on") != "off")
     server_box["s"] = server
     server.set_client(client)
+    server._cfg = locals_ref["cfg"]          # ACP session cloning fallback
+    server._index = locals_ref["idx"]
     if acp:
         from . import acp as acp_mod
 
         def _acp_set_profile(ref):
+            # ACP sessions are scoped: only this session's cloned cfg changes.
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            if sess is not None and sess.cfg is not None:
+                profiles = getattr(sess.cfg, "profiles", {}) or {}
+                if profiles and ref not in profiles:
+                    have = ", ".join(sorted(profiles)) or "none"
+                    raise ConfigError(
+                        f"unknown profile {ref!r}; available: {have}")
+                sess.cfg.active_profile = str(ref)
+                return str(ref)
             return _rpc_switch(ref, "main")
 
         def _acp_set_execution_mode(mode):
-            cur = locals_ref["cfg"]
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            cur = sess.cfg if sess is not None and sess.cfg is not None \
+                else locals_ref["cfg"]
             cur.execution_mode = str(mode).strip().lower()
             return cur.execution_mode
 
         def _acp_set_images(images):
-            cur = locals_ref["cfg"]
+            from . import session_ctx as _sctx
+            sess = _sctx.current_session()
+            cur = sess.cfg if sess is not None and sess.cfg is not None \
+                else locals_ref["cfg"]
             if images:
                 cur._task_images = list(images)
             else:
@@ -3605,7 +3960,8 @@ def _cmd_rpc(args, cfg, client, idx, root, locals_ref, run, save_checkpoint,
             output_stream=real_stdout,
             set_profile=_acp_set_profile,
             set_execution_mode=_acp_set_execution_mode,
-            on_images=_acp_set_images)
+            on_images=_acp_set_images,
+            base_cfg=locals_ref["cfg"])
         elog.tee = bridge.out
         print("pedacito acp: Agent Client Protocol (JSON-RPC 2.0) over "
               "stdin/stdout - Ctrl-D to exit.", file=sys.stderr)
@@ -3704,6 +4060,9 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                     help=t("cli.opt.version"))
     ap.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES, default=None,
                     help=t("cli.opt.lang"))
+    ap.add_argument("--attach-daemon", action="store_true",
+                    help="opt in to the loopback daemon for warm, shared "
+                         "workspace sessions (off by default)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_index = sub.add_parser("index", help=t("cli.cmd.index"))
@@ -3839,8 +4198,16 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                       help="the repository (default: current directory)")
     p_wt.add_argument("--base", default="HEAD",
                       help="commit/branch for a new worktree (default: HEAD)")
+    p_wt.add_argument("--dirty", choices=["refuse", "carry_over", "stash"],
+                      default="refuse",
+                      help="with create: what to do with uncommitted changes "
+                           "(default: refuse; carry_over copies them in, "
+                           "stash stashes them first)")
     p_wt.add_argument("--force", action="store_true",
                       help="with remove: discard modified/untracked files")
+    p_wt.add_argument("--keep-branch", dest="keep_branch",
+                      action="store_true",
+                      help="with remove: keep the pedacito/<name> branch")
 
     p_commit = sub.add_parser(
         "commit", help="review the staged diff and create a local git commit")
@@ -4183,6 +4550,24 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_acp.set_defaults(apply=False, review=False, no_review=True,
                        refine=False, plan=False, no_plan=True,
                        resume=False, jsonl=False, rpc=False)
+
+    p_daemon = sub.add_parser(
+        "daemon", help=t("cli.cmd.daemon"))
+    p_daemon.add_argument("action", nargs="?", default="status",
+                          choices=("start", "stop", "status", "sessions"),
+                          help="start, stop, status (default) or sessions")
+    p_daemon.add_argument("--port", type=int, default=0,
+                          help="loopback port (0 = let the OS choose)")
+    p_daemon.add_argument("--foreground", action="store_true",
+                          help="run in this process instead of detaching")
+    p_daemon.add_argument("--state-dir", default=None,
+                          help="directory for daemon.json (default: the "
+                               "per-user state folder)")
+    p_daemon.add_argument("--json", action="store_true",
+                          help="print one JSON object")
+    p_daemon.set_defaults(apply=False, review=False, no_review=True,
+                          refine=False, plan=False, no_plan=True,
+                          resume=False, jsonl=False, rpc=False)
 
     p_cal = sub.add_parser(
         "calibrate", help="measure the configured model (tool choice, edit "
@@ -4605,21 +4990,49 @@ def _main(argv=None) -> int:
     # start, reusing the same redirect the --jsonl path uses further down.
     json_stdout = sys.stdout
     if ask_json:
+        # BUG-15: only an EXPLICIT --review is a conflict worth naming; the
+        # `--json` contract already implies --no-review, and the config's
+        # `review = true` stays silent because the caller never asked for the
+        # page. stdout stays valid JSON, so the note goes to stderr.
+        if getattr(args, "review", False):
+            print("Note: --json disables interactive --review; omit --json "
+                  "to open the review page.", file=sys.stderr)
         args.no_review = True
         args.review = False
         if hasattr(args, "review_plan"):
             args.review_plan = False
         sys.stdout = sys.stderr
-    # A command whose positional is optional (`rpc`) parses it as one string;
-    # every consumer below expects a list of paths.
-    if isinstance(getattr(args, "paths", None), str):
-        args.paths = [args.paths]
+    # R2-BUG-02: resolve the project target exactly once, before any config
+    # or index work. An omitted optional positional (`rpc`/`acp`/`tui`) is
+    # NOT the same as an explicit ".": with `--root A` the target is A, never
+    # the caller's current directory. An explicit relative positional path is
+    # resolved against `--root` too, so `pdc rpc --root A` run from B can
+    # never index B's files into A's index.
+    root_arg = getattr(args, "root", None)
+    root_path = (Path(root_arg).expanduser().resolve()
+                 if root_arg else None)
     if getattr(args, "cmd", "") == "tui":
-        project = getattr(args, "project", ".") or "."
+        project = getattr(args, "project", None)
         if isinstance(project, (list, tuple)):
-            project = next((str(p) for p in project if p), ".")
+            project = next((str(p) for p in project if p), None)
+        if not project:
+            project = str(root_path) if root_path is not None else "."
+        elif root_path is not None and not Path(str(project)).is_absolute():
+            project = str((root_path / str(project)).resolve())
         args.project = str(project)
         args.paths = [args.project]
+    elif hasattr(args, "paths"):
+        # An optional positional (`rpc`/`acp`) parses as one string; every
+        # consumer below expects a list of paths.
+        paths = getattr(args, "paths", None)
+        if isinstance(paths, str):
+            paths = [paths]
+        if paths is None:
+            paths = [str(root_path)] if root_path is not None else ["."]
+        elif root_path is not None:
+            paths = [p if Path(str(p)).is_absolute()
+                     else str((root_path / str(p)).resolve()) for p in paths]
+        args.paths = paths
 
     # `pedacito rpc --describe` is a pure protocol-introspection command: no
     # model, config or index is needed (and none must be touched to print it).
@@ -4627,6 +5040,11 @@ def _main(argv=None) -> int:
         from . import rpc as rpc_mod
         print(json.dumps(rpc_mod.describe(), indent=2))
         return 0
+
+    # The daemon is loopback-only and needs no model/config/index to answer
+    # `status`, `sessions` or `stop`: it must exit 0 cleanly offline.
+    if args.cmd == "daemon":
+        return _cmd_daemon(args)
 
     # `acp` owns stdout for JSON-RPC 2.0. Point every human line at stderr
     # before config/index work starts, so not even setup chatter can corrupt
@@ -4823,6 +5241,14 @@ def _main(argv=None) -> int:
 
         if args.cmd == "restore":
             root = _root(args)
+            if not getattr(args, "list", False) \
+                    and not getattr(args, "dry_run", False):
+                ok, reason = workspace.check_maintenance_safe(
+                    root, action="restore",
+                    force=bool(getattr(args, "force", False)))
+                if not ok:
+                    print(f"ERROR: {reason}", file=sys.stderr)
+                    return 2
             cp_target = getattr(args, "checkpoint", None) \
                 or (getattr(args, "snapshot", None)
                     if str(getattr(args, "snapshot", None) or "").startswith("cp_")

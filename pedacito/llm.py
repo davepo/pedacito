@@ -2042,10 +2042,19 @@ class LLMClient:
             return False
 
     def _cancel_requested(self, extra=None) -> bool:
-        """Check the client's own flag, an explicit token, and the run-wide
-        token the GUI stores on the config. Never raises."""
+        """Check the client's own flag, an explicit token, the run-wide
+        token the GUI stores on the config, and the active SessionContext's
+        cancel_event. Never raises."""
+        sess_cancel = None
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                sess_cancel = sess.cancel_event
+        except Exception:
+            pass
         for source in (self._cancel, extra, getattr(self, "cancel_event", None),
-                       getattr(self.cfg, "_cancel_event", None)):
+                       getattr(self.cfg, "_cancel_event", None), sess_cancel):
             if self._token_set(source):
                 return True
         return False
@@ -2145,7 +2154,16 @@ class LLMClient:
     def _outbound_root(self):
         """The workspace this request belongs to, when the caller set one."""
         root = getattr(self.cfg, "_root", "") or ""
-        return root or None
+        if root:
+            return root
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None and sess.root is not None:
+                return str(sess.root)
+        except Exception:
+            pass
+        return None
 
     def _notify_redaction(self, count: int, findings, mode: str) -> None:
         """Tell the listening surface that raw secrets were replaced."""
@@ -2753,6 +2771,13 @@ class LLMClient:
             events.note_call(record)
         except Exception:
             pass          # run aggregation is best-effort
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None and sess.budget_ledger is not None:
+                sess.budget_ledger.record(cost_usd=cost, tokens=total)
+        except Exception:
+            pass          # session budget tracking is best-effort
         cb = self.on_call
         if cb is not None:
             try:

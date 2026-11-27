@@ -33,7 +33,9 @@ import contextlib
 import dataclasses
 import difflib
 import hashlib
+import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import weakref
@@ -50,6 +52,62 @@ EditResult = Result
 # A dry-run mirror is a copy of the tracked project files: refuse to build one
 # for a tree this large rather than fill a temp disk.
 MAX_MIRROR_BYTES = 400_000_000
+
+
+def _link_node_modules(link: Path, target: Path) -> None:
+    """Link a project's `node_modules` into a mirror, or skip cleanly.
+
+    An unprivileged symlink fails on Windows without the developer-mode
+    ``SeCreateSymbolicLinkPrivilege`` (``OSError`` / ``WinError 1314``). Fall
+    back to a directory junction (``mklink /J``, which needs no privilege), and
+    finally skip without failing mirror creation -- the project copy is still
+    fully usable, just without its already-installed dependencies.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True, check=False, timeout=30)
+            if link.exists():
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Last resort: leave `node_modules` absent rather than crash the mirror.
+
+
+def _register_mirror(ws: "VirtualWorkspace") -> None:
+    """Register `ws.close` as a `temp_mirror` resource under the bound session."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return
+    if sess is None or sess.resource_registry is None:
+        return
+    try:
+        ws._mirror_resource_id = sess.resource_registry.register(
+            "temp_mirror", str(ws._mirror or ""), ws.close)
+    except Exception:
+        pass
+
+
+def _unregister_mirror(ws: "VirtualWorkspace") -> None:
+    rid = getattr(ws, "_mirror_resource_id", None)
+    if not rid:
+        return
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None and sess.resource_registry is not None:
+            sess.resource_registry.unregister(rid)
+    except Exception:
+        pass
+    ws._mirror_resource_id = None
 
 
 class WorkspaceError(Exception):
@@ -117,6 +175,7 @@ class VirtualWorkspace:
         self._mirror_rev = -1
         self._mirror_touched: set[str] = set()
         self._finalizer = None
+        self._mirror_resource_id: str | None = None
 
     # ------------------------------------------------------------ paths
     def _resolve(self, rel, *, write: bool,
@@ -141,6 +200,17 @@ class VirtualWorkspace:
         why = safety.is_protected(canon, self.cfg if write else None, write=write)
         if why:
             raise PathRefused(why)
+        if write and not allow_sensitive:
+            # D10: the SAME gate as the two-phase engine. Every write/edit/
+            # create/delete/rename path goes through `_resolve(write=True)`,
+            # so sensitive files are refused identically in both engines.
+            allowed, error = security.check_sensitive_write(
+                self.root, canon, action="write",
+                policy=getattr(self.cfg, "policy", None))
+            if not allowed:
+                exc = PathRefused(error)
+                exc.sensitive = True
+                raise exc
         if not allow_sensitive and security.is_sensitive_path(canon):
             exc = PathRefused(
                 f"`{canon}` holds secrets/credentials; it is never read or "
@@ -513,6 +583,7 @@ class VirtualWorkspace:
             self._mirror = mirror
             self._finalizer = weakref.finalize(
                 self, shutil.rmtree, str(mirror), True)
+            _register_mirror(self)
             total = 0
             try:
                 for rel, src in checkpoints.iter_workspace_files(self.root):
@@ -529,8 +600,7 @@ class VirtualWorkspace:
                     shutil.copy2(src, dest)
                 deps = self.root / "node_modules"
                 if deps.is_dir() and not (mirror / "node_modules").exists():
-                    (mirror / "node_modules").symlink_to(deps,
-                                                         target_is_directory=True)
+                    _link_node_modules(mirror / "node_modules", deps)
             except BaseException:
                 self.close()
                 raise
@@ -540,6 +610,8 @@ class VirtualWorkspace:
             return self._mirror
         mirror = self._mirror
         for rel in sorted(self._mirror_touched - set(self._entries)):
+            if security.is_sensitive_path(rel):
+                continue
             # Rolled back since the last sync: put the real file back.
             dest = mirror / rel
             src = self.root / rel
@@ -549,6 +621,8 @@ class VirtualWorkspace:
             elif dest.exists():
                 dest.unlink()
         for rel, entry in self._entries.items():
+            if security.is_sensitive_path(rel):
+                continue                     # never mirror secret bytes
             dest = mirror / rel
             if entry.current is None:
                 if dest.exists():
@@ -561,6 +635,7 @@ class VirtualWorkspace:
 
     def close(self) -> None:
         """Remove the dry-run mirror (idempotent; it is rebuilt on demand)."""
+        _unregister_mirror(self)
         with self._lock:
             if self._finalizer is not None:
                 self._finalizer()

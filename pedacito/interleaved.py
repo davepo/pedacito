@@ -1246,6 +1246,21 @@ class _ToolRunner:
                 "it. `read` the file first, then edit it; creating new files "
                 "is always allowed.")
 
+    def _policy_deny(self, capability: str, target: str) -> str:
+        """'' when the unified policy engine allows/asks (or is inactive),
+        else the refusal text for a hard-deny."""
+        try:
+            from . import policy as policy_mod
+            root = getattr(self.ws, "root", None) or getattr(
+                self.cfg, "_root", None)
+            d = policy_mod.enforce(self.cfg, capability, target, root=root)
+        except Exception as exc:
+            # FAIL CLOSED: a policy evaluation error is a denial, never "".
+            return (f"ERROR: denied by policy: policy evaluation error: {exc}")
+        if d is not None and d.decision == "deny":
+            return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
+        return ""
+
     def _t_edit_file(self, args: dict) -> ToolOutcome:
         file = _as_text(_arg(args, "file", "path", "filename")).strip()
         search = _as_text(_arg(args, "search", "old", "old_string"))
@@ -1268,6 +1283,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("write", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         first = last = None
         if not symbol and anchored:
             first = _as_int(start, 0) or None
@@ -1287,6 +1305,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("write", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         self.gates.prepare_frontend(file)
         snap = self.ws.snapshot()
         res = self.ws.write(file, _as_text(args.get("content")))
@@ -1299,6 +1320,9 @@ class _ToolRunner:
         blocked = self._allowlist_error(file)
         if blocked:
             return ToolOutcome(blocked, ok=False)
+        policy_err = self._policy_deny("delete", file)
+        if policy_err:
+            return ToolOutcome(policy_err, ok=False)
         snap = self.ws.snapshot()
         res = self.ws.delete(file)
         return self._after_mutation(res, snap)
@@ -2110,6 +2134,45 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
     do_apply = bool(apply) and not review
     cfg = agent.cfg
     root = agent.index.root
+    # Best-effort durable task journal (D7). Only apply-mode runs (which really
+    # write to disk) journal: a dry run / review leaves the tree byte-identical
+    # by contract, so it must not create `.pedacito/journal/...` either.
+    #
+    # R2-BUG-06: `loop.run_task` opens the task journal BEFORE delegating here,
+    # so when `cfg._task_journal` is already active we REUSE it instead of
+    # opening the same file again (which duplicated `task_start` and reset the
+    # sequence). Only the owner that created the journal closes it.
+    journal = None
+    owns_journal = False
+    if do_apply:
+        journal = getattr(cfg, "_task_journal", None)
+        if journal is None:
+            sess = None
+            try:
+                from . import journal as journal_mod
+                sid = ""
+                try:
+                    from . import session_ctx
+                    sess = session_ctx.current_session()
+                    if sess is not None:
+                        sid = str(sess.session_id)
+                except Exception:
+                    pass
+                journal = journal_mod.TaskJournal(root, task, session_id=sid)
+                journal.append("task_start", task=(task or "")[:400])
+                owns_journal = True
+                try:
+                    cfg._task_journal = journal
+                except Exception:
+                    pass
+                try:
+                    if sess is not None:
+                        sess._task_journal = journal
+                except Exception:
+                    pass
+            except Exception:
+                journal = None
+                owns_journal = False
     try:
         cfg._root = str(root)
     except Exception:
@@ -2122,9 +2185,29 @@ def run_interleaved(agent, task: str, *, apply: bool = True,
                  on_event=on_event)
     try:
         loop.result.checkpoint_id = _take_checkpoint(checkpoint, ws, task)
+        if journal is not None and loop.result.checkpoint_id:
+            journal.append("checkpoint",
+                           checkpoint_id=loop.result.checkpoint_id)
         return loop.run()
     except Exception as exc:                      # the loop never raises
         loop.result.error = f"{type(exc).__name__}: {exc}"
         return loop._finalize(STOP_ERROR)
     finally:
+        if journal is not None:
+            try:
+                journal.append("step", turns=loop.result.turns,
+                               tool_calls=loop.result.tool_calls)
+                journal.append("model_call", calls=loop.model_calls)
+                if loop.result.changed_files:
+                    journal.append("edit",
+                                   files=loop.result.changed_files[:200])
+                if owns_journal:
+                    journal.close(status="completed", ok=loop.result.ok)
+            except Exception:
+                pass
+            if owns_journal:
+                try:
+                    cfg._task_journal = None
+                except Exception:
+                    pass
         ws.close()

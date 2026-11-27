@@ -297,7 +297,34 @@ Commands that the model causes to run (`run`, and the test commands used by
 |---|---|---|
 | Linux | `bwrap` (bubblewrap) | Unprivileged user namespaces, no setuid helper |
 | macOS | `sandbox-exec` (Seatbelt) | A generated profile applied to the child process |
-| Windows | none | Commands run unsandboxed, with one notice |
+| Windows | `win_restricted` (Job Object + restricted token) | Built in since v0.4.0; see below |
+
+**Windows sandbox (`win_restricted`, v0.4.0).** `pedacito/sandbox_win.py` runs
+the child inside a Windows Job Object and a restricted token at Low integrity
+(`ctypes`, loaded lazily behind `os.name == "nt"`; no third-party packages). The
+job is set to kill every process when it closes, so a cancelled, timed-out or
+crashed command takes its whole process tree with it, and Pedacito waits for the
+child before it removes any temporary directory. The Low-integrity label is
+applied to the project and temporary directories only, and the relabel walker
+skips the guarded `.git`, `.pedacito` and `.pedacito.toml` (and never follows
+NTFS junctions or symlinks), so a sandboxed command cannot rewrite a git hook,
+the policy file or its own guard rails. Pedacito probes the backend at
+start-up with a real no-op child; if the Job Object, restricted token or child
+launch fails, the backend reports `unavailable` and is never claimed.
+`sandbox.status()` reports `active`, `unavailable` or `off`.
+
+`win_restricted` isolates process lifetime (Job Object) and restricts writes to
+the relabeled project and temporary directories (Low Integrity, skipping the
+guarded paths above), but it does **not** filter outbound network traffic or
+hide user-readable files: outbound network filtering and read-hiding require an
+AppContainer on Windows, or the POSIX `bwrap` / `sandbox-exec` backends.
+`sandbox = false` turns wrapping off entirely.
+
+**Unattended hard gate (D14).** Unattended `workspace-write` and `danger` modes,
+background tasks, and `approval_policy = "never"` with `sandbox` on must run inside
+an active OS sandbox. When no backend is active they raise `SandboxRefused` and
+the command does not run. Interactive `ask` runs are not blocked by the gate, but
+they still use the sandbox when one exists.
 
 The Linux `bwrap` arguments give the following guarantees:
 
@@ -626,6 +653,41 @@ credential with no known shape can still survive redaction — the same
 - [ ] `record_trajectories` is on only where you are prepared to keep the full prompts locally.
 - [ ] You never run Pedacito as root.
 
+## Sensitive artifacts, policy trust and approvals (v0.4.0)
+
+**Sensitive-artifact hygiene (D10).** Credential material never leaves the project through
+Pedacito's own stores. The shared gate, `security.check_sensitive_write`, refuses `.env`
+variants, `id_rsa*`, `*.pem`, `*.key`, `*.p12`, `credentials.json` and the other names in
+`security.SENSITIVE_NAMES` and `SENSITIVE_PATTERNS`, and the `~/.ssh`-style directories. It
+applies in both engines: the two-phase engine (`edits.apply_edits`, `tools.tool_write`) and
+the interleaved engine (`workspace_overlay.VirtualWorkspace`) refuse the same writes with the
+same message. The following never carry the bytes of a sensitive file:
+
+- checkpoints, the ratchet snapshots and the backups (`fileio.backup_copy` refuses and
+  creates nothing);
+- dry-run mirrors (`VirtualWorkspace.exec_root`);
+- review diffs, review pages and GUI JSON previews. Embedded tokens are redacted as
+  `[REDACTED]` in the review HTML and rows, but the text that gets applied is unchanged.
+
+Template and public-key names stay usable: `.env.example`, `.env.sample`, `.env.template`
+and `id_rsa.pub` are not treated as secrets.
+
+**Policy file trust (`.pedacito/policy.toml`).** A project's policy file can narrow what the
+agent may do, but it cannot widen it. The file is read only when the project is trusted
+(`pedacito trust PROJECT`). An untrusted file is ignored
+entirely, so its `permission_mode` or `approval_policy` never takes effect. The policy
+engine (`pedacito/policy.py`) resolves every capability against the permission mode and
+the approval policy, and a subagent gets a `child_policy()` that can only intersect with
+its parent, never add to it.
+
+**Permission modes and approvals.** `permission_mode` is one of `plan` (read-only),
+`ask` (every mutating capability asks), `accept-edits` (file writes are automatic, other
+capabilities ask), `workspace-write` (writes and runs are automatic inside the sandbox)
+and `danger` (everything is automatic). `approval_policy` is `ask`, `never` (a prompt is
+denied at once, with a `permission_decision` event) or `auto-safe` (`pytest`, `ruff`,
+`git status` and `git diff` are approved, everything else asks). Background and headless sessions are denied
+deterministically instead of waiting for a person.
+
 ## Known limits and gaps
 
 These are real boundaries. Read them before you rely on Pedacito for untrusted code.
@@ -648,8 +710,12 @@ These are real boundaries. Read them before you rely on Pedacito for untrusted c
 - **Dev servers, browser, LSP and MCP servers are not sandboxed.** They get a scrubbed
   environment, protected paths, allow-lists and trust prompts. A server you configure is a
   program you chose to run.
-- **Windows has no sandbox.** Commands run unsandboxed after one notice, or are refused with
-  `sandbox_strict = true`.
+- **Windows sandbox is process-level, not a container.** `win_restricted` uses a Job Object
+  and a Low-integrity restricted token. It does not isolate the file system the way a VM or
+  AppContainer does, so a command can still read what the user can read, and it does not
+  filter outbound network traffic (that needs an AppContainer). Where the backend
+  is unavailable, interactive commands run unsandboxed after one notice, and unattended runs
+  are refused (see the unattended hard gate above).
 - **Container and CI environments may disable the sandbox.** If user namespaces are off,
   Pedacito falls back as described in Pillar 3.
 - **Checkpoints are not tamper-evident.** See Pillar 4.

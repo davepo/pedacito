@@ -74,6 +74,16 @@ from . import llm, security
 # line is refused rather than trusted to fit memory.
 MAX_LINE = 10_000_000
 
+# WP-4006 / D11-D12: the Pedacito session protocol version and the features a
+# client may rely on across `rpc`, `acp` and the daemon.
+PROTOCOL_VERSION = "0.4.0"
+CAPABILITIES = {
+    "sessions": True,
+    "event_seq_replay": True,
+    "permission_session_keyed": True,
+    "policy_engine": True,
+}
+
 # How long a worker waits for a permission decision before the request is
 # denied as if nobody answered (same policy as the GUI's broker).
 PERMISSION_TIMEOUT = 120.0
@@ -92,7 +102,8 @@ _TASK_METHODS = ("ask", "explain")
 _DECISIONS = ("allow_once", "allow_run", "allow_always", "always_allow", "deny")
 
 _METHODS = _TASK_METHODS + ("steer", "permission_reply", "cancel",
-                            "consolidate", "switch_profile", "status")
+                            "consolidate", "switch_profile", "status",
+                            "hello")
 
 #: Per-method documentation for `pedacito rpc --describe`. Kept next to the
 #: dispatcher so a machine client can discover the wire without scraping help.
@@ -127,7 +138,9 @@ _METHOD_DOCS: dict[str, dict] = {
     },
     "status": {"params": {}, "result": "profile, model, tier, scout, steps, "
                                        "writes, index, session, cache_hit, "
-                                       "context_utilization_pct, busy"},
+                                       "context_utilization_pct, busy, "
+                                       "protocol_version, capabilities"},
+    "hello": {"params": {}, "result": "protocol_version, capabilities"},
 }
 
 
@@ -135,6 +148,8 @@ def describe() -> dict:
     """The machine-readable protocol description printed by `--describe`."""
     return {
         "protocol": "pedacito-jsonl-rpc",
+        "protocol_version": PROTOCOL_VERSION,
+        "capabilities": dict(CAPABILITIES),
         "transport": {
             "request": "stdin, one JSON object per line",
             "event": "stdout, one JSON object per line; diagnostics on stderr",
@@ -487,7 +502,15 @@ class RpcServer:
             except (ValueError, KeyError, OSError) as exc:
                 return self._frame(req_id, method, error=str(exc))
             payload["busy"] = self._busy.is_set()
+            payload["protocol_version"] = PROTOCOL_VERSION
+            payload["capabilities"] = dict(CAPABILITIES)
             return self._frame(req_id, method, result=payload)
+
+        if method == "hello":
+            return self._frame(req_id, method, result={
+                "protocol_version": PROTOCOL_VERSION,
+                "capabilities": dict(CAPABILITIES),
+            })
 
         if method == "consolidate":
             if self._busy.is_set():

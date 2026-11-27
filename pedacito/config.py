@@ -983,6 +983,36 @@ class Config:
     browser_eval_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "::1",
                                            "0.0.0.0")
 
+    # --- Unified policy engine (WP-4005, §1.2) -------------------------------
+    # Capability-decision mode for the unified policy engine. The normative
+    # five-mode matrix, most restrictive first:
+    #   "plan"            read-only (read + read-only subagents only)
+    #   "ask"             prompt for every mutation/execution (the default)
+    #   "accept-edits"    auto-approve workspace writes/edits; still ask to run
+    #   "workspace-write" sandboxed run + configured hooks/subagents auto-approved
+    #   "danger"          everything the deny rules, safe-path and budget guards allow
+    permission_mode: str = "ask"
+    # How an "ask" decision from the policy engine is resolved:
+    #   "ask"       ask the human (permission broker / legacy prompts)
+    #   "never"     refuse every "ask" (unattended-safe: a background or
+    #               headless run can never be upgraded to allow)
+    #   "auto-safe" auto-approve known safe read-only/test commands (pytest,
+    #               ruff, git status, git diff, or a trusted [commands].allow)
+    approval_policy: str = "ask"
+    # Path (relative to the project root) of the trust-gated capability policy
+    # file. Its [paths]/[commands]/[network]/[mcp]/[budget] rules only apply
+    # after `pedacito trust`; an untrusted file can never widen permissions.
+    policy_file: str = ".pedacito/policy.toml"
+    # Loopback port for the optional background daemon (WP-4006); 0 = an
+    # ephemeral loopback port chosen by the OS. The daemon is never spawned
+    # from a project config (see daemon_auto_start in the execution fields).
+    daemon_port: int = 0
+    # Auto-start the background daemon for this run. An execution switch: a
+    # project's own `.pedacito.toml` cannot turn it on until `pedacito trust`.
+    daemon_auto_start: bool = False
+    # Cap on subagents that may run in parallel (WP-4006); 3 by default.
+    subagent_max_parallel: int = 3
+
     # --- Verification and tests ----------------------------------------------
     # Check an edit reply before/while applying it: "off", "deterministic"
     # (free: dry-apply, placeholder / stale-reference / unread-citation
@@ -1254,6 +1284,9 @@ _ENUM_FIELDS = {
     "language": ("en", "es"),
     "llm_reply_language": ("match_ui", "auto", "en", "es"),
     "modality": ("", "text", "image", "audio", "embedding"),
+    "permission_mode": ("plan", "ask", "accept-edits", "workspace-write",
+                        "danger"),
+    "approval_policy": ("ask", "never", "auto-safe"),
 }
 _ENUM_EMPTY_OK = ("prompt_pack", "answer_mode", "modality")
 
@@ -1528,14 +1561,58 @@ def _coerce(name: str, value, path: Path | None = None):
     return value
 
 
-def _read(path: Path) -> tuple[dict, dict]:
-    """Parse one TOML config file into (settings, profiles)."""
+def _read_utf8_toml(path: Path) -> dict:
+    """Read `path` as a UTF-8 TOML document, raising `ConfigError` on any
+    decode or parse problem.
+
+    The bytes are read raw first so a UTF-16 file -- the default
+    `Out-File -Encoding Unicode` on Windows PowerShell writes a `\\xff\\xfe`
+    BOM and NUL bytes -- is refused with a clear message instead of crashing
+    with an unhandled `UnicodeDecodeError` (BUG-04). A UTF-8 BOM is stripped
+    cleanly. Shared by `load` and by `pedacito trust`'s pre-trust validation.
+    """
     try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
+        raw = path.read_bytes()
+    except OSError as e:
+        raise ConfigError(f"{path}: could not be read: {e}") from e
+    head = raw[:256]
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in head:
+        # No "Config error: " prefix here: `cli.main` already formats a
+        # raised `ConfigError` that way, and `pedacito trust` prints this
+        # message directly (R2-BUG-07: it used to read "Config error:
+        # Config error: ...").
+        raise ConfigError(
+            f"{path} appears to be UTF-16 (not UTF-8). "
+            "On Windows PowerShell, re-save as UTF-8 "
+            "(e.g. Set-Content -Encoding utf8).")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"{path}: not valid UTF-8: {e}") from e
+    try:
+        return tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: invalid TOML: {e}") from e
-    return _flatten(data, path)
+
+
+def validate_utf8_toml(path: Path) -> str | None:
+    """`None` when `path` is valid UTF-8 TOML, else a one-line error message.
+
+    `pedacito trust` calls this BEFORE pinning a `.pedacito.toml` or
+    `.pedacito/policy.toml` as trusted, so a UTF-16 or syntactically broken
+    file is refused (exit code 2) rather than trusted (BUG-04)."""
+    try:
+        _read_utf8_toml(path)
+    except ConfigError as e:
+        return str(e)
+    return None
+
+
+def _read(path: Path) -> tuple[dict, dict]:
+    """Parse one TOML config file into (settings, profiles)."""
+    return _flatten(_read_utf8_toml(path), path)
 
 
 def find_project_config(root: Path) -> Path | None:
@@ -1595,7 +1672,9 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "allow_fetch", "fetch_allowed_hosts",
                "enable_web", "wrap_observations", "redact_secrets",
                "security_outbound_mode", "protected_paths", "auto_plan_file",
-               "allow_image_gen")
+               "allow_image_gen",
+               "permission_mode", "approval_policy", "policy_file",
+               "daemon_auto_start")
 TRUST_FILE = "trusted_projects.json"
 
 

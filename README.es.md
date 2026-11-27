@@ -39,11 +39,25 @@ Primero inicia un servidor de modelos (LM Studio, Ollama, Lemonade o llama.cpp).
 > ¿Prefieres español? Usa el selector `EN | ES` en la barra superior de la GUI, presiona `F3` en la TUI o ejecuta
 > `pdc --lang es gui`. Consulta [Idioma y localización](docs/es/CONFIG.md#idioma-y-localización-language-llm_reply_language).
 
+## Novedades de la v0.4.0
+
+| Función | Qué obtienes | Más información |
+|---|---|---|
+| **Sesiones aisladas** | Las sesiones concurrentes de un mismo proceso no comparten configuración, índice, eventos, permisos ni presupuestos | [ARCHITECTURE.md](docs/es/ARCHITECTURE.md#aislamiento-de-sesiones-daemon-y-subagentes-paralelos-v040) |
+| **Modos de permisos y aprobaciones** | `permission_mode` (plan, ask, accept-edits, workspace-write, danger) y `approval_policy`; el `.pedacito/policy.toml` de un proyecto solo restringe, y solo si el proyecto es de confianza | [SECURITY.md](docs/es/SECURITY.md#higiene-de-artefactos-sensibles-confianza-de-política-y-aprobaciones-v040) |
+| **Sandbox de Windows** | Los comandos se ejecutan en un Job Object con token restringido (`win_restricted`); las ejecuciones desatendidas sin sandbox se rechazan | [SECURITY.md](docs/es/SECURITY.md#pilar-3-ejecución-con-mínimos-privilegios) |
+| **Daemon de sesiones** | `pedacito daemon` es un servicio de loopback protegido por token con repetición de eventos por sesión | [USAGE.md](docs/es/USAGE.md#la-cli-de-un-vistazo) |
+| **Subagentes paralelos** | `subagent_max_parallel` acota los subagentes concurrentes; los roles de solo lectura siguen siendo de solo lectura | [CONFIG.md](docs/es/CONFIG.md) |
+| **Manifiesto de paquete** | `pedacito-package.toml` declara lo que necesita un paquete de extensión o habilidad | [SKILLS_AND_TOOLS.md](docs/es/SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml) |
+
+Notas completas: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
+
 ## Novedades de la v0.3.3
 
 | Función | Qué obtienes | Más información |
 |---|---|---|
 | **Puente Agent Client Protocol** | `pedacito acp` habla JSON-RPC 2.0 por stdio para editores y hosts de agentes: `session/new`, `session/prompt` con bloques de texto, `@file` e imagen, eventos `session/update` en streaming y `session/request_permission`. Envuelve el mismo motor caliente que `rpc`, que gana `--events` y `--describe`. | [Puente ACP](docs/es/USAGE.md#acp-puente-de-agent-client-protocol) |
+| **Daemon de sesiones headless** | `pedacito daemon` mantiene un índice caliente y los leases de modelo en un servidor HTTP/SSE solo en loopback con sesiones de espacio de trabajo aisladas, autenticación bearer, adjuntar/separar, enrutamiento de permisos y revisión, y cierre/reposo limpio. `pedacito daemon status` sale con 0 sin conexión. | [La CLI de un vistazo](docs/es/USAGE.md#la-cli-de-un-vistazo) |
 | **TUI enriquecida sin dependencias** | Diffs en línea con resaltado de sintaxis, tarjetas plegables de llamadas a herramientas (`Ctrl+O`, `/expand`, `/collapse`), un selector difuso `@` para archivos, símbolos e imágenes, y zonas de ratón SGR clicables para el cambio de idioma, las pestañas de la barra lateral y la barra de desplazamiento. | [`tui`](docs/es/USAGE.md#tui-sesión-de-terminal-en-pantalla-dividida) |
 | **Endpoints locales, LAN y Tailscale** | Una sola regla de localidad cubre loopback, `.local`, RFC 1918, Tailscale/CGNAT (`100.64.0.0/10`), link-local y ULA de IPv6. Las tarjetas locales sin temperatura calibrada se marcan como obsoletas para recalibrar. | [Endpoints locales](docs/es/CONFIG.md#endpoints-locales-lan-y-tailscale) |
 | **Mejoras para modelos pequeños y MoE disperso** | `tool_mode = "plain"` (pasos de búsqueda en palabras simples, comparados A/B por `calibrate`), un enrutador `proactive_escalation` opcional, `best_of` probado en sombra y un verificador previo al cierre en modo intercalado. La salida grande de herramientas se vuelca a `.pedacito/scratch/`, que el modelo puede leer pero nunca escribir. | [Configuración](docs/es/CONFIG.md#referencia-de-configuración) |

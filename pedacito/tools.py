@@ -2820,8 +2820,24 @@ def _compact_outline(index, rel: str) -> str:
 def tool_outline(index, cfg, file: str) -> str:
     """Return a compact table of contents for one file (classes, methods and
     functions with exact start-end lines), or, when `file` names a directory
-    or glob, the file cards under it."""
+    or glob, the file cards under it.
+
+    A sensitive file is refused outright (matching `read`): even a stale index
+    that predates the sensitive-file exclusion must never reveal its
+    doclines/content through an outline (BUG-03)."""
     file = _as_text(file)
+
+    def sensitive(rel: str) -> bool:
+        return security.is_sensitive_path(Path(index.root) / rel)
+
+    # BUG-04: refuse a sensitive file BEFORE index lookup / adoption, so a
+    # secret on disk that is not (yet) indexed returns the same explicit
+    # refusal as `read` instead of the generic "not in the index ... use grep"
+    # hint (which `adopt_if_on_disk` returning None would otherwise trigger).
+    cand = _root_rel(index, file)
+    if cand and security.is_sensitive_path(Path(index.root) / cand):
+        return _sensitive_read_gate(cfg, cand)
+
     rel = index.resolve_file(file)
     if rel is None:
         rel = adopt_if_on_disk(index, cfg, file)
@@ -2834,10 +2850,12 @@ def tool_outline(index, cfg, file: str) -> str:
         # A directory or glob lists file cards; "." lists the whole project.
         name = fileio.normalise_rel(file or "").strip()
         if name in (".", "./"):
-            return _outline_dir(index, ".", list(index.files))
+            return _outline_dir(index, ".", [f for f in index.files
+                                             if not sensitive(f)])
         if name:
             matches, note = _grep_scope(index, name)
             if not note and matches:
+                matches = [m for m in matches if not sensitive(m)]
                 # No note means `name` resolved; a miss falls through to the
                 # file-not-found hint instead of dumping every card.
                 if len(matches) == 1:
@@ -2846,6 +2864,8 @@ def tool_outline(index, cfg, file: str) -> str:
                     return _outline_dir(index, name, matches)
     if rel is None:
         return _file_hint(index, file)
+    if sensitive(rel):
+        return _sensitive_read_gate(cfg, rel)
     return _compact_outline(index, rel)
 
 
@@ -3036,6 +3056,9 @@ def tool_diagnose(index, cfg, file: str = "") -> str:
             return ("ERROR: `diagnose` is disabled (config allow_shell = false). "
                     "Enable allow_shell to let Pedacito run the project's linter/"
                     "typechecker, or run the check yourself.")
+    policy_err = _policy_denied(cfg, "run", "diagnose", root=index.root)
+    if policy_err:
+        return policy_err
     from . import diagnostics
     rel = ""
     if _as_text(file).strip():
@@ -3067,6 +3090,15 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
     if op not in ("definition", "references", "hover", "diagnostics"):
         return ("ERROR: lsp symbol must be definition, references, hover, or "
                 "diagnostics.")
+    # H7: spawning an external language server is execution; gate it with the
+    # unified policy engine (a trusted `[commands].deny` or `plan` mode refuses
+    # it) while read-only `lsp` with no server stays allowed.
+    lsp_cmd = lsp.command_for(index.root, rel, cfg)
+    if lsp_cmd:
+        policy_err = _policy_denied(cfg, "run", " ".join(lsp_cmd),
+                                    root=index.root)
+        if policy_err:
+            return policy_err
     return lsp.result(index.root, cfg, op, rel,
                       line=_as_int(start, 1) or 1,
                       column=_as_int(end, 1) or 1)
@@ -3101,6 +3133,12 @@ def tool_serve(index, cfg, symbol: str = "", command: str = "",
             return f"ERROR: could not parse command ({e})."
         if not argv:
             return "ERROR: serve start needs a command."
+        policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+        if policy_err:
+            return policy_err
+        gate_err = _run_gate(cfg, cmd, index.root)
+        if gate_err:
+            return gate_err
         denied = _allowlist_error(cfg, argv)
         if denied:
             return denied
@@ -3132,6 +3170,10 @@ def tool_mcp(index, cfg, symbol: str = "", content: str = "") -> str:
         return "ERROR: MCP is disabled (config allow_mcp = false)."
     from . import mcp
     target = _as_text(symbol).strip()
+    policy_err = _policy_denied(cfg, "mcp", target or "mcp",
+                                root=getattr(index, "root", None))
+    if policy_err:
+        return policy_err
     args = {}
     raw = _as_text(content).strip()
     if raw:
@@ -3163,6 +3205,10 @@ def tool_mcp_call(index, cfg, server: str, tool_name: str,
     if not sname or not tname:
         return ("ERROR: mcp_call needs the server name and the tool name "
                 "from the MCP TOOLS block.")
+    policy_err = _policy_denied(cfg, "mcp", f"{sname}/{tname}",
+                                root=getattr(index, "root", None))
+    if policy_err:
+        return policy_err
     spec = servers.get(sname)
     if spec is None:
         return (f"ERROR: MCP server '{sname[:100]}' is not configured "
@@ -3315,6 +3361,20 @@ def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
             "change it; creating new files is always allowed.")
 
 
+def _policy_denied(cfg, capability: str, target: str, root=None) -> str:
+    """The refusal text when the unified policy engine hard-denies this
+    capability, or "" when it is allowed/asked (legacy flow) or inactive."""
+    try:
+        from . import policy as policy_mod
+        d = policy_mod.enforce(cfg, capability, target, root=root)
+    except Exception as exc:
+        # FAIL CLOSED: a policy evaluation error is a denial, never "".
+        return (f"ERROR: denied by policy: policy evaluation error: {exc}")
+    if d is not None and d.decision == "deny":
+        return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
+    return ""
+
+
 def tool_write(index, cfg, file: str, content: str,
                append: bool = False) -> str:
     """Replace a whole file with `content` (or append it when `append` is
@@ -3349,6 +3409,13 @@ def tool_write(index, cfg, file: str, content: str,
         return f"ERROR: refusing to write outside the project root: {file}"
     if path.is_dir():
         return f"ERROR: {rel} is a directory, not a file."
+    policy_err = _policy_denied(cfg, "write", rel, root=index.root)
+    if policy_err:
+        return policy_err
+    allowed, sensitive_error = security.check_sensitive_write(
+        root, rel, action=verb, policy=getattr(cfg, "policy", None))
+    if not allowed:
+        return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, rel, verb) \
         or _task_allowlist_error(index, cfg, rel, verb)
     if err:
@@ -3485,6 +3552,16 @@ def tool_move(index, cfg, file: str, to: str) -> str:
         return f"ERROR: refusing to move outside the project root: {file} -> {to}"
     if not src.is_file():
         return f"ERROR: {src_rel} is not an existing file."
+    policy_err = _policy_denied(cfg, "write", src_rel, root=index.root) \
+        or _policy_denied(cfg, "write", dst_rel, root=index.root)
+    if policy_err:
+        return policy_err
+    policy = getattr(cfg, "policy", None)
+    for label in (src_rel, dst_rel):
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, label, action="move", policy=policy)
+        if not allowed:
+            return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, src_rel, "move") \
         or _protected_error(cfg, dst_rel, "move") \
         or _task_allowlist_error(index, cfg, src_rel, "move")
@@ -3585,6 +3662,13 @@ def tool_delete(index, cfg, file: str) -> str:
         return f"ERROR: refusing to delete outside the project root: {file}"
     if not path.is_file():
         return f"ERROR: {rel} is not an existing file."
+    policy_err = _policy_denied(cfg, "delete", rel, root=index.root)
+    if policy_err:
+        return policy_err
+    allowed, sensitive_error = security.check_sensitive_write(
+        root, rel, action="delete", policy=getattr(cfg, "policy", None))
+    if not allowed:
+        return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, rel, "delete") \
         or _task_allowlist_error(index, cfg, rel, "delete")
     if err:
@@ -3626,6 +3710,9 @@ def tool_undo(index, cfg, file: str = "") -> str:
     if not getattr(cfg, "backup", False):
         return ("ERROR: `undo` needs backups (config backup = false): there "
                 "is no pre-task snapshot of this task's changes.")
+    policy_err = _policy_denied(cfg, "write", "", root=index.root)
+    if policy_err:
+        return policy_err
     muts = list(getattr(cfg, "_task_mutations", None) or ())
     if not muts:
         return "Nothing to undo: this task has not mutated any file yet."
@@ -3803,6 +3890,66 @@ def _project_shell_patterns(cfg, root) -> tuple[str, ...]:
 _ADHOC_BG_HEADS = frozenset({"nohup", "setsid", "disown", "bg"})
 
 
+def _call_unattended_gate(cfg, *, permission_mode="", approval_policy="",
+                          background=False, requires_sandbox=False) -> None:
+    """Call `sandbox.enforce_unattended_gate`, passing `requires_sandbox` when
+    the installed sandbox accepts it (Track A lands that parameter in parallel;
+    the `TypeError` fallback keeps Track B green either way)."""
+    try:
+        sandbox.enforce_unattended_gate(
+            cfg,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            background=background,
+            requires_sandbox=requires_sandbox,
+        )
+    except TypeError:
+        sandbox.enforce_unattended_gate(
+            cfg,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            background=background,
+        )
+
+
+def _run_gate(cfg, command: str, root, *, decision=None) -> str:
+    """The D14 unattended-execution gate, or "" when the run may proceed.
+
+    Evaluates the `run` policy decision (unless one is handed in), then calls
+    `sandbox.enforce_unattended_gate` with the decision's `requires_sandbox`
+    and a `background` flag derived from the session. Returns a refusal error
+    string on `SandboxRefused` or a policy evaluation error (fail-closed)."""
+    from . import policy as policy_mod
+    from . import session_ctx
+    if decision is None:
+        try:
+            decision = policy_mod.enforce(cfg, "run", command, root=root)
+        except Exception as exc:
+            return (f"ERROR: denied by policy: policy evaluation error: {exc}")
+    perm = str(getattr(cfg, "permission_mode", "ask") or "ask").lower()
+    approval = str(getattr(cfg, "approval_policy", "ask") or "ask").lower()
+    sess = session_ctx.current_session()
+    sess_mode = str(getattr(sess, "mode", "") or "").lower()
+    background = False
+    if perm in ("workspace-write", "danger") or approval == "never":
+        if sess_mode in ("daemon", "headless") \
+                or not getattr(cfg, "_interactive", True):
+            background = True
+    requires_sandbox = bool(decision is not None
+                            and decision.requires_sandbox)
+    try:
+        _call_unattended_gate(
+            cfg,
+            permission_mode=perm,
+            approval_policy=approval,
+            background=background,
+            requires_sandbox=requires_sandbox,
+        )
+    except sandbox.SandboxRefused as exc:
+        return f"ERROR: {exc}"
+    return ""
+
+
 def tool_run(index, cfg, command: str) -> str:
     """Run one command in the project root and return its output. Gated by
     `allow_shell`.
@@ -3832,6 +3979,10 @@ def tool_run(index, cfg, command: str) -> str:
         return f"ERROR: could not parse command ({e})."
     if not argv:
         return "ERROR: run needs a `command`."
+
+    policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+    if policy_err:
+        return policy_err
 
     # `run` executes argv WITHOUT a shell: `&` reaches the program as a
     # literal argument, and `nohup`-style wrappers do not detach -- a quiet
@@ -3892,13 +4043,17 @@ def tool_run(index, cfg, command: str) -> str:
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, cmd, index.root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, index.root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
 
@@ -4047,15 +4202,26 @@ _PYTEST_EXIT_LABELS = {
 _RUN_TEST_RUNNER_CACHE: dict[str, list[str]] = {}
 
 
+def _test_runner_cache() -> dict[str, list[str]]:
+    """Session-scoped test-runner probe cache, with module fallback when no
+    SessionContext is bound."""
+    from . import session_ctx
+    sess = session_ctx.current_session()
+    if sess is not None:
+        return sess.cache("run_test_runner")
+    return _RUN_TEST_RUNNER_CACHE
+
+
 def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
     """Does this argv actually start pytest? Probed once per interpreter with
-    `--version` (a few milliseconds, capped and cached per root). A PATH
+    `--version` (a few milliseconds, capped and cached per session/root). A PATH
     `python -m pytest` from the repo's detected test command often points at
     a DIFFERENT interpreter than the one running pedacito -- typically a
     system python with no pytest installed -- so nothing is trusted sight
     unseen."""
+    cache = _test_runner_cache()
     key = str(Path(argv[0])) if argv else ""
-    hit = _RUN_TEST_RUNNER_CACHE.get(key)
+    hit = cache.get(key)
     if hit is not None:
         return True
     try:
@@ -4065,7 +4231,7 @@ def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
     except Exception:
         return False
     if rc == 0 and not stopped:
-        _RUN_TEST_RUNNER_CACHE[key] = argv
+        cache[key] = argv
         return True
     return False
 
@@ -4213,13 +4379,17 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run the Node tests: {str(out)[:300]}"
     try:
@@ -4375,13 +4545,17 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run the tests: {str(out)[:300]}"
     try:
@@ -4501,6 +4675,10 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
     filt = _as_text(k_filter).strip()[:160]
     preview = (f"{tgt}" if tgt else "the whole suite") \
         + (f" -k {filt}" if filt else "")
+    policy_err = _policy_denied(cfg, "run", f"run_test {preview}",
+                                root=index.root)
+    if policy_err:
+        return policy_err
     if not bool(getattr(cfg, "enable_run_test_in_gather", True)):
         # A scoped project rule ("pytest *" in this project) is the human's
         # standing answer for exactly this: run without asking.
@@ -4607,13 +4785,17 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
     env = _child_env(cfg)
+    gate_err = _run_gate(cfg, display, root)
+    if gate_err:
+        return gate_err
     try:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
-        max_output=cap, env=env)
+        max_output=cap, env=env,
+        windows_sandbox=sandbox.windows_sandbox_active(cfg))
     if stopped == "error":
         return f"ERROR: could not run pytest: {str(out)[:300]}"
 
@@ -4749,6 +4931,16 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     cmd = _as_text(command).strip()
     file = _as_text(file).strip()
     start = _as_int(start, 0)
+    # H7: writing a screenshot is a write; launching a command is a run. Both
+    # funnel through the policy engine so `plan` mode cannot capture screens.
+    policy_err = _policy_denied(cfg, "write", ".pedacito/screenshots/shot.png",
+                                root=index.root)
+    if policy_err:
+        return policy_err
+    if cmd:
+        policy_err = _policy_denied(cfg, "run", cmd, root=index.root)
+        if policy_err:
+            return policy_err
     prev = _resolve_screenshot(index, file) if file else None
     if file and prev is None:
         return f"ERROR: no screenshot named '{file}' under the project root."
@@ -4882,6 +5074,14 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
     if not cmd:
         return ("ERROR: browser needs `command`: an http(s) URL, or a command "
                 "that starts a local server and prints its URL.")
+    # H7: driving a browser is a run/network action; `plan` mode must not
+    # launch a browser or reach a page.
+    policy_err = _policy_denied(cfg, "network" if re.match(
+        r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"
+        r"127\.0\.0\.1(?::\d+)?(?:/|$))", cmd, re.IGNORECASE)
+        else "run", cmd, root=index.root)
+    if policy_err:
+        return policy_err
     prev = _resolve_screenshot(index, file) if file else None
     if file and prev is None:
         return f"ERROR: no screenshot named '{file}' under the project root."
@@ -5319,6 +5519,14 @@ def fetch_url(cfg, url: str) -> str:
     raw = str(url or "").strip().strip("`\"'")
     if not raw:
         return "ERROR: fetch_url needs a url (an http:// or https:// address)."
+    try:
+        domain = urllib.parse.urlparse(raw).hostname or raw
+    except Exception:
+        domain = raw
+    policy_err = _policy_denied(cfg, "network", domain,
+                                root=getattr(cfg, "_root", None))
+    if policy_err:
+        return policy_err
     allowed_hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
     blocked = security.ssrf_error(raw, allowed_hosts)
     if blocked:
@@ -5413,6 +5621,10 @@ def web_search(cfg, query: str) -> str:
     q = " ".join(str(query or "").split())
     if not q:
         return "ERROR: web_search needs a query."
+    policy_err = _policy_denied(cfg, "network", "web_search",
+                                root=getattr(cfg, "_root", None))
+    if policy_err:
+        return policy_err
     if not getattr(cfg, "enable_web", False) \
             and not _web_ask_broker(f"Web search: {q}", q):
         return WEB_DENIED_MESSAGE
@@ -5479,6 +5691,11 @@ def tool_generate_image(index, cfg, prompt: str, file: str = "",
         if not allowed:
             return msg
     root = Path(index.root).resolve()
+    target_rel = fileio.normalise_rel(str(file or "")) \
+        if str(file or "").strip() else ".pedacito/images/image"
+    policy_err = _policy_denied(cfg, "write", target_rel, root=index.root)
+    if policy_err:
+        return policy_err
     try:
         result = imagegen.generate_image(
             cfg, prompt, output_path=(file or None), size=size, root=root)
@@ -5530,6 +5747,12 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
         from . import gitinfo
         return gitinfo.tool_git_diff(index, cfg, step.get("file", ""))
     if action == "remember":
+        # H7: `remember` mutates project memory; gate it as a write so `plan`
+        # mode cannot change `.pedacito/memory.md`.
+        policy_err = _policy_denied(cfg, "write", ".pedacito/memory.md",
+                                    root=getattr(index, "root", None))
+        if policy_err:
+            return policy_err
         from . import memory
         return memory.tool_remember(index, cfg, step.get("content", ""))
     if action == "skill":
@@ -5565,6 +5788,13 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
     if action == DIAGNOSE_ACTION:
         return tool_diagnose(index, cfg, step.get("file", ""))
     if action == TODO_ACTION:
+        # `todo` mutates `.pedacito/todo.md` when content is given; gate that
+        # write so `plan` mode cannot edit the checklist.
+        if _as_text(step.get("content")).strip():
+            policy_err = _policy_denied(cfg, "write", ".pedacito/todo.md",
+                                        root=getattr(index, "root", None))
+            if policy_err:
+                return policy_err
         return tool_todo(index, cfg, step.get("content", ""))
     if action == MCP_ACTION:
         return tool_mcp(index, cfg, step.get("symbol", ""),

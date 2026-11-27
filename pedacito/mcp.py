@@ -71,8 +71,48 @@ _EXTRA_TIME: dict[tuple[str, tuple[str, ...]], float] = {}
 # startup) is retried after this many seconds instead of poisoning the whole
 # run: servers come up late, and a restart should not need a new session.
 _RETRY_UNAVAILABLE_AFTER = 30.0
-# Live keep-alive sessions by server command string (see module docstring).
+# Live keep-alive sessions. The dict key is the server command string when no
+# session is bound (the process-level fallback, so session-less callers and the
+# legacy catalog behave exactly as before), and a NUL-prefixed ``<sid>\0<cmd>``
+# string when a session owns the child -- cancelling one session then reaps only
+# ITS servers, never a sibling's.
 _SESSIONS: dict[str, "_Session"] = {}
+_REGISTERED_SESSIONS: set[str] = set()
+
+
+def _sid() -> str:
+    """The bound session id ('' when no session is bound): the process-level
+    fallback key used by session-less callers and the legacy catalog."""
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        return str(sess.session_id) if sess is not None else ""
+    except Exception:
+        return ""
+
+
+def _key(sid: str, name: str) -> str:
+    """The cache key for one server, session-scoped only when a session binds."""
+    return f"{sid}\x00{name}" if sid else name
+
+
+def _register_mcp_cleanup(sid: str) -> None:
+    """Register ONE mcp cleanup per session (idempotent)."""
+    if not sid or sid in _REGISTERED_SESSIONS:
+        return
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+    except Exception:
+        return
+    if sess is None or sess.resource_registry is None:
+        return
+    _REGISTERED_SESSIONS.add(sid)
+    try:
+        sess.resource_registry.register(
+            "mcp", f"mcp:{sid}", lambda: close_session(sid))
+    except Exception:
+        _REGISTERED_SESSIONS.discard(sid)
 
 
 class MCPError(RuntimeError):
@@ -240,28 +280,32 @@ _COOLDOWN: dict[str, tuple[int, float]] = {}
 
 def _cooling(cmd: str) -> float:
     """Seconds left before `cmd` may be started again (0 = now)."""
+    key = _key(_sid(), cmd)
     with _SESSIONS_LOCK:
-        n, until = _COOLDOWN.get(cmd, (0, 0.0))
+        n, until = _COOLDOWN.get(key, (0, 0.0))
     return max(0.0, until - time.time()) if n >= 2 else 0.0
 
 
 def _note_failure(cmd: str) -> None:
+    key = _key(_sid(), cmd)
     with _SESSIONS_LOCK:
-        n = _COOLDOWN.get(cmd, (0, 0.0))[0] + 1
-        _COOLDOWN[cmd] = (n, time.time() + min(300, 15 * 2 ** (n - 1)))
+        n = _COOLDOWN.get(key, (0, 0.0))[0] + 1
+        _COOLDOWN[key] = (n, time.time() + min(300, 15 * 2 ** (n - 1)))
 
 
 def _live_session(cmd: str, timeout: int) -> "_Session":
     """The cached initialised session for `cmd`, restarted when the cached
     process has exited. Callers `_drop_session` after a failed request so the
     next call starts a fresh server."""
+    sid = _sid()
+    key = _key(sid, cmd)
     stale: "_Session | None" = None
     with _SESSIONS_LOCK:
-        s = _SESSIONS.get(cmd)
+        s = _SESSIONS.get(key)
         if s is not None:
             if s.proc.poll() is None:
                 return s
-            stale = _SESSIONS.pop(cmd, None)
+            stale = _SESSIONS.pop(key, None)
         wait = _cooling(cmd)
     if stale is not None:
         stale.close()
@@ -278,18 +322,20 @@ def _live_session(cmd: str, timeout: int) -> "_Session":
         raise
     prev: "_Session | None" = None
     with _SESSIONS_LOCK:
-        _COOLDOWN.pop(cmd, None)
-        prev = _SESSIONS.get(cmd)
-        _SESSIONS[cmd] = s
+        _COOLDOWN.pop(key, None)
+        prev = _SESSIONS.get(key)
+        _SESSIONS[key] = s
     if prev is not None and prev is not s:
         prev.close()
+    _register_mcp_cleanup(sid)
     return s
 
 
 def _drop_session(cmd: str) -> None:
     """Close and forget `cmd`'s cached session after a failure."""
+    key = _key(_sid(), cmd)
     with _SESSIONS_LOCK:
-        s = _SESSIONS.pop(cmd, None)
+        s = _SESSIONS.pop(key, None)
     if s is not None:
         s.close()
 
@@ -310,6 +356,26 @@ def close_all() -> None:
         _CATALOG_TIME.clear()
         _NAMED_TOOLS.clear()
         _NAMED_TOOLS_TIME.clear()
+    for s in legacy:
+        s.close()
+    for s in named:
+        s.close()
+
+
+def close_session(session_id: str) -> None:
+    """Close and forget every MCP session owned by one session (legacy and
+    named), leaving sibling sessions' servers completely untouched."""
+    prefix = f"{str(session_id)}\x00"
+    with _SESSIONS_LOCK:
+        legacy = [s for k, s in _SESSIONS.items() if k.startswith(prefix)]
+        for k in [k for k in _SESSIONS if k.startswith(prefix)]:
+            _SESSIONS.pop(k, None)
+        named = [s for k, s in _NAMED_SESSIONS.items() if k.startswith(prefix)]
+        for k in [k for k in _NAMED_SESSIONS if k.startswith(prefix)]:
+            _NAMED_SESSIONS.pop(k, None)
+        for k in [k for k in _COOLDOWN if k.startswith(prefix)]:
+            _COOLDOWN.pop(k, None)
+    _REGISTERED_SESSIONS.discard(str(session_id))
     for s in legacy:
         s.close()
     for s in named:
@@ -1098,12 +1164,14 @@ def _parse_named_tools(result: dict) -> list[dict]:
 def _named_session(name: str, spec: dict, timeout: int):
     """The cached initialised session for one named server (stdio process or
     HTTP endpoint), restarted when the cached process has exited."""
+    sid = _sid()
+    key = _key(sid, name)
     stale = None
     with _SESSIONS_LOCK:
-        s = _NAMED_SESSIONS.get(name)
+        s = _NAMED_SESSIONS.get(key)
         if s is not None:
             if isinstance(s, _Session) and s.proc.poll() is not None:
-                stale = _NAMED_SESSIONS.pop(name, None)
+                stale = _NAMED_SESSIONS.pop(key, None)
             else:
                 # The cached session was built for the 5s listing budget; a tool
                 # call gets its own (larger) timeout, not the listing's.
@@ -1122,17 +1190,19 @@ def _named_session(name: str, spec: dict, timeout: int):
         s.close()
         raise
     with _SESSIONS_LOCK:
-        prev = _NAMED_SESSIONS.get(name)
-        _NAMED_SESSIONS[name] = s
+        prev = _NAMED_SESSIONS.get(key)
+        _NAMED_SESSIONS[key] = s
     if prev is not None and prev is not s:
         prev.close()
+    _register_mcp_cleanup(sid)
     return s
 
 
 def _drop_named_session(name: str) -> None:
     """Close and forget one named server's session after a failure."""
+    key = _key(_sid(), name)
     with _SESSIONS_LOCK:
-        s = _NAMED_SESSIONS.pop(name, None)
+        s = _NAMED_SESSIONS.pop(key, None)
     if s is not None:
         s.close()
 

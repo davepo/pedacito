@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ctypes
 import re
-import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -28,6 +27,7 @@ from .. import index as index_mod
 from .. import loop, scaffold, steering, workspace
 from .. import plan as plan_mod
 from .. import security as security_mod
+from .. import session_ctx
 from .. import update as update_mod
 from ..agent import Agent
 from ..config import ConfigError
@@ -62,7 +62,8 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
     `echo` (when given) runs synchronously after the job slot is claimed and
     before the thread starts, so a submitted prompt reaches the chat
     transcript -- and the SSE stream -- without waiting for the worker."""
-    job = STATE.begin_job(kind, title)
+    target_state = STATE._resolve() if hasattr(STATE, "_resolve") else STATE
+    job = target_state.begin_job(kind, title)
     if job is None:
         return None
     if echo is not None:
@@ -70,6 +71,36 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
             echo()
         except Exception:
             pass                    # a chat echo must never block the job
+
+    outer = session_ctx.current_session()
+    with target_state.lock:
+        sid = str(getattr(target_state, "session_id", "gui-default") or "gui-default")
+        root = getattr(target_state, "root", None)
+        base_cfg = getattr(target_state, "cfg", None)
+        idx = getattr(target_state, "idx", None)
+        client = getattr(target_state, "client", None)
+    run_cfg = session_ctx.clone_config(base_cfg)
+    run_bus = events_mod.SessionEventBus(
+        sid,
+        sink=None,
+        redact=bool(getattr(run_cfg, "redact_secrets", True)) if run_cfg is not None else True,
+    )
+    run_ctx = session_ctx.SessionContext(
+        session_id=sid,
+        root=root,
+        cfg=run_cfg,
+        idx=idx,
+        client=client,
+        event_bus=run_bus,
+        permission_broker=outer.permission_broker if outer is not None else None,
+        cancel_event=job.cancel_event,
+        parent_session_id=(
+            outer.session_id
+            if (outer is not None and outer.session_id != sid)
+            else ""
+        ),
+        mode="interactive",
+    )
 
     def worker():
         err = ""
@@ -119,10 +150,14 @@ def spawn(kind: str, title: str, fn, *, echo=None) -> Job | None:
             # the turn is over: the thread on disk must match what the user
             # just saw, including anything the throttled saves held back
             _uninterruptible(STATE.save_active_thread, force=True)
+            _uninterruptible(run_bus.close)
 
-    job.thread = threading.Thread(target=worker, daemon=True,
-                                  name=f"pedacito-gui-job-{job.id}")
-    job.thread.start()
+    with session_ctx.use_session(run_ctx):
+        job.thread = session_ctx.spawn_thread_with_context(
+            worker,
+            daemon=True,
+            name=f"pedacito-gui-job-{job.id}",
+        )
     return job
 
 
@@ -311,17 +346,49 @@ class _Feed:
 def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
     """Attach the page to a client/config for the length of one job."""
     cfg, client, root = p.cfg, p.client, p.root
+    if cfg is not None and cfg is STATE.cfg:
+        cfg = session_ctx.clone_config(cfg)
+        p.cfg = cfg
+    sess = session_ctx.current_session()
+    if sess is not None:
+        with sess._lock:
+            sess.cfg = cfg
+            sess.root = Path(root) if root is not None else None
+            sess.client = client
     job.client = client
     feed = _Feed(client, job)
     saved_cb, saved_echo = client.stream_callback, client.echo_stream
     saved_cancel = getattr(client, "cancel_event", _MISSING)
+    saved_client_cfg = getattr(client, "cfg", _MISSING)
+    agent = getattr(p, "agent", None)
+    saved_agent_cfg = getattr(agent, "cfg", _MISSING) if agent is not None else _MISSING
     try:
         client.cancel_event = job.cancel_event
     except Exception:
         pass
+    if cfg is not None:
+        if saved_client_cfg is not _MISSING:
+            try:
+                client.cfg = cfg
+            except Exception:
+                pass
+        if agent is not None and saved_agent_cfg is not _MISSING:
+            try:
+                agent.cfg = cfg
+            except Exception:
+                pass
     client.stream_callback = feed.token
     elog = events_mod.get(root, cfg)
-    elog.listeners.append(feed.event)
+    bus = sess.event_bus if sess is not None else None
+    bus_listener = None
+    if bus is not None and hasattr(bus, "add_listener"):
+        def _on_bus_event(env) -> None:
+            feed.event(env.kind, env.payload)
+
+        bus_listener = _on_bus_event
+        bus.add_listener(bus_listener)
+    else:
+        elog.listeners.append(feed.event)
     # Route per-call usage AND the pre-request heartbeat into the event log
     # (the scratchpad Ask has no agent to attach its own client). A New
     # preview's target does not exist yet: emitting into its EventLog would
@@ -358,10 +425,23 @@ def session(p: SimpleNamespace, job: Job, *, interactive: bool, lock: bool):
                     client.cancel_event = saved_cancel
             except Exception:
                 pass
-            try:
-                elog.listeners.remove(feed.event)
-            except ValueError:
-                pass
+            if saved_client_cfg is not _MISSING:
+                try:
+                    client.cfg = saved_client_cfg
+                except Exception:
+                    pass
+            if agent is not None and saved_agent_cfg is not _MISSING:
+                try:
+                    agent.cfg = saved_agent_cfg
+                except Exception:
+                    pass
+            if bus is not None and bus_listener is not None:
+                bus.remove_listener(bus_listener)
+            else:
+                try:
+                    elog.listeners.remove(feed.event)
+                except ValueError:
+                    pass
             for k, v in had.items():
                 if v is _MISSING:
                     cfg.__dict__.pop(k, None)
@@ -377,14 +457,19 @@ _MISSING = object()
 
 
 def _project(need_index: bool = True) -> SimpleNamespace:
-    """A snapshot of the open project's pieces for a worker to use unlocked."""
+    """A snapshot of the open project's pieces for a worker to use unlocked.
+
+    `cfg` is cloned per run so run-scoped attributes (`_cancel_event`,
+    `_steer`, `_pinned_refs`, `hybrid_routing`, `max_steps`, etc.) never
+    mutate the shared project config or sibling sessions."""
     with STATE.lock:
         if STATE.root is None:
             raise ConfigError("Open a project first.")
         if need_index and STATE.agent is None:
             raise ConfigError("This project has no index yet -- build it "
                               "first (the banner in the chat has a button).")
-        return SimpleNamespace(root=STATE.root, args=STATE.args, cfg=STATE.cfg,
+        return SimpleNamespace(root=STATE.root, args=STATE.args,
+                               cfg=session_ctx.clone_config(STATE.cfg),
                                client=STATE.client, idx=STATE.idx,
                                agent=STATE.agent)
 
@@ -726,10 +811,18 @@ def run_calibrate(job: Job, opts: dict) -> None:
     client.cancel_event = job.cancel_event
     with STATE.lock:
         job.client = client
-    client.check(warn=False)
-    client.warmup()
-    card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
-    path = modelcard.save_card(card)
+    from .. import leases as leases_mod
+    lease = leases_mod.default_lease_manager().acquire(
+        "gui-calibrate", cfg.base_url, cfg.model, cfg=cfg, exclusive=True,
+        priority=leases_mod.LeasePriority.EXCLUSIVE, timeout_s=0.0,
+        cancel_event=job.cancel_event)
+    try:
+        client.check(warn=False)
+        client.warmup()
+        card = modelcard.calibrate(client, cfg, verbose=True, quick=quick)
+        path = modelcard.save_card(card)
+    finally:
+        lease.release()
     m = card.get("measured") or {}
     caps = ", ".join(
         f"{k[4:]}={'yes' if v else 'no' if v is False else '?'}"
@@ -816,6 +909,11 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
             client.cancel_event = job.cancel_event
             with STATE.lock:
                 job.client = client
+            from .. import leases as leases_mod
+            lease = leases_mod.default_lease_manager().acquire(
+                "gui-calibrate", cfg.base_url, cfg.model, cfg=cfg,
+                exclusive=True, priority=leases_mod.LeasePriority.EXCLUSIVE,
+                timeout_s=0.0, cancel_event=job.cancel_event)
             try:
                 client.check(warn=False)
                 client.warmup()
@@ -837,6 +935,7 @@ def run_calibrate_all(job: Job, opts: dict) -> None:
                     f"{str(exc).splitlines()[0][:240]} \u2014 skipping and "
                     "continuing.", kind="error")
             finally:
+                lease.release()
                 llm_mod.unload_model(client)
     except (CancelledError, KeyboardInterrupt):
         pass                    # spawn's handler reports the stop
@@ -1139,6 +1238,13 @@ def run_task(job: Job, opts: dict) -> None:
     _set_pinned_refs(cfg, opts)
 
     _evict_other_servers(cfg)
+    sess = session_ctx.current_session()
+    sid = sess.session_id if sess is not None else "gui-default"
+    from .. import leases as leases_mod
+    lease = leases_mod.default_lease_manager().acquire(
+        sid, cfg.base_url, cfg.model, cfg=cfg,
+        priority=leases_mod.LeasePriority.NORMAL,
+        cancel_event=job.cancel_event)
     saved_steps = cfg.max_steps
     saved_creative = cfg.creative_mode
     saved_hybrid = (cfg.hybrid_routing, cfg.architect_provider,
@@ -1194,6 +1300,7 @@ def run_task(job: Job, opts: dict) -> None:
             feed.end_stream()
             _post_task_result(tr, client, reviewing)
     finally:
+        lease.release()
         cfg.max_steps = saved_steps
         cfg.creative_mode = saved_creative
         (cfg.hybrid_routing, cfg.architect_provider,
@@ -1547,7 +1654,7 @@ def run_new(job: Job, opts: dict) -> None:
         STATE.carry_transcript(transcript, title=spec_text)
         job.project_root = str(target)
         with STATE.lock:
-            cfg, client = STATE.cfg, STATE.client
+            cfg, client = session_ctx.clone_config(STATE.cfg), STATE.client
         _apply_security_choices(cfg, opts)
         if "creative" in opts:
             cfg.creative_mode = bool(opts.get("creative"))

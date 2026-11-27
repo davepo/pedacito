@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
@@ -114,6 +115,53 @@ FILE_SUMMARY_SYSTEM = (
     "sentences: what this module is responsible for, and what another part of the system "
     "would come here to do. Do not list the functions back. No markdown, no preamble."
 )
+
+# Phrasings a small local model echoes back from the summariser system/user
+# prompt (or its reasoning meta) instead of producing a real summary. All
+# matched case-insensitively on the whole summary text (BUG-10).
+_PROMPT_ECHO_PHRASES = (
+    "you summarise source code",
+    "you summarize source code",
+    "summarise source code for",
+    "summarize source code for",
+    "given one unit of code",
+    "reply with one sentence",
+    "reply with one sentence (two at most)",
+    "one sentence (two at most)",
+    "we need to respond to user",
+    "we need answer user",
+    "we need to answer the user",
+    "the user wants me to summarize",
+    "lookup index. one sentence",
+    "lookup index. one sentence (two at most)",
+)
+
+
+_ECHO_ZERO_WIDTH = ("\u200b", "\u200c", "\u200d", "\ufeff")
+_ECHO_WS = re.compile(r"\s+")
+
+
+def _is_prompt_echo_summary(text: str) -> bool:
+    """True when a model "summary" is really the summariser prompt echoed back
+    (or reasoning meta about it) rather than a one-sentence description of the
+    code unit. An empty/whitespace text is also treated as echo -- there is
+    nothing worth caching (BUG-10)."""
+    s = text or ""
+    if not s.strip():
+        return True
+    # Normalise so whitespace/Unicode mutations cannot bypass the guard: NFKC
+    # compatibility folding collapses fullwidth/ligature forms, zero-width and
+    # format characters become word separators (a model can sprinkle `\u200b`
+    # between words to evade a substring match), and all runs of whitespace
+    # become a single space before the case-insensitive phrase match
+    # (R2-BUG-05).
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(" " if ch in _ECHO_ZERO_WIDTH or unicodedata.category(ch) == "Cf"
+                else ch for ch in s)
+    low = _ECHO_WS.sub(" ", s).strip().lower()
+    if not low:
+        return True
+    return any(phrase in low for phrase in _PROMPT_ECHO_PHRASES)
 
 
 class Index:
@@ -770,8 +818,8 @@ class Index:
             "chunks": [c.to_record() for c in self.chunks],
         }
         p = d / INDEX_FILE
-        fileio.write_bytes(
-            p, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        from . import workspace
+        workspace.atomic_update_json(p, lambda _old: payload, compact=True)
         return p
 
     @classmethod
@@ -889,15 +937,18 @@ def _load_cache(root: Path) -> dict:
 
 
 def _save_cache(root: Path, cache: dict) -> None:
-    """Persist the summary cache to .pedacito/summaries.json (atomic)."""
+    """Persist the summary cache to .pedacito/summaries.json (atomic, no lost
+    updates across concurrent summarisation workers)."""
     d = root / INDEX_DIR
     d.mkdir(exist_ok=True)
     p = _cache_path(root)
-    fileio.write_bytes(p, json.dumps(cache, indent=1).encode("utf-8"))
+    snapshot = dict(cache)
+    from . import workspace
+    workspace.atomic_update_json(p, lambda _old: snapshot)
     try:
         st = p.stat()
         with _cache_lock:
-            _cache_memo[str(p)] = ((st.st_mtime_ns, st.st_size), cache)
+            _cache_memo[str(p)] = ((st.st_mtime_ns, st.st_size), snapshot)
     except OSError:
         pass
 
@@ -1008,10 +1059,15 @@ def _ask(client, cfg, system: str, prompt: str, label: str,
         return ""
     breaker.ok()
     if max_tokens:
-        return s
+        # A batched reply is parsed by the caller; still refuse a whole-reply
+        # prompt echo up front.
+        return "" if _is_prompt_echo_summary(s) else s
     s = s.replace("\n", " ")
     if len(s) > 400:
         s = s[:400].rsplit(" ", 1)[0] + "..."
+    # BUG-10: never store a prompt echo as a summary.
+    if _is_prompt_echo_summary(s):
+        return ""
     return s
 
 
@@ -1184,7 +1240,10 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
     def land(i: int, group: list[Chunk], texts: list[str]) -> None:
         nonlocal done
         for c, text in zip(group, texts):
-            if text:
+            # BUG-10: a prompt-echo summary (or an empty one) is rejected and
+            # falls back to the deterministic AST/docline fallback -- it is
+            # never cached in summaries.json or index.json.
+            if text and not _is_prompt_echo_summary(text):
                 c.summary = text
                 idx.stale_summaries.discard(c.key)
                 _put(cache, c.sha, text, cfg.model)
@@ -1202,8 +1261,9 @@ def _summarise_units(idx: "Index", todo: list[Chunk], client, cfg, cache: dict,
                           file=sys.stderr)
                 land(i, group, work(group))
         else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            from concurrent.futures import as_completed
+            from .session_ctx import ContextThreadPoolExecutor
+            with ContextThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(work, g): (i, g)
                         for i, g in enumerate(groups, 1)}
                 for fut in as_completed(futs):
@@ -1251,6 +1311,29 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     matcher = matcher if matcher is not None else Matcher.from_files(root)
 
     files = select(paths, root, matcher, indexable_exts(cfg))
+    # BUG-03: `select()` already drops sensitive files, but `build` re-checks
+    # so a caller passing a hand-built file list (or an explicitly named path)
+    # can never fold a secret into `.pedacito/index.json`.
+    from . import security
+    kept: list[Path] = []
+    for f in files:
+        try:
+            rel = f.resolve().relative_to(root).as_posix()
+        except ValueError:
+            # BUG-02: an out-of-root file must never be indexed under a fake
+            # root-relative basename (`f.name`) -- that would leak foreign CWD
+            # files into root/.pedacito/index.json. Skip it cleanly.
+            if verbose:
+                print(f"  [skip] {f.name}: outside project root (not indexed)",
+                      file=sys.stderr)
+            continue
+        if security.is_sensitive_path(rel):
+            if verbose:
+                print(f"  [skip] {rel}: sensitive file (never indexed)",
+                      file=sys.stderr)
+            continue
+        kept.append(f)
+    files = kept
     if not files:
         if verbose:
             print("  no indexable files yet; writing an empty index "
@@ -1261,13 +1344,20 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
 
     chunks: list[Chunk] = []
     rels: list[str] = []
+    files_kept: list[Path] = []
     imports_by_file: dict[str, list[str]] = {}
     for f in files:
         try:
             rel = f.resolve().relative_to(root).as_posix()
         except ValueError:
-            rel = f.name
+            # Defense-in-depth: `files` is already filtered to in-root files,
+            # but never fall back to `f.name` for a file that escapes the root.
+            if verbose:
+                print(f"  [skip] {f.name}: outside project root (not indexed)",
+                      file=sys.stderr)
+            continue
         rels.append(rel)
+        files_kept.append(f)
         try:
             got, imps = _chunk_with_imports(rel, f, cfg)
             chunks.extend(got)
@@ -1276,7 +1366,7 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
             print(f"[skip] {rel}: syntax error line {e.lineno}", file=sys.stderr)
 
     idx = Index(root, chunks, file_imports=imports_by_file)
-    for rel, f in zip(rels, files):
+    for rel, f in zip(rels, files_kept):
         idx.file_hashes[rel] = file_hash(f)
         st = file_stat(f)
         if st is not None:
@@ -1287,7 +1377,9 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
     cache = {} if resummarise else _load_cache(root)
     for c in chunks:
         if c.sha in cache:
-            c.summary = _entry(cache[c.sha])[0]
+            text = _entry(cache[c.sha])[0]
+            if text and not _is_prompt_echo_summary(text):
+                c.summary = text
     skeletons: dict[str, tuple[str, str]] = {}   # rel -> (skeleton, cache key)
     for rel in idx.files:
         # same skip condition as the summarise loop below
@@ -1297,7 +1389,9 @@ def build(paths: list[str], cfg, client=None, root: Path | None = None,
         key = "file:" + hashlib.sha256(skel.encode()).hexdigest()[:16]
         skeletons[rel] = (skel, key)
         if key in cache:
-            idx.file_summaries[rel] = _entry(cache[key])[0]
+            text = _entry(cache[key])[0]
+            if text and not _is_prompt_echo_summary(text):
+                idx.file_summaries[rel] = text
 
     if not (summarise and client is not None):
         idx.save()

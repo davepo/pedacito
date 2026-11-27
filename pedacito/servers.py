@@ -45,13 +45,13 @@ import re
 import shlex
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 
 from . import safety
+from .session_ctx import ContextThreadPoolExecutor
 
 GIB = 1024 ** 3
 MEMINFO_PATH = Path("/proc/meminfo")
@@ -721,7 +721,7 @@ def list_server_states(config, timeout: float = PROBE_TIMEOUT) -> list[dict]:
     configured = configured_local_servers(config)
     if len(configured) <= 1:
         return [_probe_server(s, timeout=timeout) for s in configured]
-    with ThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
+    with ContextThreadPoolExecutor(max_workers=min(4, len(configured))) as pool:
         # executor.map yields results in submission order, not finish order.
         return list(pool.map(lambda s: _probe_server(s, timeout=timeout),
                              configured))
@@ -1021,6 +1021,24 @@ def _target_url(server, config) -> str:
     return ""
 
 
+def _lease_protected(server, model: str, config) -> bool:
+    """Whether the lease manager forbids evicting `model` from `server`.
+
+    A live session's non-exclusive lease, a `do_not_evict` lease or a pinned
+    model all protect the model from the auto-evict handshake. Best-effort:
+    the manager is never the source of a raised exception."""
+    try:
+        from . import leases
+        url = _target_url(server, config)
+        if not url and isinstance(server, dict):
+            url = normalize_url(str(server.get("base_url") or ""))
+        if not url:
+            return False
+        return not leases.default_lease_manager().can_evict(url, model)
+    except Exception:
+        return False
+
+
 def load_server_model(server, model: str = "", config=None, *,
                       evict_others: bool = False, kind: str = "") -> dict:
     """Load `model` on one local server (or the server's configured model).
@@ -1091,6 +1109,14 @@ def unload_server_model(server, model: str = "", config=None, *,
                     "models": loaded, "results": results,
                     "detail": f"unloaded {sum(1 for r in results if r.get('ok'))}"
                               f" of {len(loaded)} model(s)"}
+    if _lease_protected(server, model, config):
+        return {"ok": False, "action": "unload", "skipped": True,
+                "server": _mapping_get(server, "name"),
+                "base_url": _mapping_get(server, "base_url", ""),
+                "kind": _mapping_get(server, "kind", ""),
+                "model": model, "method": "none",
+                "detail": "model is leased by an active session; refusing "
+                          "to unload"}
     return _server_action(server, "unload", model, config)
 
 
@@ -1209,6 +1235,17 @@ def evict_other_local_servers(target_provider, config,
             skipped.append(str(state.get("name") or state.get("base_url")))
             continue
         loaded = [str(m) for m in (state.get("loaded_models") or []) if m]
+        # A live session's lease protects its model from auto-evict: report it
+        # as skipped and unload only the unleased residents.
+        leased = [m for m in loaded if _lease_protected(state, m, config)]
+        if leased:
+            skipped.append(
+                f"{state.get('name') or state.get('base_url')} "
+                f"(leased: {', '.join(sorted(leased))})")
+            remaining = [m for m in loaded if m not in leased]
+            for model_id in remaining:
+                evicted.append(unload_server_model(state, model_id, config))
+            continue
         pinned = {str(m) for m in (state.get("pinned_models") or []) if m}
         if pinned:
             # A pin is the user telling every manager, Lemonade's LRU and

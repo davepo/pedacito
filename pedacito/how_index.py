@@ -18,6 +18,7 @@ import re
 import unicodedata
 from functools import lru_cache
 
+from . import i18n
 from .config import Config
 
 # ------------------------------------------------------------------ tokenising
@@ -72,6 +73,12 @@ _ES_SYNONYMS = {
     "seguridad": ("security", "sandbox", "permissions"),
     "memoria": ("memory", "vram", "gpu", "context"),
     "lento": ("slow", "performance", "context"),
+    "politica": ("policy", "permission", "permissions", "permission_mode",
+                 "approval_policy", "sandbox", "security"),
+    "politicas": ("policy", "permission", "permissions", "policy_file"),
+    "permisos": ("permission", "permissions", "permission_mode"),
+    "permiso": ("permission", "permissions", "permission_mode"),
+    "aprobacion": ("approval", "approve", "approval_policy"),
 }
 
 
@@ -154,6 +161,10 @@ _PHRASE_HINTS = {
     "mention file": ("@", "files"),
     "small model": ("small", "budget"),
     "small models": ("small", "budget"),
+    "permission mode": ("permission_mode", "permission"),
+    "permission modes": ("permission_mode", "permission"),
+    "approval policy": ("approval_policy", "approval"),
+    "policy file": ("policy_file", "policy"),
 }
 
 
@@ -669,6 +680,43 @@ CLI_COMMANDS = [
             "zero duplicated engine logic: it is pedacito/rpc.py underneath",
         ],
         "common": True,
+    },
+    {
+        "name": "daemon",
+        "usage": "pedacito daemon [start|stop|status|sessions] [--port N] "
+                 "[--foreground] [--json]",
+        "summary": "Headless loopback-only daemon: a warm index and model "
+                   "leases shared by isolated workspace sessions. Every "
+                   "endpoint requires the per-run bearer token and nothing "
+                   "is exposed beyond 127.0.0.1. `status` (the default) exits "
+                   "0 cleanly when no daemon is running, and `sessions` "
+                   "lists attached clients.",
+        "keywords": ["daemon", "background", "sessions", "workspace sessions",
+                     "http", "sse", "attach", "detach", "bearer token",
+                     "loopback", "warm index", "shared lease"],
+        "examples": [
+            "pedacito daemon status",
+            "pedacito daemon start --foreground --port 8765",
+            "pedacito daemon sessions --json",
+            "pedacito daemon stop",
+        ],
+        "flags": [
+            {"flag": "--port N",
+             "help": "loopback port; 0 lets the OS choose an ephemeral one"},
+            {"flag": "--foreground",
+             "help": "keep the daemon in this process instead of detaching"},
+            {"flag": "--json", "help": "print one JSON object"},
+        ],
+        "notes": [
+            "discovery file: the per-user state folder's daemon.json (0o600 "
+            "where the platform honours it), removed on stop when its pid "
+            "matches",
+            "HTTP/SSE control surface: /v1/health, /v1/sessions, "
+            "/v1/sessions/<id>/events, /v1/quiesce and /v1/shutdown",
+            "every request needs X-Pedacito-Token or Authorization: Bearer",
+            "remote/WAN binding is refused by construction (loopback only)",
+        ],
+        "common": False,
     },
     {
         "name": "config",
@@ -3493,8 +3541,8 @@ _SETTING_KEYWORDS = {
                           "offline", "opt out", "update banner"],
     "show_update_reminder": ["update reminder", "active development",
                              "reminder", "exit reminder", "update tip"],
-    "picard_mode": ["picard", "make it so", "captain picard", "star trek",
-                    "button labels"],
+    "picard_mode": ["picard", "make it so", "hágalo así", "captain picard",
+                    "star trek", "button labels"],
     "review": ["review page", "diff review", "approve changes"],
     "backup": ["backup", "snapshot", "undo", "restore"],
     "allow_shell": ["run commands", "shell", "tool permission", "allow run"],
@@ -3567,6 +3615,19 @@ _SETTING_KEYWORDS = {
     "context_tokens": ["context window", "window size", "context length"],
     "use_model_card": ["model card", "calibrate", "tuned defaults"],
     "sandbox": ["sandbox", "bubblewrap", "safety", "isolated commands"],
+    "permission_mode": ["permission mode", "policy", "approval mode",
+                        "capability", "read only mode", "plan mode",
+                        "accept edits", "workspace write", "danger",
+                        "permission", "permissions", "politica"],
+    "approval_policy": ["approval policy", "approval", "auto-safe",
+                        "auto safe", "never ask", "unattended", "headless",
+                        "approve"],
+    "policy_file": ["policy file", "policy.toml", "capability policy",
+                    "permission policy", "trust", "politica"],
+    "subagent_max_parallel": ["parallel subagents", "subagent parallel",
+                              "subagent concurrency"],
+    "daemon_port": ["daemon port", "background daemon port"],
+    "daemon_auto_start": ["daemon", "auto start daemon", "background daemon"],
     "auto_install_deps": ["pip install", "missing module", "dependency"],
     "enable_run_test_in_gather": ["run tests in gather", "pytest during "
                                   "investigation", "live traceback", "run_test"],
@@ -3876,52 +3937,197 @@ def _first_sentence(text: str, limit: int = 280) -> str:
     return cut.rstrip() + "…"
 
 
-def _flag_text(doc: dict, limit: int = 8) -> str:
+_ES_SUMMARIES = {
+    "gui:permission-dialog": "Cuando el modelo pide algo que requiere permiso (acceso web, instalar un paquete, un comando de shell no aprobado o un archivo sensible), la ejecución se pausa hasta que respondas.",
+    "gui:set-up-config": "Usa el asistente de configuración de la primera ejecución en Ajustes, o crea y prueba una configuración mínima desde la CLI.",
+    "gui:find-settings": "Todos los ajustes es un formulario con búsqueda para cada clave de configuración, aplicado globalmente o a un solo perfil.",
+    "gui:language-switch": "La GUI, la TUI y la CLI funcionan en inglés y español. Cambia el idioma en vivo en la GUI o la TUI, por ejecución en la CLI, o de forma permanente con el ajuste language; llm_reply_language controla por separado el idioma de las respuestas del modelo.",
+    "gui:plan-only": "Marca Solo plan en las opciones de Auto, u omite --apply en la CLI; edita la lista de tareas en el panel Plan.",
+    "gui:run-auto": "Dale a Auto un objetivo; escribe una lista de tareas y las trabaja una por una, con verificación opcional de cada tarea.",
+    "gui:switch-model": "Elige otro perfil en la barra superior y pulsa Cambiar; el proyecto abierto se recarga con ese modelo.",
+    "gui:reset-config": "Restablece la configuración del usuario a los valores recomendados de Pedacito; antes se respalda el archivo anterior.",
+    "gui:undo-run": "Cada escritura se guarda antes en una instantánea; restaura la más reciente o una elegida desde el panel Espacio de trabajo.",
+    "gui:allow-tools": "Son ajustes de confianza opcionales en Todos los ajustes; permiten que el modelo ejecute comandos o escriba durante la fase de recopilación.",
+    "gui:web-access": "El acceso web está desactivado por defecto. fetch_url y web_search se ejecutan si enable_web está activo, o si apruebas cada llamada en el diálogo de permisos.",
+    "gui:api-key-hosted": "Pon la URL del servidor, el modelo y la clave de API en el perfil; para APIs alojadas usa api_key_env para que el secreto no quede en el archivo.",
+    "gui:index-project": "El botón Indexar de la barra superior construye el mapa; Mayús+clic crea un índice rápido sin resúmenes del modelo.",
+    "gui:install-pedacito": "Instala desde PyPI con `pip install pedacito` (o `pipx install pedacito` para una CLI aislada); se requiere Python 3.11+. Ambos dejan `pedacito` y el alias corto `pdc` en tu PATH.",
+    "gui:verify-tests": "El modo Auto puede ejecutar un comando de verificación tras cada tarea; Task/Edit puede correr las pruebas del proyecto tras las ediciones aplicadas.",
+    "gui:green-ratchet": "Auto guarda una instantánea antes de cada paso. Un paso que sigue fallando tras sus rondas de reparación se deshace, así el siguiente paso parte del último estado que pasaba.",
+    "gui:execution-mode": "two_phase recopila contexto y luego responde con bloques de edición; interleaved ejecuta una conversación agéntica donde el modelo lee, edita, ejecuta pruebas y corrige hasta terminar; auto elige interleaved cuando corresponde.",
+    "gui:live-telemetry": "Un pie bajo el espacio de trabajo de la GUI muestra la ventana de contexto, los tokens del turno y de la sesión, la velocidad de generación, los aciertos de caché KV y los pliegues mientras corre una tarea; la CLI imprime los mismos números en una línea.",
+    "gui:cli-gui-cheatsheet": "La GUI y la CLI usan el mismo motor; usa la que te quede más cerca de la tarea.",
+    "gui:named-mcp-servers": "Las tablas [mcp_servers.<nombre>] describen un servidor stdio (command + args) o uno Streamable HTTP (url). La fase de recopilación solo muestra al modelo las herramientas que coinciden con la tarea actual.",
+    "cli:daemon": "Daemon sin interfaz y solo de loopback: un índice caliente y concesiones de modelo compartidas por sesiones de espacio de trabajo aisladas. Cada endpoint exige el token de portador de cada ejecución y nada queda expuesto fuera de 127.0.0.1.",
+    "cli:config": "Muestra cada ajuste resuelto y de dónde viene; crea, prueba, imprime o añade opciones documentadas al archivo de configuración.",
+    "cli:trust": "Aprueba el .pedacito.toml de este proyecto para que sus hooks, servidores MCP y comandos de verificación puedan ejecutarse.",
+    "cli:how": "Pregunta cómo usar Pedacito. Busca en la referencia integrada de la CLI, la GUI y los ajustes; funciona sin modelo con --offline.",
+    "cli:tui": "Interfaz de terminal dividida: panel de transcripción, barra lateral de actividad y plan, pie de telemetría y desplazamiento con PgUp/PgDn o la rueda del ratón.",
+    "cli:index": "Construye o actualiza el índice del proyecto (mapa y resúmenes) que usan ask, explain y auto.",
+    "cli:map": "Imprime el índice o mapa exactamente como lo recibiría el modelo.",
+    "cli:files": "Muestra qué archivos se indexarían y por qué, incluidos los archivos ignorados y sus motivos.",
+    "cli:ask": "Ejecuta una tarea de código de principio a fin. Sin --apply es una ejecución de prueba que imprime las ediciones propuestas.",
+    "cli:auto": "Convierte un objetivo en una lista de tareas y luego implementa cada una en un contexto nuevo. Sin --apply solo escribe o imprime el plan.",
+    "cli:reset": "Borra el estado de Pedacito de este proyecto (índice, planes, cachés, sesiones y respaldos); el código y los archivos de configuración no se tocan. No es un restablecimiento de la configuración.",
+    "cli:undo": "Deshace la última ejecución: restaura el espacio de trabajo al estado anterior al checkpoint activo (o a la instantánea de respaldo más reciente en proyectos antiguos).",
+    "cli:gui": "Abre el panel de control local en el navegador (solo 127.0.0.1).",
+    "cli:calibrate": "Mide el modelo configurado (elección de herramientas, formato de edición, honestidad, contexto largo y sondas de especialidad) y guarda una tarjeta de modelo que ajusta los valores por defecto.",
+    "cli:rpc": "JSONL-RPC interactivo por stdin/stdout para editores y otros agentes: una petición JSON por línea; cada línea de stdout es un marco JSON y los diagnósticos humanos van a stderr.",
+}
+
+
+# Spanish step, note and title text for the highest-traffic permission, tools
+# and daemon cards, keyed by the English text they replace.
+_ES_CARD_TEXT = {
+    "Approve or deny a Permission requested dialog":
+        "Aprobar o denegar un diálogo de permiso solicitado",
+    "Read the badge, the action, the reason and the exact target shown in the dialog":
+        "Lee la insignia, la acción, el motivo y el destino exacto que muestra el diálogo",
+    "Allow Once: this single request only":
+        "Permitir una vez: solo esta solicitud",
+    "Allow for This Run: no more prompts for this kind of request until the run ends":
+        "Permitir durante esta ejecución: no vuelve a preguntar por este tipo de solicitud hasta que termine la ejecución",
+    "Always Allow: never asks again for that request. It is saved to your config when one exists. Web access flips enable_web, shell commands flip allow_shell":
+        "Permitir siempre: no vuelve a preguntar por esa solicitud. Se guarda en tu configuración si existe. El acceso web activa enable_web y los comandos de shell activan allow_shell",
+    "Allow '<pattern>' in this project (GUI) or p in the TUI: a shell command matching a narrow rule skips the prompt in that project only. The rule is saved to shell_allowlist_by_project; package installs, shells and chained commands are never covered":
+        "Permitir '<patrón>' en este proyecto (GUI) o p en la TUI: un comando de shell que coincida con una regla estrecha omite el aviso solo en ese proyecto. La regla se guarda en shell_allowlist_by_project; las instalaciones de paquetes, los shells y los comandos encadenados nunca quedan cubiertos",
+    "Deny & Redirect: refuses the request. The model is told to continue with local project files only. Stop, or letting the dialog time out, also denies":
+        "Denegar y redirigir: rechaza la solicitud y se le indica al modelo que continúe solo con los archivos locales del proyecto. Detener, o dejar que el diálogo expire, también deniega",
+    "The CLI has no dialog: a gated tool returns its 'disabled in config' error unless the matching setting is on":
+        "La CLI no tiene diálogo: una herramienta restringida devuelve su error 'disabled in config' salvo que el ajuste correspondiente esté activado",
+    "Allow shell, write, browser or screenshot tools":
+        "Permitir herramientas de shell, escritura, navegador o capturas de pantalla",
+    "⚙ Settings → All settings → search for allow_shell / allow_write / allow_browser / allow_screenshots":
+        "⚙ Ajustes → Todos los ajustes → busca allow_shell / allow_write / allow_browser / allow_screenshots",
+    "Apply to: Global (every profile), choose on, then Save":
+        "Aplicar a: Global (todos los perfiles), elige on y luego Guardar",
+    "Review the safety companions too: shell_allowlist, shell_deny, sandbox, sandbox_network":
+        "Revisa también los ajustes de seguridad relacionados: shell_allowlist, shell_deny, sandbox, sandbox_network",
+    "In a project's own .pedacito.toml these toggles stay ignored until you read that file and run pedacito trust PROJ; your user config and --config FILE need no approval":
+        "En el .pedacito.toml de un proyecto estos interruptores se ignoran hasta que leas ese archivo y ejecutes pedacito trust PROJ; tu configuración de usuario y --config FILE no necesitan aprobación",
+    "discovery file: the per-user state folder's daemon.json (0o600 where the platform honours it), removed on stop when its pid matches":
+        "archivo de descubrimiento: daemon.json en la carpeta de estado del usuario (0o600 donde la plataforma lo respete), se elimina al detener si coincide su pid",
+    "HTTP/SSE control surface: /v1/health, /v1/sessions, /v1/sessions/<id>/events, /v1/quiesce and /v1/shutdown":
+        "superficie de control HTTP/SSE: /v1/health, /v1/sessions, /v1/sessions/<id>/events, /v1/quiesce y /v1/shutdown",
+    "every request needs X-Pedacito-Token or Authorization: Bearer":
+        "cada solicitud necesita X-Pedacito-Token o Authorization: Bearer",
+    "remote/WAN binding is refused by construction (loopback only)":
+        "la vinculación remota o WAN se rechaza por diseño (solo bucle local)",
+}
+
+# Remaining English navigation words in Spanish card text (a fallback for the
+# GUI paths and setting groups that have no exact entry above).
+_ES_UI_TERMS = (
+    ("⚙ Settings", "⚙ Ajustes"),
+    ("All settings", "Todos los ajustes"),
+    ("→ search ", "→ buscar "),
+    ("Apply to:", "Aplicar a:"),
+    ("Profiles", "Perfiles"),
+    ("Unified policy engine", "Motor de políticas unificado"),
+    ("Connection & Capabilities", "Conexión y capacidades"),
+    ("Memory, skills, sub-agents, git", "Memoria, habilidades, subagentes y git"),
+    ("Agent loop", "Bucle del agente"),
+    ("Safety", "Seguridad"),
+)
+
+
+def es_card_text(text: str, lang: str = "en") -> str:
+    """Spanish text for an English card string (exact match first, then the
+    navigation terms); English text is returned unchanged."""
+    if i18n.normalize_lang(lang) != "es" or not text:
+        return text
+    if text in _ES_CARD_TEXT:
+        return _ES_CARD_TEXT[text]
+    out = text
+    for english, spanish in _ES_UI_TERMS:
+        out = out.replace(english, spanish)
+    return out
+
+
+def _card_summary(item: dict, lang: str = "en") -> str:
+    if i18n.normalize_lang(lang) == "es":
+        return str(item.get("summary_es") or item.get("summary") or "")
+    return str(item.get("summary") or "")
+
+
+def setting_help(item: dict, lang: str = "en") -> str:
+    if i18n.normalize_lang(lang) == "es":
+        return str(item.get("help_es") or item.get("help") or "")
+    return str(item.get("help") or "")
+
+
+def localize_matches(matches: dict, lang: str = "es",
+                     setting_help: dict[str, str] | None = None) -> None:
+    """Attach Spanish card text to the (copied) items of a `search()` result.
+
+    `setting_help` maps a setting key to its Spanish description from the
+    Spanish configuration reference; English text stays as the fallback."""
+    if i18n.normalize_lang(lang) != "es":
+        return
+    for item in matches.get("gui") or []:
+        summary = _ES_SUMMARIES.get(f"gui:{item.get('id')}")
+        if summary:
+            item["summary_es"] = summary
+    for item in matches.get("cli") or []:
+        summary = _ES_SUMMARIES.get(f"cli:{item.get('name')}")
+        if summary:
+            item["summary_es"] = summary
+    for item in matches.get("settings") or []:
+        text = (setting_help or {}).get(item.get("key"))
+        if text:
+            item["help_es"] = text
+
+
+def _flag_text(doc: dict, limit: int = 8, lang: str = "en") -> str:
     flags = [f['flag'] for f in doc.get("flags", [])]
     if not flags:
         return ""
     shown = ", ".join(f"`{f}`" for f in flags[:limit])
     if len(flags) > limit:
-        shown += f", … ({len(flags) - limit} more; run `pedacito " \
-                 f"{doc['name']} --help`)"
+        shown += i18n.t("how.flags_more", lang=lang,
+                        n=len(flags) - limit, name=doc["name"])
     return shown
 
 
-def render_answer(question: str, matches: dict) -> str:
+def render_answer(question: str, matches: dict, lang: str = "en") -> str:
     """Format retrieved facts without a model. Always returns useful text."""
+    lang = i18n.normalize_lang(lang)
+
+    def t(key: str, **kw) -> str:
+        return i18n.t(f"how.{key}", lang=lang, **kw)
+
     gui = matches.get("gui") or []
     cli = matches.get("cli") or []
     settings = matches.get("settings") or []
     lines: list[str] = []
-    lines.append("**Built-in reference**: no model or project needed.")
+    lines.append(t("banner"))
     lines.append("")
-    best = (gui[0]["summary"] if gui else
-            cli[0]["summary"] if cli else
-            "I could not match that question to the built-in reference.")
+    best = (_card_summary(gui[0], lang) if gui else
+            _card_summary(cli[0], lang) if cli else
+            t("cant_match"))
     if best:
         lines.append(best)
         lines.append("")
     if gui:
-        lines.append("**In the GUI**")
+        lines.append(t("gui_heading"))
         for item in gui[:2]:
-            lines.append(f"1. **{item['title']}**")
+            lines.append(f"1. **{es_card_text(item['title'], lang)}**")
             for step in item.get("steps", [])[:6]:
-                lines.append(f"   - {step}")
+                lines.append(f"   - {es_card_text(step, lang)}")
             if item.get("notes"):
                 for note in item["notes"][:3]:
-                    lines.append(f"   - {note}")
+                    lines.append(f"   - {es_card_text(note, lang)}")
         lines.append("")
     else:
-        lines.append("**In the GUI**")
-        lines.append("- No dedicated control matches this question; use the "
-                     "CLI or edit `config.toml`.")
+        lines.append(t("gui_heading"))
+        lines.append(t("gui_none"))
         lines.append("")
-    lines.append("**In the Terminal (CLI)**")
+    lines.append(t("cli_heading"))
     if cli:
         for item in cli[:2]:
             lines.append(f"- **`pedacito {item['name']}`**: "
-                         f"{_first_sentence(item['summary'], 220)}")
-            lines.append(f"  - Usage: `{item['usage']}`")
+                         f"{_first_sentence(_card_summary(item, lang), 220)}")
+            lines.append(f"  - {t('usage_label')}: `{item['usage']}`")
             examples = item.get("examples") or []
             if examples:
                 lines.append("")
@@ -3929,31 +4135,27 @@ def render_answer(question: str, matches: dict) -> str:
                 for example in examples[:3]:
                     lines.append(f"  {example}")
                 lines.append("  ```")
-            flags = _flag_text(item)
+            flags = _flag_text(item, lang=lang)
             if flags:
-                lines.append(f"  - Flags: {flags}")
+                lines.append(f"  - {t('flags_label')}: {flags}")
             if item.get("common"):
-                lines.append("  - Common project flags: `--exclude`, "
-                             "`--include`, `--ext`, `--url`, `--model`, "
-                             "`--profile`, `--steps`, `--role`, `--record`, "
-                             "`--replay`, `--jsonl`, `--max-cost` "
-                             "(see `--help`).")
+                lines.append(f"  - {t('common_flags')}")
             if item.get("notes"):
                 for note in item["notes"][:4]:
-                    lines.append(f"  - {note}")
+                    lines.append(f"  - {es_card_text(note, lang)}")
             lines.append("")
     else:
-        lines.append("- No CLI command is needed for this; the GUI setting is "
-                     "the direct route.")
+        lines.append(t("cli_none"))
         lines.append("")
-    lines.append("**Relevant Settings (`config.toml`)**")
+    lines.append(t("settings_heading"))
     if settings:
         for item in settings[:4]:
             default = item.get("default_text", "")
-            lines.append(f"- **`{item['key']}`** (default: `{default}`): "
-                         f"{_first_sentence(item.get('help', ''), 240)}")
+            lines.append(f"- **`{item['key']}`** ({t('default_label')}: "
+                         f"`{default}`): "
+                         f"{_first_sentence(setting_help(item, lang), 240)}")
             if item.get("gui"):
-                lines.append(f"  - Where: {item['gui']}")
+                lines.append(f"  - {t('where_label')}: {item['gui']}")
             if item.get("toml"):
                 lines.append("")
                 lines.append("    ```toml")
@@ -3962,11 +4164,9 @@ def render_answer(question: str, matches: dict) -> str:
                 lines.append("    ```")
             lines.append("")
     else:
-        lines.append("- No specific setting is required; use the GUI control "
-                     "or CLI command above.")
+        lines.append(t("settings_none"))
     lines.append("")
-    lines.append("_Ask with `--offline` (CLI) or turn off “Use model” in the "
-                 "How tab for this deterministic answer every time._")
+    lines.append(t("footer"))
     return "\n".join(lines).rstrip() + "\n"
 
 

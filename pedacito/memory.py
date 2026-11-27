@@ -27,7 +27,7 @@ import re
 import time
 from pathlib import Path
 
-from . import fileio, safety, security
+from . import fileio, safety, security, workspace
 
 CATEGORIES = ("commands", "conventions", "landmines", "notes")
 _HEADINGS = {c: c.capitalize() for c in CATEGORIES}
@@ -82,8 +82,14 @@ def _read(path: Path | None) -> dict[str, list[str]]:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return out
+    return _parse(text)
+
+
+def _parse(text: str) -> dict[str, list[str]]:
+    """The memory.md text parsed into per-category lists (see `_read`)."""
+    out: dict[str, list[str]] = {c: [] for c in CATEGORIES}
     cat = "notes"
-    for line in text.splitlines():
+    for line in (text or "").splitlines():
         m = _HEADING_RE.match(line)
         if m:
             name = m.group(1).lower()
@@ -96,15 +102,29 @@ def _read(path: Path | None) -> dict[str, list[str]]:
     return out
 
 
-def _write(path: Path, data: dict[str, list[str]]) -> None:
+def _serialize(data: dict[str, list[str]]) -> str:
     lines = ["# Pedacito memory (hints for the model; edit or delete freely)", ""]
     for c in CATEGORIES:
         if data[c]:
             lines.append(f"## {_HEADINGS[c]}")
             lines += [f"- {x}" for x in data[c]]
             lines.append("")
+    return "\n".join(lines)
+
+
+def _write(path: Path, data: dict[str, list[str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fileio.write_bytes(path, "\n".join(lines).encode("utf-8"))
+    fileio.write_bytes(path, _serialize(data).encode("utf-8"))
+
+
+def _update_memory(path: Path, mutate) -> None:
+    """Read-modify-write a memory.md file under a per-path lock (no lost
+    entries when concurrent sessions remember/forget at once)."""
+    def updater(text: str) -> str:
+        data = _parse(text)
+        mutate(data)
+        return _serialize(data)
+    workspace.atomic_update_text(path, updater)
 
 
 def guess_category(text: str) -> str:
@@ -140,14 +160,20 @@ def remember(root, text: str, category: str = "", scope: str = "project"
         path = _safe_project_memory_file(root)
         if path is None:
             return False, "refused: unsafe project memory path"
-    data = _read(path)
     h = _hash(line)
-    if any(_hash(x) == h for lst in data.values() for x in lst):
+    stored = [False]
+
+    def mutate(data: dict[str, list[str]]) -> None:
+        if any(_hash(x) == h for lst in data.values() for x in lst):
+            return
+        data[cat].append(line)
+        if len(data[cat]) > _PER_CATEGORY:
+            data[cat] = data[cat][-_PER_CATEGORY:]
+        stored[0] = True
+
+    _update_memory(path, mutate)
+    if not stored[0]:
         return False, "already remembered"
-    data[cat].append(line)
-    if len(data[cat]) > _PER_CATEGORY:
-        data[cat] = data[cat][-_PER_CATEGORY:]
-    _write(path, data)
     return True, f"remembered under {cat}"
 
 
@@ -160,17 +186,18 @@ def forget(root, needle: str, scope: str = "project") -> int:
         path = _safe_project_memory_file(root)
         if path is None:
             return 0
-    data = _read(path)
-    n = 0
     low = needle.lower().strip()
-    for c in CATEGORIES:
-        keep = [x for x in data[c]
-                if low not in x.lower() and _hash(x) != low]
-        n += len(data[c]) - len(keep)
-        data[c] = keep
-    if n:
-        _write(path, data)
-    return n
+    n = [0]
+
+    def mutate(data: dict[str, list[str]]) -> None:
+        for c in CATEGORIES:
+            keep = [x for x in data[c]
+                    if low not in x.lower() and _hash(x) != low]
+            n[0] += len(data[c]) - len(keep)
+            data[c] = keep
+
+    _update_memory(path, mutate)
+    return n[0]
 
 
 def entries(root) -> list[tuple[str, str, str]]:
@@ -698,27 +725,34 @@ def _profile_key(cfg) -> str:
 def note_zero_edit(root, cfg) -> int:
     """Record one zero-edit run for the active profile; return the new count."""
     path = profile_stats_file(root)
-    data = _read_json(path, {})
     key = _profile_key(cfg)
+
+    def mutate(data: dict) -> dict:
+        row = data.get(key)
+        if not isinstance(row, dict):
+            row = {}
+        row["zero_edit_runs"] = int(row.get("zero_edit_runs", 0)) + 1
+        data[key] = row
+        return data
+
+    data = _update_json(path, mutate)
     row = data.get(key)
-    if not isinstance(row, dict):
-        row = {}
-    n = int(row.get("zero_edit_runs", 0)) + 1
-    row["zero_edit_runs"] = n
-    data[key] = row
-    _write_json(path, data)
-    return n
+    return int(row.get("zero_edit_runs", 0)) if isinstance(row, dict) else 0
 
 
 def clear_zero_edit(root, cfg) -> None:
     """A landed edit proves the profile can do the work: reset its counter."""
     path = profile_stats_file(root)
-    data = _read_json(path, {})
-    row = data.get(_profile_key(cfg))
-    if isinstance(row, dict) and row.get("zero_edit_runs"):
-        row["zero_edit_runs"] = 0
-        data[_profile_key(cfg)] = row
-        _write_json(path, data)
+    key = _profile_key(cfg)
+
+    def mutate(data: dict) -> dict:
+        row = data.get(key)
+        if isinstance(row, dict) and row.get("zero_edit_runs"):
+            row["zero_edit_runs"] = 0
+            data[key] = row
+        return data
+
+    _update_json(path, mutate)
 
 
 def zero_edit_runs(root, cfg) -> int:
@@ -767,6 +801,17 @@ def _write_json(path: Path, data) -> None:
         pass
 
 
+def _update_json(path: Path, mutate) -> dict:
+    """Atomic read-modify-write of a JSON state file (zero lost updates).
+
+    Best-effort like the original `_write_json`: an un-writable state file
+    (read-only .pedacito, full disk) is swallowed, never a crash."""
+    try:
+        return workspace.atomic_update_json(path, mutate)
+    except OSError:
+        return {}
+
+
 def _facts_doc(root) -> dict:
     """The micro-fact document: {facts, pending, retired, anti_patterns,
     promoted, retired_lessons}.
@@ -776,7 +821,10 @@ def _facts_doc(root) -> dict:
     (lessons that graduated into auto-managed path-scoped rules) and
     `retired_lessons` (lessons retired for zero measured effect) must be
     listed here or another writer's round-trip would silently drop them."""
-    raw = _read_json(micro_facts_file(root), {})
+    return _facts_from_raw(_read_json(micro_facts_file(root), {}))
+
+
+def _facts_from_raw(raw: dict) -> dict:
     facts = [f for f in raw.get("facts", ())
              if isinstance(f, dict) and f.get("fact_id") and f.get("text")]
     pending = [f for f in raw.get("pending", ())
@@ -797,6 +845,18 @@ def _facts_doc(root) -> dict:
             "anti_patterns": anti[-_MAX_ANTI_PATTERNS:],
             "promoted": promoted[-_MAX_PROMOTED:],
             "retired_lessons": retired_lessons[-_MAX_MICRO_FACTS:]}
+
+
+def _update_facts_doc(root, mutate) -> dict:
+    """Atomic read-modify-write of the micro-fact document."""
+    def updater(raw: dict) -> dict:
+        doc = _facts_from_raw(raw)
+        mutate(doc)
+        return doc
+    try:
+        return workspace.atomic_update_json(micro_facts_file(root), updater)
+    except OSError:
+        return {}
 
 
 # ------------------------------------------------- repair lesson ledger ---
@@ -1044,38 +1104,44 @@ def record_anti_pattern(root, kind: str, text: str,
     # free text at all -- an instruction-shaped lesson cannot be produced.
     lesson_id = _lesson_identity(kind, text)
     now = time.time()
-    doc = _facts_doc(root)
-    promoted = next((a for a in doc["promoted"]
-                     if a.get("lesson_id") == lesson_id), None)
-    if promoted is not None:
-        # Already graduated into a path-scoped rule: refresh the row where it
-        # lives, never re-add it to the global ledger.
-        promoted["confirmations"] = int(promoted.get("confirmations", 1) or 1) + 1
-        promoted["last_seen"] = now
-        promoted["files"] = sorted({str(f) for f in (files or ())}
-                                   | {str(f) for f in promoted.get("files", ())})[:8]
-        _write_json(micro_facts_file(root), doc)
-        return promoted
-    existing = next((a for a in doc["anti_patterns"]
-                     if a.get("lesson_id") == lesson_id), None)
-    if existing is not None:
-        existing["confirmations"] = int(existing.get("confirmations", 1) or 1) + 1
-        existing["last_seen"] = now
-        existing["files"] = sorted({str(f) for f in (files or ())}
-                                   | {str(f) for f in existing.get("files", ())})[:8]
-        row = existing
-    else:
-        row = {"lesson_id": lesson_id, "kind": kind, "text": text,
-               "files": sorted({str(f) for f in (files or ())})[:8],
-               "confirmations": 1, "last_seen": now,
-               "runs": 0, "recurred": 0, "avoided": 0}
-        doc["anti_patterns"].append(row)
-        doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
-    # A lesson that has now proven itself twice *and* names one directory
-    # graduates into a path-scoped rule and leaves the global prefix (§24).
-    _try_promote_lesson(root, row, doc)
-    _write_json(micro_facts_file(root), doc)
-    return row
+    result: dict = {"row": None}
+
+    def mutate(doc: dict) -> None:
+        promoted = next((a for a in doc["promoted"]
+                         if a.get("lesson_id") == lesson_id), None)
+        if promoted is not None:
+            # Already graduated into a path-scoped rule: refresh the row where
+            # it lives, never re-add it to the global ledger.
+            promoted["confirmations"] = int(promoted.get("confirmations", 1) or 1) + 1
+            promoted["last_seen"] = now
+            promoted["files"] = sorted(
+                {str(f) for f in (files or ())}
+                | {str(f) for f in promoted.get("files", ())})[:8]
+            result["row"] = promoted
+            return
+        existing = next((a for a in doc["anti_patterns"]
+                         if a.get("lesson_id") == lesson_id), None)
+        if existing is not None:
+            existing["confirmations"] = int(existing.get("confirmations", 1) or 1) + 1
+            existing["last_seen"] = now
+            existing["files"] = sorted(
+                {str(f) for f in (files or ())}
+                | {str(f) for f in existing.get("files", ())})[:8]
+            row = existing
+        else:
+            row = {"lesson_id": lesson_id, "kind": kind, "text": text,
+                   "files": sorted({str(f) for f in (files or ())})[:8],
+                   "confirmations": 1, "last_seen": now,
+                   "runs": 0, "recurred": 0, "avoided": 0}
+            doc["anti_patterns"].append(row)
+            doc["anti_patterns"] = doc["anti_patterns"][-_MAX_ANTI_PATTERNS:]
+        # A lesson that has now proven itself twice *and* names one directory
+        # graduates into a path-scoped rule and leaves the global prefix (§24).
+        _try_promote_lesson(root, row, doc)
+        result["row"] = row
+
+    _update_facts_doc(root, mutate)
+    return result["row"]
 
 
 def load_anti_patterns(root, prune: bool = True) -> list[dict]:
@@ -1133,31 +1199,37 @@ def note_lesson_run(root, failed_kinds, cfg=None, injected=None) -> dict:
     doc = _facts_doc(root)
     if not doc["anti_patterns"]:
         return empty
-    live, retired_now = [], []
-    counted = 0
-    for row in doc["anti_patterns"]:
-        if injected is not None and row.get("lesson_id") not in injected:
-            live.append(row)      # born after this run's prompt was built
-            continue
-        counted += 1
-        row["runs"] = int(row.get("runs", 0) or 0) + 1
-        if str(row.get("kind", "")).strip().lower() in kinds:
-            row["recurred"] = int(row.get("recurred", 0) or 0) + 1
-        else:
-            row["avoided"] = int(row.get("avoided", 0) or 0) + 1
-        if row["runs"] >= _LESSON_RETIRE_RUNS \
-                and int(row.get("avoided", 0) or 0) == 0:
-            row["retired_at"] = time.time()
-            retired_now.append(row)
-        else:
-            live.append(row)
-    if retired_now:
-        doc["anti_patterns"] = live
-        doc["retired_lessons"] = (doc["retired_lessons"]
-                                  + retired_now)[-_MAX_MICRO_FACTS:]
-    _write_json(micro_facts_file(root), doc)
-    return {"counted": counted,
-            "retired": [str(r.get("lesson_id", "")) for r in retired_now]}
+    result: dict = {"counted": 0, "retired": []}
+
+    def mutate(doc: dict) -> None:
+        live, retired_now = [], []
+        counted = 0
+        for row in doc["anti_patterns"]:
+            if injected is not None and row.get("lesson_id") not in injected:
+                live.append(row)      # born after this run's prompt was built
+                continue
+            counted += 1
+            row["runs"] = int(row.get("runs", 0) or 0) + 1
+            if str(row.get("kind", "")).strip().lower() in kinds:
+                row["recurred"] = int(row.get("recurred", 0) or 0) + 1
+            else:
+                row["avoided"] = int(row.get("avoided", 0) or 0) + 1
+            if row["runs"] >= _LESSON_RETIRE_RUNS \
+                    and int(row.get("avoided", 0) or 0) == 0:
+                row["retired_at"] = time.time()
+                retired_now.append(row)
+            else:
+                live.append(row)
+        if retired_now:
+            doc["anti_patterns"] = live
+            doc["retired_lessons"] = (doc["retired_lessons"]
+                                      + retired_now)[-_MAX_MICRO_FACTS:]
+        result["counted"] = counted
+        result["retired"] = [str(r.get("lesson_id", ""))
+                             for r in retired_now]
+
+    _update_facts_doc(root, mutate)
+    return {"counted": result["counted"], "retired": result["retired"]}
 
 
 def load_retired_lessons(root) -> list[dict]:
@@ -1204,24 +1276,23 @@ def forget_lesson(root, lesson_id: str) -> int:
     lesson_id = str(lesson_id or "").strip()
     if not lesson_id:
         return 0
-    path = micro_facts_file(root)
-    raw = _read_json(path, {})
-    if not isinstance(raw, dict):
-        return 0
-    removed = 0
-    for key in ("anti_patterns", "promoted", "retired_lessons"):
-        rows = raw.get(key)
-        if not isinstance(rows, list):
-            continue
-        keep = [r for r in rows
-                if not (isinstance(r, dict)
-                        and str(r.get("lesson_id") or "") == lesson_id)]
-        removed += len(rows) - len(keep)
-        if key in raw:
-            raw[key] = keep
-    if removed:
-        _write_json(path, raw)
-    return removed
+    removed = [0]
+
+    def mutate(raw: dict) -> dict:
+        for key in ("anti_patterns", "promoted", "retired_lessons"):
+            rows = raw.get(key)
+            if not isinstance(rows, list):
+                continue
+            keep = [r for r in rows
+                    if not (isinstance(r, dict)
+                            and str(r.get("lesson_id") or "") == lesson_id)]
+            removed[0] += len(rows) - len(keep)
+            if key in raw:
+                raw[key] = keep
+        return raw
+
+    _update_json(micro_facts_file(root), mutate)
+    return removed[0]
 
 
 def _command_identity(command: str) -> tuple[str, str]:
@@ -1272,70 +1343,72 @@ def observe_command(root, command: str, ok: bool, cfg=None,
         return None
     command = safety.redact(command)
     now = time.time()
-    doc = _facts_doc(root)
+    result: dict = {"promoted": None}
 
-    for fact in list(doc["facts"]):
-        if fact.get("fact_id") != fact_id:
-            continue
-        confirmations = int(fact.get("confirmations", 0) or 0)
-        if ok:
-            fact["confirmations"] = confirmations + 1
+    def mutate(doc: dict) -> None:
+        for fact in list(doc["facts"]):
+            if fact.get("fact_id") != fact_id:
+                continue
+            confirmations = int(fact.get("confirmations", 0) or 0)
+            if ok:
+                fact["confirmations"] = confirmations + 1
+                fact["last_seen"] = now
+                fact["last_ok"] = True
+                fact["text"] = _fact_text(command, fact.get("kind", kind),
+                                          fact["confirmations"])
+                result["promoted"] = fact
+                return
+            # Contradiction: the command that used to work now fails. Retire
+            # it at once -- a stale environment fact is worse than none.
+            fact["contradictions"] = int(fact.get("contradictions", 0) or 0) + 1
             fact["last_seen"] = now
-            fact["last_ok"] = True
-            fact["text"] = _fact_text(command, fact.get("kind", kind),
-                                      fact["confirmations"])
-            _write_json(micro_facts_file(root), doc)
-            return fact
-        # Contradiction: the command that used to work now fails. Retire it
-        # at once -- a stale environment fact is worse than none.
-        fact["contradictions"] = int(fact.get("contradictions", 0) or 0) + 1
-        fact["last_seen"] = now
-        fact["last_ok"] = False
-        fact.setdefault("first_fail_seen", now)   # BUG-1007
-        doc["facts"].remove(fact)
-        doc["retired"] = (doc["retired"] + [fact])[-_MAX_MICRO_FACTS:]
-        _write_json(micro_facts_file(root), doc)
-        return None
+            fact["last_ok"] = False
+            fact.setdefault("first_fail_seen", now)   # BUG-1007
+            doc["facts"].remove(fact)
+            doc["retired"] = (doc["retired"] + [fact])[-_MAX_MICRO_FACTS:]
+            return
 
-    pending = next((p for p in doc["pending"]
-                    if p.get("fact_id") == fact_id), None)
-    if pending is None:
-        pending = {"fact_id": fact_id,
-                   "text": _pending_fact_text(command, kind, 0, 0),
-                   "successes": 0, "failures": 0, "last_seen": now,
-                   "kind": kind}
-        doc["pending"].append(pending)
-    pending["last_seen"] = now
-    pending["last_ok"] = bool(ok)
-    if ok:
-        pending["successes"] = int(pending.get("successes", 0) or 0) + 1
-    else:
-        pending["failures"] = int(pending.get("failures", 0) or 0) + 1
-        # BUG-1007: when the failure FIRST happened, not just when it was
-        # last seen. A command that went red during the current run has no
-        # right to be called "pre-existing" by that same run's second try.
-        pending.setdefault("first_fail_seen", now)
-    pending["text"] = _pending_fact_text(command, kind,
-                                         pending["successes"],
-                                         pending["failures"])
+        pending = next((p for p in doc["pending"]
+                        if p.get("fact_id") == fact_id), None)
+        if pending is None:
+            pending = {"fact_id": fact_id,
+                       "text": _pending_fact_text(command, kind, 0, 0),
+                       "successes": 0, "failures": 0, "last_seen": now,
+                       "kind": kind}
+            doc["pending"].append(pending)
+        pending["last_seen"] = now
+        pending["last_ok"] = bool(ok)
+        if ok:
+            pending["successes"] = int(pending.get("successes", 0) or 0) + 1
+        else:
+            pending["failures"] = int(pending.get("failures", 0) or 0) + 1
+            # BUG-1007: when the failure FIRST happened, not just when it was
+            # last seen. A command that went red during the current run has no
+            # right to be called "pre-existing" by that same run's second try.
+            pending.setdefault("first_fail_seen", now)
+        pending["text"] = _pending_fact_text(command, kind,
+                                             pending["successes"],
+                                             pending["failures"])
 
-    promoted = None
-    if ok and (pending["successes"] >= 2 or pending["failures"] >= 1):
-        promoted = {
-            "fact_id": fact_id,
-            "text": _fact_text(command, kind, pending["successes"]),
-            "confirmations": pending["successes"],
-            "contradictions": 0,
-            "last_seen": now,
-            "last_ok": True,
-            "kind": kind,
-        }
-        doc["facts"].append(promoted)
-        doc["pending"].remove(pending)
-    doc["facts"] = doc["facts"][-_MAX_MICRO_FACTS:]
-    doc["pending"] = doc["pending"][-_MAX_PENDING_FACTS:]
-    _write_json(micro_facts_file(root), doc)
-    return promoted
+        promoted = None
+        if ok and (pending["successes"] >= 2 or pending["failures"] >= 1):
+            promoted = {
+                "fact_id": fact_id,
+                "text": _fact_text(command, kind, pending["successes"]),
+                "confirmations": pending["successes"],
+                "contradictions": 0,
+                "last_seen": now,
+                "last_ok": True,
+                "kind": kind,
+            }
+            doc["facts"].append(promoted)
+            doc["pending"].remove(pending)
+            result["promoted"] = promoted
+        doc["facts"] = doc["facts"][-_MAX_MICRO_FACTS:]
+        doc["pending"] = doc["pending"][-_MAX_PENDING_FACTS:]
+
+    _update_facts_doc(root, mutate)
+    return result["promoted"]
 
 
 def command_was_failing(root, command: str,
@@ -1409,6 +1482,10 @@ def render_micro_facts(root, cfg=None, limit: int | None = None) -> str:
 
 def _tool_stats_doc(root) -> dict:
     raw = _read_json(tool_stats_file(root), {})
+    return _tool_stats_from_raw(raw)
+
+
+def _tool_stats_from_raw(raw: dict) -> dict:
     uses = raw.get("uses") if isinstance(raw.get("uses"), dict) else {}
     last = raw.get("last_task") if isinstance(raw.get("last_task"), dict) else {}
     return {"tasks": max(0, int(raw.get("tasks", 0) or 0)),
@@ -1420,15 +1497,21 @@ def begin_tool_task(root, cfg=None) -> int:
     """Count one task start; returns the repository's task counter."""
     if cfg is not None and not getattr(cfg, "dynamic_tool_pruning", True):
         return 0
-    doc = _tool_stats_doc(root)
-    doc["tasks"] += 1
-    _write_json(tool_stats_file(root), doc)
+    tasks = [0]
+
+    def mutate(raw: dict) -> dict:
+        doc = _tool_stats_from_raw(raw)
+        doc["tasks"] += 1
+        tasks[0] = doc["tasks"]
+        return doc
+
+    _update_json(tool_stats_file(root), mutate)
     if cfg is not None:
         try:
             cfg._track_tool_use = True
         except Exception:
             pass
-    return doc["tasks"]
+    return tasks[0]
 
 
 def record_tool_use(root, action: str, cfg=None) -> None:
@@ -1440,10 +1523,14 @@ def record_tool_use(root, action: str, cfg=None) -> None:
     action = str(action or "").strip()
     if not action:
         return
-    doc = _tool_stats_doc(root)
-    doc["uses"][action] = int(doc["uses"].get(action, 0)) + 1
-    doc["last_task"][action] = doc["tasks"]
-    _write_json(tool_stats_file(root), doc)
+
+    def mutate(raw: dict) -> dict:
+        doc = _tool_stats_from_raw(raw)
+        doc["uses"][action] = int(doc["uses"].get(action, 0)) + 1
+        doc["last_task"][action] = doc["tasks"]
+        return doc
+
+    _update_json(tool_stats_file(root), mutate)
 
 
 def tool_unused_tasks(root, action: str) -> int:

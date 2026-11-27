@@ -39,11 +39,25 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 > Prefer Spanish? Use the `EN | ES` switcher in the GUI top bar, press `F3` in the TUI, or run
 > `pdc --lang es gui`. See [Language & localization](docs/CONFIG.md#language--localization-language-llm_reply_language).
 
+## What's new in v0.4.0
+
+| Feature | What you get | Read more |
+|---|---|---|
+| **Isolated sessions** | Concurrent sessions in one process share no config, index, events, permissions or budgets | [ARCHITECTURE.md](docs/ARCHITECTURE.md#v040-session-isolation-daemon-and-parallel-subagents) |
+| **Permission modes & approvals** | `permission_mode` (plan, ask, accept-edits, workspace-write, danger) and `approval_policy`; a project's `.pedacito/policy.toml` only narrows, and only when trusted | [SECURITY.md](docs/SECURITY.md#sensitive-artifacts-policy-trust-and-approvals-v040) |
+| **Windows sandbox** | Commands run in a Job Object with a restricted token (`win_restricted`); unattended runs without a sandbox are refused | [SECURITY.md](docs/SECURITY.md#pillar-3-least-privilege-execution) |
+| **Session daemon** | `pedacito daemon` is a token-protected loopback service with per-session event replay | [USAGE.md](docs/USAGE.md#the-cli-at-a-glance) |
+| **Parallel subagents** | `subagent_max_parallel` bounds concurrent subagents; read-only roles stay read-only | [CONFIG.md](docs/CONFIG.md) |
+| **Package manifest** | `pedacito-package.toml` declares what an extension or skill package needs | [SKILLS_AND_TOOLS.md](docs/SKILLS_AND_TOOLS.md#package-manifests-pedacito-packagetoml) |
+
+Full notes: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
+
 ## What's new in v0.3.3
 
 | Feature | What you get | Read more |
 |---|---|---|
 | **Agent Client Protocol bridge** | `pedacito acp` speaks JSON-RPC 2.0 over stdio for editors and agent hosts: `session/new`, `session/prompt` with text, `@file` and image blocks, streamed `session/update` events and `session/request_permission`. It wraps the same warm engine as `rpc`, which gains `--events` and `--describe`. | [ACP bridge](docs/USAGE.md#acp-agent-client-protocol-bridge) |
+| **Headless session daemon** | `pedacito daemon` keeps one warm index and the model leases in a loopback-only HTTP/SSE server with isolated workspace sessions, bearer-token auth, attach/detach, permission and review routing, and clean quiesce/shutdown. `pedacito daemon status` exits 0 offline. | [CLI at a glance](docs/USAGE.md#the-cli-at-a-glance) |
 | **Rich zero-dependency TUI** | Inline syntax-highlighted diffs, collapsible tool-call cards (`Ctrl+O`, `/expand`, `/collapse`), an `@` fuzzy picker for files, symbols and images, and clickable SGR mouse zones for the language switch, sidebar tabs and scrollbar. | [`tui`](docs/USAGE.md#tui-split-screen-terminal-session) |
 | **Local, LAN & Tailscale endpoints** | One locality rule covers loopback, `.local`, RFC 1918, Tailscale/CGNAT (`100.64.0.0/10`), link-local and IPv6 ULA. Local cards without a calibrated temperature are marked stale for recalibration. | [Local endpoints](docs/CONFIG.md#local-lan-and-tailscale-endpoints) |
 | **Small-model & sparse-MoE upgrades** | `tool_mode = "plain"` (plain-word gather steps, A/B-tested by `calibrate`), an opt-in `proactive_escalation` router, shadow-tested `best_of`, and an interleaved pre-stop verifier. Oversized tool output spills to `.pedacito/scratch/`, which the model can read but never write. | [Configuration](docs/CONFIG.md#configuration-reference) |

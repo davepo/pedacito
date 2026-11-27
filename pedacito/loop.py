@@ -45,6 +45,68 @@ from . import trajectories
 from .edits import Result, parse_edits
 from .llm import CancelledError, CircuitOpenError, LLMError
 
+
+# ---------------------------------------------------------------- task journal
+def _journal_open(root, cfg, task: str):
+    """Best-effort `TaskJournal` for this task, stored on ``cfg._task_journal``
+    (and on the bound session, so subprocess helpers can append too). Returns
+    the journal or None when the root is absent / read-only."""
+    try:
+        from . import journal as journal_mod
+        sid = ""
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                sid = str(sess.session_id)
+        except Exception:
+            pass
+        journal = journal_mod.TaskJournal(root, task, session_id=sid)
+        journal.append("task_start", task=(task or "")[:400])
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                sess._task_journal = journal
+        except Exception:
+            pass
+        return journal
+    except Exception:
+        return None
+
+
+def _journal_append(cfg, kind: str, **data) -> None:
+    """Append one journal record, silently swallowing any failure."""
+    journal = getattr(cfg, "_task_journal", None)
+    if journal is None:
+        return
+    try:
+        journal.append(kind, **data)
+    except Exception:
+        pass
+
+
+def _journal_close(cfg) -> None:
+    """Close (append task_end) and detach the task journal, best effort."""
+    journal = getattr(cfg, "_task_journal", None)
+    if journal is not None:
+        try:
+            journal.close(status="completed")
+        except Exception:
+            pass
+    try:
+        cfg._task_journal = None
+    except Exception:
+        pass
+    try:
+        from . import session_ctx
+        sess = session_ctx.current_session()
+        if sess is not None:
+            sess._task_journal = None
+    except Exception:
+        pass
+
+
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
 _TASK_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\]\s*(.*)$")
@@ -380,10 +442,15 @@ def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
         mode = checkpoint_mode(cfg)
         title = _task_title(task).strip()[:200] or "task"
         if phase == "pre":
-            return checkpoints_mod.ensure_pre_run_checkpoint(
+            entry = checkpoints_mod.ensure_pre_run_checkpoint(
                 root, f"baseline before {title}", mode=mode)
-        return checkpoints_mod.create_checkpoint(
-            root, title, mode=mode)
+        else:
+            entry = checkpoints_mod.create_checkpoint(
+                root, title, mode=mode)
+        if isinstance(entry, dict) and entry.get("id"):
+            _journal_append(cfg, "checkpoint", checkpoint_id=str(entry["id"]),
+                            phase=phase, mode=mode)
+        return entry
     except Exception as e:
         try:
             workspace.log_event(root, f"checkpoint skipped: {e}", "WARN")
@@ -860,13 +927,21 @@ def _set_box(path: Path, task: str, box: str, notify=None) -> bool:
     a plan file the model edited mid-run still resolves. Returns False if the
     task could not be found. `notify(path, reason)`, when given, fires right
     after the file lands so a live GUI can refresh the checklist."""
-    lines = read_plan(path)
-    i = _find_unchecked(lines, task)
-    if i is None:
+    changed = [False]
+
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        i = _find_unchecked(lines, task)
+        if i is None:
+            return text
+        m = _TASK_LINE.match(lines[i])
+        lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
+        changed[0] = True
+        return "\n".join(lines)
+
+    workspace.atomic_update_text(path, updater)
+    if not changed[0]:
         return False
-    m = _TASK_LINE.match(lines[i])
-    lines[i] = f"{m.group(1)}[{box}] {m.group(3)}"
-    path.write_text("\n".join(lines), encoding="utf-8")
     if notify is not None:
         try:
             notify(path, "done" if box == "x" else "failed")
@@ -894,12 +969,20 @@ def insert_task_before(path: Path, task: str, new_title: str,
     first unchecked occurrence of ``task`` (the remediation path: the failed
     check stays unchecked and retries after the repair). Returns False when
     the anchor task is not found."""
-    lines = read_plan(path)
-    i = _find_unchecked(lines, task)
-    if i is None:
+    changed = [False]
+
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        i = _find_unchecked(lines, task)
+        if i is None:
+            return text
+        lines.insert(i, f"- [ ] {new_title}")
+        changed[0] = True
+        return "\n".join(lines)
+
+    workspace.atomic_update_text(path, updater)
+    if not changed[0]:
         return False
-    lines.insert(i, f"- [ ] {new_title}")
-    path.write_text("\n".join(lines), encoding="utf-8")
     if notify is not None:
         try:
             notify(path, "remediation")
@@ -995,7 +1078,7 @@ def write_plan(path: Path, goal: str, titles: list[str]) -> None:
         body += [f"> {ln}" if ln else ">" for ln in rest]
     body += ["", *(f"- [ ] {t}" for t in titles)]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    fileio.write_bytes(path, ("\n".join(body) + "\n").encode("utf-8"))
 
 
 def read_plan_goal(path: Path) -> str:
@@ -1098,7 +1181,7 @@ exactly one task that writes a real README.md, placed AFTER the code tasks so
 it documents what was actually built. That README must contain an Overview &
 Architecture section, a Quick Start with exact copy-pasteable commands for
 every CLI subcommand (concrete example arguments and the real flags), and a
-Running Tests section with the exact test command (e.g. `python3 -m unittest
+Running Tests section with the exact test command (e.g. `python -m unittest
 -v`). Any command-line entry point must print its help (`parser.print_help()`)
 when run with no arguments instead of crashing with a traceback."""
 
@@ -1213,19 +1296,22 @@ def order_by_dependencies(titles: list[str], deps: list[list[int]]) -> list[str]
 def replace_unchecked(path: Path, titles: list[str]) -> None:
     """Replace every still-unchecked task in a plan file with `titles`, keeping
     done/failed lines and the header (used when the planner revises the rest)."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    inserted = False
-    for ln in lines:
-        if _is_unchecked(ln):
-            if not inserted:
-                out += [f"- [ ] {t}" for t in titles]
-                inserted = True
-            continue
-        out.append(ln)
-    if not inserted:
-        out += [f"- [ ] {t}" for t in titles]
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    def updater(text: str) -> str:
+        lines = text.split("\n") if text else []
+        out: list[str] = []
+        inserted = False
+        for ln in lines:
+            if _is_unchecked(ln):
+                if not inserted:
+                    out += [f"- [ ] {t}" for t in titles]
+                    inserted = True
+                continue
+            out.append(ln)
+        if not inserted:
+            out += [f"- [ ] {t}" for t in titles]
+        return "\n".join(out) + "\n"
+
+    workspace.atomic_update_text(path, updater)
 
 
 def _titles_from(raw) -> list[str]:
@@ -1365,6 +1451,8 @@ def run_verify(root: Path, command: str, timeout: int = 600, cfg=None
     rc, out, stopped, _ = proc_mod.run(
         command, cwd=root, timeout=timeout, shell=True, max_output=200_000,
         env=safety.child_env(cfg))
+    _journal_append(cfg, "subprocess", command=command, returncode=rc,
+                    stopped=stopped)
     if stopped == "timeout":
         return False, f"(verification timed out after {timeout}s)"
     if stopped == "error":
@@ -4495,6 +4583,16 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     if images is not None:
         cfg._task_images = list(images)
     try:
+        journal = None
+        if bool(apply) and not review:
+            # A dry run / review leaves the tree byte-identical, so it must not
+            # create `.pedacito/journal/...` either.
+            journal = _journal_open(root, cfg, task)
+            if journal is not None:
+                try:
+                    cfg._task_journal = journal
+                except Exception:
+                    pass
         if _cancel_requested(cfg, client):
             _emit_run_cancelled(root, cfg, "task", task=(task or "")[:200])
             raise CancelledError("Stopped by user; no further work was done.")
@@ -4632,6 +4730,10 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
         _finish_capture(tr)
         return tr
     finally:
+        # Record the terminal journal entry before the deadline is cleared, so
+        # a task that ends (or crashes into this finally) is never left as an
+        # incomplete task for crash recovery.
+        _journal_close(cfg)
         # The task's wall-clock budget is over: clear the deadline so the next
         # task's (or a post-task summary refresh's) requests are not clamped
         # by a stale deadline.
@@ -5268,6 +5370,11 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
               + f", {stats['seconds']:.0f}s]", file=sys.stderr)
     _fire(cfg, root, "post_task", task=task[:300], applied=applied,
           files=changed, ok=ok_n, failed=len(results) - ok_n)
+    _journal_append(cfg, "step", steps=len(steps_log),
+                    title=_task_title(task)[:200])
+    if changed:
+        _journal_append(cfg, "edit", files=changed[:200])
+    _journal_append(cfg, "model_call", calls=int(stats.get("calls") or 0))
     return TaskResult(results, reply, applied, changed, idx, session,
                       steps_log, fabricated=fabricated_only,
                       backup_dir=backup_dir,

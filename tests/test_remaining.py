@@ -414,7 +414,9 @@ def test_run_lock_blocks_a_live_holder_and_takes_over_a_stale_one(tmp_path):
         sleeper.kill()
         sleeper.wait()
     workspace.acquire_lock(tmp_path)            # holder is dead: taken over
-    assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
+    import json as _json
+    data = _json.loads(lock.read_text(encoding="utf-8"))
+    assert data["pid"] == os.getpid()
     workspace.release_lock(tmp_path)
     assert not lock.exists()
 
@@ -569,6 +571,12 @@ def test_sandbox_really_blocks_writes_when_a_backend_works(tmp_path):
     cfg = Config()
     if sandbox.status(cfg)[0] != "active":
         pytest.skip("no working sandbox backend on this machine")
+    if sandbox.backend_name() == "win_restricted":
+        # The Windows sandbox is applied inside proc.run (Job Object +
+        # restricted token / Low Integrity), not as an argv prefix, so a bare
+        # subprocess.run of the wrapped argv never sees it. Its write block is
+        # exercised live in test_sandbox_windows.py instead.
+        pytest.skip("win_restricted sandbox is applied via proc.run, not argv")
     # The parent of tmp_path is allowed on macOS (/private/var/folders), so
     # aim at the home directory: both backends deny writes outside the root.
     outside = Path.home() / f".pedacito-sandbox-escape-{os.getpid()}.txt"

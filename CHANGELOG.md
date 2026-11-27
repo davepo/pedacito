@@ -2,6 +2,54 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
+## v0.4.0 — 2026-11-26
+
+### Session Foundation, Isolation Contract, Sandbox, Daemon and Parallel Subagents
+
+- **Session isolation (D1–D15).** Every session owns a `SessionContext` with its own
+  config clone, index, client, event bus, permission broker, budget ledger, policy,
+  review queue, resource registry, run telemetry and tool caches. Context propagates
+  through `use_session`, `spawn_thread_with_context` and `ContextThreadPoolExecutor`,
+  so concurrent sessions in one process share no runtime state. The v0.4.0 acceptance
+  gates (`tests/test_v040_acceptance_gates.py`) prove it end to end: sessions never see
+  each other's events, prompts or decisions.
+- **Model leases.** `ModelLeaseManager` queues a second local model behind an active
+  lease rather than evicting it. `exclusive` leases (calibration) drain active work
+  first and never preempt it. Hosted endpoints bypass the pool.
+- **Project state safety.** `ProjectLockManager` refuses a second writer with
+  `ProjectBusy`. `atomic_update_json` loses no concurrent updates. `reset` and `prune`
+  refuse while a session or daemon session is active.
+- **Write-ahead task journal.** `TaskJournal` records every task step durably. After a
+  crash, `find_incomplete_tasks` and `rollback_incomplete_task` recover the work, and a
+  stale `run.lock` is taken over.
+- **Worktree safety.** A dirty tree is refused by default, or carried over or stashed
+  with `dirty_policy`. A failed creation or a cancelled session leaves no stale worktree.
+- **Policy engine.** `PolicyEngine` resolves each capability against `permission_mode`
+  (`plan`, `ask`, `accept-edits`, `workspace-write`, `danger`) and `approval_policy`
+  (`ask`, `never`, `auto-safe`). A project's `.pedacito/policy.toml` applies only when
+  the project is trusted, and it can only narrow. A subagent's `child_policy()` only
+  intersects with its parent.
+- **Windows OS sandbox (`win_restricted`).** Commands run inside a Job Object with a
+  restricted Low-integrity token. Backend probing reports `unavailable` honestly. The
+  unattended hard gate (D14) refuses unattended `workspace-write`, `danger`, background
+  and `never`-approval runs that have no active sandbox, with `SandboxRefused`.
+- **Sensitive-artifact hygiene (D10).** `.env`, keys, certificates and credential files
+  never reach checkpoints, ratchet snapshots, backups, dry-run mirrors or review pages.
+  The two-phase and interleaved engines refuse the same writes. Embedded tokens are
+  redacted in review HTML and rows.
+- **Cancellation cascade (D13).** Cancelling a session stops its child processes, denies
+  its prompts, releases its lease and tears down its own resources only.
+- **Loopback daemon.** `pedacito daemon` runs a token-authenticated, loopback-only HTTP
+  and SSE service. Each route is scoped to one session, with `/v1/sessions/<id>/events`
+  replay, prompt, cancel, permission and review endpoints.
+- **Bounded parallel subagents.** `subagent_max_parallel` (default 3) caps concurrent
+  subagents. Each runs in its own context, and read-only roles are forced into `plan`.
+- **Package manifest.** `pedacito-package.toml` declares an extension, skill, command set
+  or model pack, with its kind, requested capabilities and minimum Pedacito version.
+- **Protocol 0.4.0.** `rpc` and the daemon report protocol version `0.4.0`.
+- **How index.** `pedacito how "permission mode"` and `pedacito how --lang es "política"`
+  resolve to the permission and approval settings.
+
 ## v0.3.3 — 2026-11-25
 
 ### Guided Git, ACP Bridge, Rich TUI, and Hardened Local Networking

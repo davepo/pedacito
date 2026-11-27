@@ -788,6 +788,60 @@ allow_image_gen = true       # expose the generate_image agent action
   probe instead of the text probes; the GUI's **Probe image** button does the
   same. See the [Model guide](../MODEL_GUIDE.md#image-models-modality--image).
 
+## Unified policy & capability sandbox (`permission_mode`, `approval_policy`, `policy_file`)
+
+Every capability decision — `run`, `write`, `delete`, hooks, MCP, network, and
+subagent inheritance — funnels through one policy engine (`pedacito/policy.py`).
+Two keys set the default stance, and a per-project policy file can tighten it:
+
+| Setting | Values | Default | Meaning |
+|---|---|---|---|
+| `permission_mode` | `"plan"` \| `"ask"` \| `"accept-edits"` \| `"workspace-write"` \| `"danger"` | `"ask"` | The five-mode capability matrix. `plan` is read-only (reads + read-only subagents only); `ask` prompts for every mutation/execution; `accept-edits` auto-approves workspace writes/edits but still asks to run; `workspace-write` adds sandboxed `run` and configured hooks/subagents; `danger` allows everything the deny rules, safe-path and budget guards still permit. |
+| `approval_policy` | `"ask"` \| `"never"` \| `"auto-safe"` | `"ask"` | How an `ask` verdict resolves: ask the human, refuse (unattended-safe), or auto-approve known safe read-only/test commands (`pytest`, `ruff`, `git status`, `git diff`, or a trusted `[commands].allow`). |
+| `policy_file` | a path | `.pedacito/policy.toml` | The trust-gated capability policy file. Its `[policy]`, `[paths]`, `[commands]`, `[network]`, `[mcp]` and `[budget]` rules apply only after `pedacito trust`; an untrusted file can never widen permissions. |
+| `daemon_port` | integer | `0` | Loopback port for the optional background daemon; `0` lets the OS choose an ephemeral one. |
+| `daemon_auto_start` | bool | false | Auto-start the background daemon for a run. An execution switch: a project config cannot turn it on until `pedacito trust`. |
+| `subagent_max_parallel` | integer | `3` | Cap on subagents that may run in parallel. |
+
+The five modes are a strict lattice: `plan` ⊂ `ask` ⊂ `accept-edits` ⊂
+`workspace-write` ⊂ `danger`, and a subagent can only ever *intersect* (never
+widen) its parent's capabilities. `approval_policy = "never"` converts every
+`ask` into a `deny`, so a background or headless run can never be upgraded
+without a human. On Windows, `workspace-write`/`danger` command execution is a
+**hard gate**: it runs under the built-in Job Object + restricted-token
+(Low Integrity) sandbox, and `sandbox_strict` (or `approval_policy = "never"`
+with `sandbox` on) refuses it outright when no OS sandbox is active.
+
+A `.pedacito/policy.toml` looks like:
+
+```toml
+[policy]
+permission_mode = "ask"               # plan | ask | accept-edits | workspace-write | danger
+approval_policy = "ask"               # ask | never | auto-safe
+subagent_inheritance = "narrow_only"  # narrow_only | inherit_readonly
+
+[paths]
+allow = ["src/**", "tests/**"]
+deny = [".env*", "**/*.pem", "secrets/**"]
+
+[commands]
+allow = ["pytest *", "ruff *"]
+deny = ["git push*", "rm -rf *", "curl *"]
+
+[network]
+allow_domains = ["127.0.0.1", "localhost"]
+deny_domains = ["*"]
+
+[mcp]
+allow_servers = []
+deny_servers = ["*"]
+
+[budget]
+max_cost_usd = 0.0
+max_tokens = 0
+max_steps = 0
+```
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito

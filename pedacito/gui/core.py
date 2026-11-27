@@ -13,6 +13,7 @@ and terminal text are also kept here, so a reloaded page rebuilds itself from
 
 from __future__ import annotations
 
+import copy
 import json
 import queue
 import re
@@ -30,7 +31,7 @@ from .. import config as config_mod
 from .. import fileio
 from .. import i18n
 from .. import review as review_mod
-from .. import security, themes as themes_mod, workspace
+from .. import safety, security, session_ctx, themes as themes_mod, workspace
 from .. import update as update_mod
 from ..config import USER_CONFIG
 from ..events import cache_hit_ratio
@@ -387,15 +388,23 @@ def before_text(fd) -> str:
 
 
 def pack_rows(rows) -> list:
-    """Compact JSON form of diff rows for the browser."""
+    """Compact JSON form of diff rows for the browser.
+
+    Displayed line text passes through `safety.redact`, so an accidental
+    embedded token (`sk-...`, `ghp_...`, `AKIA...`) never reaches the JSON
+    preview payload. The FileDiff's before/after text is left intact for the
+    real write."""
     out = []
     for r in rows:
         if r.kind == "skip":
             out.append(["skip", r.hidden, r.fold])
         else:
-            out.append([r.kind, r.a_no, r.a, r.b_no, r.b,
-                        [list(s) for s in r.a_spans],
-                        [list(s) for s in r.b_spans], r.fold,
+            a = safety.redact(r.a)
+            b = safety.redact(r.b)
+            a_spans = [list(s) for s in r.a_spans] if a == r.a else []
+            b_spans = [list(s) for s in r.b_spans] if b == r.b else []
+            out.append([r.kind, r.a_no, a, r.b_no, b,
+                        a_spans, b_spans, r.fold,
                         getattr(r, "hunk", -1)])
     return out
 
@@ -408,6 +417,75 @@ def pack_hunks(hunks) -> list:
              "added": h.added, "removed": h.removed, "rows": list(h.rows),
              "clauses": list(getattr(h, "clauses", ()))}
             for h in (hunks or [])]
+
+
+def staged_review_meta(staged) -> dict:
+    """JSON-safe summary for a per-session `review.StagedReview`."""
+    return {
+        "id": staged.review_id,
+        "review_id": staged.review_id,
+        "session_id": staged.session_id,
+        "task": safety.redact(staged.task),
+        "outcome": staged.outcome,
+        "detail": staged.detail,
+        "partial_ok": staged.partial_ok,
+        "pending": not staged.outcome,
+        "clause_texts": {k: safety.redact(v)
+                         for k, v in (staged.clause_texts or {}).items()},
+        "unaccepted": list(staged.unaccepted),
+        "accepted_hunks": dict(staged.accepted_hunks or {}),
+        "files": [{
+            "rel": d.rel,
+            "added": d.added,
+            "removed": d.removed,
+            "message": safety.redact(d.message),
+            "source": d.removed_source,
+            "renames_from": list(d.renames_from),
+            "edited": d.rel in staged.edits,
+            "clauses": list(getattr(d, "clauses", ())),
+            "hunks": pack_hunks(getattr(d, "hunks", ())),
+            "accepted_hunks": (
+                list(d.hunk_selection)
+                if getattr(d, "hunk_selection", None) is not None else None),
+        } for d in staged.diffs],
+    }
+
+
+def staged_review_file(staged, rel: str) -> dict | None:
+    """One staged review's rows for `/api/review/file`."""
+    for fd in staged.diffs:
+        if fd.rel == rel:
+            return {
+                "rel": fd.rel,
+                "rows": pack_rows(fd.rows),
+                "after": staged.edits.get(rel, fd.after_text),
+                "added": fd.added,
+                "removed": fd.removed,
+                "message": safety.redact(fd.message),
+                "hunks": pack_hunks(getattr(fd, "hunks", ())),
+            }
+    return None
+
+
+def staged_review_rediff(staged, rel: str, text: str) -> dict | None:
+    """Hand-edit one staged file and return its diff against the original."""
+    if staged.outcome or not staged.partial_ok:
+        return None
+    fd = next((d for d in staged.diffs if d.rel == rel), None)
+    if fd is None or fd.removed_source:
+        return None
+    before = before_text(fd)
+    text = str(text or "").replace("\r\n", "\n")
+    rows, added, removed, hunks = review_mod.build_diff(before, text)
+    fd.rows, fd.added, fd.removed = rows, added, removed
+    fd.after_text = text
+    fd.hunks = hunks
+    fd.hunk_selection = None
+    staged.edits[rel] = text
+    return {"rel": rel, "rows": pack_rows(rows), "after": text,
+            "added": added, "removed": removed,
+            "message": safety.redact(fd.message),
+            "hunks": pack_hunks(hunks)}
 
 
 def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
@@ -477,10 +555,19 @@ def profile_catalog(cfg, calibration: dict | None = None) -> list[dict]:
     return out
 
 
-class State:
-    """Everything held between HTTP requests (one active project)."""
+DEFAULT_SESSION_ID = "gui-default"
 
-    def __init__(self):
+
+class State:
+    """Everything held between HTTP requests (one active session/project)."""
+
+    def __init__(
+        self,
+        session_id: str = DEFAULT_SESSION_ID,
+        *,
+        load_global_threads: bool = True,
+    ):
+        self.session_id = str(session_id or DEFAULT_SESSION_ID)
         self.lock = threading.RLock()
         self.bus = Bus()
         self.root: Path | None = None
@@ -541,11 +628,20 @@ class State:
         self.thread_id = ""
         self._thread_io = threading.Lock()
         self._last_thread_save = 0.0
-        self._load_threads()
+        if load_global_threads:
+            self._load_threads()
+        else:
+            rec = self._new_thread_locked()
+            self.threads[rec["id"]] = rec
+            self._attach_thread(rec)
 
         self.review: Review | None = None
         self._rid = 0
         self.apply_lock = threading.Lock()
+        # D9: every GUI session owns a review queue; /api/review* can route by
+        # (session_id, review_id) while the legacy `review`/int-id flow keeps
+        # working unchanged.
+        self.review_queue = review_mod.ReviewQueue(self.session_id)
 
         # Live Permission Broker: a gated tool call (web fetch,
         # pip install, unapproved shell command, sensitive file read) parks
@@ -554,7 +650,7 @@ class State:
         # clean denial. `_perm_slots` maps request id -> waiter;
         # `pending_permission` is the modal's payload (the oldest waiter).
         self.pending_permission: dict | None = None
-        self._perm_slots: dict[str, dict] = {}
+        self._perm_slots: dict[tuple[str, str], dict] = {}
         self._perm_seq = 0
         # "Allow for Run" grants, cleared when a new job claims the slot.
         self.run_allow: set[tuple[str, str]] = set()
@@ -1605,7 +1701,7 @@ class State:
                 return True, ""
             self._perm_seq += 1
             pid = f"perm-{self._perm_seq}"
-            req = {"id": pid, "category": category,
+            req = {"id": pid, "session_id": self.session_id, "category": category,
                    "action_summary": str(info.get("action_summary") or ""),
                    "detail": str(info.get("detail") or ""),
                    "risk_level": str(info.get("risk_level") or "medium"),
@@ -1615,7 +1711,8 @@ class State:
                    "project_root": str(info.get("project_root") or ""),
                    "key": key, "created_at": time.time()}
             slot = {"event": threading.Event(), "decision": "", "req": req}
-            self._perm_slots[pid] = slot
+            slot_key = (self.session_id, pid)
+            self._perm_slots[slot_key] = slot
             self._refresh_pending_locked()
             job = self.job
         self.bus.publish("permission", request=dict(req))
@@ -1628,7 +1725,7 @@ class State:
                 break
         decision = slot["decision"]
         with self.lock:
-            self._perm_slots.pop(pid, None)
+            self._perm_slots.pop(slot_key, None)
             self._refresh_pending_locked()
         if decision == "allow_once":
             self.bus.publish("status")
@@ -1672,15 +1769,20 @@ class State:
                                   }.get(category)
         with self.lock:
             cfg = self.cfg
-        if cfg is not None and setting:
-            try:
-                setattr(cfg, setting, True)
-                if category == security.CAT_WEB and key:
-                    hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
-                    if "*" not in hosts and key not in hosts:
-                        cfg.fetch_allowed_hosts = tuple(hosts) + (key,)
-            except (TypeError, AttributeError):
-                pass
+        targets = [cfg] if cfg is not None else []
+        sess = session_ctx.current_session()
+        if sess is not None and sess.cfg is not None and sess.cfg is not cfg:
+            targets.append(sess.cfg)
+        for target_cfg in targets:
+            if setting:
+                try:
+                    setattr(target_cfg, setting, True)
+                    if category == security.CAT_WEB and key:
+                        hosts = tuple(getattr(target_cfg, "fetch_allowed_hosts", ()) or ())
+                        if "*" not in hosts and key not in hosts:
+                            target_cfg.fetch_allowed_hosts = tuple(hosts) + (key,)
+                except (TypeError, AttributeError):
+                    pass
         changes = {setting: True} if setting else {}
         if category == security.CAT_WEB and key and cfg is not None:
             hosts = tuple(getattr(cfg, "fetch_allowed_hosts", ()) or ())
@@ -1706,19 +1808,23 @@ class State:
         if not pattern or not root:
             return
         key = security.normalize_project_root(root)
+        sess = session_ctx.current_session()
         with self.lock:
-            cfg = self.cfg
-            if cfg is not None and key:
-                mapping: dict = {}
-                for k, v in (getattr(cfg, "shell_allowlist_by_project",
-                                     None) or {}).items():
-                    nk = security.normalize_project_root(k)
-                    if nk:
-                        mapping[nk] = tuple(v or ())
-                pats = mapping.get(key, ())
-                if pattern not in pats:
-                    mapping[key] = pats + (pattern,)
-                cfg.shell_allowlist_by_project = mapping
+            targets = [self.cfg] if self.cfg is not None else []
+            if sess is not None and sess.cfg is not None and sess.cfg is not self.cfg:
+                targets.append(sess.cfg)
+            for cfg in targets:
+                if key:
+                    mapping: dict = {}
+                    for k, v in (getattr(cfg, "shell_allowlist_by_project",
+                                         None) or {}).items():
+                        nk = security.normalize_project_root(k)
+                        if nk:
+                            mapping[nk] = tuple(v or ())
+                    pats = mapping.get(key, ())
+                    if pattern not in pats:
+                        mapping[key] = pats + (pattern,)
+                    cfg.shell_allowlist_by_project = mapping
             self.session_allow.add((str(req.get("category") or ""),
                                     str(req.get("key") or "")))
         try:                                    # best effort: in-memory wins
@@ -1726,17 +1832,27 @@ class State:
         except Exception:
             pass
 
-    def decide_permission(self, pid: str, decision: str) -> tuple[bool, str]:
+    def decide_permission(
+        self, pid: str, decision: str, *, session_id: str | None = None
+    ) -> tuple[bool, str]:
         """Answer a pending request from the browser. Returns (ok, detail)."""
+        if session_id is not None and str(session_id) != self.session_id:
+            return False, "session mismatch"
+        slot_key = (self.session_id, str(pid))
         with self.lock:
-            slot = self._perm_slots.get(pid)
+            slot = self._perm_slots.get(slot_key)
             if slot is None:
                 return False, "This permission request is no longer pending."
             slot["decision"] = decision
-            self._perm_slots.pop(pid, None)
+            self._perm_slots.pop(slot_key, None)
             self._refresh_pending_locked()
         slot["event"].set()
-        self.bus.publish("permission_decided", id=pid, decision=decision)
+        self.bus.publish(
+            "permission_decided",
+            id=pid,
+            session_id=self.session_id,
+            decision=decision,
+        )
         self.bus.publish("status")
         return True, ""
 
@@ -1805,6 +1921,11 @@ class State:
         # so": if the review became visible first, `/api/state` could return
         # the card without the "Staged changes..." line (the two are read by
         # separate calls in the state handler).
+        rv_args = dict(rv_args or {})
+        # D10: secret/credential files never reach the review page, the JSON
+        # preview or the write step.
+        rv_args["diffs"] = review_mod.filter_sensitive_diffs(
+            rv_args.get("diffs") or [])
         with self.lock:
             self._rid += 1
             rv = Review(self._rid, **rv_args)
@@ -2060,6 +2181,13 @@ class State:
                     extra["hunks_total"] = total_h
         self.set_message(rv.mid, **extra)
         rv.done.set()
+        # Keep the per-session queue mirror consistent when the legacy int-id
+        # flow made the decision (no second write: the queue only records it).
+        attached = getattr(rv, "queue_review", None)
+        if attached is not None and not attached.outcome:
+            attached.outcome = outcome
+            attached.detail = detail
+            attached.done.set()
         self.bus.publish("review_done", id=rv.id, outcome=outcome)
 
     # --- snapshots for the browser ---------------------------------------------
@@ -2182,6 +2310,7 @@ class State:
                     profile_models[name] = str(model or cfg.model or "")
             no_project = self.root is None
             return {
+                "session_id": self.session_id,
                 "root": str(self.root) if self.root else "",
                 "profile": cfg.active_profile if cfg else "",
                 "profiles": sorted(cfg.profiles) if cfg else [],
@@ -2372,7 +2501,113 @@ class State:
                           for d in rv.diffs]}
 
 
-STATE = State()
+class SessionRegistry:
+    """Registry of per-session GUI `State` instances, keyed by `session_id`."""
+
+    def __init__(self, default_id: str = DEFAULT_SESSION_ID) -> None:
+        self._lock = threading.RLock()
+        self._default_id = str(default_id or DEFAULT_SESSION_ID)
+        self._states: dict[str, State] = {
+            self._default_id: State(session_id=self._default_id)
+        }
+
+    @property
+    def default_id(self) -> str:
+        return self._default_id
+
+    def default(self) -> State:
+        with self._lock:
+            st = self._states.get(self._default_id)
+            if st is None:
+                st = State(session_id=self._default_id)
+                self._states[self._default_id] = st
+            return st
+
+    def get(
+        self, session_id: str | None = None, *, create: bool = False
+    ) -> State | None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return self.default()
+        with self._lock:
+            st = self._states.get(sid)
+            if st is None and create:
+                st = State(
+                    session_id=sid,
+                    load_global_threads=(sid == self._default_id),
+                )
+                self._states[sid] = st
+            return st
+
+    def get_or_create(self, session_id: str) -> State:
+        st = self.get(session_id, create=True)
+        assert st is not None
+        return st
+
+    def resolve(self, session_id: str | None = None) -> State:
+        """Resolve explicit `session_id`, else active `SessionContext`, else
+        the default GUI session."""
+        if session_id:
+            st = self.get(session_id, create=False)
+            return st if st is not None else self.default()
+        sess = session_ctx.current_session()
+        if sess is not None and sess.session_id:
+            return self.get_or_create(sess.session_id)
+        return self.default()
+
+    def remove(self, session_id: str) -> State | None:
+        sid = str(session_id or "").strip()
+        if not sid or sid == self._default_id:
+            return None
+        with self._lock:
+            st = self._states.pop(sid, None)
+        if st is not None:
+            st.deny_all_permissions("session removed")
+            st.bus.close()
+        return st
+
+    def list_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._states)
+
+
+class StateProxy:
+    """Backwards-compatible proxy for `STATE` backed by `SessionRegistry`.
+
+    Resolves `current_session()`'s GUI `State` first and falls back to the
+    default GUI session. Using `__slots__` lets `vars(STATE)`,
+    `pytest.monkeypatch.setattr(core.STATE, ...)`, and `core.STATE.__init__()`
+    operate transparently on the resolved `State`.
+    """
+
+    __slots__ = ("_registry",)
+
+    def __init__(self, registry: SessionRegistry | None = None) -> None:
+        if registry is not None:
+            object.__setattr__(self, "_registry", registry)
+            return
+        state = self._resolve()
+        sid = getattr(state, "session_id", DEFAULT_SESSION_ID)
+        state.__init__(session_id=sid)
+
+    def _resolve(self) -> State:
+        return object.__getattribute__(self, "_registry").resolve()
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        setattr(self._resolve(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._resolve(), name)
+
+    def __repr__(self) -> str:
+        return f"<StateProxy session_id={self._resolve().session_id!r}>"
+
+
+REGISTRY = SessionRegistry()
+STATE = StateProxy(REGISTRY)
 
 
 def install_runner() -> None:
@@ -2385,6 +2620,23 @@ def install_runner() -> None:
             "task": task, "diffs": diffs, "writer": writer,
             "on_discard": on_discard, "partial_ok": on_discard is None,
             "clause_texts": clause_texts})
+        # D9: mirror the review into this session's ReviewQueue so the
+        # /api/review* routes can address it by (session_id, review_id) while
+        # the legacy `STATE.review` int-id flow keeps working.
+        try:
+            state = STATE._resolve() if hasattr(STATE, "_resolve") else STATE
+            staged = state.review_queue.stage(
+                task=task, diffs=copy.deepcopy(rv.diffs), writer=(
+                    lambda *, files=None, accepted_hunks=None:
+                    state.decide_review(rv.id, "apply", files,
+                                        accepted_hunks=accepted_hunks)),
+                on_discard=lambda: state.decide_review(
+                    rv.id, "reject", None),
+                partial_ok=rv.partial_ok,
+                clause_texts=clause_texts, ttl_s=timeout)
+            rv.queue_review = staged
+        except Exception:
+            pass                    # the legacy review path still works
         job = STATE.job
         deadline = time.time() + float(timeout or 1800)
         while not rv.done.wait(0.5):
@@ -2418,6 +2670,10 @@ def uninstall_runner() -> None:
     review_mod.RUNNER = None
 
 
+def _gui_permission_hook(info: dict) -> tuple[bool, str]:
+    return STATE.request_permission(info)
+
+
 def install_permission_broker() -> None:
     """Route gated tool calls (web fetch, package install, unapproved shell
     command, sensitive file read) into the page: the worker thread parks in
@@ -2425,7 +2681,7 @@ def install_permission_broker() -> None:
     the review runner while the GUI server serves; the CLI never installs a
     hook, so headless runs keep their historical "disabled in config"
     errors instead of waiting on a human who is not there."""
-    security.install_permission_hook(STATE.request_permission)
+    security.install_permission_hook(_gui_permission_hook)
 
 
 def uninstall_permission_broker() -> None:
@@ -2435,11 +2691,17 @@ def uninstall_permission_broker() -> None:
     STATE.deny_all_permissions("server shutting down")
 
 
+def _tee_write(text: str) -> None:
+    """Route captured stdout/stderr to the active session's terminal buffer."""
+    STATE.term_write(text)
+
+
 def install_tee() -> tuple:
-    """Mirror stdout/stderr into the terminal pane; returns the originals."""
+    """Mirror stdout/stderr into the active session's terminal pane; returns
+    the originals."""
     orig = (sys.stdout, sys.stderr)
-    sys.stdout = Tee(orig[0], STATE.term_write)
-    sys.stderr = Tee(orig[1], STATE.term_write)
+    sys.stdout = Tee(orig[0], _tee_write)
+    sys.stderr = Tee(orig[1], _tee_write)
     return orig
 
 

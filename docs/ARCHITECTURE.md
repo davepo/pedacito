@@ -956,6 +956,112 @@ backups and event files and trims `log.txt`.
   and the recommendations title are looked up through `i18n.t`, so
   `pedacito --lang es profiles` prints Spanish labels. English stays the default.
 
+## v0.4.0 session isolation, daemon and parallel subagents
+
+v0.4.0 lets several sessions run in one process, or behind `pedacito daemon`,
+without sharing runtime state. The contract below is the set of rules that the
+acceptance gates in `tests/test_v040_acceptance_gates.py` prove end to end.
+
+### The Session Isolation Contract
+
+| ID | Rule | Where it lives |
+|---|---|---|
+| D5 | Local model servers are shared through leases, never evicted under a live session | `leases.py` |
+| D6 / D15 | Project state is guarded by a lock, and maintenance waits for live sessions and daemons | `workspace.py` |
+| D7 | Every task writes a durable write-ahead journal that survives a crash | `journal.py` |
+| D8 | A session that uses a worktree gets its own branch and directory; a dirty tree is refused, carried or stashed, never silently mixed | `worktree.py` |
+| D9 | Review routing and the review queue belong to one session | `review.py`, `session_ctx.py` |
+| D10 | Sensitive artifacts never reach checkpoints, ratchet, backups, mirrors or review | `security.py`, `edits.py`, `workspace_overlay.py` |
+| D11-D12 | The session protocol carries its version and per-session features | `rpc.py`, `daemon.py` |
+| D13 | Cancelling a session runs one deterministic cascade over its own resources only | `resources.py`, `session_ctx.py` |
+| D14 | Unattended execution runs inside an OS sandbox or is refused | `sandbox.py`, `sandbox_win.py` |
+
+Two numbering notes. The D-numbers are the work-package labels used in the code
+and tests; a few numbers (D1-D4) are used by other test areas for unrelated
+work and are not part of this contract. The gate suite is the executable
+definition of the contract.
+
+### SessionContext and context propagation
+
+A `SessionContext` (`session_ctx.py`) owns everything a session mutates: its
+`cfg` clone, `idx`, `client`, `event_bus`, `permission_broker`, `model_lease`,
+`budget_ledger`, `worktree`, `policy`, `review_queue`, `resource_registry`,
+`run_telemetry`, and the `tool_caches` namespaces. The active context is a
+`contextvars` value. `use_session(ctx)` binds it for a block,
+`spawn_thread_with_context(...)` starts a thread with a copy of the caller's
+context, and `ContextThreadPoolExecutor` copies the context on every `submit`.
+Threads started from a session therefore see that session and no other, and
+concurrent tasks never race on one another's budget, telemetry or cache.
+
+### Events, permissions and the daemon
+
+`SessionEventBus` (`events.py`) is a per-session, monotonic stream with
+bounded `replay(after_seq)`. Every envelope carries its `session_id` and `seq`.
+Events are also written to the root's JSONL log under
+`<root>/.pedacito/events/`, tagged the same way. `SessionPermissionBroker`
+(`security.py`) keys pending prompts by `(session_id, request_id)`: a decision
+for another session is refused with `session mismatch`. A non-interactive or
+`approval_policy = "never"` prompt is denied at once and emits a
+`permission_decision` event.
+
+`DaemonServer` (`daemon.py`) is a loopback-only HTTP/SSE service that owns
+isolated `WorkspaceSession`s. Each route is scoped to one session id:
+`/v1/sessions/<id>/events`, `/prompt`, `/cancel`, `/permission` and `/review`.
+Every request needs the per-run bearer token. The daemon's `quiesce` hook makes
+`check_maintenance_safe` refuse `reset` and `prune` while a daemon session is
+active.
+
+### ModelLeaseManager
+
+Local models are a shared, expensive resource. `ModelLeaseManager` (`leases.py`)
+grants a lease per `(server, model)`. A lease marks its model as in use:
+`can_evict()` is False while any lease is held, and `servers.evict_other_local_servers()`
+skips leased models, so a session's model is never unloaded under it. A session that needs a different local model queues. An
+`exclusive=True` lease (for example `calibrate`, at `LeasePriority.EXCLUSIVE`)
+drains active leases first and then runs, without preempting a session that is
+already running. Hosted endpoints bypass the pool.
+
+### ProjectLockManager and maintenance
+
+`ProjectLockManager` (`workspace.py`) holds one writer per project root. A second
+exclusive claim from another session raises `ProjectBusy`, and shared claims
+coexist. `atomic_update_json` performs read-modify-write under a file lock, so
+concurrent updates are not lost. `check_maintenance_safe(root, action=...)`
+returns `(False, reason)` while a registered quiesce hook reports active sessions
+or the run lock is held, and `force=True` is the only override.
+
+### TaskJournal (WAL)
+
+`TaskJournal` (`journal.py`) appends one JSON line per step and fsyncs it by
+default. A torn trailing line is ignored. `find_incomplete_tasks` lists tasks that
+started but never ended, and `rollback_incomplete_task` records the rollback.
+A stale `run.lock` left by a dead process is taken over by `acquire_lock`.
+
+### SessionResourceRegistry and cancellation
+
+Anything a session starts registers a cleanup with its `SessionResourceRegistry`
+(`resources.py`): dev servers, LSP and MCP clients, temporary mirrors, ephemeral
+worktrees and review servers. `SessionContext.cancel()` denies pending prompts,
+releases the model lease, runs `teardown_all` in reverse order, and wakes any
+review the session is waiting on. Only that session's resources are touched. A
+`proc.run` child is stopped through the session's cancel event, and its process
+tree is reaped before the cancel returns.
+
+### Bounded parallel subagents
+
+`subagent_max_parallel` (default 3) caps how many subagents run at once. They run
+on a `ContextThreadPoolExecutor`, so each one has its own context. A child is
+given a `PolicyEngine.child_policy(role=...)` that can only intersect with its
+parent. Read-only roles (`explore`, `verifier`) are forced into `plan` mode.
+
+### Package manifests
+
+An extension, skill, command set or model pack declares itself in a
+`pedacito-package.toml` at its root: its `kind`, the `capabilities` it asks for
+and the minimum Pedacito version it needs. `pkg_manifest.py` validates the file,
+and a person reviews it before anything in the package runs. See
+[SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md#package-manifests-pedacito-packagetoml).
+
 ## Known limits
 
 These are the real boundaries. Missing harness features are not on this list:

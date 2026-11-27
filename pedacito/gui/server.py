@@ -38,7 +38,8 @@ from ..config import ConfigError
 from ..local_server import LocalHTTPServer
 from ..select import Matcher, is_venv_dir, suggest_context
 from . import jobs, settings_api
-from .core import (STATE, install_permission_broker, install_runner,
+from . import core as gui_core
+from .core import (REGISTRY, STATE, install_permission_broker, install_runner,
                    install_tee, uninstall_permission_broker,
                    uninstall_runner, uninstall_tee)
 
@@ -292,6 +293,9 @@ def plan_payload() -> dict:
 
 GET_ROUTES: dict = {}
 POST_ROUTES: dict = {}
+# A malformed JSON body is refused (400) on these routes instead of being
+# treated as an empty request that could still write or decide something.
+_STRICT_JSON_ROUTES = {"/api/settings/set", "/api/review/decide"}
 
 
 def get(path):
@@ -380,6 +384,13 @@ def _update_run(q, body=None):
                          "detail": "An upgrade is already running."}
         STATE.update_run["running"] = True
         info = STATE.update
+    root = _effective_root()
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="update", force=bool((body or {}).get("force")))
+    if not ok:
+        with STATE.lock:
+            STATE.update_run["running"] = False
+        return 409, {"ok": False, "detail": reason}
     started_worker = False
     try:
         if not update_mod.updates_enabled(cfg):
@@ -837,6 +848,10 @@ def _checkpoints_restore(q, body):
         files = [body.get("file")]
     if isinstance(files, str):
         files = [files]
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="restore", force=bool(body.get("force")))
+    if not ok:
+        return 409, {"ok": False, "detail": reason}
     try:
         workspace.acquire_lock(root)
     except workspace.ProjectBusy as e:
@@ -1132,16 +1147,71 @@ def _fs(q, body=None):
 
 @get("/api/review")
 def _review(q, body=None):
+    sid, rid = _review_params(q)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            if rid:
+                return 404, {"ok": False,
+                             "detail": f"unknown review {rid!r}"}
+            target = REGISTRY.get(sid, create=False) if sid else REGISTRY.resolve()
+            return 200, {"review": target.review_meta() if target else None}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        return 200, {"review": gui_core.staged_review_meta(staged)}
     return 200, {"review": STATE.review_meta()}
+
+
+def _review_params(q, body=None):
+    """Optional `(session_id, review_id)` from a JSON body or query string."""
+    body = body or {}
+    sid = str(body.get("session_id")
+              or (q.get("session_id") or [""])[0] or "").strip()
+    rid = str(body.get("review_id")
+              or (q.get("review_id") or [""])[0] or "").strip()
+    if not rid:
+        raw = body.get("id") if body else (q.get("id") or [""])[0]
+        if isinstance(raw, str) and raw.startswith("rev_"):
+            rid = raw.strip()
+    return sid, rid
+
+
+def _review_queue_for(session_id):
+    if session_id:
+        target = REGISTRY.get(session_id, create=False)
+        return getattr(target, "review_queue", None) if target else None
+    target = REGISTRY.resolve()
+    return getattr(target, "review_queue", None)
+
+
+def _staged_for(queue, review_id):
+    if queue is None:
+        return None
+    if review_id:
+        return queue.get(review_id)
+    pending = queue.pending_reviews()
+    return pending[-1] if pending else None
 
 
 @get("/api/review/file")
 def _review_file(q, body=None):
+    sid, rid = _review_params(q)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            return 404, {"ok": False, "detail": "no such review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        out = gui_core.staged_review_file(staged, q.get("rel", [""])[0])
+        return (200, out) if out else (404, {"ok": False,
+                                             "detail": "no such file"})
     try:
-        rid = int(q.get("id", ["0"])[0])
+        rid_int = int(q.get("id", ["0"])[0])
     except ValueError:
-        rid = 0
-    out = STATE.review_file(rid, q.get("rel", [""])[0])
+        rid_int = 0
+    out = STATE.review_file(rid_int, q.get("rel", [""])[0])
     return (200, out) if out else (404, {"ok": False, "detail": "no such file"})
 
 
@@ -1412,6 +1482,11 @@ def _project_reset(q, body):
     dry_run = bool(body.get("dry_run"))
     keep_memory = bool(body.get("keep_memory"))
     keep_config = bool(body.get("keep_config"))
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="reset", force=bool(body.get("force")))
+        if not ok:
+            return 409, {"ok": False, "detail": reason}
     running = [str(r.get("name")) for r in processes.list_procs(root)
                if r.get("status") == "running"]
     stopped: list[str] = []
@@ -2059,6 +2134,11 @@ def _project_prune(q, body):
     keep_sessions = _int("keep_sessions", 0)
     keep_backups = _int("keep_backups", 0)
     dry_run = bool(body.get("dry_run"))
+    if not dry_run:
+        ok, reason = workspace.check_maintenance_safe(
+            root, action="prune", force=bool(body.get("force")))
+        if not ok:
+            return 409, {"ok": False, "detail": reason}
     removed = workspace.prune(
         root, keep_sessions, keep_backups,
         int(getattr(cfg, "keep_events", 20) or 0),
@@ -2383,22 +2463,34 @@ def _answer(q, body):
 def _permission_decide(q, body):
     """Answer a live permission request: decision is one of allow_once,
     allow_run, allow_always, allow_project, deny. Unblocks the parked worker
-    thread."""
-    pid = str(body.get("id") or "")
+    thread. Accepts optional `session_id` (defaulting to the active GUI
+    session) and enforces `(session_id, request_id)` matching."""
+    pid = str(body.get("id") or body.get("request_id") or "")
     decision = str(body.get("decision") or "")
+    session_id = str(
+        body.get("session_id") or (q.get("session_id") or [""])[0] or ""
+    ).strip()
     if decision not in ("allow_once", "allow_run", "allow_always",
                         "allow_project", "deny"):
         return 400, {"ok": False, "detail": f"unknown decision {decision!r}"}
-    ok, detail = STATE.decide_permission(pid, decision)
+    if session_id:
+        target = REGISTRY.get(session_id, create=False)
+        if target is None:
+            return 409, {"ok": False, "detail": "session mismatch"}
+        ok, detail = target.decide_permission(pid, decision, session_id=session_id)
+    else:
+        ok, detail = STATE.decide_permission(pid, decision)
     return (200 if ok else 409), {"ok": ok, "detail": detail}
 
 
 @post("/api/review/decide")
 def _decide(q, body):
-    try:
-        rid = int(body.get("id") or 0)
-    except (TypeError, ValueError):
-        return 400, {"ok": False, "detail": "id must be an integer."}
+    sid, _review_id = _review_params(q, body)
+    raw_id = body.get("review_id") or body.get("id")
+    is_queue_review = bool(
+        _review_id
+        or (isinstance(raw_id, str) and raw_id.startswith("rev_"))
+        or (sid and raw_id in (None, "", 0)))
     files = body.get("files")
     raw_hunks = body.get("accepted_hunks")
     hunks = None
@@ -2412,7 +2504,26 @@ def _decide(q, body):
                              "accepted_hunks must map file paths to lists "
                              "of hunk indices."}
             hunks[str(rel)] = ids
-    ok, detail = STATE.decide_review(
+    if is_queue_review:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, _review_id or str(raw_id or ""))
+        if staged is None:
+            return 404, {"ok": False, "detail": "unknown review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        ok, detail = queue.decide(
+            staged.review_id, str(body.get("action", "")),
+            files=list(files) if isinstance(files, list) else None,
+            accepted_hunks=hunks)
+        return (200 if ok else 409), {"ok": ok, "detail": detail}
+    try:
+        rid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "detail": "id must be an integer."}
+    target = REGISTRY.get(sid, create=False) if sid else STATE
+    if target is None:
+        return 404, {"ok": False, "detail": f"unknown session {sid!r}"}
+    ok, detail = target.decide_review(
         rid, str(body.get("action", "")),
         list(files) if isinstance(files, list) else None,
         accepted_hunks=hunks)
@@ -2421,11 +2532,23 @@ def _decide(q, body):
 
 @post("/api/review/rediff")
 def _rediff(q, body):
+    sid, rid = _review_params(q, body)
+    if sid or rid:
+        queue = _review_queue_for(sid)
+        staged = _staged_for(queue, rid)
+        if staged is None:
+            return 404, {"ok": False, "detail": "unknown review"}
+        if sid and staged.session_id != sid:
+            return 403, {"ok": False, "detail": "session mismatch"}
+        out = gui_core.staged_review_rediff(
+            staged, str(body.get("rel", "")), str(body.get("text", "")))
+        return (200, out) if out else (
+            409, {"ok": False, "detail": "This file can't be edited."})
     try:
-        rid = int(body.get("id") or 0)
+        rid_int = int(body.get("id") or 0)
     except (TypeError, ValueError):
         return 400, {"ok": False, "detail": "id must be an integer."}
-    out = STATE.review_rediff(rid, str(body.get("rel", "")),
+    out = STATE.review_rediff(rid_int, str(body.get("rel", "")),
                               str(body.get("text", "")))
     return (200, out) if out else (409, {"ok": False,
                                          "detail": "This file can't be edited."})
@@ -2433,6 +2556,11 @@ def _rediff(q, body):
 
 @post("/api/restore")
 def _restore(q, body):
+    root = _effective_root()
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="restore", force=bool(body.get("force")))
+    if not ok:
+        return 409, {"ok": False, "detail": reason}
     ok, detail = jobs.restore_snapshot(str(body.get("snapshot", "")))
     return (200 if ok else 400), {"ok": ok, "detail": detail}
 
@@ -3052,8 +3180,12 @@ class _Handler(BaseHTTPRequestHandler):
         CSP forbids -- a previewed page must be embeddable by the same origin
         and may run its own inline scripts/styles. Sensitive files are never
         previewed. Relative asset links inside the page resolve back through
-        /preview/ as well."""
-        self._serve_project_asset(rel)
+        /preview/ as well.
+
+        The iframe's opaque origin sends `Origin: null` on its module-script
+        fetches, so that one origin is answered with `ACAO: null` (never `*`,
+        which would let any website read project files from this port)."""
+        self._serve_project_asset(rel, opaque_cors=True)
 
     def _runner_preview(self, rel: str) -> None:
         """The Run tab's preview endpoint, with the same path-traversal gate
@@ -3061,7 +3193,7 @@ class _Handler(BaseHTTPRequestHandler):
         images, fonts, JSON, wasm and media all load from the project root."""
         self._serve_project_asset(rel)
 
-    def _serve_project_asset(self, rel: str) -> None:
+    def _serve_project_asset(self, rel: str, opaque_cors: bool = False) -> None:
         root = STATE.root
         if root is None:
             self._send(404, b"no project open", "text/plain")
@@ -3107,6 +3239,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "SAMEORIGIN")
             self.send_header("Content-Security-Policy", PREVIEW_CSP)
+            if opaque_cors:
+                self.send_header("Vary", "Origin")
+                if (self.headers.get("Origin") or "") == "null":
+                    self.send_header("Access-Control-Allow-Origin", "null")
             self.end_headers()
             self.wfile.write(data)
         except _CLIENT_DISCONNECT:
@@ -3145,7 +3281,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             url = urlparse(self.path)
             query = parse_qs(url.query)
-            if url.path == "/events":
+            if url.path in ("/events", "/api/events"):
                 self._events(query)
                 return
             if url.path.startswith("/api/runner/preview/"):
@@ -3199,9 +3335,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._discard_request_body()
                 self._json(413, {"ok": False, "detail": "Request too large."})
                 return
+            raw = self.rfile.read(n)
             try:
-                body = json.loads(self.rfile.read(n) or b"{}")
+                body = json.loads(raw) if raw.strip() else {}
             except ValueError:
+                if url.path in _STRICT_JSON_ROUTES:
+                    self._json(400, {"ok": False, "error": "invalid JSON body"})
+                    return
                 body = {}
             if not isinstance(body, dict):
                 body = {}
@@ -3227,7 +3367,17 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(code, obj)
 
     def _events(self, query) -> None:
-        """Server-Sent Events: everything after `since` (or Last-Event-ID)."""
+        """Server-Sent Events: everything after `since` (or Last-Event-ID).
+        Accepts optional `?session_id=` (defaulting to the active GUI session)."""
+        session_id = str((query.get("session_id") or [""])[0] or "").strip()
+        if session_id:
+            target = REGISTRY.get(session_id, create=False)
+            if target is None:
+                self._json(404, {"ok": False, "detail": f"unknown session {session_id!r}"})
+                return
+            bus = target.bus
+        else:
+            bus = STATE.bus
         try:
             last = int(self.headers.get("Last-Event-ID")
                        or query.get("since", ["0"])[0])
@@ -3238,8 +3388,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._headers(200, "text/event-stream", None)
             self.wfile.write(b"retry: 1500\n\n")
             self.wfile.flush()
-            while not STATE.bus.closed:
-                events, resync = STATE.bus.wait(last, 15.0)
+            while not bus.closed:
+                events, resync = bus.wait(last, 15.0)
                 if resync:
                     self.wfile.write(b"event: resync\ndata: {}\n\n")
                     self.wfile.flush()

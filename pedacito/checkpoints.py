@@ -216,7 +216,8 @@ def _is_binary(path: Path) -> bool:
 def _trackable(path: Path) -> bool:
     """True when `path` is a regular source/asset file worth snapshotting."""
     try:
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or security.is_junction_or_reparse(path) \
+                or not path.is_file():
             return False
         size = path.stat().st_size
     except OSError:
@@ -237,14 +238,20 @@ def iter_workspace_files(root) -> list[tuple[str, Path]]:
         d = Path(dirpath)
         dirnames[:] = sorted(
             name for name in dirnames
-            if name not in EXCLUDED_DIRS and not (d / name).is_symlink())
+            if name not in EXCLUDED_DIRS and not (d / name).is_symlink()
+            and not security.is_junction_or_reparse(d / name))
         for name in sorted(filenames):
             p = d / name
-            if not _trackable(p):
-                continue
             try:
                 rel = p.relative_to(root).as_posix()
             except ValueError:
+                continue
+            # Defense in depth: secret/credential material is never opened,
+            # hashed or copied into `.pedacito/checkpoints/snapshots/<id>/`
+            # (or anywhere else the checkpoint store can restore from).
+            if security.is_sensitive_path(rel):
+                continue
+            if not _trackable(p):
                 continue
             out.append((rel, p))
     return out
@@ -387,7 +394,13 @@ def create_checkpoint(root, label: str, mode: str = "task",
             "mode": mode,
             "label": label,
             "files_changed": changed,
-            "file_count": len(copied),
+            # BUG-14: `file_count` used to mean "files in the snapshot", so a
+            # 14-file project with 3 changed files looked like "14 files
+            # changed". Keep `file_count` as the changed count and name both
+            # totals explicitly.
+            "file_count": len(changed),
+            "changed_file_count": len(changed),
+            "snapshot_file_count": len(copied),
         }
         data["checkpoints"].append(entry)
         data["head_id"] = cp_id
@@ -636,8 +649,11 @@ def _prune_empty_dirs(root: Path, start: Path) -> None:
 
 
 def _delete_tracked(root: Path, rel: str) -> bool:
+    # A restore must never unlink secret/credential material, even by accident.
+    if security.is_sensitive_path(rel):
+        return False
     p = root / rel
-    if p.is_symlink():
+    if p.is_symlink() or security.is_junction_or_reparse(p):
         try:
             p.unlink()
             return True

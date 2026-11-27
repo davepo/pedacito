@@ -51,6 +51,7 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import shlex
 import socket
@@ -58,9 +59,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable
 from urllib.parse import urlparse
 
-from . import fileio
+from . import fileio, session_ctx
 
 __all__ = [
     "CATEGORY_LABELS",
@@ -74,12 +76,15 @@ __all__ = [
     "DENIED_MESSAGE",
     "MCP_DENIED_MESSAGE",
     "OUTBOUND_MODES",
+    "PermissionRequest",
     "REDACTED_SECRET",
     "SensitiveFileFinding",
     "SecretFinding",
     "SecurityError",
+    "SessionPermissionBroker",
     "acknowledge_findings",
     "check_git_secret_hygiene",
+    "check_sensitive_write",
     "clear_security_cache",
     "ensure_gitignore_entries",
     "format_finding",
@@ -164,12 +169,14 @@ SENSITIVE_NAMES = {
     ".npmrc", ".pypirc", ".netrc", ".git-credentials",
     "credentials.json", "credentials.yml", "credentials.yaml",
     "secrets.json", "secrets.yaml", "secrets.yml",
+    "service_account.json", ".pgpass", ".my.cnf", ".htpasswd", "kubeconfig",
 }
 # Globs (matched against the lower-cased file name).
 SENSITIVE_PATTERNS = (
     "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.kdbx",
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "id_sk_ed25519*",
     "*.credentials", "service-account*.json", "*-service-account*.json",
+    "*.tfstate", "*.tfstate.backup",
 )
 # `.env` variants that are templates, not secrets.
 ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template",
@@ -177,14 +184,37 @@ ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template",
 # Directories whose very name means "credentials live here".
 SENSITIVE_DIRS = {".ssh", ".gnupg", ".aws", ".docker", ".config/gcloud"}
 
+# A secret/credential file with one of these suffixes is still secret:
+# `server.pem.bak`, `id_rsa.old`, `credentials.json.orig`.
+_SENSITIVE_BACKUP_SUFFIXES = (".bak", ".old", ".orig")
+
 # Is `.foo.env` sensitive? Only as an exact name; `app.env` style files are
 # the project's own config samples and stay readable.
 
+
+def _strip_ntfs_tricks(part: str) -> str:
+    """Undo Windows NTFS normalisation on one path component: strip an
+    Alternate Data Stream suffix (`env::$DATA` -> `env`) and trailing
+    spaces/dots (`.env ` -> `.env`, `server.pem ` -> `server.pem`,
+    `credentials.json.` -> `credentials.json`)."""
+    s = str(part or "")
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    return s.rstrip(" .")
+
+
 def is_sensitive_path(path) -> bool:
     """True when `path` names secret/credential material that must never be
-    indexed or read into a model prompt without an explicit human approval."""
+    indexed or read into a model prompt without an explicit human approval.
+
+    Windows NTFS tricks are defeated first (`.env::$DATA`, `server.pem `,
+    `credentials.json.`), then the usual name/suffix checks run."""
     p = PurePosixPath(str(path or "").replace("\\", "/"))
     parts = tuple(x.lower() for x in p.parts if x not in ("/", "", "."))
+    if not parts:
+        return False
+    parts = tuple(_strip_ntfs_tricks(x) for x in parts)
+    parts = tuple(x for x in parts if x)
     if not parts:
         return False
     name = parts[-1]
@@ -200,15 +230,21 @@ def is_sensitive_path(path) -> bool:
                 return True
     if name in ENV_TEMPLATE_NAMES:
         return False
-    if name == ".env" or name.startswith(".env."):
+    # A secret with a backup/old/orig suffix is still secret.
+    base_name = name
+    for suffix in _SENSITIVE_BACKUP_SUFFIXES:
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)]
+            break
+    if base_name == ".env" or base_name.startswith(".env."):
         # `.env`, `.env.local`, `.env.production`... all hold live secrets.
         return True
-    if name.endswith(".env"):
+    if base_name.endswith(".env"):
         return True                       # `prod.env` style dotenv files too
-    if name in SENSITIVE_NAMES:
+    if base_name in SENSITIVE_NAMES:
         return True
     for pat in SENSITIVE_PATTERNS:
-        if fnmatch.fnmatch(name, pat):
+        if fnmatch.fnmatch(base_name, pat):
             return True
     return False
 
@@ -216,6 +252,144 @@ def is_sensitive_path(path) -> bool:
 def is_sensitive_rel(root, rel: str) -> bool:
     """`is_sensitive_path` for a project-relative path."""
     return is_sensitive_path(Path(str(root)) / str(rel or ""))
+
+
+def is_junction_or_reparse(path) -> bool:
+    """True when `path` is a Windows junction/reparse point (in addition to any
+    symlink). A junction to a secrets folder must never be followed by a
+    snapshot walk, even when `is_symlink()` reports False."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def _display_rel(root: Path, rel: Any) -> str:
+    """A clean project-relative spelling of `rel` for messages and checks.
+
+    Handles POSIX (`sub/.env`), Windows backslash (`sub\\\\.env`) and absolute
+    spellings (`C:\\\\proj\\\\credentials.json`). An absolute path under `root`
+    becomes root-relative; an absolute path outside it keeps its meaningful
+    tail so `is_sensitive_path` still sees the final name."""
+    raw = str(rel or "").strip().strip("`\"'")
+    if not raw:
+        return ""
+    win = None
+    try:
+        win = PureWindowsPath(raw)
+    except (TypeError, ValueError):
+        win = None
+    is_abs = False
+    try:
+        is_abs = Path(raw).is_absolute()
+    except (TypeError, ValueError, OSError):
+        is_abs = False
+    is_abs = is_abs or bool(win is not None and win.is_absolute())
+    if is_abs:
+        for candidate in (raw, raw.replace("\\", "/")):
+            try:
+                return Path(candidate).resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+        if win is not None:
+            parts = [p for p in win.parts
+                     if not re.fullmatch(r"[A-Za-z]:[\\\\/]?", p)
+                     and p not in ("\\", "/")]
+            if parts:
+                return "/".join(parts)
+    return fileio.normalise_rel(raw)
+
+
+def check_sensitive_write(
+    root: Path | str,
+    rel: str,
+    *,
+    action: str = "write",
+    policy: Any = None,
+) -> tuple[bool, str]:
+    """The single write gate for secret/credential paths.
+
+    Returns ``(allowed, error_message)``. A non-sensitive path is always
+    allowed. A sensitive path is refused by default -- in BOTH edit engines,
+    for writes, edits, creations, moves, deletes and renames -- so `.env`,
+    `*.pem`, `id_rsa`, `credentials.json` and friends can never be staged,
+    reviewed or snapshotted.
+
+    ``policy`` is the WP-4005 hook: when it exposes ``evaluate`` and returns an
+    explicit ``decision == "allow"`` for ``capability="sensitive_write"`` AND
+    the human approves through the Permission Broker, the write is allowed.
+    With no policy (the default) the refusal is deterministic. Plan/ask/
+    headless/unattended sessions never consult the policy: nobody is there to
+    approve.
+    """
+    root_path = Path(str(root or ".")).expanduser()
+    try:
+        root_resolved = root_path.resolve()
+    except OSError:
+        root_resolved = root_path
+    target = _display_rel(root_resolved, rel)
+    raw_rel = fileio.normalise_rel(str(rel or ""))
+    # Resolve the real target inside the root and check the RESOLVED root-
+    # relative path too, so a symlink `notes.txt -> .env` (or a Windows
+    # `.env ` / `.env::$DATA` spelling) cannot slip past the raw `rel` check.
+    resolved_rel = target
+    try:
+        resolved = resolve_safe_path(root_resolved, rel)
+        try:
+            resolved_rel = resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            resolved_rel = target
+    except SecurityError:
+        resolved_rel = target
+    if not (is_sensitive_path(target) or is_sensitive_path(raw_rel)
+            or is_sensitive_path(resolved_rel)):
+        return True, ""
+    message = (f"refused to {action} sensitive file "
+               f"(secrets/credentials): {target or rel}")
+    if policy is None or not hasattr(policy, "evaluate"):
+        return False, message
+
+    sess = session_ctx.current_session()
+    mode = str(getattr(sess, "mode", "") or "").lower()
+    if sess is not None and mode in (
+            "plan", "ask", "headless", "unattended"):
+        return False, message
+    decision = None
+    try:
+        decision = policy.evaluate(
+            capability="sensitive_write", action=action, path=target,
+            root=str(root_resolved))
+    except TypeError:
+        try:
+            decision = policy.evaluate("sensitive_write", target)
+        except Exception:
+            decision = None
+    except Exception:
+        decision = None
+    verdict = getattr(decision, "decision", None)
+    if verdict is None and isinstance(decision, dict):
+        verdict = decision.get("decision")
+    if verdict is None and isinstance(decision, str):
+        verdict = decision
+    if str(verdict or "").lower() != "allow":
+        return False, message
+    try:
+        approved, _why = request_permission(
+            CAT_SENSITIVE_FILE,
+            f"{action.capitalize()} sensitive file `{target}`",
+            detail=f"policy allowed {action} of a secret/credential path; "
+                   "human confirmation is still required",
+            risk_level="high",
+            reason=message,
+            key=f"sensitive:{action}:{resolved_rel}",
+            project_root=str(root_resolved),
+        )
+    except Exception:
+        approved = False
+    if approved:
+        return True, ""
+    return False, message
 
 
 # --- 3. GUI server origin guard ---------------------------------------------------
@@ -427,6 +601,341 @@ DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: Do not retry this action. "
 MCP_DENIED_MESSAGE = ("[PERMISSION DENIED BY USER: MCP tool execution was "
                       "declined. Proceed using local repository tools only.]")
 
+@dataclass
+class PermissionRequest:
+    """One permission request scoped strictly to a single session."""
+
+    session_id: str
+    request_id: str
+    category: str
+    action_summary: str
+    detail: str
+    risk_level: str
+    reason: str
+    key: str
+    setting_key: str
+    suggested_pattern: str
+    project_root: str
+    created_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.request_id,
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "category": self.category,
+            "action_summary": self.action_summary,
+            "detail": self.detail,
+            "risk_level": self.risk_level,
+            "reason": self.reason,
+            "key": self.key,
+            "setting_key": self.setting_key,
+            "suggested_pattern": self.suggested_pattern,
+            "project_root": self.project_root,
+            "created_at": self.created_at,
+        }
+
+
+def _broker_key(key: str) -> str:
+    """The broker's grant key for `key`: hashed (sha256) when unusually long so
+    two long command suffixes can never collide by truncation. Short keys pass
+    through unchanged."""
+    text = str(key or "")
+    if len(text) > 400:
+        return "sha256:" + hashlib.sha256(
+            text.encode("utf-8", "replace")).hexdigest()
+    return text
+
+
+class SessionPermissionBroker:
+    """Isolated permission broker scoped strictly to one `session_id`.
+
+    Pending slots are keyed by `(session_id, request_id)`; `decide()` rejects
+    any mismatched `session_id` with `(False, "session mismatch")`.
+
+    When `approval_policy == "never"` or (`responder is None` and not
+    `interactive`), `request()` denies immediately without blocking and emits
+    a `permission_decision` event (`decision="deny"`,
+    `reason="non_interactive_or_policy_never"`).
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        responder: Callable[[PermissionRequest], tuple[bool, str] | None] | None = None,
+        timeout_s: float = 120.0,
+        approval_policy: str = "ask",  # "ask" | "never" | "auto-safe"
+        cancel_event: threading.Event | None = None,
+        event_bus: Any = None,
+        interactive: bool = False,
+    ) -> None:
+        self.session_id = str(session_id)
+        self._responder = responder
+        self.timeout_s = float(timeout_s)
+        self.approval_policy = str(approval_policy or "ask").strip().lower()
+        self._cancel_event = cancel_event
+        self._event_bus = event_bus
+        self._interactive = bool(interactive)
+        self._lock = threading.RLock()
+        self._slots: dict[tuple[str, str], dict[str, Any]] = {}
+        self._seq = 0
+        self._run_grants: set[tuple[str, str]] = set()
+        self._session_grants: set[tuple[str, str]] = set()
+
+    def _emit(self, kind: str, **fields: Any) -> None:
+        bus = self._event_bus
+        if bus is None:
+            sess = session_ctx.current_session()
+            if sess is not None and sess.session_id == self.session_id:
+                bus = sess.event_bus
+        if bus is not None:
+            emit_fn = getattr(bus, "emit", None)
+            if callable(emit_fn):
+                try:
+                    emit_fn(kind, **fields)
+                except Exception:
+                    pass
+
+    def _is_cancelled(self) -> bool:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            return True
+        sess = session_ctx.current_session()
+        if sess is not None and sess.session_id == self.session_id:
+            if sess.cancel_event.is_set():
+                return True
+        return False
+
+    def request(self, info: dict[str, Any]) -> tuple[bool, str]:
+        category = str(info.get("category") or CAT_SHELL)
+        detail = str(info.get("detail") or "")[:4000]
+        action_summary = str(info.get("action_summary") or "")
+        risk_level = str(info.get("risk_level") or "medium")
+        reason = str(info.get("reason") or "")
+        key = _broker_key(str(info.get("key") or detail or ""))
+        setting_key = str(info.get("setting_key") or "")
+        suggested_pattern = str(info.get("suggested_pattern") or "")
+        if not suggested_pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
+            suggested_pattern = suggest_shell_pattern(detail)
+        project_root = normalize_project_root(info.get("project_root") or "")
+
+        # `approval_policy == "never"` (or a headless broker) refuses BEFORE any
+        # run/session grant is consulted, so a stale grant can never bypass an
+        # explicit "never" policy.
+        if self.approval_policy == "never" or (
+            self._responder is None and not self._interactive
+        ):
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                category=category,
+                key=key,
+                decision="deny",
+                reason="non_interactive_or_policy_never",
+            )
+            return False, DENIED_MESSAGE
+
+        with self._lock:
+            if (category, key) in self._run_grants or (category, key) in self._session_grants:
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id="",
+                    category=category,
+                    key=key,
+                    decision="allow",
+                    reason="cached_grant",
+                )
+                return True, ""
+
+        if self.approval_policy == "auto-safe" and risk_level.strip().lower() == "low":
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                category=category,
+                key=key,
+                decision="allow",
+                reason="policy_auto_safe",
+            )
+            return True, ""
+
+        with self._lock:
+            self._seq += 1
+            request_id = f"perm-{self._seq}"
+            req = PermissionRequest(
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                action_summary=action_summary,
+                detail=detail,
+                risk_level=risk_level,
+                reason=reason,
+                key=key,
+                setting_key=setting_key,
+                suggested_pattern=suggested_pattern,
+                project_root=project_root,
+                created_at=time.time(),
+            )
+            slot_key = (self.session_id, request_id)
+            slot: dict[str, Any] = {
+                "event": threading.Event(),
+                "decision": "",
+                "message": "",
+                "req": req,
+            }
+            self._slots[slot_key] = slot
+
+        self._emit("permission_request", **req.to_dict())
+
+        if self._responder is not None:
+            try:
+                res = self._responder(req)
+            except Exception:
+                with self._lock:
+                    self._slots.pop(slot_key, None)
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    category=category,
+                    key=key,
+                    decision="deny",
+                    reason="responder_error",
+                )
+                return False, DENIED_MESSAGE
+            if res is not None:
+                with self._lock:
+                    self._slots.pop(slot_key, None)
+                allowed, message = bool(res[0]), str(res[1] or "")
+                if not allowed and not message:
+                    message = DENIED_MESSAGE
+                self._emit(
+                    "permission_decision",
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    category=category,
+                    key=key,
+                    decision="allow" if allowed else "deny",
+                    reason="responder",
+                )
+                return allowed, message
+
+        deadline = time.monotonic() + max(0.0, self.timeout_s)
+        while not slot["event"].wait(0.05):
+            if self._is_cancelled() or time.monotonic() >= deadline:
+                break
+
+        with self._lock:
+            self._slots.pop(slot_key, None)
+            decision = str(slot.get("decision") or "").strip().lower()
+            message = str(slot.get("message") or "")
+
+        if decision in ("allow", "allow_once", "once"):
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+        if decision in ("allow_run", "run"):
+            with self._lock:
+                self._run_grants.add((category, key))
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+        if decision in ("allow_always", "allow_project", "always"):
+            with self._lock:
+                self._session_grants.add((category, key))
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id=request_id,
+                category=category,
+                key=key,
+                decision=decision,
+                reason="user",
+            )
+            return True, message
+
+        deny_reason = (
+            "cancelled"
+            if (not decision and self._is_cancelled())
+            else ("timeout" if not decision else "denied")
+        )
+        self._emit(
+            "permission_decision",
+            session_id=self.session_id,
+            request_id=request_id,
+            category=category,
+            key=key,
+            decision="deny",
+            reason=deny_reason,
+        )
+        return False, message or DENIED_MESSAGE
+
+    def decide(
+        self, session_id: str, request_id: str, decision: str
+    ) -> tuple[bool, str]:
+        """Resolve a pending permission slot strictly matching `(session_id, request_id)`."""
+        if str(session_id) != self.session_id:
+            return False, "session mismatch"
+        slot_key = (self.session_id, str(request_id))
+        with self._lock:
+            slot = self._slots.get(slot_key)
+            if slot is None:
+                return False, "This permission request is no longer pending."
+            slot["decision"] = str(decision or "deny")
+            self._slots.pop(slot_key, None)
+        slot["event"].set()
+        return True, ""
+
+    def pending(self) -> list[dict[str, Any]]:
+        """Return currently pending requests for this session, oldest first."""
+        with self._lock:
+            ordered = sorted(
+                self._slots.values(), key=lambda s: s["req"].created_at
+            )
+            return [s["req"].to_dict() for s in ordered]
+
+    def deny_all(self, reason: str = "session closed") -> int:
+        """Deny and release every pending request in this session."""
+        with self._lock:
+            slots = list(self._slots.values())
+            self._slots.clear()
+        for slot in slots:
+            slot["decision"] = "deny"
+            slot["message"] = DENIED_MESSAGE
+            slot["event"].set()
+        if slots:
+            self._emit(
+                "permission_decision",
+                session_id=self.session_id,
+                request_id="",
+                decision="deny",
+                reason=str(reason or "session closed"),
+                count=len(slots),
+            )
+        return len(slots)
+
+    def clear_run_grants(self) -> None:
+        """Clear run-scoped (`allow_run`) grants for this session."""
+        with self._lock:
+            self._run_grants.clear()
+
+
 _hook = None
 _hook_lock = threading.Lock()
 
@@ -453,7 +962,10 @@ def permission_handler():
 
 
 def permission_broker_active() -> bool:
-    """True while an interactive broker is installed (a GUI is listening)."""
+    """True while a session permission broker or legacy interactive hook is active."""
+    sess = session_ctx.current_session()
+    if sess is not None and sess.permission_broker is not None:
+        return True
     return _hook is not None
 
 
@@ -473,11 +985,9 @@ def request_permission(category: str, action_summary: str, detail: str = "",
     shell/test requests without an explicit suggestion get one derived from
     `detail` when it is safe to persist.
 
-    With no broker installed this answers `(False, DENIED_MESSAGE)` -- callers
-    check `permission_broker_active()` first and keep their own historical
-    error text for the CLI, so this fallback only fires on an uninstall race,
-    which must deny in the safe direction."""
-    hook = _hook
+    Consults `current_session().permission_broker` first, falling back to the
+    legacy global hook. With neither active this answers
+    `(False, DENIED_MESSAGE)`."""
     pattern = str(suggested_pattern or "")
     if not pattern and category in (CAT_SHELL, CAT_TEST_EXECUTION):
         pattern = suggest_shell_pattern(detail)
@@ -486,10 +996,22 @@ def request_permission(category: str, action_summary: str, detail: str = "",
             "detail": str(detail or "")[:4000],
             "risk_level": str(risk_level or "medium"),
             "reason": str(reason or ""),
-            "key": str(key or detail or "")[:500],
+            "key": _broker_key(str(key or detail or "")),
             "setting_key": str(setting_key or ""),
             "suggested_pattern": pattern,
             "project_root": normalize_project_root(project_root)}
+    sess = session_ctx.current_session()
+    if sess is not None and sess.permission_broker is not None:
+        try:
+            allowed, message = sess.permission_broker.request(info)
+        except Exception:
+            return False, DENIED_MESSAGE
+        allowed = bool(allowed)
+        message = str(message or "")
+        if not allowed and not message:
+            message = DENIED_MESSAGE
+        return allowed, message
+    hook = _hook
     if hook is None:
         return False, DENIED_MESSAGE
     try:
@@ -1104,7 +1626,17 @@ def _ack_key(root) -> str:
         return str(root)
 
 
-_SESSION_ACK: dict[str, set[str]] = {}
+def _session_ack_key(root) -> tuple[str, str] | str:
+    """Scope in-memory acknowledgments by `(session_id, resolved_root)` when a
+    `SessionContext` is active, falling back to `resolved_root` otherwise."""
+    root_key = _ack_key(root)
+    sess = session_ctx.current_session()
+    if sess is not None and sess.session_id:
+        return (sess.session_id, root_key)
+    return root_key
+
+
+_SESSION_ACK: dict[tuple[str, str] | str, set[str]] = {}
 _ACK_LOCK = threading.RLock()
 
 
@@ -1140,8 +1672,8 @@ def _read_ack_file(root) -> set[str]:
 
 
 def load_acknowledged_fingerprints(root) -> set[str]:
-    """Disk acknowledgments for `root` plus this process's session set."""
-    key = _ack_key(root)
+    """Disk acknowledgments for `root` plus this session's in-memory set."""
+    key = _session_ack_key(root)
     with _ACK_LOCK:
         session = set(_SESSION_ACK.get(key, set()))
     disk = _read_ack_file(root) if root is not None else set()
@@ -1153,10 +1685,10 @@ def acknowledge_findings(root, fingerprints) -> set[str]:
 
     Returns the workspace's full acknowledged set. A missing/unwritable
     `.pedacito` is non-fatal: the in-memory session set still suppresses
-    the warning for the rest of this process.
+    the warning for the rest of this session.
     """
     wanted = _normalise_fingerprints(fingerprints)
-    key = _ack_key(root)
+    key = _session_ack_key(root)
     # One lock covers the session set and the file so two threads answering
     # the same preflight cannot lose each other's fingerprints.
     with _ACK_LOCK:
@@ -1309,7 +1841,10 @@ def redact_messages(messages, root=None):
 def _gitignore_patterns(root: Path) -> list[str]:
     path = Path(root) / ".gitignore"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # `utf-8-sig` drops a leading UTF-8 BOM (PowerShell `Set-Content
+        # -Encoding utf8` prepends one), so line 1 (`\ufeff.env`) still matches
+        # `.env` (R2-UI-06).
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
     return [ln.strip() for ln in text.splitlines()
@@ -1419,7 +1954,9 @@ def ensure_gitignore_entries(root, patterns=None) -> list[str]:
         return []
     path = base / ".gitignore"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # `utf-8-sig` drops a leading UTF-8 BOM so line 1 matches cleanly
+        # (R2-UI-06).
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         text = ""
     existing = {ln.strip() for ln in text.splitlines()

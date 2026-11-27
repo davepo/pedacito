@@ -14,6 +14,7 @@ custom skills, named MCP servers, JSON hooks, and prompt overrides. Settings liv
 - [JSON hooks](#json-hooks)
 - [Image generation action](#image-generation-action)
 - [Gather formats and oversized observations (v0.3.3)](#gather-formats-and-oversized-observations-v033)
+- [Package manifests (`pedacito-package.toml`)](#package-manifests-pedacito-packagetoml)
 - [Prompt overrides](#prompt-overrides)
 
 ## Bundled skills
@@ -129,6 +130,37 @@ Any observation over `max_observation_tokens` from `run`, `run_test`, `grep`, `d
 gets the head, the tail, the line count and the file name. It can then `read` or `grep` exact lines
 from that file, and only from direct `*.log` files under `.pedacito/scratch/`. The model can never
 write to that directory. See [Security](SECURITY.md#git-commits-pull-requests-undo-and-scratch-files-v033).
+
+## Package manifests (`pedacito-package.toml`)
+
+Every distributable extension, skill, command set or model pack declares itself in a
+`pedacito-package.toml` file at the package root:
+
+```toml
+schema_version = 1
+name = "acme-lint"
+version = "1.2.0"
+kind = "extension"          # extension | skill | command | model-pack
+description = "Acme lint rules for Pedacito"
+capabilities = ["read_workspace", "run_commands"]
+min_pedacito_version = "0.4.0"
+
+[entry_points]
+main = "acme_lint/plugin.py"
+```
+
+`schema_version` must be `1`. `name` accepts letters, digits, `.`, `_` and `-`.
+`capabilities` may only use `read_workspace`, `write_workspace`, `run_commands`,
+`network`, `mcp_server`, `hooks`, `prompts` and `model_profiles`. Every
+`entry_points` value must be a relative path inside the package: absolute paths
+and `..` traversal are rejected before anything is loaded.
+
+The manifest is declarative; it never executes code by itself. `load_manifest`
+validates it and computes the SHA-256 of the raw bytes. `trust_manifest` pins
+that hash in `trusted_packages.json` under the per-user state folder, and
+`is_manifest_trusted` returns `False` as soon as the file changes by even one
+byte. An untrusted or malformed package is refused before any entry point could
+run.
 
 ## Prompt overrides
 
