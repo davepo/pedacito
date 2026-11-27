@@ -353,7 +353,7 @@ Comandos de Pedacito TUI
   /creative [on|off|auto]   modo diseño/creativo para cambios de interfaz
   /theme [NOMBRE]           listar temas de color o cambiar a NOMBRE
   /lang [en|es]             cambiar idioma de la interfaz (F3 alterna EN/ES)
-  /picard [on|off]          activar o desactivar el Modo Capitán Picard ('Make it so.')
+  /picard [on|off]          activar o desactivar el Modo Capitán Picard ('Hágalo así.')
   /image PROMPT [--out ARCHIVO] [--size WxH]
                             generar una imagen con el perfil de imagen configurado
   /attach [RUTA|list|clear] adjuntar una imagen (PNG/JPEG/WebP/GIF, <=10 MB, máx 4)
@@ -2326,7 +2326,7 @@ class TuiSession:
         if pattern:
             opts += " / " + i18n.t("tui.perm.allow_project", lang=self.lang,
                                    pattern=pattern)
-        allow_cue = ("Make it so?"
+        allow_cue = (i18n.t("picard.confirm", lang=self.lang)
                      if bool(getattr(self.cfg, "picard_mode", False))
                      else "Allow?")
         banner = (f"[Permission Required: {category} ({label}) "
@@ -3908,8 +3908,9 @@ class TuiSession:
                          "for one pass)", "system")
             self.run_auto(goal)
             return
+        picard_confirm = i18n.t("picard.confirm", lang=self.lang)
         question = (
-            "Run as a single-pass Task instead? \u2014 Make it so? [Y/n]:"
+            f"Run as a single-pass Task instead? \u2014 {picard_confirm} [Y/n]:"
             if bool(getattr(self.cfg, "picard_mode", False))
             else "Run as a single-pass Task instead? [Y/n]:"
         )
@@ -5741,14 +5742,15 @@ class TuiSession:
 
     def _confirm(self, question: str) -> bool:
         if bool(getattr(self.cfg, "picard_mode", False)):
+            cue = i18n.t("picard.confirm", lang=self.lang)
             if re.search(r"[\(\[]y/N[\)\]]", question):
                 question = re.sub(
                     r"\s*[\(\[]y/N[\)\]]\s*:?\s*$",
-                    " Make it so? [y/N]:",
+                    f" {cue} [y/N]:",
                     question,
                 )
-            elif "Make it so?" not in question:
-                question = question.rstrip(" :") + " \u2014 Make it so? [y/N]:"
+            elif cue not in question:
+                question = question.rstrip(" :") + f" \u2014 {cue} [y/N]:"
         self._set_banner(question)
         self._append(question, "activity")
         self._redraw(force=True)

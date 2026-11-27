@@ -63,7 +63,7 @@ PDC.fmtTokens = (n) => {
 // Captain Picard Mode: relabels primary action buttons to 'Make it so.' while
 // preserving the original semantic label in the button's title tooltip.
 PDC.isPicardMode = () => !!(S && S.status && S.status.picard_mode);
-PDC.picardText = (normalText) => PDC.isPicardMode() ? 'Make it so.' : normalText;
+PDC.picardText = (normalText) => PDC.isPicardMode() ? PDC.t('picard.action', null, 'Make it so.') : normalText;
 PDC.picardTitle = (normalText, baseTitle) => {
   if (!PDC.isPicardMode()) return baseTitle || '';
   const sem = String(normalText || '').trim();

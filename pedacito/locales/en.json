@@ -573,6 +573,8 @@
   "profiles.col.context": "context",
   "profiles.col.status": "status",
   "profiles.recommend_title": "Recommendations (suggestions -- confirm before applying):",
+  "picard.action": "Make it so.",
+  "picard.confirm": "Make it so?",
   "tui.hint_bar_picard": "Enter: Make it so. | Shift/Alt+Enter: newline | PgUp/PgDn/Wheel: scroll | Tab: complete | F3: [EN|es] | /help | /quit",
   "tui.picard.on": "Captain Picard Mode: ON \u2014 Make it so.",
   "tui.picard.off": "Captain Picard Mode: OFF",

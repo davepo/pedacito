@@ -133,6 +133,31 @@ def test_tui_picard_slash_command_header_and_confirm_cues(tmp_path):
         session.close()
 
 
+def test_picard_mode_spanish_localization(tmp_path):
+    from pedacito import i18n
+
+    assert i18n.t("picard.action", lang="es") == "Hágalo así."
+    assert i18n.t("picard.confirm", lang="es") == "¿Hágalo así?"
+    assert "Hágalo así." in i18n.t("tui.hint_bar_picard", lang="es")
+    assert "Hágalo así." in i18n.t("tui.picard.on", lang="es")
+    assert "Hágalo así." in i18n.t("settings.picard_on", lang="es")
+    assert "Hágalo así." in tui_mod.HELP_TEXT_ES
+
+    cfg = Config()
+    cfg.language = "es"
+    session = tui_mod.TuiSession(tmp_path, cfg, client=None, headless=True)
+    try:
+        session.handle_line("/picard on")
+        assert any("Hágalo así." in line for _k, line in session.transcript)
+        frame_on = session.render_frame(120, 30)
+        assert "Enter: Hágalo así." in frame_on
+        session._read_answer_line = lambda: "n"
+        assert session._confirm("¿Borrar todo? [y/N]:") is False
+        assert any("¿Hágalo así? [y/N]" in line for _k, line in session.transcript)
+    finally:
+        session.close()
+
+
 def test_gui_state_and_settings_expose_picard_mode_and_reminder(gui):
     status, st = gui.get("/api/state")
     assert status == 200
@@ -172,6 +197,7 @@ def test_gui_static_picard_text_and_reminder_wiring():
     assert "PDC.picardText" in app_js
     assert "PDC.picardTitle" in app_js
     assert "'Make it so.'" in app_js
+    assert "picard.action" in app_js
 
     # Primary buttons wired through picardText
     assert "PDC.picardText(sendSem)" in app_js          # Composer Run / Send
