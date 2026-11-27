@@ -1169,19 +1169,27 @@ CLI_COMMANDS = [
     },
     {
         "name": "eval",
-        "usage": "pedacito eval [--task ID] [--out FILE] [--baseline FILE]",
+        "usage": "pedacito eval [--task ID] [--out FILE] [--baseline FILE] "
+                 "[--scorecard FILE]",
         "summary": "Score the harness on built-in fixture repos (locate "
-                   "precision, edit success, tokens, cache hits).",
-        "keywords": ["benchmark", "score", "harness", "baseline", "regression"],
+                   "precision, edit success, tokens, cache hits). With "
+                   "--scorecard it also writes a schema-v2 scorecard, the "
+                   "comparable artifact for `pedacito bench compare`.",
+        "keywords": ["benchmark", "score", "harness", "baseline", "regression",
+                     "scorecard"],
         "examples": [
             "pedacito eval --list",
             "pedacito eval --out report.json",
             "pedacito eval --task locate_symbol --task edit_small",
             "pedacito eval --baseline old-report.json --max-token-growth 0.2",
+            "pedacito eval --seed 1 --scorecard card-before.json",
         ],
         "flags": [
             {"flag": "--task ID", "help": "run only this task id; repeatable"},
             {"flag": "--out FILE", "help": "write the JSON report here"},
+            {"flag": "--scorecard FILE",
+             "help": "write a schema-v2 scorecard; needs --seed or --repeats "
+                     "greater than 1 and the full task set"},
             {"flag": "--baseline FILE",
              "help": "A/B gate against an earlier --out report"},
             {"flag": "--max-token-growth FRAC",
@@ -1665,7 +1673,8 @@ CLI_COMMANDS = [
     {
         "name": "bench",
         "usage": "pedacito bench [BENCHMARK|all] [--list | --recent] "
-                 "[--dir DIR] [--json] [--strict]",
+                 "[--dir DIR] [--json] [--strict] | pedacito bench compare "
+                 "BASELINE CURRENT [--json]",
         "summary": "Run the six-project diagnostic benchmark suite with its "
                    "hidden holdout rubric, or list the benchmarks and recent "
                    "runs. A run builds the project through the normal loop, "
@@ -1678,10 +1687,18 @@ CLI_COMMANDS = [
             "pedacito bench rpn_expression_calc",
             "pedacito bench all --json --strict",
             "pedacito bench rpn_expression_calc --dir ~/benchmarks --json",
+            "pedacito bench compare before.json after.json",
         ],
         "flags": [
             {"flag": "BENCHMARK",
              "help": "one benchmark id, or 'all' for all six (default: all)"},
+            {"flag": "compare BASELINE CURRENT",
+             "help": "gate two eval scorecards: exit 0 pass, 1 regression, "
+                     "2 invalid or incomparable"},
+            {"flag": "--max-prompt-growth FRAC",
+             "help": "compare: allowed prompt-token growth (default 0)"},
+            {"flag": "--max-time-growth FRAC",
+             "help": "compare: allowed seconds growth (default 0.50)"},
             {"flag": "--list", "help": "list the six benchmarks and exit"},
             {"flag": "--recent",
              "help": "list recent runs under the benchmarks root and exit"},

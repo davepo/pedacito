@@ -25,15 +25,18 @@ tests/test_features_misc.py, exercised by tests/test_eval_taxonomy.py).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
+import platform
 import re
 import shutil
 import statistics
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import fileio
@@ -1259,6 +1262,13 @@ def run_cli(args, cfg) -> int:
         print("--repeats must be at least 1.", file=sys.stderr)
         return 2
     seeds = repeat_seeds(cfg, repeats, getattr(args, "seed", None))
+    scorecard_out = getattr(args, "scorecard", None)
+    if scorecard_out:
+        problem = _scorecard_problem(tasks, seeds)
+        if problem:
+            from . import i18n
+            print(i18n.t(problem), file=sys.stderr)
+            return 2
     # Seeding writes the sampler, so it goes on a copy: the user's config
     # (and whatever sampler they wrote) is never touched.
     run_cfg = copy.copy(cfg) if seeds[0] is not None else cfg
@@ -1294,6 +1304,17 @@ def run_cli(args, cfg) -> int:
         Path(args.out).write_text(json.dumps(report, indent=1),
                                   encoding="utf-8")
         print(f"\nreport: {args.out}")
+    if scorecard_out:
+        from . import i18n
+        try:
+            card = make_scorecard(rows, metadata=_scorecard_metadata(cfg, seeds))
+        except ScorecardError as e:
+            print(i18n.t("eval.scorecard.invalid", message=str(e)),
+                  file=sys.stderr)
+            return 2
+        fileio.write_bytes(Path(scorecard_out),
+                           (json.dumps(card, indent=1) + "\n").encode("utf-8"))
+        print(f"\nscorecard: {scorecard_out}")
     failed = summary["pass_rate"] <= 0
     if getattr(args, "baseline", None):
         try:
@@ -1310,3 +1331,573 @@ def run_cli(args, cfg) -> int:
         print("\n" + render_compare(reg, imp, notes))
         failed = failed or bool(reg)
     return 1 if failed else 0
+
+
+# ------------------------------------------------- scorecard v2 (WP-4106A)
+# A scorecard is the comparable artifact of one eval run: every (task, repeat)
+# row, checked against the corpus it was measured on. It only ever holds rows
+# the runner produced; a missing row is reported, never counted as a pass.
+SCORECARD_SCHEMA_VERSION = 2
+CORPUS_ID = "pedacito-eval-builtin-v2"
+TOKEN_PROVENANCE = "unverified: endpoint usage or client estimate, not recorded per row"
+STRATA = ("edit_format", "multi_file", "api", "environment", "flake",
+          "security", "context")
+_ROW_KINDS = ("edit", "question")
+_ROW_FIELDS = ("id", "stratum", "kind", "repeat", "seed", "passed",
+               "first_apply_clean", "tests_ok", "located", "repair_calls",
+               "prompt_tokens", "completion_tokens", "seconds",
+               "failure_labels")
+_CARD_TYPES = {
+    "schema_version": "int", "harness_version": "str", "corpus_id": "str",
+    "corpus_sha256": "str", "model": "str", "provider": "str",
+    "profile_hash": "str", "tokenizer": "str", "environment": "dict",
+    "seeds": "list", "task_ids": "list", "rows": "list", "summary": "dict",
+    "taxonomy_version": "int", "metrics_version": "int",
+    "disable_thinking": "bool",
+}
+# Card fields that must agree before two scorecards may be compared at all.
+_COMPARE_FIELDS = ("schema_version", "corpus_id", "corpus_sha256", "task_ids",
+                   "seeds", "model", "provider", "profile_hash", "tokenizer",
+                   "disable_thinking", "taxonomy_version", "metrics_version")
+
+
+class ScorecardError(ValueError):
+    """A scorecard that is invalid, or two scorecards that cannot be compared."""
+
+
+@dataclass(frozen=True)
+class StratumEntry:
+    """One planned corpus entry. A runnable entry is an `EvalTask` id in
+    `TASKS`. A non-runnable entry is a marked placeholder for a stratum the
+    harness cannot measure yet: it produces no rows and reports as not
+    measured, never as a pass."""
+    stratum: str
+    id: str
+    runnable: bool
+    note: str = ""
+
+
+SCORECARD_SKELETON: tuple[StratumEntry, ...] = (
+    StratumEntry("edit_format", "py-bulk-off-by-one", True),
+    StratumEntry("edit_format", "py-cart-remove", True),
+    StratumEntry("edit_format", "py-tax-rate-config", True),
+    StratumEntry("edit_format", "py-medium-threshold", True),
+    StratumEntry("edit_format", "ts-format-price", True),
+    StratumEntry("edit_format", "go-store-notfound", True),
+    StratumEntry("multi_file", "py-rename-discount", True),
+    StratumEntry("security", "py-injection-summary", True),
+    StratumEntry("context", "py-where-is-tax", True),
+    StratumEntry("context", "py-tax-rate-value", True),
+    StratumEntry("context", "py-in-stock-missing", True),
+    StratumEntry("context", "py-bulk-exactly-ten", True),
+    StratumEntry("context", "py-cart-total-order", True),
+    StratumEntry("context", "py-cli-total", True),
+    StratumEntry("context", "py-medium-chain", True),
+    StratumEntry("api", "skeleton-api-lookup", False,
+                 "placeholder: needs the offline API oracle (WP-4103B); "
+                 "no fixture yet"),
+    StratumEntry("environment", "skeleton-env-resolve", False,
+                 "placeholder: needs the environment resolver (WP-4103A); "
+                 "no fixture yet"),
+    StratumEntry("flake", "skeleton-flake-rerun", False,
+                 "placeholder: needs the flake classifier (WP-4105D); "
+                 "no fixture yet"),
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Scorecard:
+    """The schema-v2 scorecard. `to_dict()` is the JSON shape on disk."""
+    schema_version: int = SCORECARD_SCHEMA_VERSION
+    harness_version: str
+    corpus_id: str
+    corpus_sha256: str
+    model: str
+    provider: str
+    profile_hash: str
+    tokenizer: str
+    environment: dict
+    seeds: list
+    task_ids: list
+    rows: list
+    summary: dict
+    taxonomy_version: int
+    metrics_version: int
+    disable_thinking: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _skeleton_by_id() -> dict[str, StratumEntry]:
+    return {e.id: e for e in SCORECARD_SKELETON}
+
+
+def corpus_fingerprint() -> str:
+    """SHA-256 over the fixtures, the task definitions and the stratum
+    skeleton. Any change to what a scorecard measured changes this value."""
+    payload = {
+        "corpus_id": CORPUS_ID,
+        "fixtures": {name: FIXTURES[name] for name in sorted(FIXTURES)},
+        "tasks": [asdict(t) for t in TASKS],
+        "skeleton": [asdict(e) for e in SCORECARD_SKELETON],
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _type_ok(value, name: str) -> bool:
+    if name == "int":
+        return _is_int(value)
+    if name == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, {"bool": bool, "str": str, "dict": dict,
+                              "list": list}[name])
+
+
+def _nullable(value, name: str, where: str):
+    """A measured value of type `name`, or None for unavailable. Any other
+    type is refused: a malformed value is never coerced into a number or a
+    pass."""
+    if value is None:
+        return None
+    if not _type_ok(value, name):
+        raise ScorecardError(f"{where} must be {name} or null, got {value!r}")
+    if name == "number" and not math.isfinite(value):
+        raise ScorecardError(f"{where} must be finite, got {value!r}")
+    return float(value) if name == "number" else value
+
+
+def _task_by_id() -> dict:
+    return {t.id: t for t in TASKS}
+
+
+def _rate_obj(num: int, den: int) -> dict:
+    return {"numerator": num, "denominator": den,
+            "rate": round(num / den, 4) if den else None}
+
+
+def _mean_obj(vals: list) -> dict:
+    return {"count": len(vals),
+            "mean": round(sum(vals) / len(vals), 3) if vals else None}
+
+
+def _summarize_rows(rows: list[dict]) -> dict:
+    """Denominator-bearing rates and counts over the rows. A null value is
+    left out of its own denominator, so it is never read as zero."""
+    entries = _skeleton_by_id()
+    runnable_strata = {e.stratum for e in entries.values() if e.runnable}
+    fac = [r["first_apply_clean"] for r in rows
+           if r["first_apply_clean"] is not None]
+    labels: dict[str, int] = {}
+    for r in rows:
+        for label in r["failure_labels"]:
+            labels[label] = labels.get(label, 0) + 1
+    summary = {
+        "pass": _rate_obj(sum(1 for r in rows if r["passed"]), len(rows)),
+        "first_apply_clean": _rate_obj(sum(1 for v in fac if v), len(fac)),
+        "repair_calls": _mean_obj([r["repair_calls"] for r in rows
+                                   if r["repair_calls"] is not None]),
+        "prompt_tokens": _mean_obj([r["prompt_tokens"] for r in rows
+                                    if r["prompt_tokens"] is not None]),
+        "completion_tokens": _mean_obj([r["completion_tokens"] for r in rows
+                                        if r["completion_tokens"] is not None]),
+        "seconds": _mean_obj([r["seconds"] for r in rows
+                              if r["seconds"] is not None]),
+        "located": _mean_obj([r["located"] for r in rows
+                              if r["located"] is not None]),
+        "failure_labels": dict(sorted(labels.items())),
+        "by_stratum": {},
+    }
+    for stratum in STRATA:
+        sub = [r for r in rows if r["stratum"] == stratum]
+        sub_fac = [r["first_apply_clean"] for r in sub
+                   if r["first_apply_clean"] is not None]
+        summary["by_stratum"][stratum] = {
+            "runnable": stratum in runnable_strata,
+            "rows": len(sub),
+            "pass": _rate_obj(sum(1 for r in sub if r["passed"]), len(sub)),
+            "first_apply_clean": _rate_obj(sum(1 for v in sub_fac if v),
+                                           len(sub_fac)),
+        }
+    return summary
+
+
+def _scorecard_row(r, seeds: list[int], entries: dict[str, StratumEntry]) -> dict:
+    """One runner row as a card row. Missing measurements become null; a value
+    of the wrong type, a missing repeat or a contradictory pass/label is
+    refused, so nothing is coerced into a pass or a number."""
+    if not isinstance(r, dict):
+        raise ScorecardError("a scorecard row must be an object")
+    rid = r.get("id")
+    entry = entries.get(rid) if isinstance(rid, str) else None
+    if entry is None or not entry.runnable:
+        raise ScorecardError(f"row {rid!r} is not a runnable corpus task")
+    where = f"row {rid!r}"
+    repeat = r.get("repeat")
+    if not _is_int(repeat) or not 0 <= repeat < len(seeds):
+        raise ScorecardError(f"{where} has repeat {repeat!r}, outside the "
+                             f"{len(seeds)} seed(s)")
+    seed = r.get("seed", seeds[repeat])
+    kind = r.get("kind")
+    if kind not in _ROW_KINDS:
+        raise ScorecardError(f"{where} has kind {kind!r}")
+    passed = r.get("passed")
+    if not isinstance(passed, bool):
+        raise ScorecardError(f"{where} passed must be a boolean, got {passed!r}")
+    fac = _nullable(r.get("first_apply_clean"), "bool", f"{where} first_apply_clean")
+    if kind == "question" and fac is not None:
+        raise ScorecardError(f"{where}: first_apply_clean is only for edit rows")
+    failure = r.get("failure")
+    if failure is None:
+        failure = ""
+    if not isinstance(failure, str):
+        raise ScorecardError(f"{where} failure must be a string")
+    if passed and failure:
+        raise ScorecardError(f"{where} passed but carries failure {failure!r}")
+    if not passed and not failure:
+        raise ScorecardError(f"{where} failed without a failure label")
+    tests_ok = _nullable(r.get("tests_ok"), "bool", f"{where} tests_ok")
+    if kind == "question" and tests_ok is not None:
+        raise ScorecardError(f"{where}: tests_ok is only for edit rows")
+    task = _task_by_id().get(rid)
+    if task is None:
+        raise ScorecardError(f"{where} is not in the current task set")
+    if passed and task.test_cmd and tests_ok is not True:
+        raise ScorecardError(f"{where} passed but its required test is "
+                             f"unverified (tests_ok={tests_ok!r}); a scorecard "
+                             "may not record it as a verified pass")
+    located = _nullable(r.get("located"), "number", f"{where} located")
+    if located is not None and not 0.0 <= located <= 1.0:
+        raise ScorecardError(f"{where} located must be within [0, 1], got {located!r}")
+    return {"id": rid, "stratum": entry.stratum, "kind": kind,
+            "repeat": repeat, "seed": seed, "passed": passed,
+            "first_apply_clean": fac, "tests_ok": tests_ok, "located": located,
+            "repair_calls": _nullable(r.get("repair_calls"), "int", f"{where} repair_calls"),
+            "prompt_tokens": _nullable(r.get("prompt_tokens"), "int", f"{where} prompt_tokens"),
+            "completion_tokens": _nullable(r.get("completion_tokens"), "int", f"{where} completion_tokens"),
+            "seconds": _nullable(r.get("seconds"), "number", f"{where} seconds"),
+            "failure_labels": [] if passed else [failure]}
+
+
+def make_scorecard(rows: list[dict], *, metadata: dict) -> dict:
+    """A validated schema-v2 scorecard over the runner's `rows`. `metadata`
+    supplies the model, provider, profile, tokenizer, environment, the seed of
+    each repeat, the thinking mode and the metric/taxonomy versions. Raises
+    ScorecardError rather than returning a card that does not validate."""
+    required = ("harness_version", "model", "provider", "profile_hash",
+                "tokenizer", "environment", "seeds", "disable_thinking",
+                "taxonomy_version", "metrics_version")
+    missing = [k for k in required if k not in metadata]
+    if missing:
+        raise ScorecardError("scorecard metadata missing: " + ", ".join(missing))
+    seeds = list(metadata["seeds"])
+    built = [_scorecard_row(r, seeds, _skeleton_by_id()) for r in rows]
+    card = Scorecard(
+        harness_version=metadata["harness_version"],
+        corpus_id=CORPUS_ID,
+        corpus_sha256=corpus_fingerprint(),
+        model=metadata["model"],
+        provider=metadata["provider"],
+        profile_hash=metadata["profile_hash"],
+        tokenizer=metadata["tokenizer"],
+        environment=dict(metadata["environment"]),
+        seeds=seeds,
+        task_ids=sorted(t.id for t in TASKS),
+        rows=built,
+        summary=_summarize_rows(built),
+        taxonomy_version=metadata["taxonomy_version"],
+        metrics_version=metadata["metrics_version"],
+        disable_thinking=bool(metadata["disable_thinking"]),
+    ).to_dict()
+    errors = validate_scorecard(card)
+    if errors:
+        raise ScorecardError("; ".join(errors))
+    return card
+
+
+def validate_scorecard(card) -> list[str]:
+    """Every reason `card` is not a complete schema-v2 scorecard for the
+    current corpus. An empty list means it is valid."""
+    if not isinstance(card, dict):
+        return ["scorecard must be a JSON object"]
+    errors: list[str] = []
+    for key, name in _CARD_TYPES.items():
+        if key not in card:
+            errors.append(f"missing field: {key}")
+        elif not _type_ok(card[key], name):
+            errors.append(f"field {key} must be {name}")
+    if errors:
+        return errors
+    if card["schema_version"] != SCORECARD_SCHEMA_VERSION:
+        errors.append(f"unsupported schema_version {card['schema_version']} "
+                      f"(expected {SCORECARD_SCHEMA_VERSION})")
+    for key in ("harness_version", "corpus_id", "model", "provider",
+                "profile_hash", "tokenizer"):
+        if not card[key].strip():
+            errors.append(f"field {key} must not be blank")
+    if card["corpus_id"] != CORPUS_ID:
+        errors.append(f"corpus_id {card['corpus_id']!r} is not {CORPUS_ID!r}")
+    expected_sha = corpus_fingerprint()
+    if card["corpus_sha256"] != expected_sha:
+        errors.append("corpus_sha256 does not match the current corpus "
+                      f"(expected {expected_sha})")
+    if card["taxonomy_version"] not in _LABELS:
+        errors.append(f"unknown taxonomy_version {card['taxonomy_version']}")
+    if card["metrics_version"] != METRICS_VERSION:
+        errors.append(f"metrics_version {card['metrics_version']} is not "
+                      f"{METRICS_VERSION}")
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in card["environment"].items()):
+        errors.append("environment must map strings to strings")
+    seeds = card["seeds"]
+    if not seeds or not all(_is_int(s) for s in seeds):
+        errors.append("seeds must be a nonempty list of integers")
+        return errors
+    expected_ids = sorted(t.id for t in TASKS)
+    if card["task_ids"] != expected_ids:
+        errors.append("task_ids must be the full runnable corpus "
+                      f"({len(expected_ids)} tasks)")
+    entries = _skeleton_by_id()
+    for tid in expected_ids:
+        if tid not in entries or not entries[tid].runnable:
+            errors.append(f"task {tid} has no runnable skeleton entry")
+    task_kind = {t.id: t.kind for t in TASKS}
+    n_repeats = len(seeds)
+    pair_counts = Counter((r["id"], r["repeat"]) for r in card["rows"]
+                          if isinstance(r, dict) and isinstance(r.get("id"), str)
+                          and _is_int(r.get("repeat")))
+    known = _LABELS.get(card["taxonomy_version"], frozenset())
+    row_errors: list[str] = []
+    for i, r in enumerate(card["rows"]):
+        if not isinstance(r, dict):
+            row_errors.append(f"row {i} must be an object")
+            continue
+        missing = [k for k in _ROW_FIELDS if k not in r]
+        if missing:
+            row_errors.append(f"row {i} missing fields: {', '.join(missing)}")
+            continue
+        rid = r["id"]
+        where = f"row {i} ({rid!r})"
+        if not isinstance(rid, str) or rid not in task_kind:
+            row_errors.append(f"{where}: not a runnable corpus task")
+            continue
+        entry = entries.get(rid)
+        if entry is None or not entry.runnable:
+            row_errors.append(f"{where}: no runnable skeleton entry")
+            continue
+        if r["stratum"] != entry.stratum:
+            row_errors.append(f"{where}: stratum {r['stratum']!r} should be "
+                              f"{entry.stratum!r}")
+        if r["kind"] != task_kind[rid]:
+            row_errors.append(f"{where}: kind {r['kind']!r} should be "
+                              f"{task_kind[rid]!r}")
+        rep = r["repeat"]
+        if not _is_int(rep) or not 0 <= rep < n_repeats:
+            row_errors.append(f"{where}: repeat {rep!r} is outside the seeds")
+            continue
+        if r["seed"] != seeds[rep]:
+            row_errors.append(f"{where}: seed {r['seed']!r} should be "
+                              f"{seeds[rep]}")
+        if not isinstance(r["passed"], bool):
+            row_errors.append(f"{where}: passed must be a boolean")
+        fac = r["first_apply_clean"]
+        if fac is not None and not isinstance(fac, bool):
+            row_errors.append(f"{where}: first_apply_clean must be a boolean or null")
+        if r["kind"] == "question" and fac is not None:
+            row_errors.append(f"{where}: first_apply_clean is only for edit rows")
+        for key in ("repair_calls", "prompt_tokens", "completion_tokens"):
+            if r[key] is not None and (not _is_int(r[key]) or r[key] < 0):
+                row_errors.append(f"{where}: {key} must be a count or null")
+        if r["seconds"] is not None and (not _type_ok(r["seconds"], "number")
+                                         or not math.isfinite(r["seconds"])
+                                         or r["seconds"] < 0):
+            row_errors.append(f"{where}: seconds must be a finite number or null")
+        tests_ok = r["tests_ok"]
+        if tests_ok is not None and not isinstance(tests_ok, bool):
+            row_errors.append(f"{where}: tests_ok must be a boolean or null")
+        elif r["kind"] == "question" and tests_ok is not None:
+            row_errors.append(f"{where}: tests_ok is only for edit rows")
+        elif r["passed"] is True and _task_by_id()[rid].test_cmd \
+                and tests_ok is not True:
+            row_errors.append(f"{where}: passed without a verified required "
+                              "test (tests_ok is not true)")
+        located = r["located"]
+        if located is not None and (not _type_ok(located, "number")
+                                    or not math.isfinite(located)
+                                    or not 0.0 <= located <= 1.0):
+            row_errors.append(f"{where}: located must be a finite number in "
+                              "[0, 1] or null")
+        labels = r["failure_labels"]
+        if not isinstance(labels, list) or not all(isinstance(x, str)
+                                                   for x in labels):
+            row_errors.append(f"{where}: failure_labels must be a list of strings")
+        else:
+            unknown = [x for x in labels if x not in known]
+            if unknown:
+                row_errors.append(f"{where}: unknown failure label(s) "
+                                  f"{', '.join(unknown)}")
+            if r["passed"] and labels:
+                row_errors.append(f"{where}: a passing row has failure labels")
+            if not r["passed"] and not labels:
+                row_errors.append(f"{where}: a failing row has no failure label")
+    for (rid, rep), count in sorted(pair_counts.items()):
+        if count > 1:
+            row_errors.append(f"duplicate row: {rid} repeat {rep} appears "
+                              f"{count} times (exactly one row per pair)")
+    errors.extend(row_errors)
+    for tid in expected_ids:
+        for rep in range(n_repeats):
+            if pair_counts[(tid, rep)] == 0:
+                errors.append(f"missing row: {tid} repeat {rep} (a missing row "
+                              "is not a pass)")
+    if not row_errors and not any(e.startswith("missing row") for e in errors):
+        if card["summary"] != _summarize_rows(card["rows"]):
+            errors.append("summary does not match the rows")
+    return errors
+
+
+def _legacy_view(card: dict) -> dict:
+    """The card as the report shape `compare_reports` already gates on, so
+    the scorecard gate reuses the same metric logic. A null stays absent."""
+    rows = [{"id": r["id"], "kind": r["kind"], "repeat": r["repeat"],
+             "passed": r["passed"],
+             "first_apply_clean": r["first_apply_clean"],
+             "repair_calls": r["repair_calls"],
+             "prompt_tokens": r["prompt_tokens"],
+             "completion_tokens": r["completion_tokens"],
+             "seconds": r["seconds"],
+             "located": r["located"],
+             "failure": r["failure_labels"][0] if r["failure_labels"] else ""}
+            for r in card["rows"]]
+    s = card["summary"]
+    return {
+        "summary": {
+            "pass_rate": s["pass"]["rate"] or 0.0,
+            "first_apply_clean": s["first_apply_clean"]["rate"] or 0.0,
+            "injection_followed": sum(1 for r in rows
+                                      if r["failure"] == "injection followed"),
+            "failures": dict(s["failure_labels"]),
+            "mean_prompt_tokens": s["prompt_tokens"]["mean"] or 0.0,
+            "mean_seconds": s["seconds"]["mean"] or 0.0,
+            "locate_rate": s["located"]["mean"] or 0.0,
+        },
+        "rows": rows,
+        "taxonomy": card["taxonomy_version"],
+        "metrics": card["metrics_version"],
+        "disable_thinking": card["disable_thinking"],
+    }
+
+
+def compare_scorecards(baseline: dict, current: dict, *,
+                       max_prompt_growth: float = 0.0,
+                       max_time_growth: float = 0.50,
+                       notes: list[str] | None = None
+                       ) -> tuple[list[str], list[str]]:
+    """Regressions and improvements between two scorecards.
+
+    Both cards must validate, and must agree on every field in
+    `_COMPARE_FIELDS` (corpus, task set, seeds, model, profile, tokenizer,
+    thinking mode and metric versions); otherwise ScorecardError is raised and
+    nothing is synthesised. Prompt-token growth beyond `max_prompt_growth`
+    (default: none) is a regression. Time and the other rates go through
+    `compare_reports`. Per-stratum rates go to `notes`, which is not gated.
+    """
+    for name, tolerance in (("max_prompt_growth", max_prompt_growth),
+                            ("max_time_growth", max_time_growth)):
+        if not _type_ok(tolerance, "number") or not math.isfinite(tolerance) \
+                or tolerance < 0:
+            raise ScorecardError(f"{name} must be a finite number >= 0, "
+                                 f"got {tolerance!r}")
+    for name, card in (("baseline", baseline), ("current", current)):
+        errors = validate_scorecard(card)
+        if errors:
+            raise ScorecardError(f"invalid {name} scorecard: " + "; ".join(errors))
+    mismatch = [f"{f} differs (baseline {baseline[f]!r}, current {current[f]!r})"
+                for f in _COMPARE_FIELDS if baseline[f] != current[f]]
+    if mismatch:
+        raise ScorecardError("incomparable scorecards: " + "; ".join(mismatch))
+    info = notes if notes is not None else []
+    regressions: list[str] = []
+    improvements: list[str] = []
+    for side, card in (("baseline", baseline), ("current", current)):
+        n_locate_null = sum(1 for r in card["rows"] if r["located"] is None)
+        if n_locate_null:
+            regressions.append(
+                f"{side}: locate rate not measured for {n_locate_null} of "
+                f"{len(card['rows'])} row(s) (fail closed)")
+        n_null = sum(1 for r in card["rows"]
+                     if r["kind"] == "edit" and r["first_apply_clean"] is None)
+        if n_null:
+            regressions.append(f"{side}: first-apply-clean not measured for "
+                               f"{n_null} edit row(s)")
+        n_prompt_null = sum(1 for r in card["rows"]
+                            if r["prompt_tokens"] is None)
+        if n_prompt_null:
+            regressions.append(
+                f"{side}: prompt tokens not measured for {n_prompt_null} of "
+                f"{len(card['rows'])} row(s); paired prompt growth cannot be "
+                "verified (fail closed)")
+    b_view, c_view = _legacy_view(baseline), _legacy_view(current)
+    old = b_view["summary"]["mean_prompt_tokens"]
+    new = c_view["summary"]["mean_prompt_tokens"]
+    if new > old * (1 + max_prompt_growth) + 1e-9:
+        regressions.append(f"mean prompt tokens: {old:.1f} -> {new:.1f} "
+                           f"(growth above {max_prompt_growth:.0%})")
+    elif new < old - 1e-9:
+        improvements.append(f"mean prompt tokens: {old:.1f} -> {new:.1f}")
+    reg, imp = compare_reports(b_view, c_view,
+                               max_token_growth=float("inf"),
+                               max_time_growth=max_time_growth, notes=info)
+    for stratum in STRATA:
+        b = baseline["summary"]["by_stratum"][stratum]
+        c = current["summary"]["by_stratum"][stratum]
+        if not b["runnable"]:
+            info.append(f"stratum {stratum}: not measured (non-runnable placeholder)")
+            continue
+        info.append(f"stratum {stratum}: pass {b['pass']['numerator']}/"
+                    f"{b['pass']['denominator']} -> {c['pass']['numerator']}/"
+                    f"{c['pass']['denominator']}")
+    return regressions + reg, improvements + imp
+
+
+def _scorecard_problem(tasks: list, seeds: list) -> str:
+    """Why `--scorecard` cannot write a comparable card ('' when it can)."""
+    if seeds[0] is None:
+        return "eval.scorecard.needs_seed"
+    if len(tasks) != len(TASKS):
+        return "eval.scorecard.needs_full_corpus"
+    return ""
+
+
+def _scorecard_metadata(cfg, seeds: list) -> dict:
+    """The run's identity for a scorecard: the profile is stored as a hash of
+    its behaviour-relevant settings, never as the raw config or endpoint."""
+    from . import __version__
+    thinking = bool(getattr(cfg, "disable_thinking", False))
+    sampler = {k: v for k, v in (cfg.sampler or {}).items() if k != "seed"}
+    profile = {"model": cfg.model, "prompt_pack": getattr(cfg, "prompt_pack", ""),
+               "edit_style": getattr(cfg, "edit_style", None),
+               "disable_thinking": thinking, "sampler": sampler}
+    digest = hashlib.sha256(
+        json.dumps(profile, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return {
+        "harness_version": __version__,
+        "model": str(cfg.model or ""),
+        "provider": str(getattr(cfg, "provider", "") or "unspecified"),
+        "profile_hash": digest,
+        # `llm` takes the server's usage when it reports one and otherwise
+        # substitutes a client estimate, and the stats do not say which. So the
+        # count is labelled unverified, never exact.
+        "tokenizer": TOKEN_PROVENANCE,
+        "environment": {"os": platform.system() or "unknown",
+                        "python": platform.python_version()},
+        "seeds": list(seeds),
+        "disable_thinking": thinking,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "metrics_version": METRICS_VERSION,
+    }

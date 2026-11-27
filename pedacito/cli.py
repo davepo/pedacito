@@ -3287,11 +3287,78 @@ def _bench_summary(result) -> str:
     return "\n".join(lines)
 
 
+def _finite_fraction(text: str) -> float:
+    """argparse type for a tolerance: a finite number >= 0. NaN or infinity
+    would switch a regression check off, so the parser refuses them (exit 2)."""
+    import math
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number >= 0, got {text!r}")
+    return value
+
+
+def _reject_nonfinite(token: str):
+    raise ValueError(f"non-finite number {token} is not allowed")
+
+
+def _cmd_bench_compare(args) -> int:
+    """`pedacito bench compare BASELINE CURRENT`: the scorecard gate. Exit 0
+    for a pass, 1 for a regression, 2 for an invalid or incomparable pair."""
+    import json
+
+    from . import evalrun
+
+    paths = list(getattr(args, "bench_args", []) or [])
+    if len(paths) != 2:
+        print(i18n.t("cli.bench.compare.usage"), file=sys.stderr)
+        return 2
+    cards = []
+    for path in paths:
+        try:
+            cards.append(json.loads(Path(path).read_text(encoding="utf-8"),
+                                    parse_constant=_reject_nonfinite))
+        except (OSError, ValueError) as e:
+            print(i18n.t("cli.bench.compare.unreadable", path=path,
+                         error=str(e)), file=sys.stderr)
+            return 2
+    notes: list[str] = []
+    try:
+        regressions, improvements = evalrun.compare_scorecards(
+            cards[0], cards[1],
+            max_prompt_growth=float(getattr(args, "max_prompt_growth", 0.0)),
+            max_time_growth=float(getattr(args, "max_time_growth", 0.50)),
+            notes=notes)
+    except evalrun.ScorecardError as e:
+        print(i18n.t("cli.bench.compare.incomparable", message=str(e)),
+              file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({
+            "result": "regression" if regressions else "pass",
+            "regressions": regressions, "improvements": improvements,
+            "notes": notes,
+        }, indent=2, ensure_ascii=False))
+    else:
+        print(evalrun.render_compare(regressions, improvements, notes))
+    return 1 if regressions else 0
+
+
 def _cmd_bench(args) -> int:
     """`pedacito bench`: run the built-in diagnostic benchmarks and holdout."""
     import json
 
     from . import benchmarks
+
+    wanted_compare = str(args.benchmark or "").strip() == "compare"
+    if wanted_compare:
+        return _cmd_bench_compare(args)
+    if getattr(args, "bench_args", None):
+        print(i18n.t("cli.bench.extra_args"), file=sys.stderr)
+        return 2
 
     if args.list:
         rows = benchmarks.list_benchmarks()
@@ -4868,11 +4935,11 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         help="A/B gate: compare this run's metrics with an "
                              "earlier eval --out report; exit nonzero on a "
                              "regression")
-    p_eval.add_argument("--max-token-growth", type=float, default=0.20,
+    p_eval.add_argument("--max-token-growth", type=_finite_fraction, default=0.20,
                         metavar="FRAC",
                         help="allow this much token growth vs baseline "
                              "(default 0.20)")
-    p_eval.add_argument("--max-time-growth", type=float, default=0.50,
+    p_eval.add_argument("--max-time-growth", type=_finite_fraction, default=0.50,
                         metavar="FRAC",
                         help="allow this much wall-time growth vs baseline "
                              "(default 0.50)")
@@ -4884,6 +4951,10 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         help="base sampler.seed: repeat i uses S+i (default: "
                              "your sampler seed, else 0, when --repeats > 1; "
                              "unset for a single run)")
+    p_eval.add_argument("--scorecard", metavar="FILE",
+                        help="also write a schema-v2 scorecard for `bench "
+                             "compare`; needs --seed or --repeats > 1 and the "
+                             "full task set (no --task)")
     p_eval.add_argument("--list", action="store_true", help="list tasks and exit")
     for flag in ("--url", "--model", "--config", "--profile"):
         p_eval.add_argument(flag)
@@ -4898,6 +4969,16 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
         "benchmark", nargs="?", default="",
         help="benchmark id to run, or 'all' to run all six sequentially "
              "(default: all)")
+    p_bench.add_argument("bench_args", nargs="*", default=[],
+                         help=argparse.SUPPRESS)
+    p_bench.add_argument("--max-prompt-growth", type=_finite_fraction, default=0.0,
+                         metavar="FRAC",
+                         help="bench compare: allowed mean prompt-token growth "
+                              "(default 0: none)")
+    p_bench.add_argument("--max-time-growth", type=_finite_fraction, default=0.50,
+                         metavar="FRAC",
+                         help="bench compare: allowed mean seconds growth "
+                              "(default 0.50)")
     p_bench.add_argument("--list", action="store_true",
                          help="list the six benchmarks and exit")
     p_bench.add_argument("--recent", action="store_true",

@@ -207,6 +207,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito parsers prefetch [--languages ...]` | Pre-warm the tree-sitter grammars for offline or air-gapped use and report ok or failed per language |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
+| `pedacito bench compare BASELINE CURRENT` | Gate two eval scorecards written by `pedacito eval --scorecard`: exit 0 pass, 1 regression, 2 invalid or incomparable. Needs no model; `--max-prompt-growth` defaults to 0 |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
 
 Benchmarks also run from the GUI through the **Benchmarks** button; the CLI
@@ -1017,6 +1018,8 @@ pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model need
 pedacito ask PROJ -t "..." --replay FILE --strict-replay  # fail on prompt drift
 pedacito ask PROJ -t "..." --continue        # seed the task from the newest ask checkpoint
 pedacito eval --out new.json --baseline base.json         # CI A/B regression gate
+pedacito eval --seed 1 --scorecard card-before.json       # schema-v2 scorecard (full task set, explicit seed)
+pedacito bench compare card-before.json card-after.json   # scorecard gate: 0 pass, 1 regression, 2 invalid/incomparable
 pedacito eval --repeats 3 --seed 1 --out new.json   # 3 seeded runs: pass counts, mean ± spread
 pedacito new app -t "..." --design           # interfaces/data/tests before code
 pedacito serve --root PROJ --name web -- npm run dev

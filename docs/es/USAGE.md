@@ -208,6 +208,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito index`, `map`, `files`, `cost` | Construyen e inspeccionan el índice. No necesitan llamada al modelo, salvo los resúmenes de `index` |
 | `pedacito eval` | Puntúa el arnés sobre repositorios de prueba. Usa `--baseline` como compuerta de regresión |
 | `pedacito bench [BENCHMARK\|all]` | Ejecuta la suite de benchmarks de diagnóstico de seis proyectos y la rúbrica oculta de evaluación. `--list` y `--recent` no necesitan modelo; `--json` y `--strict` encajan en CI |
+| `pedacito bench compare BASELINE CURRENT` | Compara dos scorecards de eval escritas con `pedacito eval --scorecard`: salida 0 aprobado, 1 regresión, 2 inválido o no comparable. No necesita modelo; `--max-prompt-growth` vale 0 por defecto |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Herramientas de mantenimiento y de especialista. `mcp list` muestra las herramientas de los servidores MCP con nombre y sus indicadores de confianza |
 
 Los benchmarks también se ejecutan desde la GUI mediante el botón **Benchmarks**; el comando
@@ -1007,6 +1008,8 @@ pedacito ask PROJ -t "..." --replay FILE     # re-run the harness, no model need
 pedacito ask PROJ -t "..." --replay FILE --strict-replay  # fail on prompt drift
 pedacito ask PROJ -t "..." --continue        # seed the task from the newest ask checkpoint
 pedacito eval --out new.json --baseline base.json         # CI A/B regression gate
+pedacito eval --seed 1 --scorecard card-before.json       # scorecard schema v2 (tareas completas, semilla explícita)
+pedacito bench compare card-before.json card-after.json   # puerta de scorecards: 0 aprobado, 1 regresión, 2 inválido/no comparable
 pedacito eval --repeats 3 --seed 1 --out new.json   # 3 seeded runs: pass counts, mean ± spread
 pedacito new app -t "..." --design           # interfaces/data/tests before code
 pedacito serve --root PROJ --name web -- npm run dev
