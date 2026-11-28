@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import posixpath
 import re
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------- extraction
 _JS_RES = (
@@ -300,3 +301,95 @@ def _resolve_rust(rel: str, spec: str, fs: FileSet) -> list[str]:
             if got:
                 return got[:1]
     return []
+
+
+# ------------------------------------------------------- Python module naming
+def module_name(rel: str) -> str:
+    """Absolute dotted module name of a Python path.
+
+    ``pkg/__init__.py`` -> ``pkg``, ``pkg/core.py`` -> ``pkg.core``,
+    ``core.py`` -> ``core``. Returns "" for a non-Python path.
+    """
+    rel = (rel or "").replace("\\", "/")
+    low = rel.lower()
+    if low.endswith(".py"):
+        rel = rel[:-3]
+    elif low.endswith(".pyi"):
+        rel = rel[:-4]
+    else:
+        return ""
+    parts = [p for p in rel.split("/") if p]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def relative_specifier(importer_rel: str, target_rel: str) -> str | None:
+    """Relative dotted specifier that imports ``target_rel``'s module from
+    ``importer_rel``'s package.
+
+    Importer ``pkg/a.py`` to target ``pkg/sub/b.py`` gives ``.sub.b``; to
+    ``pkg/core.py`` gives ``.core``; importer ``pkg/sub/a.py`` to ``pkg/core.py``
+    gives ``..core``. Returns None when no clean relative path exists (the
+    caller falls back to the absolute dotted name)."""
+    target = module_name(target_rel)
+    if not target:
+        return None
+    importer_pkg = posixpath.dirname(importer_rel.replace("\\", "/"))
+    target_dir = posixpath.dirname(target_rel.replace("\\", "/"))
+    base = target.rsplit(".", 1)[-1]
+    if importer_pkg == target_dir:
+        return "." + base
+    if target_dir.startswith(importer_pkg + "/") or importer_pkg == "":
+        rel_dir = target_dir[len(importer_pkg) + 1:] if importer_pkg else target_dir
+        tail = rel_dir.replace("/", ".")
+        return "." + (tail + "." if tail else "") + base
+    ip = importer_pkg.split("/") if importer_pkg else []
+    td = target_dir.split("/") if target_dir else []
+    common = 0
+    while common < len(ip) and common < len(td) and ip[common] == td[common]:
+        common += 1
+    if common == 0:
+        return None
+    dots = "." + "." * (len(ip) - common)
+    down = td[common:]
+    return dots + ("." + ".".join(down) + "." if down else "") + base
+
+
+# --------------------------------------------------- structured import bindings
+@dataclass(frozen=True)
+class PyImport:
+    """One Python import statement, structured for cross-file rewrite."""
+
+    kind: str                       # "import" or "from"
+    module: str                     # dotted module ("" for `import`; `from` fills it)
+    level: int                      # relative-import level (`from` only)
+    names: tuple[tuple[str, str], ...]  # (name, asname-or-"")
+    lineno: int
+    end_lineno: int
+
+
+def python_import_bindings(src: str, tree: ast.AST | None = None
+                           ) -> list[PyImport]:
+    """Every import statement in ``src`` (top-level and nested), with names,
+    aliases and source lines. Returns [] when the file does not parse."""
+    if tree is None:
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            return []
+    out: list[PyImport] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            out.append(PyImport(
+                "import", "", 0,
+                tuple((a.name, a.asname or "") for a in n.names),
+                int(getattr(n, "lineno", 1) or 1),
+                int(getattr(n, "end_lineno", n.lineno) or n.lineno)))
+        elif isinstance(n, ast.ImportFrom):
+            out.append(PyImport(
+                "from", n.module or "", int(n.level or 0),
+                tuple((a.name, a.asname or "") for a in n.names),
+                int(getattr(n, "lineno", 1) or 1),
+                int(getattr(n, "end_lineno", n.lineno) or n.lineno)))
+    return out

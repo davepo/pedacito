@@ -28,9 +28,9 @@ Gated by `allow_write`, snapshotted like every other write (undo with
 `pedacito restore`), and the index is refreshed afterwards.
 
 The mechanical codemod recipes (imports, logger conversion, constant
-extraction, annotations) live in :mod:`pedacito.codemod`. Two thin facade
-functions keep this module's public surface the single import path for
-refactoring callers while the engine stays independently testable.
+extraction, annotations, cross-file moves) live in :mod:`pedacito.codemod`.
+Thin facade functions keep this module's public surface the single import path
+for refactoring callers while the engine stays independently testable.
 """
 
 from __future__ import annotations
@@ -1100,3 +1100,10 @@ def codemod_apply(root, request, *, index=None, cfg=None):
     from .codemod import apply
 
     return apply(root, request, index=index, cfg=cfg)
+
+
+def codemod_list():
+    """The codemod catalog, in stable documented order (a deep copy)."""
+    from .codemod import list_recipes
+
+    return list_recipes()
