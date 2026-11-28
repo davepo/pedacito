@@ -2171,15 +2171,60 @@ class LLMClient:
         temperature, say) would otherwise trigger a pointless trim cascade."""
         return bool(_CONTEXT_OVERFLOW_RE.search(body or ""))
 
+    def _emit_event(self, kind: str, **fields) -> None:
+        """A typed event for autopsy: codes and scalars only, never a server
+        body or prompt text. Never raises."""
+        try:
+            from . import events as events_mod
+            events_mod.get(self._outbound_root(), self.cfg).emit(kind, **fields)
+        except Exception:
+            pass
+
     def _emit_error_code(self, code: str) -> None:
         """A typed `llm_error` event for autopsy: the code only, never the
         server's body text. Never raises."""
-        try:
-            from . import events as events_mod
-            events_mod.get(self._outbound_root(), self.cfg).emit(
-                "llm_error", code=code)
-        except Exception:
-            pass
+        self._emit_event("llm_error", code=code)
+
+    def _budget_refusal(self, message: str, reason_code: str) -> BudgetExceeded:
+        """The BudgetExceeded for a refused call, after its typed event: a
+        `timeout` when the run's deadline refused it, else a `budget_stop`."""
+        if "deadline" in message.lower():
+            self._emit_event("timeout", reason_code="run_deadline")
+        else:
+            self._emit_event("budget_stop", reason_code=reason_code)
+        return BudgetExceeded(message)
+
+    def _timeout_error(self, req_timeout: float) -> LLMError:
+        """The LLMError for a request that ran out of time, after its typed
+        event. A request clamped by the run's deadline (--max-minutes) names
+        the timeout it actually had, not the configured `timeout`."""
+        clamped = float(req_timeout) < float(self.cfg.timeout)
+        self._emit_event("timeout", timeout_s=round(float(req_timeout), 1),
+                         reason_code="run_deadline" if clamped
+                         else "request_timeout")
+        if clamped:
+            return LLMError(
+                f"The server at {self.cfg.base_url} did not answer within "
+                f"{req_timeout:g}s, the time left in this run's budget "
+                f"(--max-minutes). `timeout` in your config is "
+                f"{self.cfg.timeout:g}s; raise --max-minutes to allow more.")
+        return LLMError(
+            f"The server at {self.cfg.base_url} did not answer within "
+            f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
+            "local model may need a larger timeout; a hosted API may be "
+            "overloaded.")
+
+    def _check_run_deadline(self) -> None:
+        """Refuse a retry that would start after the run's or the task's
+        wall-clock deadline (--max-minutes)."""
+        task = float(getattr(self.cfg, "_task_deadline", 0.0) or 0.0)
+        deadlines = [d for d in (task, self._run_deadline() or 0.0) if d]
+        if deadlines and time.monotonic() >= min(deadlines):
+            self._emit_event("timeout", reason_code="run_deadline")
+            raise LLMError(
+                "The run's time budget (--max-minutes) expired before this "
+                "model call could be retried; stopping instead of spending "
+                "more minutes on re-asks.")
 
     def _http_post(self, url: str, **kw):
         """`requests.post` through this client's pooled session (a fresh TCP/TLS
@@ -2580,11 +2625,12 @@ class LLMClient:
             if trip_circuit:
                 self._record_success()
 
+        req_timeout = self._effective_timeout()
         try:
             try:
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
-                    timeout=self._effective_timeout(), stream=stream)
+                    timeout=req_timeout, stream=stream)
             except requests.exceptions.ConnectionError:
                 # A pooled keep-alive connection the server already closed
                 # looks like a refused connection; retry once on a fresh
@@ -2596,7 +2642,7 @@ class LLMClient:
                 self._reset_session()
                 r = self._http_post(
                     self.url, headers=self.headers, json=payload,
-                    timeout=self._effective_timeout(), stream=stream)
+                    timeout=req_timeout, stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
@@ -2604,11 +2650,7 @@ class LLMClient:
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
             _fail()
-            raise LLMError(
-                f"The server at {self.cfg.base_url} did not answer within "
-                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
-                "local model may need a larger timeout; a hosted API may be "
-                "overloaded.") from e
+            raise self._timeout_error(req_timeout) from e
         except requests.exceptions.RequestException as e:
             _fail()
             raise LLMError(
@@ -2924,6 +2966,8 @@ class LLMClient:
             if empty_streak > 2:
                 if always and self.last_reasoning_chars:
                     raise LLMError(self._always_thinks_fit_error(max_tokens))
+                if self.last_finish_reason == "length":
+                    raise LLMError(self._reasoning_exhausted_error(max_tokens))
                 return text
             effective_thinking_off = (disable_thinking
                                       if disable_thinking is not None
@@ -2969,6 +3013,7 @@ class LLMClient:
                 how = " with thinking disabled"
             else:
                 how = ""
+            self._check_run_deadline()
             print(f"[the model streamed an EMPTY answer (~"
                   f"{self.last_reasoning_chars:,} chars of hidden reasoning, "
                   f"finish '{self.last_finish_reason or 'stop'}'); "
@@ -2989,6 +3034,18 @@ class LLMClient:
             "profile, or pick a model with a larger window or a working "
             "thinking off switch.")
 
+    def _reasoning_exhausted_error(self, max_tokens: int) -> str:
+        """The diagnostic for a streamed reply that stayed empty after the
+        bounded retries because hidden reasoning used the whole reply budget
+        (finish 'length'). Retrying the same call again would not help."""
+        return (
+            f"'{self.cfg.model}' streamed no answer after 2 retries: each reply "
+            f"spent the {max_tokens}-token reply budget on hidden reasoning "
+            f"(~{self.last_reasoning_chars:,} chars, finish 'length') and emitted "
+            "nothing.\n"
+            "  Raise max_tokens_build / max_tokens_answer in your profile, set "
+            "disable_thinking = true, or pick a model that reasons less.")
+
     def _check_budget(self) -> None:
         """Raise BudgetExceeded before a call when a configured token/cost
         budget is already spent."""
@@ -2997,15 +3054,16 @@ class LLMClient:
             cost = self.stats["cost"]
         cap_tokens = int(getattr(self.cfg, "max_total_tokens", 0) or 0)
         if cap_tokens and used >= cap_tokens:
-            raise BudgetExceeded(
+            raise self._budget_refusal(
                 f"Token budget spent: {used:,} of max_total_tokens="
                 f"{cap_tokens:,}. Raise it (or pass --max-tokens-budget) to "
-                "continue; progress so far is saved.")
+                "continue; progress so far is saved.", "max_total_tokens")
         cap_cost = float(getattr(self.cfg, "max_cost", 0) or 0)
         if cap_cost and cost >= cap_cost:
-            raise BudgetExceeded(
+            raise self._budget_refusal(
                 f"Cost budget spent: ${cost:.4f} of max_cost="
-                f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.")
+                f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.",
+                "max_cost")
 
     def _reserve_call(self, messages: list[dict], max_tokens: int) -> str | None:
         """Reserve this call against a strict :class:`RunBudget` (if active).
@@ -3027,7 +3085,7 @@ class LLMClient:
             try:
                 budget.settle_call(leftover, None)
             except RunBudgetError as e:
-                raise BudgetExceeded(str(e)) from e
+                raise self._budget_refusal(str(e), "strict_cost") from e
         prices = {
             "input": float(getattr(self.cfg, "price_input_per_mtok", 0) or 0),
             "output": float(getattr(self.cfg, "price_output_per_mtok", 0) or 0),
@@ -3039,7 +3097,7 @@ class LLMClient:
         try:
             token = budget.reserve_call(prompt_est, int(max_tokens or 0), prices)
         except RunBudgetError as e:
-            raise BudgetExceeded(str(e)) from e
+            raise self._budget_refusal(str(e), "strict_cost") from e
         self._active_reservation = token
         return token
 
@@ -3054,7 +3112,7 @@ class LLMClient:
         try:
             budget.settle_call(token, actual_usd)
         except RunBudgetError as e:
-            raise BudgetExceeded(str(e)) from e
+            raise self._budget_refusal(str(e), "strict_cost") from e
 
     def _account(self, usage: dict, timings: dict | None, seconds: float,
                  prompt_est: int, out_text: str = "") -> dict:
@@ -3883,10 +3941,11 @@ class LLMClient:
             if trip_circuit:
                 self._record_success()
 
+        req_timeout = self._effective_timeout()
         try:
             try:
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self._effective_timeout(), stream=stream)
+                                    timeout=req_timeout, stream=stream)
             except requests.exceptions.ConnectionError:
                 with self._session_lock:
                     used = self._session_used
@@ -3894,7 +3953,7 @@ class LLMClient:
                     raise
                 self._reset_session()
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self._effective_timeout(), stream=stream)
+                                    timeout=req_timeout, stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
@@ -3902,11 +3961,7 @@ class LLMClient:
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
             _fail()
-            raise LLMError(
-                f"The server at {self.cfg.base_url} did not answer within "
-                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
-                "local model may need a larger timeout; a hosted API may be "
-                "overloaded.") from e
+            raise self._timeout_error(req_timeout) from e
         except requests.exceptions.RequestException as e:
             _fail()
             raise LLMError(
@@ -4284,10 +4339,11 @@ class LLMClient:
             if trip_circuit:
                 self._record_success()
 
+        req_timeout = self._effective_timeout()
         try:
             try:
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self._effective_timeout(), stream=stream)
+                                    timeout=req_timeout, stream=stream)
             except requests.exceptions.ConnectionError:
                 with self._session_lock:
                     used = self._session_used
@@ -4295,7 +4351,7 @@ class LLMClient:
                     raise
                 self._reset_session()
                 r = self._http_post(url, headers=headers, json=payload,
-                                    timeout=self._effective_timeout(), stream=stream)
+                                    timeout=req_timeout, stream=stream)
             with self._session_lock:
                 self._session_used = True
         except requests.exceptions.ConnectionError as e:
@@ -4303,11 +4359,7 @@ class LLMClient:
             raise LLMError(CONNECT_HELP.format(url=self.cfg.base_url)) from e
         except requests.exceptions.Timeout as e:
             _fail()
-            raise LLMError(
-                f"The server at {self.cfg.base_url} did not answer within "
-                f"{self.cfg.timeout:g}s (`timeout` in your config). A slow "
-                "local model may need a larger timeout; a hosted API may be "
-                "overloaded.") from e
+            raise self._timeout_error(req_timeout) from e
         except requests.exceptions.RequestException as e:
             _fail()
             raise LLMError(
@@ -6097,6 +6149,8 @@ class LLMClient:
                             "api_key in your config (`pedacito config --check`).")
             raise LLMError(f"Server returned {status}: {body}{hint}") from e
         except requests.exceptions.Timeout as e:
+            self._emit_event("timeout", timeout_s=15.0,
+                             reason_code="model_list")
             raise LLMError(
                 f"The server at {self.cfg.base_url} did not answer within "
                 "15s while listing models. A local model may still be "

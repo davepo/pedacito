@@ -67,7 +67,7 @@ _OBS_MARKERS = (
 _SCALAR_FIELDS = (
     "file", "action", "gate", "n", "step", "field", "stopped", "ok",
     "applied", "failed", "errors", "code", "obs_code", "phase", "rc",
-    "steps", "signal", "reason_code",
+    "steps", "signal", "reason_code", "timeout_s",
 )
 
 _NEXT_STEPS = {
@@ -133,6 +133,8 @@ def typed_category(ev: dict) -> str:
         return ""
     if kind == "task_budget":
         return "budget_stop"
+    if kind in ("budget_stop", "timeout"):
+        return kind
     if kind == "incremental_partial":
         return "partial_batch"
     if kind == "llm_error":

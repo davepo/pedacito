@@ -16,7 +16,9 @@ Typed failure fields (additive; read by `autopsy.py`, never free text):
 observation),
 `payload_cut` (a step's payload was cut off), `step_rejected` (a malformed
 step, `reason="malformed"`), `llm_error` (`code` is `context_overflow` or
-`schema_rejection`), and `test_result` (`ok`, `stopped`). Raw observations and
+`schema_rejection`), `budget_stop` (a refused call: `reason_code` names the
+budget), `timeout` (a request or the run deadline ran out: `timeout_s`,
+`reason_code`), and `test_result` (`ok`, `stopped`). Raw observations and
 server bodies are never written as these fields.
 """
 

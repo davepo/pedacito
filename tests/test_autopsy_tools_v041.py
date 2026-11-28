@@ -236,6 +236,79 @@ def test_gui_autopsy_route_is_read_only(tmp_path, monkeypatch):
     assert status == 400 and body["ok"] is False
 
 
+# ------------------------------------------- controlled budget and timeouts --
+
+def test_budget_stop_and_timeout_kinds_map_deterministically(tmp_path):
+    _write_log(tmp_path, [_ev("budget_stop", 1, reason_code="max_cost"),
+                          _ev("exit", 2, code=1)])
+    result = autopsy.autopsy(tmp_path, "last")
+    assert result.category == "budget_stop" and result.incomplete is False
+    _write_log(tmp_path, [
+        _ev("llm_start", 1, model="m"),
+        _ev("timeout", 2, timeout_s=52.6, reason_code="run_deadline"),
+        _ev("exit", 3, code=1),
+    ], name="20260101-000001-1.jsonl")
+    result = autopsy.autopsy(tmp_path, "last")
+    assert result.category == "timeout" and result.incomplete is False
+    assert result.evidence[0]["timeout_s"] == 52.6
+    assert autopsy.typed_category({"kind": "budget_stop"}) == "budget_stop"
+    assert autopsy.typed_category({"kind": "timeout"}) == "timeout"
+
+
+def _real_cfg(tmp_path, **overrides):
+    cfg = Config()
+    cfg.base_url = "http://127.0.0.1:9/v1"
+    cfg.model = "stub-model"
+    cfg.log_sessions = False
+    cfg.log_events = True
+    cfg._root = str(tmp_path)
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def test_strict_cost_refusal_autopsies_as_budget_stop(tmp_path, monkeypatch):
+    from pedacito import session_ctx
+    from pedacito.llm import BudgetExceeded, LLMClient
+
+    def no_request(url, **kw):
+        raise AssertionError("no request may start past the strict cap")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", no_request)
+    cfg = _real_cfg(tmp_path, strict_cost_budget=True, max_cost=0.000001)
+    session_ctx.set_run_budget(session_ctx.RunBudget(max_cost_usd=0.000001), cfg)
+    events.get(tmp_path, cfg).emit("session_start", cmd="ask")
+    with pytest.raises(BudgetExceeded):
+        LLMClient(cfg).chat([{"role": "user", "content": "hi"}], 100, stream=False)
+    events.get(tmp_path, cfg).emit("exit", code=1)
+    result = autopsy.autopsy(tmp_path, "last")
+    assert result.category == "budget_stop"
+    assert result.incomplete is False
+
+
+def test_clamped_timeout_autopsies_as_timeout(tmp_path, monkeypatch):
+    import time
+
+    import requests
+
+    from pedacito.llm import LLMClient, LLMError
+
+    def timed_out(url, **kw):
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", timed_out)
+    cfg = _real_cfg(tmp_path, timeout=600.0)
+    cfg._task_deadline = time.monotonic() + 30.0
+    events.get(tmp_path, cfg).emit("session_start", cmd="ask")
+    with pytest.raises(LLMError):
+        LLMClient(cfg).chat([{"role": "user", "content": "hi"}], 100, stream=False)
+    events.get(tmp_path, cfg).emit("exit", code=1)
+    result = autopsy.autopsy(tmp_path, "last")
+    assert result.category == "timeout"
+    assert result.incomplete is False
+    assert 5 <= result.evidence[0]["timeout_s"] <= 30
+
+
 # --------------------------------------------------------------- inspector --
 
 @pytest.fixture

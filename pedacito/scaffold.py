@@ -1375,6 +1375,10 @@ def _build_repair_note(target: PlannedFile, bad: list, root: Path) -> str:
     return "\n".join(parts)
 
 
+def _past_deadline(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                   on_file=None, backup_dir=None,
                   tests_first: bool | None = None,
@@ -1382,9 +1386,10 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     """Run a build pass for each planned source file, in plan order, stopping
     early if the server goes away. Returns
     {"done": [paths], "noop": [paths], "failed": [(path, message)],
-     "skipped": [paths], "capped": bool}; `noop` holds files the build left
-    untouched because they were already complete (they count as finished, not
-    failed).
+     "skipped": [paths], "capped": bool, "aborted": bool}; `noop` holds files
+    the build left untouched because they were already complete (they count as
+    finished, not failed). `aborted` is set when a model error (for example a
+    reply that spent its whole budget on hidden reasoning) stopped the build.
 
     With `tests_first` (spec-driven scaffolding), test stubs are implemented
     before their sources so the tests define the contract. The default keeps
@@ -1404,6 +1409,7 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
     failed: list[tuple[str, str]] = []
     skipped: list[str] = []
     capped = False
+    aborted = False
     for i, t in enumerate(targets):
         if deadline is not None and time.monotonic() >= deadline:
             skipped.extend(x.path for x in targets[i:])
@@ -1431,11 +1437,12 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                 raise
             except LLMError as e:
                 print(f"  stopped: {e}", file=sys.stderr)
-                failed.append((t.path, "server error"))
+                reason = (str(e).splitlines() or ["server error"])[0]
+                failed.append((t.path, reason[:200]))
                 skipped.extend(x.path for x in targets
                                if x.path not in done and x.path not in noop
                                and x.path != t.path)
-                stopped = True
+                stopped = aborted = True
                 break
             ok = [r for r in results if r.ok]
             bad = [r for r in results if not r.ok]
@@ -1449,7 +1456,7 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                     idx = index_mod.reindex_file(idx, r.file, cfg)
                 if on_file is not None:
                     on_file(t.path, idx)
-            if not bad or attempt:
+            if not bad or attempt or _past_deadline(deadline):
                 break
             # BUG-201: a failed build pass gets ONE repair re-ask (the
             # diagnostic + a window of the file) before it is reported
@@ -1470,7 +1477,7 @@ def build_project(client, cfg, idx, plan: Plan, verbose: bool = True,
                 for r in bad:
                     print(f"  FAILED {r.file}: {r.message}", file=sys.stderr)
     return {"done": done, "noop": noop, "failed": failed, "skipped": skipped,
-            "capped": capped}
+            "capped": capped, "aborted": aborted}
 
 
 def _cli_source_for_docs(idx, plan: Plan, max_chars: int = 6000) -> str:
@@ -1979,11 +1986,13 @@ def _fix_from_output(client, cfg, idx: Index, py_rels, project_name: str,
 def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
                    backup_dir, *, explicit_cmd: str = "", rounds: int = 2,
                    smoke: bool = True, smoke_timeout: int = 20,
-                   verbose: bool = True) -> tuple[bool, str]:
+                   verbose: bool = True,
+                   deadline: float | None = None) -> tuple[bool, str]:
     """Run the explicit --verify and/or a smoke run, feeding failures back to
     the model for up to `rounds` repairs. Returns (passed, final_output).
     Missing dependencies are reported, not repaired; environment failures count
-    as "could not verify"."""
+    as "could not verify". `deadline` (a `time.monotonic()` value) stops the
+    repair rounds once the run's time budget has passed."""
     from . import loop
 
     def checks():
@@ -2011,7 +2020,7 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
             return True, (f"could not verify in this environment: "
                           f"{env[0][1][:200]}")
         label, last = code_fails[0]
-        if attempt >= rounds:
+        if attempt >= rounds or _past_deadline(deadline):
             return False, last
         if verbose:
             print(f"\n  [verify failed ({label}); repairing, "
@@ -2297,13 +2306,9 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     print(f"\n--- building {len(plan.sources)} file(s) "
           f"({'WRITING' if apply else 'for review'}) ---",
           file=sys.stderr)
-    summary = build_project(client, cfg, idx, plan, verbose=verbose,
-                            backup_dir=backup_dir,
-                            tests_first=True if design_doc else None,
-                            deadline=deadline)
-    if summary.get("capped"):
-        # The budget ran out between files: close the run honestly instead of
-        # spending more minutes on repair/docs/gates over a half-built tree.
+    def _close_capped(summary: dict) -> int:
+        """The budget ran out: close the run honestly instead of spending more
+        minutes on repair/docs/gates over a half-built tree."""
         print("\n" + summarise_result(summary))
         print(f"\nBUILD CAPPED: the {minutes}-minute time budget ran out; the "
               "skipped files are still stubs.\n"
@@ -2313,6 +2318,22 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             root, f"new: {minutes}-minute time budget reached; "
                   f"{len(summary['skipped'])} file(s) left as stubs", "WARN")
         _new_checkpoint(f"new: {plan.project_name} (capped)")
+        return 1
+
+    summary = build_project(client, cfg, idx, plan, verbose=verbose,
+                            backup_dir=backup_dir,
+                            tests_first=True if design_doc else None,
+                            deadline=deadline)
+    if summary.get("capped") or _past_deadline(deadline):
+        return _close_capped(summary)
+    if summary.get("aborted"):
+        # A model error stopped the build; the later phases would only call
+        # the same model again, so the run ends here with a non-zero exit.
+        print("\n" + summarise_result(summary))
+        print("\nBUILD INCOMPLETE: the model could not finish a file (see the "
+              "message above); later steps were skipped.", file=sys.stderr)
+        workspace.log_event(root, "new: build stopped by a model error", "ERROR")
+        _new_checkpoint(f"new: {plan.project_name} (incomplete)")
         return 1
     contract_failed = False
     tests_failed = False
@@ -2335,6 +2356,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     if docs_summary["done"] and verbose:
         print(f"  documented {len(docs_summary['done'])} file(s)",
               file=sys.stderr)
+    if _past_deadline(deadline):
+        return _close_capped(summary)
     print("\n" + summarise_result(summary))
 
     # BUG-05: the per-file build can leave `def main()` without the __main__
@@ -2368,7 +2391,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
             v_ok, v_out = verify_and_fix(
                 client, cfg, idx, [f.path for f in plan.files],
                 plan.project_name, backup_dir, explicit_cmd=check_cmd,
-                rounds=rounds, smoke=False, verbose=verbose)
+                rounds=rounds, smoke=False, verbose=verbose,
+                deadline=deadline)
             if v_ok and v_out.startswith("could not verify"):
                 print(f"  [warning] {v_out}", file=sys.stderr)
                 workspace.log_event(root, f"new: {v_out}", "WARN")

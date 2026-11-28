@@ -6719,6 +6719,7 @@ def _main(argv=None) -> int:
             except LLMError:
                 if json_mode:
                     run_summary.update(events_mod.end_run())
+                elog.emit("exit", code=1)
                 _finish(1, ok=False)
                 raise
             else:

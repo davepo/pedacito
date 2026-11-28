@@ -7,15 +7,24 @@ unknown usage, unbounded output and over-budget reservations, uncapped
 """
 from __future__ import annotations
 
+import json
+import re
 import sys
 import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito.session_ctx import (RunBudget, RunBudgetError, SessionContext,
+from pedacito import llm as llm_mod  # noqa: E402
+from pedacito import scaffold  # noqa: E402
+from pedacito.config import Config  # noqa: E402
+from pedacito.llm import BudgetExceeded, LLMClient, LLMError  # noqa: E402
+from pedacito.session_ctx import (RunBudget, RunBudgetError, SessionContext,  # noqa: E402
                                   current_run_budget, set_run_budget,
                                   use_session)
 
@@ -234,3 +243,247 @@ def test_poison_is_sticky_and_thread_safe():
     for t in threads:
         t.join()
     assert results == [False, False, False, False]
+
+
+# ------------------------------------------ bounded empty-reasoning retries
+def _sse(obj) -> str:
+    return "data: " + json.dumps(obj)
+
+
+def _reasoning_only_stream() -> list[str]:
+    """A streamed reply that spent its whole budget on hidden reasoning."""
+    return [_sse({"choices": [{"delta": {"reasoning_content": "hmm " * 40},
+                               "finish_reason": None}]}),
+            _sse({"choices": [{"delta": {}, "finish_reason": "length"}]})]
+
+
+class _Resp:
+    status_code = 200
+    headers: dict = {}
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def iter_lines(self, decode_unicode=False):
+        yield from self._lines
+
+    def close(self):
+        pass
+
+
+def _cfg(tmp_path=None, **kw) -> Config:
+    cfg = Config()
+    cfg.base_url = "http://127.0.0.1:9/v1"
+    cfg.model = "stub-model"
+    cfg.log_sessions = False
+    cfg.log_events = tmp_path is not None
+    if tmp_path is not None:
+        cfg._root = str(tmp_path)
+    for k, v in kw.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _events(root: Path) -> list[dict]:
+    out: list[dict] = []
+    for path in sorted((root / ".pedacito" / "events").glob("*.jsonl")):
+        out += [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return out
+
+
+def test_reasoning_exhausted_stream_retries_twice_then_explains(monkeypatch):
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
+    budgets = []
+
+    def fake_post(url, **kw):
+        budgets.append(kw["json"]["max_tokens"])
+        return _Resp(_reasoning_only_stream())
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg()).chat([{"role": "user", "content": "hi"}], 2000,
+                               stream=True, disable_thinking=True)
+    assert len(budgets) == 3                    # the call plus two retries
+    assert budgets == [2000, 2000, 2000]        # re-rolled, never escalated
+    assert "2 retries" in str(e.value) and "finish 'length'" in str(e.value)
+    assert "max_tokens_build" in str(e.value)
+
+
+def test_empty_retry_never_starts_past_the_run_deadline(monkeypatch):
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
+    cfg = _cfg()
+    posts = []
+
+    def fake_post(url, **kw):
+        posts.append(1)
+        cfg._task_deadline = time.monotonic() - 1.0   # the deadline passes here
+        return _Resp(_reasoning_only_stream())
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    with pytest.raises(LLMError) as e:
+        LLMClient(cfg).chat([{"role": "user", "content": "hi"}], 2000,
+                            stream=True, disable_thinking=True)
+    assert posts == [1]
+    assert "time budget" in str(e.value)
+
+
+def test_timeout_names_the_clamped_request_timeout_and_is_typed(tmp_path,
+                                                                monkeypatch):
+    def fake_post(url, **kw):
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    cfg = _cfg(tmp_path, timeout=600.0)
+    cfg._task_deadline = time.monotonic() + 42.0
+    with pytest.raises(LLMError) as e:
+        LLMClient(cfg).chat([{"role": "user", "content": "hi"}], 100,
+                            stream=False)
+    msg = str(e.value)
+    assert "did not answer within 600s" not in msg and "--max-minutes" in msg
+    secs = float(re.search(r"within ([\d.]+)s", msg).group(1))
+    assert 5 <= secs <= 42
+    timeouts = [ev for ev in _events(tmp_path) if ev["kind"] == "timeout"]
+    assert len(timeouts) == 1
+    assert timeouts[0]["reason_code"] == "run_deadline"
+    assert abs(timeouts[0]["timeout_s"] - secs) < 0.1
+
+
+def test_unclamped_timeout_keeps_the_configured_value(tmp_path, monkeypatch):
+    def fake_post(url, **kw):
+        raise requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    with pytest.raises(LLMError) as e:
+        LLMClient(_cfg(tmp_path, timeout=600.0)).chat(
+            [{"role": "user", "content": "hi"}], 100, stream=False)
+    assert "within 600s (`timeout` in your config)" in str(e.value)
+    timeouts = [ev for ev in _events(tmp_path) if ev["kind"] == "timeout"]
+    assert timeouts[0]["reason_code"] == "request_timeout"
+
+
+def test_refused_call_records_budget_stop_before_any_request(tmp_path,
+                                                             monkeypatch):
+    def fake_post(url, **kw):
+        raise AssertionError("no request may start past the cost cap")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    client = LLMClient(_cfg(tmp_path, max_cost=0.000001))
+    client.stats["cost"] = 0.5
+    with pytest.raises(BudgetExceeded):
+        client.chat([{"role": "user", "content": "hi"}], 100, stream=False)
+    events = _events(tmp_path)
+    assert [ev["kind"] for ev in events] == ["budget_stop"]
+    assert events[0]["reason_code"] == "max_cost"
+
+
+def test_strict_cost_refusal_records_budget_stop(tmp_path, monkeypatch):
+    def fake_post(url, **kw):
+        raise AssertionError("no request may start past the strict cap")
+
+    monkeypatch.setattr("pedacito.llm.requests.post", fake_post)
+    cfg = _cfg(tmp_path, strict_cost_budget=True, max_cost=0.000001)
+    set_run_budget(RunBudget(max_cost_usd=0.000001), cfg)
+    with pytest.raises(BudgetExceeded):
+        LLMClient(cfg).chat([{"role": "user", "content": "hi"}], 100,
+                            stream=False)
+    events = _events(tmp_path)
+    assert [ev["kind"] for ev in events] == ["budget_stop"]
+    assert events[0]["reason_code"] == "strict_cost"
+
+
+# ------------------------------------------- scaffold: bounded build + deadline
+def _two_file_plan(tmp_path):
+    for rel in ("a.py", "b.py"):
+        (tmp_path / rel).write_text(f"# stub {rel}\n", encoding="utf-8")
+    plan = scaffold.Plan(
+        "p", "s",
+        files=[scaffold.PlannedFile("a.py"), scaffold.PlannedFile("b.py")],
+        spec=scaffold.Spec("build a and b"))
+    return plan, types.SimpleNamespace(root=tmp_path)
+
+
+def test_model_error_aborts_the_build_instead_of_retrying_the_next_file(
+        tmp_path, monkeypatch):
+    plan, idx = _two_file_plan(tmp_path)
+    calls = []
+
+    def build_pass(client, cfg, idx_, plan_, t, *a, **k):
+        calls.append(t.path)
+        raise LLMError("'stub' streamed no answer after 2 retries: each reply "
+                       "spent the budget on hidden reasoning.")
+
+    monkeypatch.setattr(scaffold, "build_pass", build_pass)
+    summary = scaffold.build_project(None, _cfg(), idx, plan, verbose=False)
+    assert calls == ["a.py"]
+    assert summary["aborted"] is True and summary["done"] == []
+    assert summary["failed"][0][0] == "a.py"
+    assert summary["failed"][0][1].startswith("'stub' streamed no answer")
+    assert summary["skipped"] == ["b.py"]
+
+
+def test_build_starts_no_repair_pass_past_the_deadline(tmp_path, monkeypatch):
+    plan, idx = _two_file_plan(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(scaffold, "time",
+                        types.SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = []
+
+    def build_pass(client, cfg, idx_, plan_, t, *a, **k):
+        calls.append(t.path)
+        clock[0] = 20.0            # the deadline passes during this pass
+        return [scaffold.Result(False, t.path, "rejected block")], ""
+
+    monkeypatch.setattr(scaffold, "build_pass", build_pass)
+    summary = scaffold.build_project(None, _cfg(), idx, plan, verbose=False,
+                                     deadline=10.0)
+    assert calls == ["a.py"]
+    assert summary["failed"][0][0] == "a.py"
+
+
+def test_verify_repair_rounds_stop_at_the_deadline(tmp_path, monkeypatch):
+    from pedacito import loop
+    monkeypatch.setattr(loop, "run_verify",
+                        lambda root, cmd, cfg=None: (False, "AssertionError: boom"))
+    monkeypatch.setattr(loop, "missing_modules", lambda out, root=None: [])
+    repairs = []
+    monkeypatch.setattr(scaffold, "_fix_from_output",
+                        lambda *a, **k: repairs.append(1) or True)
+    ok, out = scaffold.verify_and_fix(
+        None, _cfg(), types.SimpleNamespace(root=tmp_path), [], "p", None,
+        explicit_cmd="pytest", rounds=2, smoke=False, verbose=False,
+        deadline=time.monotonic() - 1.0)
+    assert ok is False and "boom" in out
+    assert repairs == []
+
+
+def test_run_new_closes_capped_when_the_deadline_passes_mid_build(
+        tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(scaffold, "time", types.SimpleNamespace(
+        monotonic=lambda: clock[0], time=time.time, sleep=time.sleep))
+    monkeypatch.setattr(scaffold, "build_plan", lambda spec, client, cfg, root,
+                        *a, **k: scaffold.Plan(
+                            "p", "s", files=[scaffold.PlannedFile("a.py")],
+                            spec=spec))
+    monkeypatch.setattr(scaffold, "build_interface", lambda *a, **k: {})
+    monkeypatch.setattr(scaffold, "apply_skeleton", lambda root, plan, **k: [])
+    idx = types.SimpleNamespace(root=tmp_path / "proj")
+    monkeypatch.setattr(scaffold, "skeleton_index",
+                        lambda root, plan, cfg: idx)
+    later = []
+
+    def build_project(client, cfg, idx_, plan, **k):
+        clock[0] = 100.0           # the one-minute budget runs out mid-build
+        later.append(1)
+        return {"done": ["a.py"], "noop": [], "failed": [], "skipped": [],
+                "capped": False, "aborted": False}
+
+    monkeypatch.setattr(scaffold, "build_project", build_project)
+    monkeypatch.setattr(scaffold, "build_docs", lambda *a, **k: later.append(2)
+                        or {"done": [], "noop": [], "failed": [], "skipped": []})
+    code = scaffold.run_new(tmp_path / "proj", _cfg(), None,
+                            scaffold.Spec("a tiny app"), apply=True,
+                            verbose=False, max_minutes=1)
+    assert code == 1
+    assert later == [1]        # docs and verification never started
