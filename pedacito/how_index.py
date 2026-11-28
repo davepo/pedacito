@@ -3762,6 +3762,8 @@ _SETTING_KEYWORDS = {
     "max_gathered_chars": ["gather budget", "context budget", "small window"],
     "max_total_model_calls": ["call cap", "model call budget"],
     "post_edit_check": ["syntax check", "lint after edit", "check edit"],
+    "autofix_enabled": ["autofix", "auto fix", "lint fix", "auto repair",
+                        "fix formatting", "format before repair"],
     "static_gate": ["undefined name", "missing import", "ruff", "static "
                     "analysis", "fast check", "syntax gate", "typo check"],
     "static_gate_timeout": ["ruff timeout", "static analysis timeout"],

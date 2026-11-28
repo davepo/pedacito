@@ -555,6 +555,30 @@ def quick_findings(root, files: list[str], *, environment=None
     return out
 
 
+def finding_identity(line: str) -> str:
+    """A finding line with its positions erased, for baseline comparison.
+
+    The autofix ladder (§3.4) compares findings by identity, not by line
+    number: a fix that removes one unused import and shifts every later line
+    must still read as "that finding is gone", not as "every finding moved".
+    This is the public spelling of :func:`_norm_finding`."""
+    return _norm_finding(line)
+
+
+def finding_identities(findings: dict[str, list[str]]) -> frozenset[str]:
+    """The position-erased identity set of ``{rel: [finding lines]}``.
+
+    Each identity is ``rel:<normalised finding>``, so two findings that differ
+    only in which file they come from stay distinct, while line/column shifts
+    within one file do not. Used by the autofix ladder to prove a candidate
+    strictly shrinks the baseline set and adds nothing new."""
+    return frozenset(
+        f"{rel}:{_norm_finding(line)}"
+        for rel, lines in findings.items()
+        for line in lines
+    )
+
+
 def new_findings(baseline: dict[str, list[str]],
                  current: dict[str, list[str]]) -> dict[str, list[str]]:
     """Findings in `current` whose normalised text is absent from `baseline`

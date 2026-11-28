@@ -411,6 +411,18 @@ class Config:
     auto_diagnostics: bool = False
     diagnostics_timeout: int = 90
     max_diagnostics_chars: int = 8000
+    # Opt-in autofix ladder (§3.4): before the model repair rounds, run the
+    # project's own deterministic formatters/linters (`ruff check --fix`,
+    # installed Biome or ESLint `--fix`, `gofmt`, `cargo fmt`, then
+    # `cargo clippy --fix`) on an independent no-link shadow copy and commit a
+    # candidate ONLY when the baseline finding identity set strictly shrinks,
+    # no new findings appear, and the impacted tests actually run and stay
+    # green relative to a green baseline. Missing tools, no tests, a red
+    # baseline, timeouts, out-of-scope mutations or a preimage hash mismatch
+    # discard the candidate (verified=false), never "green". Runs commands, so
+    # it is an EXEC_FIELDS setting: a project's own `.pedacito.toml` cannot
+    # turn it on until `pedacito trust`. Off by default.
+    autofix_enabled: bool = False
     # After every applied edit, run the cheap per-file check (one linter run
     # per changed file, else a syntax parse) and feed back only findings that
     # were NOT in the file before the task (baseline diff), in at most
@@ -1679,6 +1691,7 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
+               "autofix_enabled",
                "shell_allowlist", "shell_allowlist_by_project",
                "browser_eval_hosts",
                "allow_fetch", "fetch_allowed_hosts",
@@ -3819,6 +3832,13 @@ creative_auto = true
 # Diagnostics and MCP are opt-in. MCP also needs mcp_servers configured.
 auto_diagnostics = false
 post_edit_check = true
+# Opt-in autofix ladder: before model repair, run the project's own
+# formatters/linters (ruff check --fix, Biome/ESLint --fix, gofmt, cargo fmt,
+# cargo clippy --fix) on an independent no-link shadow copy and keep a
+# candidate only when it is a proven net-positive fix (fewer findings, no new
+# ones, impacted tests still green). Runs commands, so it needs trust in a
+# project config. Off by default.
+autofix_enabled = false
 # Deterministic HTML/JS DOM contract gate (missing <script src>/<link href>
 # targets, getElementById/querySelector('#id') names with no matching HTML id,
 # unparseable JS). Set false to disable the gate.

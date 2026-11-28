@@ -3062,6 +3062,49 @@ def _restore_rejected_files(root, backup_dir, rels, idx, cfg):
     return restored, deleted, idx
 
 
+def _run_autofix_pass(root, cfg, results, reply, changed):
+    """Run the opt-in §3.4 autofix ladder before the model repair rounds.
+
+    A retained candidate is already committed to disk by `run_autofix`; here we
+    only refresh the in-memory `Result.after` buffers for the kept files so the
+    syntax gate and any later review diff see the fixed content, and note the
+    outcome in the reply. A discarded candidate (or any exception) leaves
+    `results`/`reply` untouched so the ordinary model repair proceeds.
+    """
+    try:
+        from . import autofix as autofix_mod
+        from . import env_resolve as env_resolve_mod
+        env = env_resolve_mod.resolve_environment(root)
+        deadline = getattr(cfg, "_task_deadline", 0) or None
+        result = autofix_mod.run_autofix(root, changed, cfg=cfg, env=env,
+                                         deadline=deadline)
+    except Exception as exc:
+        try:
+            workspace.log_event(root, f"autofix skipped: {exc}", "WARN")
+        except Exception:
+            pass
+        return results, reply
+    if not result.verified:
+        return results, reply
+    kept = set(result.kept)
+    refreshed: list = []
+    for r in results:
+        rel = fileio_norm(getattr(r, "file", ""))
+        if getattr(r, "ok", False) and rel and rel in kept:
+            try:
+                path = security_mod.resolve_safe_path(root, rel)
+                text, _style = fileio.read(path)
+                r.after = text
+                r.message = (str(getattr(r, "message", "") or "").rstrip()
+                             + f" [autofix: {result.reason}]")
+            except Exception:
+                pass
+        refreshed.append(r)
+    note = (f"\n\n[Pedacito autofixed {len(kept)} file(s) before repair: "
+            f"{result.reason}.]")
+    return refreshed, (reply.rstrip() + note if reply.strip() else reply)
+
+
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                      baseline, edit_files, collect=None):
     """After edits were written, run the impacted tests (`verify_tests`).
@@ -3161,6 +3204,14 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                   "created file(s) to the pre-task state]", file=sys.stderr)
 
     changed = sorted({r.file for r in results if r.ok and r.file}) or edit_files
+    if getattr(cfg, "autofix_enabled", False) and changed:
+        # §3.4 autofix ladder: try the project's own deterministic fixers on an
+        # independent shadow copy BEFORE the model repair rounds. A retained
+        # candidate is committed to disk here, so the gates below re-check the
+        # fixed content and the model is only asked to repair what remains.
+        results, reply = _run_autofix_pass(root, cfg, results, reply, changed)
+        changed = (sorted({fileio_norm(r.file) for r in results if r.ok and r.file})
+                   or edit_files)
     base_out = (baseline[1] if baseline is not None and not baseline[0]
                 else "")
     base_failures = failure_identities(base_out)
