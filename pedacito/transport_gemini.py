@@ -203,6 +203,30 @@ def _clean_schema(schema):
     return out
 
 
+def _reasoning_parts(message: dict) -> list[dict]:
+    """Opaque thought parts a prior assistant turn returned to us.
+
+    Gemini pairs thought text with an optional ``thoughtSignature``; replay it
+    in the model turn so a following function response keeps the signed
+    context.  Nothing here is ever added to visible text.
+    """
+    out: list[dict] = []
+    for item in message.get("reasoning_items") or ():
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            text = item.get("thinking")
+        if not isinstance(text, str) or not text:
+            continue
+        part: dict = {"text": text, "thought": True}
+        signature = item.get("thoughtSignature") or item.get("signature")
+        if signature:
+            part["thoughtSignature"] = str(signature)
+        out.append(part)
+    return out
+
+
 def translate_messages(messages: list[dict]) -> tuple[dict | None, list[dict]]:
     """Translate OpenAI-shaped messages into Gemini ``(systemInstruction, contents)``."""
     system_texts: list[str] = []
@@ -241,6 +265,8 @@ def translate_messages(messages: list[dict]) -> tuple[dict | None, list[dict]]:
             })
             gemini_role = "user"
         else:
+            if role == "assistant":
+                parts.extend(_reasoning_parts(message))
             if isinstance(content, str):
                 if content:
                     parts.append({"text": content})
@@ -438,6 +464,7 @@ def parse_response(data: dict) -> dict:
 
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    reasoning_items: list[dict] = []
     tool_calls: list[dict] = []
 
     for part in parts:
@@ -458,6 +485,10 @@ def parse_response(data: dict) -> dict:
         elif "text" in part and isinstance(part.get("text"), str):
             if part.get("thought"):
                 reasoning_parts.append(part["text"])
+                item = {"text": part["text"], "thought": True}
+                if part.get("thoughtSignature"):
+                    item["thoughtSignature"] = part["thoughtSignature"]
+                reasoning_items.append(item)
             else:
                 text_parts.append(part["text"])
 
@@ -467,6 +498,7 @@ def parse_response(data: dict) -> dict:
     return {
         "text": "".join(text_parts),
         "reasoning": "".join(reasoning_parts),
+        "reasoning_items": reasoning_items,
         "tool_calls": tool_calls,
         "finish_reason": finish_reason,
         "usage": _normalise_usage(data.get("usageMetadata")),
@@ -482,6 +514,7 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
     dict shape as :func:`parse_response`."""
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    reasoning_items: list[dict] = []
     tool_calls: list[dict] = []
     last_usage: dict = {}
     raw_finish = ""
@@ -543,6 +576,10 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
                     continue
                 if part.get("thought"):
                     reasoning_parts.append(delta)
+                    item = {"text": delta, "thought": True}
+                    if part.get("thoughtSignature"):
+                        item["thoughtSignature"] = part["thoughtSignature"]
+                    reasoning_items.append(item)
                     if on_reasoning is not None:
                         on_reasoning(delta)
                 else:
@@ -553,6 +590,7 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
     return {
         "text": "".join(text_parts),
         "reasoning": "".join(reasoning_parts),
+        "reasoning_items": reasoning_items,
         "tool_calls": tool_calls,
         "finish_reason": _map_finish_reason(
             raw_finish, has_tool_calls=bool(tool_calls)),

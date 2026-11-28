@@ -30,22 +30,40 @@ FETCH_TIMEOUT = 3.0
 CACHE_TTL = 24 * 3600.0
 CACHE_NAME = "model_catalog.json"
 
-# Map URL host substrings -> models.dev provider IDs in priority order.
+# Map URL host patterns -> models.dev provider IDs in priority order.  Patterns
+# are exact hostnames, dot-boundary suffixes (".example.com") or "*" labels;
+# `providers.host_matches` enforces the boundary, so a look-alike host cannot
+# inherit a real provider's catalog rows.
 _HOST_TO_PROVIDER_IDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("api.anthropic.com", ("anthropic",)),
     ("api.openai.com", ("openai",)),
     ("generativelanguage.googleapis.com", ("google", "gemini", "google-vertex")),
     ("api.deepseek.com", ("deepseek",)),
-    ("dashscope", ("alibaba", "alibaba-cn", "dashscope", "qwen")),
-    ("aliyuncs", ("alibaba", "alibaba-cn", "dashscope", "qwen")),
+    ("dashscope.aliyuncs.com", ("alibaba", "alibaba-cn", "dashscope", "qwen")),
+    ("dashscope-intl.aliyuncs.com",
+     ("alibaba", "alibaba-cn", "dashscope", "qwen")),
+    (".aliyuncs.com", ("alibaba", "alibaba-cn", "dashscope", "qwen")),
     ("openrouter.ai", ("openrouter",)),
     ("api.groq.com", ("groq",)),
     ("api.together.xyz", ("togetherai", "together")),
     ("api.x.ai", ("xai",)),
     ("api.moonshot.cn", ("moonshotai", "moonshot")),
+    ("api.moonshot.ai", ("moonshotai", "moonshot")),
     ("api.mistral.ai", ("mistral",)),
     ("api.cerebras.ai", ("cerebras",)),
     ("api.fireworks.ai", ("fireworks-ai",)),
+    ("api.minimax.io", ("minimax",)),
+    ("api.minimaxi.com", ("minimax",)),
+    ("api.z.ai", ("zai", "z-ai", "zhipu")),
+    ("integrate.api.nvidia.com", ("nvidia",)),
+    ("router.huggingface.co", ("huggingface", "hf")),
+    ("api-inference.huggingface.co", ("huggingface", "hf")),
+    ("api.deepinfra.com", ("deepinfra",)),
+    ("api.studio.nebius.ai", ("nebius",)),
+    ("api.sambanova.ai", ("sambanova",)),
+    ("api.hyperbolic.xyz", ("hyperbolic",)),
+    ("api.lambdalabs.com", ("lambda",)),
+    ("api.perplexity.ai", ("perplexity",)),
 )
 
 _DATE_SUFFIX_RE = re.compile(r"-(?:20\d{6}|\d{4}-\d{2}-\d{2})$")
@@ -115,9 +133,10 @@ def provider_ids_for_base_url(base_url: str) -> tuple[str, ...]:
     host = _host(base_url)
     if not host:
         return ()
+    from . import providers
     out: list[str] = []
-    for needle, pids in _HOST_TO_PROVIDER_IDS:
-        if needle in host:
+    for pattern, pids in _HOST_TO_PROVIDER_IDS:
+        if providers.host_matches(host, pattern):
             for pid in pids:
                 if pid not in out:
                     out.append(pid)

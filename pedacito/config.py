@@ -2908,10 +2908,15 @@ _LAN_V6_NETS = (ipaddress.ip_network("fc00::/7"),)
 
 # Runtime/provider labels that name a self-hosted server, whatever the URL says
 # (a tunneled box still runs on the user's hardware). Matched case-insensitively
-# after underscores are stripped, so "llama_cpp" folds to "llamacpp".
+# as exact spellings (after normalising separators), so "my-ollama-proxy" does
+# not become local merely because it resembles a runtime name.
 _LOCAL_PROVIDER_LABELS = ("local", "llamacpp", "llama.cpp", "lemonade",
                           "lemond", "vllm", "lmstudio", "ollama",
                           "strata", "avalon")
+_LOCAL_PROVIDER_COMPACT = frozenset(
+    re.sub(r"[\s_.-]+", "", label.lower())
+    for label in _LOCAL_PROVIDER_LABELS + ("local-moe", "mlx-lm", "sglang",
+                                           "tabbyapi", "koboldcpp", "localai"))
 
 
 def _endpoint_is_local(base_url: str, provider: str = "") -> bool:
@@ -2939,8 +2944,19 @@ def _endpoint_is_local(base_url: str, provider: str = "") -> bool:
         nets = _LAN_V4_NETS if addr.version == 4 else _LAN_V6_NETS
         if any(addr in net for net in nets):
             return True
-    name = str(provider or "").lower().replace("_", "")
-    return any(label in name for label in _LOCAL_PROVIDER_LABELS)
+    name = str(provider or "").strip().lower()
+    if not name:
+        return False
+    try:
+        from . import providers as providers_mod
+        if providers_mod.is_local_runtime_label(name):
+            return True
+    except Exception:
+        pass
+    # Exact legacy spellings only: a label that merely contains a runtime name
+    # ("my-ollama-proxy") must not make an arbitrary remote endpoint local.
+    compact = re.sub(r"[\s_.-]+", "", name)
+    return compact in _LOCAL_PROVIDER_COMPACT
 
 
 # --- model capability profiles ------------------------------------------------

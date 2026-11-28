@@ -180,11 +180,40 @@ def _tool_arguments(fn: dict) -> dict:
     return args if isinstance(args, dict) else {}
 
 
+def _reasoning_blocks(message: dict) -> list[dict]:
+    """Opaque thinking blocks a prior assistant turn sent back to us.
+
+    Only complete blocks are replayed: Anthropic rejects unsigned thinking
+    blocks, so a bare `reasoning_content` string from another transport is
+    left out rather than fabricated into a thinking block.
+    """
+    out: list[dict] = []
+    for item in message.get("reasoning_items") or ():
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "thinking":
+            text = item.get("thinking")
+            signature = item.get("signature")
+            if isinstance(text, str) and text and signature:
+                out.append({"type": "thinking", "thinking": text,
+                            "signature": str(signature)})
+        elif itype == "redacted_thinking" and item.get("data"):
+            out.append({"type": "redacted_thinking",
+                        "data": str(item["data"])})
+    return out
+
+
 def _message_blocks(message: dict) -> list[dict]:
     """Anthropic content blocks for one non-system OpenAI message."""
     role = message.get("role")
     content = message.get("content")
     blocks: list[dict] = []
+    # Prior assistant turns carry opaque thinking blocks (text plus the
+    # provider's signature).  They must go back verbatim on the next
+    # tool-call turn, but never inside the visible text content.
+    if role == "assistant":
+        blocks.extend(_reasoning_blocks(message))
     if isinstance(content, str):
         if content:
             blocks.append({"type": "text", "text": content})
@@ -376,6 +405,7 @@ def parse_json_response(data: dict) -> dict:
     content = data.get("content") or []
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    reasoning_items: list[dict] = []
     tool_calls: list[dict] = []
     for block in content:
         if not isinstance(block, dict):
@@ -384,7 +414,15 @@ def parse_json_response(data: dict) -> dict:
         if btype == "text":
             text_parts.append(block.get("text") or "")
         elif btype == "thinking":
-            reasoning_parts.append(block.get("thinking") or "")
+            thinking = block.get("thinking") or ""
+            reasoning_parts.append(thinking)
+            item = {"type": "thinking", "thinking": thinking}
+            if block.get("signature"):
+                item["signature"] = str(block["signature"])
+            reasoning_items.append(item)
+        elif btype == "redacted_thinking" and block.get("data"):
+            reasoning_items.append({"type": "redacted_thinking",
+                                    "data": str(block["data"])})
         elif btype == "tool_use":
             raw = block.get("input") or {}
             args = raw if isinstance(raw, str) else json.dumps(raw)
@@ -401,6 +439,7 @@ def parse_json_response(data: dict) -> dict:
     return {
         "text": "".join(text_parts),
         "reasoning": "".join(reasoning_parts),
+        "reasoning_items": reasoning_items,
         "tool_calls": tool_calls,
         "finish_reason": _map_stop_reason(data.get("stop_reason")),
         "usage": {
@@ -427,6 +466,7 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_uses: dict[int, dict] = {}
+    thinking_blocks: dict[int, dict] = {}
     input_tokens = 0
     output_tokens = 0
     cache_read = 0
@@ -467,6 +507,17 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
                 tool_uses[index] = {"id": block.get("id") or "",
                                     "name": block.get("name") or "",
                                     "json": []}
+            elif block.get("type") == "thinking":
+                thinking_blocks[index] = {
+                    "type": "thinking",
+                    "thinking": block.get("thinking") or "",
+                    "signature": block.get("signature") or "",
+                }
+            elif block.get("type") == "redacted_thinking" and block.get("data"):
+                thinking_blocks[index] = {
+                    "type": "redacted_thinking",
+                    "data": str(block["data"]),
+                }
         elif etype == "content_block_delta":
             delta = obj.get("delta") or {}
             dtype = delta.get("type")
@@ -478,10 +529,23 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
                         on_text(text)
             elif dtype == "thinking_delta":
                 text = delta.get("thinking") or ""
+                index = obj.get("index", 0)
+                entry = thinking_blocks.setdefault(
+                    index, {"type": "thinking", "thinking": "",
+                            "signature": ""})
+                entry["thinking"] = (entry.get("thinking") or "") + text
                 if text:
                     reasoning_parts.append(text)
                     if on_reasoning is not None:
                         on_reasoning(text)
+            elif dtype == "signature_delta":
+                index = obj.get("index", 0)
+                entry = thinking_blocks.setdefault(
+                    index, {"type": "thinking", "thinking": "",
+                            "signature": ""})
+                entry["signature"] = (
+                    (entry.get("signature") or "")
+                    + str(delta.get("signature") or ""))
             elif dtype == "input_json_delta":
                 partial = delta.get("partial_json") or ""
                 index = obj.get("index", 0)
@@ -512,9 +576,15 @@ def parse_sse_stream(resp, *, on_text=None, on_reasoning=None,
             })
 
     prompt_tokens = input_tokens + cache_read + cache_creation
+    reasoning_items = [
+        block for _index, block in sorted(thinking_blocks.items())
+        if block.get("type") == "redacted_thinking"
+        or (block.get("thinking") or block.get("signature"))
+    ]
     return {
         "text": "".join(text_parts),
         "reasoning": "".join(reasoning_parts),
+        "reasoning_items": reasoning_items,
         "tool_calls": tool_calls,
         "finish_reason": _map_stop_reason(stop_reason),
         "usage": {

@@ -227,6 +227,45 @@ probes the active provider and reports the cache as *observed*, *not observed*,
 or *explicit-only* (DeepSeek-style caches persist asynchronously, so "not
 observed" is not "unsupported").
 
+## Provider registry and capability evidence
+
+One registry in `pedacito/providers.py` backs hosted profiles, local runtimes
+and the GUI quick-add catalog. The hosted side covers OpenAI, Anthropic, Google
+Gemini, DeepSeek, Qwen/DashScope, OpenRouter, Groq, Mistral, Moonshot/Kimi, xAI,
+Together, Cerebras, Fireworks, MiniMax, Z.ai/GLM, NVIDIA NIM, Hugging Face,
+DeepInfra, Nebius, SambaNova, Hyperbolic, Lambda, Perplexity and LiteLLM. Local
+runtimes include LM Studio, Ollama, llama.cpp, vLLM, Lemonade/lemond,
+Strata/Avalon, MLX-LM, SGLang, TabbyAPI, KoboldCpp and LocalAI. The GUI's Add
+Hosted Provider dialog keeps its stable seven-entry quick-add subset.
+
+Host matching is exact: an entry matches its hostname or a dot-boundary suffix
+(`.example.com`, `*.example.com`), never a substring. `notapi.openai.com`,
+`api.openai.com.attacker.test` and `api.openai.com@evil.test` stay custom
+endpoints.
+
+Capabilities are tri-state: `None` means unknown, never supported.
+`providers.get_capabilities(base_url, model)` blends built-in catalog evidence,
+cached models.dev context/output metadata and refusals observed live by the
+JSON-schema and acceleration ladders. It performs no network I/O. A probe runs
+only with explicit consent (`allow_probe=True`), sends one minimal bounded
+request, follows no redirects (credentials never cross a redirect boundary),
+and caches the result for 24 hours in `provider_capabilities.json` beside
+`config.toml`. The cache key is the normalized URL plus the exact model plus an
+auth-identity hash; it contains no API key, prompt, tool output or credential.
+Offline use never probes automatically.
+
+Azure OpenAI, AWS Bedrock and Google Vertex are catalog entries marked
+**gateway-only**: their native authentication and endpoint protocols are not
+implemented here, so they work only behind a configured OpenAI-compatible
+gateway and report `unverified`, not green. They are not counted as supported
+native integrations.
+
+Reasoning state is preserved across assistant tool-call turns on every
+transport: OpenAI-compatible `reasoning_content`, Anthropic thinking blocks with
+their signatures, and Gemini thought parts / `thoughtSignature`. It is replayed
+as protocol metadata, never merged into visible content and never written to
+logs or the capability cache.
+
 ## Hosted APIs keep their own sampling
 
 A hosted provider tunes sampling per model itself, so Pedacito stops dictating

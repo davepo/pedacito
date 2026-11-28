@@ -235,7 +235,27 @@ def _fingerprint(root: str, timeout: float, headers=None, deadline=None) -> str:
         return "Ollama"
     if _get(root + "/props", timeout, headers, deadline):
         return "llama.cpp"
+    # Other registry-local runtimes with a cheap public identity endpoint.
+    # These checks run only after the long-standing ones, so existing labels
+    # keep their exact spelling.
+    if _get(root + "/get_model_info", timeout, headers, deadline):
+        return "SGLang"
+    if _get(root + "/api/v1/info", timeout, headers, deadline):
+        return "KoboldCpp"
+    if _get(root + "/v1/model", timeout, headers, deadline):
+        return "TabbyAPI"
     return ""
+
+
+def runtime_preset_id(label: str) -> str:
+    """The provider-registry id for a discovery label ("" when unknown).
+
+    Keeps the human label ("LM Studio", "llama.cpp", ...) used by older scan
+    output while giving new surfaces one stable ASCII id to reference.
+    """
+    from . import providers
+    runtime = providers.local_runtime_for_label(label)
+    return runtime.id if runtime is not None else ""
 
 
 def _ollama_entries(root: str, timeout: float, headers=None,

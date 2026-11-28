@@ -975,6 +975,35 @@ respaldos y archivos de eventos más recientes y recorta `log.txt`.
   recomendaciones se buscan con `i18n.t`, así que `pedacito --lang es profiles` imprime etiquetas en
   español. El inglés sigue siendo el predeterminado.
 
+## Registro de proveedores y evidencia de capacidades
+
+`pedacito/providers.py` es el único registro detrás de las peculiaridades de
+compatibilidad alojadas, los presets de alta rápida de la GUI y la matriz de
+capacidades. Enumera 24 proveedores alojados más LiteLLM y tres marcadores solo
+pasarela, y 13 runtimes locales (LM Studio, Ollama, llama.cpp, vLLM,
+Lemonade/lemond, Strata, Avalon, MLX-LM, SGLang, TabbyAPI, KoboldCpp, LocalAI).
+La coincidencia de host es igualdad o un sufijo delimitado por puntos / etiqueta
+`*`, nunca una subcadena, así que un host parecido no hereda las afirmaciones de
+caché o capacidades de un proveedor.
+
+`ProviderCapabilities` mantiene cada función en tres estados: `None` es
+desconocido y nunca se presenta como soportado. `get_capabilities` funciona sin
+red por defecto y combina la evidencia del catálogo, los metadatos de models.dev
+en caché y los rechazos observados en vivo por `llm._JSON_CAPS` /
+`_ACCEL_CAPS`. `probe_capabilities` solo se ejecuta tras consentimiento
+explícito, hace una petición mínima y acotada, rechaza redirecciones para que la
+autenticación no cruce un límite de host, y guarda una entrada de caché
+redactada de 24 h con clave URL normalizada + modelo exacto + hash de identidad
+de autenticación (nunca el secreto). Azure OpenAI, AWS Bedrock y Google Vertex
+son entradas solo pasarela cuya fuente de capacidades dice `unverified: requires
+configured OpenAI-compatible gateway`; no son adaptadores nativos.
+
+Los transportes conservan el razonamiento opaco entre turnos de herramientas del
+asistente: `reasoning_content` compatible con OpenAI, bloques de pensamiento
+firmados de Anthropic y partes de pensamiento de Gemini / `thoughtSignature` se
+llevan como campos separados del protocolo, no como contenido visible, y se
+excluyen de los registros y de las cachés de capacidades.
+
 ## Aislamiento de sesiones, daemon y subagentes paralelos (v0.4.0)
 
 v0.4.0 permite que varias sesiones se ejecuten en un mismo proceso, o detrás de `pedacito daemon`,

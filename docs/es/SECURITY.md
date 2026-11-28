@@ -93,7 +93,7 @@ Si necesitas una puntuación de entropía para un formato de token personalizado
 
 | Punto | Qué ocurre | Ajuste |
 |---|---|---|
-| **Antes de cada petición a un servicio alojado** | Pedacito escanea los mensajes salientes en busca de secretos no reconocidos. Los endpoints de loopback y LAN nunca se escanean, porque esas claves no salen de la máquina. | `security_outbound_mode` |
+| **Antes de cada petición a un servicio alojado** | Pedacito escanea los mensajes salientes en busca de secretos no reconocidos. Los campos de razonamiento reproducidos (`reasoning_content`, bloques de pensamiento, partes de pensamiento) también se escanean; si hay un hallazgo se descarta ese razonamiento opaco en lugar de enviarlo. Los endpoints de loopback y LAN nunca se escanean, porque esas claves no salen de la máquina. | `security_outbound_mode` |
 | **Escaneo del espacio de trabajo** | `scan_workspace_secrets` revisa los archivos indexados. Los resultados aparecen como un aviso posterior a la ejecución y en el estado de seguridad de la GUI (`/security` en la TUI). | Siempre activado |
 | **Higiene de git** | `check_git_secret_hygiene` informa los archivos sensibles que existen en el repositorio pero que no están excluidos por `.gitignore`. `ensure_gitignore_entries` puede agregar las líneas que faltan. | `manage_gitignore` |
 | **Indexación** | Los archivos sensibles nunca se indexan (ver abajo). | Siempre activado |
@@ -112,6 +112,29 @@ vista previa enmascarada (por ejemplo `sk-ab...wxyz`) y una huella SHA-256. Solo
 vista previa y la huella se serializan. Cuando reconoces un hallazgo, su
 huella se guarda en `.pedacito/security_ack.json`, de modo que la misma clave no se
 vuelve a señalar.
+
+### Sondas de capacidades de proveedores
+
+La caché de capacidades y la sonda opcional siguen las mismas reglas salientes:
+
+- Importar `pedacito.providers` nunca contacta una red. `get_capabilities`
+  funciona sin conexión salvo que quien llama pase `allow_probe=True`, que es la
+  señal de consentimiento explícito; el arranque y las llamadas normales al
+  modelo nunca sondean.
+- Una sonda envía una petición mínima y acotada a la `base_url` configurada y
+  rechaza redirecciones, así que una cabecera `Authorization` o `x-api-key`
+  nunca sigue una redirección a otro host.
+- El prompt de la sonda es fijo (`ping`) y pasa el escaneo saliente de secretos
+  existente. Los archivos del proyecto, los prompts y la salida de herramientas
+  nunca se incluyen.
+- `provider_capabilities.json` guarda solo la URL normalizada, el modelo exacto,
+  el hash de identidad de autenticación y los valores de capacidad, con un TTL de
+  24 horas. No contiene claves de API, credenciales, prompts ni salida de
+  herramientas.
+- Azure OpenAI, AWS Bedrock y Google Vertex son entradas solo pasarela y nunca
+  se presentan como adaptadores de autenticación nativos; su fuente de
+  capacidades dice `unverified` hasta que una pasarela compatible con OpenAI
+  configurada demuestre lo contrario.
 
 ### Los archivos sensibles nunca se indexan
 

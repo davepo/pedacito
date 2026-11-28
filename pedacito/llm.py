@@ -564,6 +564,25 @@ def _deny_accel_cap(base_url: str, model: str, cap: str) -> None:
             {"cache": True, "lookup": True})[cap] = False
 
 
+def runtime_capability_evidence(base_url: str, model: str) -> dict[str, bool]:
+    """Read-only bridge from the live refusal tables to `providers`.
+
+    Only *refusals* are evidence.  A missing entry means "not tried", not
+    "supported", so the adapter never upgrades an unknown capability to True.
+    Both locks are held briefly and copied, keeping the existing discipline.
+    """
+    with _JSON_CAPS_LOCK:
+        json_caps = dict(_JSON_CAPS.get(_json_cap_key(base_url, model)) or {})
+    with _ACCEL_CAPS_LOCK:
+        accel_caps = dict(_ACCEL_CAPS.get(_accel_cap_key(base_url, model)) or {})
+    from .providers import (capabilities_from_accel_caps,
+                            capabilities_from_json_caps)
+    evidence: dict[str, bool] = {}
+    evidence.update(capabilities_from_json_caps(json_caps))
+    evidence.update(capabilities_from_accel_caps(accel_caps))
+    return evidence
+
+
 # Real self-host ranges: RFC1918 plus carrier-grade NAT (a homelab behind a
 # CGNAT gateway is still the user's box), and IPv6 unique-local addresses.
 # The canonical predicate lives in config._endpoint_is_local; this module just
@@ -968,6 +987,63 @@ def _reasoning_text(message: dict) -> str:
             if parts:
                 return "".join(parts)
     return ""
+
+
+# Opaque reasoning is replayed to the provider on the next tool-call turn, so
+# it is an outbound path like any other.  These helpers keep the existing
+# secret guard covering it without ever writing the text to a log.
+_REASONING_MESSAGE_KEYS = (
+    "reasoning_content", "reasoning", "thinking", "analysis",
+    "reasoning_details", "reasoning_items", "encrypted_reasoning",
+)
+
+
+def _reasoning_payload_texts(messages) -> list[str]:
+    def item_text(item) -> str:
+        inner = _reasoning_text(item)
+        if inner:
+            return inner
+        direct = item.get("text")
+        if isinstance(direct, str) and direct:
+            return direct
+        summary = item.get("summary")
+        if isinstance(summary, list):
+            parts = [part.get("text") for part in summary
+                     if isinstance(part, dict)
+                     and isinstance(part.get("text"), str)]
+            if parts:
+                return "".join(parts)
+        return ""
+
+    texts: list[str] = []
+    for message in messages or ():
+        if not isinstance(message, dict):
+            continue
+        for key in _REASONING_MESSAGE_KEYS:
+            value = message.get(key)
+            text = _reasoning_text({key: value})
+            if text:
+                texts.append(text)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        inner = item_text(item)
+                        if inner:
+                            texts.append(inner)
+    return texts
+
+
+def _strip_reasoning_payload(messages) -> list[dict]:
+    out: list[dict] = []
+    for message in messages or ():
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        copy_msg = dict(message)
+        for key in _REASONING_MESSAGE_KEYS:
+            copy_msg.pop(key, None)
+        out.append(copy_msg)
+    return out
 
 
 # Streaming inline-reasoning support. A token stream can split `<think>` (or
@@ -1747,6 +1823,11 @@ class LLMClient:
         self.last_response_id: str = ""
         self.last_reasoning_items: list[dict] = []
         self._responses_reasoning_by_text: dict[str, list[dict]] = {}
+        # Per-transport reasoning attached to the assistant turn that produced
+        # it.  The key is the visible assistant text, so the next tool-call turn
+        # can carry the opaque reasoning back without ever echoing it as
+        # visible content.
+        self._reasoning_by_text: dict[str, dict] = {}
         # Worked step examples built from the real project (set by the agent):
         # shown instead of one dummy object when the server has no grammar.
         self.fewshot: list[dict] = []
@@ -2204,15 +2285,25 @@ class LLMClient:
             return payload
         root = self._outbound_root()
         findings = security_mod.scan_messages_for_secrets(messages, root)
+        reasoning_findings: list = []
+        for text in _reasoning_payload_texts(messages):
+            reasoning_findings.extend(
+                security_mod.scan_text_for_secrets(text, "<reasoning>"))
+        reasoning_findings = security_mod.unacknowledged_findings(
+            reasoning_findings, root)
+        findings = list(findings) + list(reasoning_findings)
         if not findings:
             return payload
         if mode == "redact" or getattr(
                 self.cfg, "_outbound_redact_secrets", False):
-            messages, count, redacted = security_mod.redact_messages(
+            messages, count, _redacted = security_mod.redact_messages(
                 messages, root)
+            if reasoning_findings:
+                messages = _strip_reasoning_payload(messages)
+                count += len(reasoning_findings)
             payload = {**payload, "messages": messages}
             if count:
-                self._notify_redaction(count, redacted, "redact")
+                self._notify_redaction(count, findings, "redact")
             return payload
         if getattr(self.cfg, "_outbound_acknowledge_secrets", False):
             # The user chose "Acknowledge & Send As-Is" for this request.
@@ -2224,11 +2315,14 @@ class LLMClient:
             host = _host_name(self.cfg) or "external provider"
             raise SecretConfirmationRequired(findings, host)
         # Non-interactive CLI/script: redact by default rather than block.
-        messages, count, redacted = security_mod.redact_messages(
+        messages, count, _redacted = security_mod.redact_messages(
             messages, root)
+        if reasoning_findings:
+            messages = _strip_reasoning_payload(messages)
+            count += len(reasoning_findings)
         payload = {**payload, "messages": messages}
         if count:
-            self._notify_redaction(count, redacted, "warn")
+            self._notify_redaction(count, findings, "warn")
         return payload
 
     def _effective_timeout(self) -> float:
@@ -2835,7 +2929,8 @@ class LLMClient:
                 cancel_event=cancel_event, on_stream=on_stream,
                 _count_call=_count_call, trip_circuit=trip_circuit)
         fmt_schema = json_schema if json_schema is not None else schema
-        msgs = [dict(m) for m in messages]
+        msgs = self._attach_cached_reasoning_items(
+            [dict(m) for m in messages], transport="openai")
         want_off = (disable_thinking if disable_thinking is not None
                     else self.cfg.disable_thinking)
         # An explicit suffix is always applied (it may be a user's own
@@ -3378,6 +3473,10 @@ class LLMClient:
         self.last_reasoning_chars = reasoning_chars
         text = strip_reasoning("".join(out))
         self.partial_text = text
+        reasoning_text = "".join(reasoning_parts)
+        reasoning_items = ([{"type": "reasoning_content", "text": reasoning_text}]
+                           if reasoning_text else [])
+        self._record_reasoning(text, "openai", reasoning_items, reasoning_text)
 
         # A server (or a test double) may answer a streaming request with a
         # standard JSON body instead of SSE. No data frame + a JSON body is
@@ -3558,7 +3657,8 @@ class LLMClient:
         external_cancel = (cancel_event if cancel_event is not None
                            else getattr(self, "cancel_event", None))
         fmt_schema = json_schema if json_schema is not None else schema
-        msgs = [dict(m) for m in messages]
+        msgs = self._attach_cached_reasoning_items(
+            [dict(m) for m in messages], transport="anthropic")
         want_off = (disable_thinking if disable_thinking is not None
                     else self.cfg.disable_thinking)
 
@@ -3809,6 +3909,8 @@ class LLMClient:
             if self._native_ok is None and text:
                 self._native_ok = True
 
+        self._record_reasoning(text, "anthropic",
+                               parsed.get("reasoning_items"), reasoning_text)
         if sink is None and self.echo_stream:
             sys.stdout.write("\n")
 
@@ -3832,6 +3934,9 @@ class LLMClient:
         text = self._anthropic_text(parsed, native)
         if native and self._native_ok is None and text:
             self._native_ok = True
+        self._record_reasoning(text, "anthropic",
+                               parsed.get("reasoning_items"),
+                               parsed.get("reasoning") or "")
         self._account(parsed.get("usage") or {}, None, time.time() - t0,
                       prompt_est, text)
         return text
@@ -3919,7 +4024,8 @@ class LLMClient:
                            stream_error_cls, on_json_fallback, native: bool,
                            prompt_est: int, t0: float, external_cancel,
                            on_stream, provider_name: str,
-                           on_parsed_extra=None) -> str:
+                           on_parsed_extra=None,
+                           reasoning_transport: str = "") -> str:
         """Shared streaming loop for native transports (Gemini / OpenAI Responses)."""
         sink = self.stream_callback
         out_parts: list[str] = []
@@ -4052,6 +4158,10 @@ class LLMClient:
                 self._native_ok = True
         if on_parsed_extra is not None:
             on_parsed_extra(parsed, text)
+        elif reasoning_transport:
+            self._record_reasoning(
+                text, reasoning_transport, parsed.get("reasoning_items"),
+                reasoning_text)
 
         if sink is None and self.echo_stream:
             sys.stdout.write("\n")
@@ -4103,7 +4213,8 @@ class LLMClient:
         external_cancel = (cancel_event if cancel_event is not None
                            else getattr(self, "cancel_event", None))
         fmt_schema = json_schema if json_schema is not None else schema
-        msgs = [dict(m) for m in messages]
+        msgs = self._attach_cached_reasoning_items(
+            [dict(m) for m in messages], transport="gemini")
         want_off = (disable_thinking if disable_thinking is not None
                     else self.cfg.disable_thinking)
 
@@ -4168,7 +4279,7 @@ class LLMClient:
                             d, native=native, prompt_est=prompt_est, t0=t0),
                         native=native, prompt_est=prompt_est, t0=t0,
                         external_cancel=external_cancel, on_stream=on_stream,
-                        provider_name="Gemini")
+                        provider_name="Gemini", reasoning_transport="gemini")
                 data = r.json()
             finally:
                 with self._active_response_lock:
@@ -4190,7 +4301,7 @@ class LLMClient:
                 d, native=native, prompt_est=prompt_est, t0=t0),
             native=native, prompt_est=prompt_est, t0=t0,
             external_cancel=external_cancel, on_stream=on_stream,
-            provider_name="Gemini")
+            provider_name="Gemini", reasoning_transport="gemini")
 
     def _consume_gemini_data(self, data: dict, *, native: bool,
                              prompt_est: int, t0: float) -> str:
@@ -4203,6 +4314,9 @@ class LLMClient:
         text = self._anthropic_text(parsed, native)
         if native and self._native_ok is None and text:
             self._native_ok = True
+        self._record_reasoning(text, "gemini",
+                               parsed.get("reasoning_items"),
+                               parsed.get("reasoning") or "")
         self._account(parsed.get("usage") or {}, None, time.time() - t0,
                       prompt_est, text)
         return text
@@ -4210,16 +4324,34 @@ class LLMClient:
     # --------------------------------------------------------- OpenAI Responses
     # Opt-in /v1/responses transport for o3 / o4 / gpt-5 reasoning models.
 
-    def _attach_cached_reasoning_items(self, msgs: list[dict]) -> list[dict]:
-        if not self._responses_reasoning_by_text:
-            return msgs
+    def _attach_cached_reasoning_items(self, msgs: list[dict],
+                                       transport: str = "") -> list[dict]:
+        """Re-attach a prior assistant turn's opaque reasoning to the same
+        transport's next request.  Reasoning is never merged into `content`."""
         out: list[dict] = []
         for msg in msgs:
             if (isinstance(msg, dict) and msg.get("role") == "assistant"
                     and not msg.get("reasoning_items")
-                    and not msg.get("encrypted_reasoning")):
+                    and not msg.get("encrypted_reasoning")
+                    and not msg.get("reasoning_content")):
                 key = _content_plain_text(msg.get("content") or "")
-                if key and key in self._responses_reasoning_by_text:
+                entry = self._reasoning_by_text.get(key) if key else None
+                if entry is not None and (not transport
+                                          or entry.get("transport") == transport):
+                    copy_msg = dict(msg)
+                    reasoning_text = str(entry.get("text") or "")
+                    if transport == "openai":
+                        if reasoning_text:
+                            copy_msg["reasoning_content"] = reasoning_text
+                    else:
+                        copy_msg["reasoning_items"] = list(
+                            entry.get("items") or [])
+                        if reasoning_text and transport == "openai-responses":
+                            copy_msg["reasoning_content"] = reasoning_text
+                    out.append(copy_msg)
+                    continue
+                if transport == "openai-responses" and key \
+                        and key in self._responses_reasoning_by_text:
                     copy_msg = dict(msg)
                     copy_msg["reasoning_items"] = list(
                         self._responses_reasoning_by_text[key])
@@ -4228,15 +4360,35 @@ class LLMClient:
             out.append(msg)
         return out
 
-    def _record_responses_state(self, parsed: dict, text: str) -> None:
-        self.last_response_id = str(parsed.get("id") or "")
-        items = list(parsed.get("reasoning_items") or [])
-        self.last_reasoning_items = items
-        if items and text:
-            self._responses_reasoning_by_text[text] = items
+    def _record_reasoning(self, text: str, transport: str,
+                          items: list[dict] | None,
+                          reasoning_text: str = "") -> None:
+        """Remember the opaque reasoning from one assistant turn (bounded)."""
+        opaque = [dict(item) for item in (items or ())
+                  if isinstance(item, dict)]
+        self.last_reasoning_items = opaque
+        key = _content_plain_text(text or "")
+        if not key:
+            return
+        self._reasoning_by_text[key] = {
+            "transport": transport,
+            "items": opaque,
+            "text": str(reasoning_text or ""),
+        }
+        if len(self._reasoning_by_text) > 32:
+            oldest = next(iter(self._reasoning_by_text))
+            self._reasoning_by_text.pop(oldest, None)
+        if transport == "openai-responses" and opaque:
+            self._responses_reasoning_by_text[key] = list(opaque)
             if len(self._responses_reasoning_by_text) > 32:
                 oldest = next(iter(self._responses_reasoning_by_text))
                 self._responses_reasoning_by_text.pop(oldest, None)
+
+    def _record_responses_state(self, parsed: dict, text: str) -> None:
+        self.last_response_id = str(parsed.get("id") or "")
+        self._record_reasoning(
+            text, "openai-responses", parsed.get("reasoning_items"),
+            parsed.get("reasoning") or "")
 
     def _chat_once_openai_responses(
         self, messages: list[dict], max_tokens: int,
@@ -4254,7 +4406,8 @@ class LLMClient:
         external_cancel = (cancel_event if cancel_event is not None
                            else getattr(self, "cancel_event", None))
         fmt_schema = json_schema if json_schema is not None else schema
-        msgs = self._attach_cached_reasoning_items([dict(m) for m in messages])
+        msgs = self._attach_cached_reasoning_items(
+            [dict(m) for m in messages], transport="openai-responses")
         want_off = (disable_thinking if disable_thinking is not None
                     else self.cfg.disable_thinking)
 
@@ -4403,6 +4556,10 @@ class LLMClient:
         except (KeyError, IndexError, TypeError) as e:
             raise LLMError(
                 f"Unexpected response shape: {json.dumps(data)[:500]}") from e
+        reasoning_text = _reasoning_text(msg) if isinstance(msg, dict) else ""
+        items = ([{"type": "reasoning_content", "text": reasoning_text}]
+                 if reasoning_text else [])
+        self._record_reasoning(text, "openai", items, reasoning_text)
         if native and self._native_ok is None:
             self._native_ok = True
         self._account(data.get("usage") or {}, data.get("timings"),
@@ -4637,6 +4794,10 @@ class LLMClient:
         if native and self._native_ok is None and text:
             self._native_ok = True
         self.partial_text = text
+        reasoning_text = "".join(reasoning_parts)
+        reasoning_items = ([{"type": "reasoning_content", "text": reasoning_text}]
+                           if reasoning_text else [])
+        self._record_reasoning(text, "openai", reasoning_items, reasoning_text)
         usage = dict(usage or {})
         if usage:
             if not _positive_int(usage.get("completion_tokens")):

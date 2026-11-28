@@ -979,6 +979,32 @@ backups and event files and trims `log.txt`.
   and the recommendations title are looked up through `i18n.t`, so
   `pedacito --lang es profiles` prints Spanish labels. English stays the default.
 
+## Provider registry and capability evidence
+
+`pedacito/providers.py` is the one registry behind hosted compatibility quirks,
+the GUI quick-add presets and the capability matrix. It lists 24 hosted
+providers plus LiteLLM and three gateway-only placeholders, and 13 local
+runtimes (LM Studio, Ollama, llama.cpp, vLLM, Lemonade/lemond, Strata, Avalon,
+MLX-LM, SGLang, TabbyAPI, KoboldCpp, LocalAI). Host matching is equality or a
+dot-boundary suffix / `*` label, never a substring, so a look-alike host cannot
+inherit a provider's caching or capability claims.
+
+`ProviderCapabilities` keeps every feature tri-state: `None` is unknown and is
+never presented as supported. `get_capabilities` is offline by default and
+merges catalog evidence, cached models.dev metadata and refusals observed live
+by `llm._JSON_CAPS` / `_ACCEL_CAPS`. `probe_capabilities` runs only after
+explicit consent, makes one bounded minimal request, refuses redirects so auth
+cannot cross a host boundary, and stores a redacted 24 h cache entry keyed by
+normalized URL + exact model + auth-identity hash (never the secret). Azure
+OpenAI, AWS Bedrock and Google Vertex are gateway-only entries whose capability
+source says `unverified: requires configured OpenAI-compatible gateway`; they
+are not native adapters.
+
+The transports preserve opaque reasoning across assistant tool-call turns:
+OpenAI-compatible `reasoning_content`, Anthropic signed thinking blocks and
+Gemini thought parts / `thoughtSignature` are carried as separate protocol
+fields, not visible content, and are excluded from logs and capability caches.
+
 ## v0.4.0 session isolation, daemon and parallel subagents
 
 v0.4.0 lets several sessions run in one process, or behind `pedacito daemon`,
