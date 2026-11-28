@@ -62,7 +62,7 @@ from .edits import locate, parse_edits
 
 @dataclass
 class Finding:
-    kind: str                  # placeholder | unread | stale | import | lost_wiring | gui_hazard | citation | coverage | model
+    kind: str                  # placeholder | unread | stale | import | lost_wiring | gui_hazard | citation | coverage | model | lsp
     severity: str              # "error" (fed to repair) | "warn"
     file: str
     message: str

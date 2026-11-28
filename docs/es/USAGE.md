@@ -1043,6 +1043,8 @@ pedacito procs --root PROJ [logs|stop NAME] [--all]
 pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 ```
 
+Puerta de diagnósticos opcional (desactivada por defecto; requiere `allow_lsp = true` y `lsp_diagnostics_gate = true`, que un archivo de proyecto debe tener confiado): para un lote de ediciones de símbolos, Pedacito pide al servidor de lenguaje los diagnósticos de los archivos antes y después de la edición, dentro de un único presupuesto de 2,9 s, y envía a la reparación solo los hallazgos nuevos en líneas cambiadas. Si el servidor falta, tarda, no responde o no puede demostrar que sus diagnósticos coinciden con el archivo actual, la puerta informa *no verificado* y no repara nada. Es un evento (`lsp_gate`), no un aprobado.
+
 
 `webcheck` ejecuta verificaciones estáticas de contrato entre archivos en un proyecto web, sin necesidad de navegador:
 ids del DOM que no existen en ningún archivo HTML, sintaxis ESM cargada mediante un `<script src>` clásico

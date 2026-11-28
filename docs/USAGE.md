@@ -1051,6 +1051,14 @@ pedacito procs --root PROJ [logs|stop NAME] [--all]
 pedacito lsp --root PROJ --file src/a.py --line 12 --op definition
 ```
 
+Optional diagnostics gate (off by default; needs `allow_lsp = true` and
+`lsp_diagnostics_gate = true`, which a project file must have trusted): for a
+symbol-batch edit, Pedacito asks the language server for diagnostics on the
+files before and after the edit, within one 2.9 s budget, and sends only new
+findings on changed lines to repair. If the server is missing, slow, silent, or
+cannot prove its diagnostics match the current file, the gate reports
+*unverified* and repairs nothing. It is an event (`lsp_gate`), not a pass.
+
 `webcheck` runs static cross-file contract checks on a web project, no browser
 needed: DOM ids that exist in no HTML file, ESM syntax loaded through a classic
 `<script src>` (a silent SyntaxError), duplicate globals across classic
