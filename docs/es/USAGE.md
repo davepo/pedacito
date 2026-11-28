@@ -188,6 +188,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito ask PROJ -t "..."` | Ejecuta una tarea. Simulación por defecto. Agrega `--review`, `--apply`, `--plan`, `--refine`, `--jsonl` o `--json` |
 | `pedacito explain PROJ -q "..."` | Responde una pregunta sobre el código. Nunca edita |
 | `pedacito auto PROJ -t "..."` | Convierte una meta en una lista de verificación y luego la implementa tarea por tarea |
+| `pedacito plan --check [PLAN] [PROJECT]` | Valida una lista de tareas contra el índice antes de una ejecución Auto o Complex; `--impact` previsualiza llamadores y pruebas. Sale con 0 si está limpio o solo hay advertencias, 1 ante errores definitivos y 2 si el plan no es válido |
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero |
 | `pedacito chat PROJ` | Sesión interactiva que mantiene caliente el índice (`--rpc` convierte la sesión en un protocolo de máquina) |
 | `pedacito tui PROJ` | TUI en pantalla dividida: transcripción, barra lateral de actividad/plan en vivo y un pie de telemetría con Context Meter / consumo de tokens / tok/s. Suite completa de comandos slash; `--headless` es programable |
@@ -719,6 +720,47 @@ notificaciones `session/update` (`agent_message_chunk`, `agent_thought_chunk`, `
 `session/request_permission`. `session/cancel` equivale a la cancelación de rpc y mantiene vivo el
 proceso. stdout es JSON-RPC puro; cada línea humana va a stderr, y el fin de stdin vacía la tarea
 activa y sale con 0.
+
+### `plan`: comprueba una lista de tareas antes de ejecutarla
+
+Auto y `new --complex` validan la lista de tareas en su límite de ejecución.
+La misma inspección está disponible por separado, sin llamada al modelo y sin
+cambiar los archivos fuente del proyecto (puede refrescar la caché del índice
+estático bajo `.pedacito/`):
+
+```bash
+pedacito plan --check PLAN.md .             # valida la lista
+pedacito plan --check PLAN.md . --impact    # previsualiza también llamadores y pruebas
+pedacito plan --check PLAN.md . --json      # informe legible por máquina para CI
+```
+
+La comprobación se apoya en el índice y es deliberadamente conservadora.
+Contiene la ruta del plan y cada mención de archivo con
+`security.resolve_safe_path`; un recorrido de ruta, una ruta absoluta fuera del
+proyecto, una escapada por symlink o junction, un archivo sensible (`.env`,
+claves, credenciales) o una ruta protegida (`.pedacito/`, `.git/`, los nombres
+de configuración de Pedacito) es un error definitivo. Las referencias
+explícitas `ruta: símbolo` se resuelven contra el índice estático; un símbolo
+ausente en un archivo Python existente es un error salvo que la tarea lo marque
+como creación. Las anotaciones de dependencia como `(depends on 1, 2)` o
+`depends_on: 1, 2` se comprueban por ciclos, números de tarea inexistentes y
+orden de tareas posteriores.
+
+Un archivo que aún no existe es válido cuando la tarea lo marca deliberadamente
+como creación ("Create `src/new.py`", "Implement `main.py`", "Add tests in
+`tests/test_new.py`"): su directorio padre debe quedar dentro del proyecto. En
+Windows una colisión solo por mayúsculas/minúsculas con un archivo existente es
+un error porque el sistema de archivos compara sin distinguir mayúsculas; en un
+sistema sensible a mayúsculas ambos nombres pueden coexistir y la casi-colisión
+es solo una advertencia. Los llamadores y las pruebas provienen de aristas
+estáticas de importación/llamada y de enlaces por nombre de archivo, así que
+las importaciones dinámicas, la reflexión y las pruebas con nombres no
+relacionados aparecen en `unknowns`, nunca como fallos.
+
+Códigos de salida: `0` limpio o solo advertencias, `1` errores definitivos, `2`
+plan inválido (ilegible, demasiado grande, sin tareas de lista o fuera de su
+proyecto). Auto y Complex se detienen solo con `1` o `2`; las advertencias no
+bloquean una ejecución.
 
 ### `new`: inicia un proyecto desde cero
 

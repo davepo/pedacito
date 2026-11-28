@@ -2434,7 +2434,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     each run in a fresh context with optional `verify` repair. Returns the
     loop's exit code. `started` is the monotonic start of the whole run, so
     the --max-minutes budget also bounds the optional README pass at the end."""
-    from . import loop
+    from . import loop, plan as plan_mod
 
     if started is None:
         started = time.monotonic()
@@ -2451,6 +2451,17 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
     loop.write_plan(plan_file, plan.project_name or spec.title, titles)
     loop.emit_plan_updated(plan_file, root=root, cfg=cfg, reason="created")
 
+    # WP-4104C: validate the generated checklist against the skeleton index
+    # before handing it to the autonomous loop. A generated plan normally names
+    # files that already exist on disk; this gate still catches an escaping
+    # path, a protected/sensitive target or a broken dependency order before
+    # the first implementation task runs. A caller that stubbed write_plan has
+    # nothing on disk to validate; leave that harness case to the loop.
+    if titles and plan_file.is_file():
+        gate_code = plan_mod.gate_plan(root, plan_file, idx, cfg=cfg)
+        if gate_code is not None:
+            return gate_code
+
     print(f"\n--- auto: implementing {len(titles)} task(s) in fresh contexts "
           f"(plan: {plan_file}) ---", file=sys.stderr)
     workspace.log_event(root, f"complex: {len(titles)} task(s) -> {plan_file.name}")
@@ -2465,6 +2476,7 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
         stop_on_fail=not keep_going,
         answer_system=AUTO_IMPLEMENT_SYSTEM,
         auto_install=auto_install,
+        validate_plan=False,
     )
 
     # BUG-806: fresh contexts are exactly why this gate is needed here, not

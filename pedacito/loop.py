@@ -5678,7 +5678,7 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              stop_on_fail: bool = True,
              answer_system: str | None = None, auto_install: bool = False,
              goal: str = "", on_task=None, strict: bool = False,
-             verify_final: bool = False,
+             verify_final: bool = False, validate_plan: bool = True,
              pinned: list | None = None) -> int:
     """Run the Ralph loop until the plan is empty (or a cap/stop is hit).
 
@@ -5708,6 +5708,11 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
                         from a title still bind the worker. Forced file-reads
                         are mined from the task TITLE only (agent.task_targets).
     - ``on_task``       optional callback invoked with each completed task.
+    - ``validate_plan`` check the checklist against the index before the first
+                        task (WP-4104C). Warnings never block; a definite
+                        containment/security/dependency error stops with 1 and
+                        an invalid plan stops with 2. Scaffold's Complex path
+                        validates once itself and passes False here.
 
     Task handling:
     - Investigation-only tasks ("Reproduce...", "Locate the cause...") are
@@ -5764,6 +5769,23 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
             cfg._pinned_refs = refs
         except Exception:
             pass
+
+    # WP-4104C: validate the checklist at the actual execution boundary, before
+    # any task can write. Warnings are logged only; a definite plan error stops
+    # the run, and an unreadable/escaping plan is invalid (exit 2).
+    if validate_plan:
+        try:
+            from . import plan as plan_mod
+            gate_code = plan_mod.gate_plan(root, Path(plan_path), idx, cfg=cfg)
+        except Exception as exc:      # validation must not become a new failure
+            gate_code = None
+            try:
+                workspace.log_event(root, f"plan check skipped: "
+                                          f"{type(exc).__name__}", "WARN")
+            except Exception:
+                pass
+        if gate_code is not None:
+            return gate_code
 
     attempted = 0
     done = 0

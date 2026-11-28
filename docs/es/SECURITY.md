@@ -190,9 +190,12 @@ Cada ruta de herramienta pasa por `security.resolve_safe_path(root, target)`:
    llamada lanza `SecurityError`.
 
 Los llamadores incluyen las herramientas de lectura, edición, escritura y renombrado (`pedacito/tools.py`,
-`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), el cargador de skills
-(`pedacito/skills.py`), la ruta de restauración de checkpoints (`pedacito/checkpoints.py`) y
-cada ruta de archivos de la GUI (`pedacito/gui/server.py`).
+`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), el comprobador de planes
+(`pedacito/plan.py`, que resuelve la ruta del plan y cada mención de archivo antes de que se ejecute
+Auto o Complex), el cargador de skills (`pedacito/skills.py`), la ruta de restauración de checkpoints
+(`pedacito/checkpoints.py`) y cada ruta de archivos de la GUI (`pedacito/gui/server.py`). El
+comprobador de planes solo lee: un recorrido de ruta o una escapada por symlink o junction se informa
+como error definitivo y detiene la ejecución antes de que la primera tarea escriba.
 
 **Una nota sobre `os.path.commonpath`.** Pedacito usa `os.path.commonpath` en
 `pedacito/index.py`, pero solo para determinar la raíz del proyecto cuando pasas varias

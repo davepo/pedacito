@@ -1113,6 +1113,32 @@ Una extensión, una habilidad, un conjunto de comandos o un paquete de modelos s
 Pedacito que necesita. `pkg_manifest.py` valida el archivo, y una persona lo revisa antes de que se ejecute
 nada del paquete. Ver [SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml).
 
+### Validación de planes e impacto
+
+`plan.check_plan(root, plan_path, index)` se ejecuta antes de que Auto y Complex
+ejecuten su primera tarea (y se expone como `pedacito plan --check [PLAN]
+[PROJECT]`). Contiene la ruta del plan y cada mención de archivo con
+`security.resolve_safe_path`, rechaza recorridos de ruta, escapadas por
+symlink/junction, destinos sensibles y protegidos, resuelve las referencias
+explícitas `ruta: símbolo` contra el índice estático, y comprueba las
+anotaciones de dependencia por ciclos, números inexistentes y orden de tareas
+posteriores. Una tarea que dice crear un archivo es una creación válida cuando
+su directorio padre queda dentro del proyecto; un archivo ausente con un verbo
+de edición y sin marca de creación es un error definitivo. En Windows una
+colisión solo por mayúsculas/minúsculas con un archivo existente es un error
+porque el sistema de archivos no puede tener ambos; un sistema sensible a
+mayúsculas trata la casi-colisión como advertencia.
+
+`PlanImpact` es una vista previa conservadora construida con el mismo índice:
+archivos y símbolos tocados, llamadores indexados (importadores, aristas de
+llamada y llamadores de símbolos), pruebas enlazadas por las convenciones de
+nombre de cada lenguaje y `unknowns` deterministas para importaciones
+dinámicas, llamadores aproximados por nombre simple, archivos sin indexar,
+creaciones planificadas y pruebas ausentes. Un índice ausente o una dependencia
+sin resolver hacen la vista previa más pequeña y explícitamente desconocida,
+nunca verde. Las advertencias no bloquean; solo los errores definitivos detienen
+una ejecución, y un plan inválido se asigna al código de salida 2.
+
 ## Límites conocidos
 
 Estos son los límites reales. Las funciones faltantes del arnés no están en esta lista:
