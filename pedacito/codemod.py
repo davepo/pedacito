@@ -44,10 +44,12 @@ import copy
 import difflib
 import hashlib
 import io
+import json
 import keyword
 import os
+import re
 import tokenize
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,11 +61,20 @@ from .imports import (FileSet, module_name, python_import_bindings,
                       resolve as _import_resolve)
 
 __all__ = ["CodemodRequest", "CodemodResult", "apply", "list_recipes",
-           "preview"]
+           "parse_option_pairs", "parse_options_json", "preview"]
 
 # A source file larger than this is refused: a codemod preview must stay
 # bounded, and a multi-megabyte source is far outside a surgical refactor.
 _MAX_SOURCE_BYTES = 2_000_000
+
+# Recipe IDs are ASCII protocol values, never localized and never paths: a
+# catalog name such as `add_import`, never `../add_import` or `pkg/recipe`.
+_RECIPE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+# Option text is small, deliberate data. A cap keeps a model-supplied JSON
+# blob from turning one request into a memory/CPU problem before the recipe's
+# own per-value 2000-character limit runs.
+_MAX_OPTIONS_JSON = 20_000
 
 # Recipe language identifiers are ASCII protocol values, never localized.
 _LANG_PYTHON = "python"
@@ -297,6 +308,94 @@ def list_recipes() -> list[dict[str, Any]]:
     return copy.deepcopy(list(_RECIPES))
 
 
+def _option_value(text: str) -> str:
+    """Validate one option value as data (never a command or a path escape).
+
+    The value is stripped exactly like `_validate_options` will strip it, so
+    what the caller sees in a refusal matches what a recipe would receive.
+    Values may legitimately contain spaces, dots, quotes or `=`; only NUL is
+    refused because it cannot survive any text protocol.
+    """
+    if "\x00" in text:
+        raise ValueError("option values must not contain NUL characters")
+    return text.strip()
+
+
+def parse_option_pairs(pairs: Iterable[str]) -> dict[str, str]:
+    """Parse repeatable CLI `--option KEY=VALUE` arguments as data.
+
+    Every item must contain exactly one leading-key separator (`=`); the
+    remainder is the value, so `default={"a": 1}` is data, not shell syntax.
+    No subprocess, shell, eval or path resolution happens here. An empty key,
+    whitespace in a key or a missing `=` raises `ValueError` with an
+    actionable message; the caller decides how to report it.
+    """
+    if isinstance(pairs, (str, bytes)):
+        raise ValueError("options must be a sequence of KEY=VALUE strings")
+    out: dict[str, str] = {}
+    for raw in pairs or ():
+        if not isinstance(raw, str):
+            raise ValueError("each option must be KEY=VALUE text")
+        text = raw.strip()
+        if not text:
+            raise ValueError("empty option: expected KEY=VALUE")
+        if "=" not in text:
+            raise ValueError(
+                f"option {raw!r} is not KEY=VALUE (the value may be empty)")
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"option {raw!r} has an empty key")
+        if any(ch.isspace() for ch in key):
+            raise ValueError(
+                f"option key {key!r} must not contain whitespace")
+        out[key] = _option_value(value)
+    return out
+
+
+def parse_options_json(text: Any) -> dict[str, str]:
+    """Parse an agent-supplied options object (JSON text or a mapping).
+
+    The agent schema carries `options` as a JSON object string, so the same
+    `KEY=VALUE` data is bounded and type-checked here before a recipe sees
+    it. JSON is parsed with `json.loads` only: no `eval`, no subprocess and no
+    filesystem access. A non-object, a non-string key/value or an oversized
+    blob raises `ValueError`.
+    """
+    if text is None or text == "":
+        return {}
+    if isinstance(text, Mapping):
+        data = text
+    else:
+        if not isinstance(text, str):
+            raise ValueError(
+                "options must be a JSON object of string values")
+        raw = text.strip()
+        if not raw:
+            return {}
+        if len(raw) > _MAX_OPTIONS_JSON:
+            raise ValueError(
+                f"options JSON is longer than the {_MAX_OPTIONS_JSON}-"
+                "character limit")
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"options is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                "options must be a JSON object such as "
+                '{"module": "os"}')
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("option names must be non-empty strings")
+        if not isinstance(value, str):
+            raise ValueError(
+                f"option '{key}' must be a string; quote it in the JSON")
+        out[key.strip()] = _option_value(value)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -315,12 +414,19 @@ def preview(root: Path, request: CodemodRequest, *, index=None,
 
 
 def apply(root: Path, request: CodemodRequest, *, index=None,
-          cfg=None) -> CodemodResult:
+          cfg=None, before_write: Callable[[str, Path], str | None] | None = None
+          ) -> CodemodResult:
     """Apply a codemod through one all-or-nothing atomic transaction.
 
     The preview is recomputed from current bytes, every touched file's preimage
     hash is verified again by ``apply_edits_atomic`` immediately before commit,
     and a policy/protection/sensitive-path failure leaves every file untouched.
+
+    ``before_write`` is the caller's last-moment write gate: it receives each
+    project-relative path and its absolute path after the batch has been
+    computed, and any non-empty error string refuses the entire batch. It runs
+    inside the same apply call, so a cross-file recipe cannot add a file that
+    the caller's policy/protection check never saw.
     """
     allow = getattr(cfg, "allow_write", None) if cfg is not None else None
     try:
@@ -335,6 +441,34 @@ def apply(root: Path, request: CodemodRequest, *, index=None,
             False, {}, (), result.warnings,
             "apply requires allow_write = true; use preview to inspect the "
             "change first")
+    if cfg is not None:
+        from . import policy as policy_mod
+        for change in plan.changes:
+            try:
+                decision = policy_mod.enforce(
+                    cfg, "write", change.rel, root=plan.root)
+            except Exception as exc:                 # fail closed
+                return CodemodResult(
+                    False, {}, (), result.warnings,
+                    f"denied by policy: policy evaluation error: {exc}; "
+                    "nothing was written")
+            if decision is not None and decision.decision == "deny":
+                return CodemodResult(
+                    False, {}, (), result.warnings,
+                    f"denied by policy ({decision.matched_rule}): "
+                    f"{decision.reason}; nothing was written")
+    if before_write is not None:
+        for change in plan.changes:
+            try:
+                refusal = before_write(change.rel, plan.root / change.rel)
+            except Exception as exc:                 # fail closed
+                return CodemodResult(
+                    False, {}, (), result.warnings,
+                    f"write gate failed for {change.rel}: {exc}; nothing was "
+                    "written")
+            if refusal:
+                return CodemodResult(False, {}, (), result.warnings,
+                                     str(refusal))
 
     backup = bool(getattr(cfg, "backup", False)) if cfg is not None else False
     backup_dir = getattr(cfg, "_backup_dir", None) if cfg is not None else None
@@ -418,6 +552,15 @@ def _prepare(root: Path, request: CodemodRequest, *, cfg, for_write: bool,
     recipe_id = str(request.recipe or "").strip()
     if not recipe_id:
         raise _Refuse("codemod recipe is required; use list_recipes() for ids")
+    if "/" in recipe_id or "\\" in recipe_id:
+        raise _Refuse(
+            f"refused: recipe id '{recipe_id}' contains a path separator; "
+            "recipe ids are catalog names (for example add_import), never "
+            "paths -- nothing was written")
+    if not _RECIPE_ID_RE.match(recipe_id):
+        raise _Refuse(
+            f"refused: recipe id '{recipe_id}' is not a catalog name; use "
+            "list_recipes() for ids -- nothing was written")
     recipe = _RECIPE_BY_ID.get(recipe_id)
     if recipe is None:
         raise _Refuse(f"unknown codemod recipe '{recipe_id}'; known recipes: "

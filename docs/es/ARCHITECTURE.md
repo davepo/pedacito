@@ -453,6 +453,7 @@ hacer:
 |---|---|---|
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Operaciones de archivo completo; `append` construye un archivo más grande que una sola respuesta. |
 | `rename` | `allow_write = true` | Renombra mecánicamente una definición y sus referencias en los archivos que la importan (cadenas y comentarios intactos, cada archivo se vuelve a analizar, con instantánea). Rechaza un nombre definido en varios lugares y lista las referencias que dejó intactas. |
+| `codemod` | `list`/`preview` siempre; `apply` con `allow_write = true` | Ejecuta una receta determinista del catálogo compartido (`add_import`, `remove_import`, `print_to_logger`, `extract_constant`, `add_annotation`, `add_param`, `remove_param`, `wrap_try`, `wrap_context`, `move_symbol`, `move_file`, `replace_deprecated`, `add_reexport`). `list`/`preview` nunca escriben; `apply` usa una única transacción atómica, instantáneas, la política de escritura, las compuertas de rutas protegidas/sensibles y el registro de mutaciones. |
 | `undo` | `allow_write = true` (+ `backup`, activado por defecto) | Autorrecuperación a mitad de tarea: revierte lo que hicieron hasta ahora las acciones `write`/`append`/`move`/`delete` de esta tarea (o solo uno de sus archivos), las instantáneas previas a la tarea regresan, los archivos que creó la tarea desaparecen. |
 | `run` | `allow_shell = true` | Ejecuta un comando (p. ej. `pytest -q`), sin shell, de modo que `&` y `nohup` se rechazan y los procesos de larga duración van a `serve`. Una GUI/servidor silencioso se detiene después de `shell_idle_seconds`. |
 | `serve` | `allow_serve = true` | Inicia, lista, muestra los registros de o detiene un servidor de desarrollo en segundo plano. El registro y los logs viven bajo `.pedacito/procs/`; también `pedacito serve` / `pedacito procs`. La lista colapsa las entradas detenidas reemplazadas (historial de reinicios) tras un contador; `procs --all` las muestra. |
@@ -805,6 +806,50 @@ cambio y guarda primero las instantáneas de los originales, de modo que `pedaci
 En la GUI, **Project ▾ → Rename symbol…** toma el nombre antiguo, el nombre nuevo y un
 archivo de alcance opcional. **Preview** muestra los diffs y **Rename** los escribe.
 El diálogo renombra solo identificadores; `--strings` es una opción de la CLI.
+
+### Codemods deterministas
+
+`pedacito/codemod.py` es un catálogo de recetas de código demostrables basadas en
+el AST y el tokenizador. La CLI y el agente comparten un único
+`CodemodRequest(recipe, file, symbol, options)` y un par `preview`/`apply`, de
+modo que su comportamiento no puede divergir:
+
+```bash
+pedacito codemod list .
+pedacito codemod preview add_import --file app.py --option module=typing --option name=Any
+pedacito codemod apply print_to_logger --file app.py
+```
+
+El catálogo inicial es `add_param`, `remove_param`, `add_import`,
+`remove_import`, `wrap_try`, `wrap_context`, `print_to_logger`,
+`extract_constant`, `add_annotation`, `move_symbol`, `move_file`,
+`replace_deprecated` y `add_reexport`. `list_recipes()` publica los nombres
+exactos de las opciones, el rol de `--symbol`, los lenguajes y el estado de cada
+receta; una receta catalogada pero no implementada informa `unverified` en vez
+de fingir que está en verde.
+
+- **Preview es lo predeterminado.** Calcula el diff unificado determinista y
+  nunca escribe, construye un índice ni crea copias o checkpoints. `list`
+  también es de solo lectura.
+- **Apply es una transacción.** `apply` recalcula el lote desde los bytes
+  actuales, vuelve a analizar cada salida y entrega el conjunto completo a
+  `edits.apply_edits_atomic` con hashes de las imágenes previas. Un rechazo de
+  política, protección, ruta sensible o sintaxis deja todos los archivos
+  intactos. La ruta del agente añade `before_write`, evaluado contra el lote
+  exacto del momento de aplicar, de modo que una receta entre archivos no puede
+  introducir un archivo que la compuerta de política nunca vio.
+- **Contención y datos, no comandos.** Los ids de receta son nombres de
+  catálogo y rechazan separadores de ruta; los archivos se resuelven mediante
+  `security.resolve_safe_path` (los escapes por recorrido, enlace simbólico o
+  junction se rechazan); `--option KEY=VALUE` se interpreta como dato y el campo
+  `options` del agente solo acepta JSON. No interviene ningún subproceso.
+- **La codificación se conserva.** `fileio` mantiene la codificación, el BOM y
+  los finales de línea de cada archivo durante la transacción.
+- **La exposición al agente se poda.** La acción `codemod` entra en el esquema
+  de pasos solo cuando la tarea nombra una transformación mecánica;
+  `ACTION_PERMISSION` registra que `apply` necesita `allow_write`. Un apply
+  correcto anota las rutas modificadas en el registro de mutaciones de la
+  tarea, así que la verificación posterior a la edición se ejecuta.
 
 ### Verificar una respuesta antes de escribirla
 

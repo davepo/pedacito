@@ -186,7 +186,9 @@ Every tool path goes through `security.resolve_safe_path(root, target)`:
    call raises `SecurityError`.
 
 Callers include the read, edit, write and rename tools (`pedacito/tools.py`,
-`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), the plan
+`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), the
+deterministic codemod surface (`pedacito/codemod.py`, which also applies the
+same containment to every file a recipe would add or update), the plan
 checker (`pedacito/plan.py`, which resolves the plan path and every file mention
 before Auto or Complex runs), the skill loader (`pedacito/skills.py`), the
 checkpoint restore path (`pedacito/checkpoints.py`), and every GUI file route
@@ -223,6 +225,16 @@ only.
   Pillar 4).
 - **Allow-list mode.** `auto_allowlist = true` restricts an autonomous task to the
   files its title names or that the lookup read. New files are always allowed.
+- **Codemods are writes.** `pedacito codemod preview` and `list` are read-only
+  and create no state. `apply` needs `allow_write = true` and the same policy,
+  protected-path, sensitive-file and task-allowlist gates as a direct write;
+  the recipe id cannot contain a path separator, `--file` resolves through
+  `security.resolve_safe_path` (traversal, symlink and junction escapes are
+  refused), `--option KEY=VALUE` is data rather than a command, and every file
+  in the batch must still parse before one atomic transaction commits. The
+  agent's `codemod` action runs the write gate against the exact apply-time
+  batch, so a cross-file recipe cannot add an unreviewed path. A recipe that is
+  catalogued but not implemented reports `unverified`, never green.
 
 ### Project config is not trusted by default
 

@@ -60,6 +60,7 @@ from datetime import datetime
 from html import unescape as _html_unescape
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 from . import browser, env_resolve, fileio, proc, safety, sandbox, security, sessions, vision
 from . import edits as edits_mod
@@ -131,6 +132,14 @@ rename_symbol - deterministic multi-file rename: every exact identifier
            importers); strings and comments are never touched, every changed
            file must still parse, nothing lands if one would break. args:
            symbol (old name), to (new name), optional file (scope)
+codemod  - run one deterministic source recipe from the `codemod` catalog
+           (list/preview/apply): add/remove import, print->logger, extract a
+           constant, add annotation, add/remove parameter, wrap try/context,
+           move symbol/file, replace deprecated, add re-export. args:
+           operation (list|preview|apply), recipe (id from list), file
+           (project-relative target), symbol (recipe target), options
+           (JSON object of string values); list/preview never write, apply
+           needs allow_write and the same policy/snapshot rules as a write.
 write    - overwrite a whole file with text. args: file, content
 append   - add text to the END of a file.    args: file, content
 move     - rename/move one file.             args: file (old), to (new)
@@ -190,7 +199,7 @@ STEP_SCHEMA = {
                      "todo",
                      "remember", "skill", "task", "fetch", "fetch_url",
                      "web_search", "question", "mcp", "mcp_call", "lsp", "api",
-                     "done"],
+                     "codemod", "done"],
         },
         "file": {"type": "string",
                  "description": "For read/write/append/move/delete/undo. For "
@@ -232,6 +241,22 @@ STEP_SCHEMA = {
                                   "server/tool, or server to list its tools. "
                                   "Empty otherwise.",
                    "maxLength": 200},
+        "recipe": {"type": "string",
+                   "description": "For codemod: the catalog recipe id from "
+                                  "operation=list (for example add_import). "
+                                  "Empty otherwise.",
+                   "maxLength": 80},
+        "operation": {"type": "string",
+                      "description": "For codemod: list, preview or apply. "
+                                     "Preview and list never write; apply "
+                                     "needs allow_write. Empty otherwise.",
+                      "maxLength": 20},
+        "options": {"type": "string",
+                    "description": "For codemod: a JSON object of string "
+                                   "option values, e.g. {\"module\": "
+                                   "\"os\"}; use operation=list for each "
+                                   "recipe's option names. Empty otherwise.",
+                    "maxLength": 4000},
         "url": {"type": "string",
                 "description": "For fetch_url: the exact http(s) URL to read. "
                                "Empty otherwise.",
@@ -331,6 +356,7 @@ FETCH_URL_ACTION = "fetch_url"
 WEB_SEARCH_ACTION = "web_search"
 GENERATE_IMAGE_ACTION = "generate_image"
 API_ACTION = "api"
+CODEMOD_ACTION = "codemod"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION, UNDO_ACTION)
 
@@ -356,6 +382,21 @@ _RUN_TEST_PROMPT_RE = re.compile(
     r"\b(?:test|tests|testing|pytest|fail|fails|failed|failure|bug|bugs|"
     r"fix|fixes|fixing|error|errors|traceback|tracebacks|reproduce|"
     r"reproduction|broken|assert|assertion|regression|repro)\b", re.I)
+
+# The deterministic codemod action is offered only on paths that ask for a
+# mechanical source transformation: adding a tool to every schema would grow
+# the gather prompt (and change its prefix) for tasks that never touch one.
+# Matching is case-insensitive and deliberately broad enough to catch the
+# recipe vocabulary a user actually writes.
+_CODEMOD_PROMPT_RE = re.compile(
+    r"\b(?:codemod|recipe|refactor|mechanical(?:ly)?|ast|"
+    r"imports?|from[- ]import|annotation|annotate|type hints?|"
+    r"constants?|extract|deprecat(?:e|ed|ion)|re-?exports?|"
+    r"parameters?|arguments?|signature|"
+    r"print|prints|logging|logger|"
+    r"try[/ ]except|exception handling|context manager|"
+    r"move (?:a )?(?:symbol|function|method|class|file)|"
+    r"wrap (?:a |the )?(?:function|method|body))\b", re.I)
 
 # Optional/specialized actions and the prompt words that justify keeping
 # them even when the repository's stats call them unused. Matching is
@@ -395,6 +436,7 @@ _PRUNE_TRIGGERS = {
                              r"screen|desktop)\b", re.I),
     "browser": re.compile(r"\b(browser|web page|website|url|http|localhost|"
                           r"headless|chromium)\b", re.I),
+    CODEMOD_ACTION: _CODEMOD_PROMPT_RE,
 }
 
 
@@ -494,6 +536,16 @@ def _run_test_offered(cfg) -> bool:
     if _repo_has_tests(cfg):
         return True
     return bool(_RUN_TEST_PROMPT_RE.search(
+        str(getattr(cfg, "_task_text", "") or "")))
+
+
+def _codemod_offered(cfg) -> bool:
+    """`codemod` enters the schema only when the task asks for a mechanical
+    source transformation. Offering is not permission: `list`/`preview` are
+    read-only, and `apply` still needs allow_write plus the write policy
+    (and its snapshots) at call time. Tasks that never mention a recipe keep
+    the previous schema and prompt byte-for-byte."""
+    return bool(_CODEMOD_PROMPT_RE.search(
         str(getattr(cfg, "_task_text", "") or "")))
 
 
@@ -627,6 +679,8 @@ _FIELD_ACTION_FRAGMENTS = {
         (("generate_image",),
          "For generate_image, the output image path (defaults to "
          ".pedacito/images/)."),
+        (("codemod",),
+         "For codemod, the project-relative source file the recipe targets."),
     ],
     "start": [
         (("read",), "For read."),
@@ -656,6 +710,9 @@ _FIELD_ACTION_FRAGMENTS = {
         (("api",),
          "For api: the exact library name from the task (or the library "
          "whose API you need)."),
+        (("codemod",),
+         "For codemod: the recipe's target symbol (empty when the recipe "
+         "ignores it)."),
     ],
     "command": [
         (("run", "screenshot"),
@@ -800,6 +857,14 @@ def build_gather_json_schema(allowed_actions: list[str],
             + ordered[ordered.index("symbol") + 1:]
         if not compact:
             required += ["prompt", "size"]
+    if CODEMOD_ACTION in actions:
+        # `recipe`/`operation`/`options` join the flat field set only while
+        # the task asks for a codemod; the default schema stays byte-identical.
+        ordered = ordered[:ordered.index("symbol") + 1] \
+            + ["recipe", "operation", "options"] \
+            + ordered[ordered.index("symbol") + 1:]
+        if not compact:
+            required += ["recipe", "operation", "options"]
     if step_reasoning_first:
         ordered = ["reasoning"] + [k for k in ordered if k != "reasoning"]
         schema["properties"]["reasoning"]["description"] = (
@@ -910,6 +975,10 @@ def _offer_rows(cfg) -> list[tuple[str, str | None]]:
     # Offered only when the project's manifests declare that library, so
     # unaffected tasks keep the existing schema byte-for-byte.
     gate(API_ACTION, _api_offered(cfg), "not_relevant")
+    # Deterministic codemods (list/preview/apply). Offered only when the task
+    # names a mechanical transformation; apply is still gated by allow_write
+    # and the write policy inside the tool.
+    gate(CODEMOD_ACTION, _codemod_offered(cfg), "not_relevant")
     # Opt-in local/hosted image generation: offered only when an image
     # profile is configured and either allow_image_gen is on or the
     # permission broker is live (each call is then approved individually).
@@ -1013,6 +1082,7 @@ ACTION_PERMISSION = {
     "question": "interactive session", "mcp": "allow_mcp",
     "mcp_call": "enable_mcp and trusted server or broker",
     "lsp": "allow_lsp", "api": "none", "generate_image": "allow_image_gen or broker",
+    "codemod": "allow_write",
 }
 
 TOOL_REASONS = ("active", "config_disabled", "policy_denied",
@@ -5976,6 +6046,145 @@ def web_search(cfg, query: str) -> str:
     return "\n".join(lines)
 
 
+def _codemod_catalog_text() -> str:
+    """The bounded, deterministic recipe catalog shown by operation=list."""
+    from . import codemod as codemod_mod
+    lines = [
+        "CODEMOD RECIPES (deterministic; list/preview never write; apply "
+        "needs allow_write and the write policy):",
+    ]
+    for recipe in codemod_mod.list_recipes():
+        options = ", ".join(
+            (o["name"] + "*") if o.get("required") else o["name"]
+            for o in recipe.get("options") or ()) or "(none)"
+        lines.append(
+            f"- {recipe['id']} [{recipe['status']}]: {recipe['title']} -- "
+            f"symbol: {recipe.get('symbol', 'ignored')}; options: {options}; "
+            f"languages: {', '.join(recipe.get('languages') or ())}")
+    lines.append(
+        "Call codemod with operation=preview|apply, recipe=<id>, "
+        "file=<project-relative path>, symbol=<recipe target>, and options="
+        "<JSON object of string values>. * = required option.")
+    text = "\n".join(lines)
+    return text[:6000] + ("\n[catalog clipped]" if len(text) > 6000 else "")
+
+
+def _codemod_observation(result, recipe: str, *, applied: bool) -> str:
+    """One bounded observation for an agent codemod preview or apply."""
+    if not result.ok:
+        error = result.error or "codemod refused"
+        if not error.lower().startswith("error:"):
+            error = "ERROR: " + error
+        return error
+    if not result.changed:
+        detail = "; ".join(result.warnings) or "the transformation produced no change"
+        return (f"CODEMOD {'APPLIED' if applied else 'PREVIEW'} "
+                f"`{recipe}`: NOTHING TO DO -- {detail}"
+                + ("" if applied else " (nothing was written)"))
+    head = (f"CODEMOD APPLIED `{recipe}`" if applied
+            else f"CODEMOD PREVIEW `{recipe}` (nothing was written)")
+    lines = [head + ": changed " + ", ".join(result.changed)]
+    for rel in result.changed:
+        diff = result.diffs.get(rel, "")
+        if diff:
+            lines.append(diff.rstrip("\n"))
+    if result.warnings:
+        lines.append("WARNINGS: " + "; ".join(result.warnings))
+    if not applied:
+        lines.append("(preview only: nothing was written)")
+    text = "\n".join(lines)
+    if len(text) > 6000:
+        text = text[:6000] + "\n[...diff clipped]"
+    return text
+
+
+def tool_codemod(index, cfg, operation: str = "", recipe: str = "",
+                 file: str = "", symbol: str = "", options: Any = "") -> str:
+    """`codemod` action: list, preview or apply one deterministic recipe.
+
+    `list` and `preview` are read-only; they never create a backup, index or
+    checkpoint and never write a source file. `apply` requires allow_write and
+    runs the same write gate as any other mutation -- policy, protected and
+    sensitive paths, the task write allowlist, one atomic transaction and the
+    task's mutation ledger -- so a denied call leaves every file untouched.
+    Recipe ids and files are resolved by `pedacito.codemod` through
+    `security.resolve_safe_path`, and the options object is parsed as data
+    (JSON only); no subprocess or shell is involved.
+    """
+    from . import codemod as codemod_mod
+
+    op = str(operation or "").strip().lower() or "preview"
+    if op not in ("list", "preview", "apply"):
+        return ("ERROR: codemod operation must be list, preview or apply "
+                f"(got {operation!r}); preview is the default.")
+    if op == "list":
+        return _codemod_catalog_text()
+
+    recipe = str(recipe or "").strip()
+    if not recipe:
+        return ("ERROR: codemod needs a recipe id; call codemod with "
+                "operation=list to see the catalog.")
+    if not str(file or "").strip():
+        return ("ERROR: codemod needs a project-relative `file` path for "
+                "preview or apply.")
+    try:
+        parsed_options = codemod_mod.parse_options_json(options)
+    except ValueError as exc:
+        return f"ERROR: codemod options: {exc}"
+    request = codemod_mod.CodemodRequest(
+        recipe=recipe, file=str(file), symbol=str(symbol or ""),
+        options=parsed_options)
+    root = Path(getattr(index, "root", None)
+                or getattr(cfg, "_root", None) or ".").resolve()
+
+    if op == "preview":
+        return _codemod_observation(
+            codemod_mod.preview(root, request, index=index, cfg=cfg),
+            recipe, applied=False)
+
+    if not getattr(cfg, "allow_write", False):
+        return ("ERROR: codemod apply needs allow_write = true. Preview the "
+                "recipe first (operation=preview) and ask the user to enable "
+                "writes; list and preview remain available.")
+
+    # A codemod can touch several files (callers, importers, a moved file).
+    # The callback below runs inside `codemod.apply` against the exact batch it
+    # is about to commit, so every path is gated before the one atomic write
+    # and a concurrent change cannot add an ungated file.
+    def _write_gate(rel: str, _path: Path) -> str | None:
+        denial = _policy_denied(cfg, "write", rel, root=root)
+        if denial:
+            return denial.removeprefix("ERROR: ")
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, rel, action="codemod apply",
+            policy=getattr(cfg, "policy", None))
+        if not allowed:
+            return "ERROR: " + sensitive_error
+        refusal = _protected_error(cfg, rel, "codemod apply")
+        if refusal:
+            return refusal.removeprefix("ERROR: ")
+        if index is not None:
+            refusal = _task_allowlist_error(
+                index, cfg, rel, "codemod apply")
+            return refusal.removeprefix("ERROR: ") or None
+        return None
+
+    result = codemod_mod.apply(
+        root, request, index=index, cfg=cfg, before_write=_write_gate)
+    if result.ok and result.changed:
+        _note_mutation(cfg, *result.changed)
+        try:
+            from . import index as index_mod
+            for rel in result.changed:
+                if (root / rel).is_file():
+                    index_mod.reindex_file(index, rel, cfg, save=False)
+                else:
+                    index.forget(rel)
+        except Exception:
+            pass                    # a stale index is not a failed apply
+    return _codemod_observation(result, recipe, applied=True)
+
+
 def tool_generate_image(index, cfg, prompt: str, file: str = "",
                         size: str = "") -> str:
     """`generate_image` action: draw one image and save it into the project.
@@ -6150,6 +6359,13 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
         return refactor.tool_rename_symbol(index, cfg, step.get("symbol", ""),
                                            step.get("to", ""),
                                            step.get("file", ""))
+    if action == CODEMOD_ACTION:
+        return tool_codemod(index, cfg,
+                            _as_text(step.get("operation")),
+                            _as_text(step.get("recipe")),
+                            _as_text(step.get("file")),
+                            _as_text(step.get("symbol")),
+                            step.get("options", ""))
     if action == GENERATE_IMAGE_ACTION:
         return tool_generate_image(index, cfg, _as_text(step.get("prompt")),
                                    _as_text(step.get("file")),

@@ -207,6 +207,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito update [--run]` | Verifica en PyPI si hay un Pedacito más reciente y, opcionalmente, actualiza esta instalación |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito rename OLD NEW` | Renombrado de símbolos en varios archivos mediante el AST y el tokenizador, sin llamada al modelo. `--file` lo acota, `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba, `--apply` escribe (por defecto: vista previa del diff) |
+| `pedacito codemod list` / `[preview] RECIPE` / `apply RECIPE` | Lista, previsualiza o aplica una receta de codemod determinista (13 ids: imports, print→logger, extraer constante, anotación, parámetro, envolver try/context, mover símbolo/archivo, obsoleto, re-exportación). `--file`, `--symbol` y `--option KEY=VALUE` repetible; preview es lo predeterminado; apply requiere `allow_write` y confirma una única transacción atómica con instantáneas. La acción `codemod` del agente expone el mismo catálogo con `operation=list\|preview\|apply` |
 | `pedacito image PROMPT` | Genera una imagen con un perfil de modelo de imagen configurado (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Se guarda en `.pedacito/images/` |
 | `pedacito diag [PATH]` | Alias de `pedacito diagnose`: ejecuta el linter o verificador de tipos detectado en el proyecto |
 | `pedacito parsers prefetch [--languages ...]` | Precarga las gramáticas de tree-sitter para uso sin conexión o aislado, e informa ok o failed por lenguaje |
@@ -220,6 +221,44 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 
 Los benchmarks también se ejecutan desde la GUI mediante el botón **Benchmarks**; el comando
 de la CLI construye los mismos proyectos y escribe los mismos informes.
+
+### Codemods deterministas
+
+`pedacito codemod` ejecuta una receta del catálogo sin llamada al modelo. Usa el
+AST y el tokenizador reales de Python, así que los comentarios, los literales de
+cadena y el formato no relacionado nunca se tocan por accidente; un símbolo
+ambiguo, un lenguaje no soportado o un resultado que rompe la sintaxis se
+rechazan en lugar de adivinarse.
+
+```bash
+pedacito codemod list .
+pedacito codemod preview add_import --file app.py \
+  --option module=typing --option name=Any
+pedacito codemod add_import --file app.py --option module=os   # preview es lo predeterminado
+pedacito codemod apply print_to_logger --file app.py           # requiere allow_write
+```
+
+Los 13 ids de receta son `add_param`, `remove_param`, `add_import`,
+`remove_import`, `wrap_try`, `wrap_context`, `print_to_logger`,
+`extract_constant`, `add_annotation`, `move_symbol`, `move_file`,
+`replace_deprecated` y `add_reexport`. `pedacito codemod list` imprime el estado
+de cada receta (`implemented` o `unverified`), el rol de `--symbol` y los nombres
+exactos de sus opciones. `--option` se puede repetir y se interpreta como dato:
+nunca es un comando de shell. Se rechazan antes de leer o escribir un id de
+receta con separador de ruta, un `--file` que escapa del proyecto mediante `..`
+o un enlace simbólico/junction, una ruta protegida o un archivo de secretos.
+
+`preview` y `list` no tienen efectos secundarios: no construyen índice, ni
+crean copias, checkpoints o escrituras de código. `apply` requiere
+`allow_write = true`, una política de escritura que lo permita y las mismas
+instantáneas que cualquier otra mutación; cada archivo tocado debe seguir
+analizándose antes de que confirme la única transacción atómica, así que nunca
+sobrevive un árbol a medio escribir. Tras un apply correcto se actualiza el
+índice existente en el sitio (sin llamada al modelo). El bucle de recopilación
+ofrece el mismo catálogo como acción `codemod` (`operation=list|preview|apply`,
+con `recipe`, `file`, `symbol` y un objeto JSON `options`); allí `apply` pasa
+por el registro de mutaciones y las mismas compuertas de política, rutas
+protegidas y archivos sensibles.
 
 ### Recuperar una tarea interrumpida
 

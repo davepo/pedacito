@@ -190,7 +190,9 @@ Cada ruta de herramienta pasa por `security.resolve_safe_path(root, target)`:
    llamada lanza `SecurityError`.
 
 Los llamadores incluyen las herramientas de lectura, edición, escritura y renombrado (`pedacito/tools.py`,
-`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), el comprobador de planes
+`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), la superficie de codemods
+deterministas (`pedacito/codemod.py`, que también aplica la misma contención a cada archivo
+que una receta añadiría o actualizaría), el comprobador de planes
 (`pedacito/plan.py`, que resuelve la ruta del plan y cada mención de archivo antes de que se ejecute
 Auto o Complex), el cargador de skills (`pedacito/skills.py`), la ruta de restauración de checkpoints
 (`pedacito/checkpoints.py`) y cada ruta de archivos de la GUI (`pedacito/gui/server.py`). El
@@ -226,6 +228,16 @@ indexadas.
   el Pilar 4).
 - **Modo de lista permitida.** `auto_allowlist = true` restringe una tarea autónoma a los
   archivos que nombra su título o que leyó la búsqueda. Los archivos nuevos siempre se permiten.
+- **Los codemods son escrituras.** `pedacito codemod preview` y `list` son de solo lectura
+  y no crean estado. `apply` requiere `allow_write = true` y las mismas compuertas de
+  política, rutas protegidas, archivos sensibles y lista permitida que una escritura
+  directa; el id de receta no puede contener un separador de ruta, `--file` se resuelve
+  mediante `security.resolve_safe_path` (se rechazan los escapes por recorrido, symlink y
+  junction), `--option KEY=VALUE` es un dato y no un comando, y cada archivo del lote debe
+  seguir analizándose antes de que confirme una única transacción atómica. La acción
+  `codemod` del agente ejecuta la compuerta de escritura contra el lote exacto del momento
+  de aplicar, así que una receta entre archivos no puede añadir una ruta no revisada. Una
+  receta catalogada pero no implementada informa `unverified`, nunca verde.
 
 ### La configuración del proyecto no es confiable por defecto
 
