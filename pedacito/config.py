@@ -463,6 +463,13 @@ class Config:
     allow_lsp: bool = False
     lsp_servers: dict = field(default_factory=dict)
     lsp_timeout: float = 10.0
+    # Opt-in API-oracle enrichment: after the static `.pyi`/`.py`/`.d.ts` index,
+    # allow the resolved toolchain to EXECUTE `go doc`, offline `cargo
+    # metadata --offline --no-deps`, or the project interpreter's `inspect`.
+    # `allow_shell` and the unified policy engine must also allow it. Static
+    # indexing never imports package code, runs a script or touches the
+    # network; off by default.
+    api_oracle_exec: bool = False
     # Let the gather loop create/overwrite files via `write`, grow them with
     # `append`, and rename/remove them with `move`/`delete`. Off by default: a
     # mid-gather write skips the edit path's syntax check and review page.
@@ -1659,7 +1666,8 @@ def _hostname(base_url: str) -> str:
 # `browser_eval_hosts`) widen what runs or where data may go, so they follow
 # the same rule.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
-               "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
+               "allow_serve", "allow_lsp", "lsp_servers", "api_oracle_exec",
+               "sandbox",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
@@ -3773,6 +3781,10 @@ mcp_timeout = 30
 allow_lsp = false
 # lsp_servers = {}          # e.g. { ".py" = "pyright-langserver --stdio" }
 lsp_timeout = 10.0
+# Opt-in: let the API oracle execute `go doc`, cargo metadata --offline
+# --no-deps, or the resolved interpreter's inspect after static declarations
+# produced nothing. Also needs allow_shell and an allowing policy.
+api_oracle_exec = false
 
 # Autonomous loop (`pedacito auto`).
 auto_plan_file = "PLAN.md"
@@ -3995,6 +4007,10 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # allow_lsp exposes exact definition/references/hover/diagnostics through a
 # language server; lsp_servers maps extensions to commands, and PATH detection
 # covers pyright/pylsp/typescript-language-server/rust-analyzer/gopls.
+# api_oracle_exec lets the API oracle enrich its read-only static index with
+# `go doc`, offline `cargo metadata --no-deps`, or the project interpreter's
+# inspect; it also needs allow_shell and an allowing policy. Off by default:
+# static `.pyi`/`.py`/`.d.ts` indexing never imports or executes package code.
 # auto_plan_file / auto_verify / auto_* configure `pedacito auto`.
 #
 # --- Context management and measurement ------------------------------------
@@ -4342,11 +4358,11 @@ _PROJECT_HEADER = """\
 #
 # Settings that run something are ignored until you read this file and run
 # `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
-# allow_lsp, lsp_servers, the sandbox settings, and the capability toggles
-# allow_shell, allow_write, allow_browser, allow_screenshots, enable_mcp and
-# allow_mcp. They are shown commented out here: active defaults would warn on
-# every load, and once trusted they would overrule the capabilities you granted
-# at user scope.
+# allow_lsp, lsp_servers, api_oracle_exec, the sandbox settings, and the
+# capability toggles allow_shell, allow_write, allow_browser,
+# allow_screenshots, enable_mcp and allow_mcp. They are shown commented out
+# here: active defaults would warn on every load, and once trusted they would
+# overrule the capabilities you granted at user scope.
 # Uncomment only the ones this repository genuinely needs. Everything else in
 # this file applies immediately.
 #

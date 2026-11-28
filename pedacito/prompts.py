@@ -237,6 +237,8 @@ def _compact_tool_help(cfg) -> str:
         "run_test": "run_test [target] [filter] - run ONE scoped pytest check (no shell)",
         "serve": "serve symbol command - start/list/log/stop a background server",
         "lsp": "lsp symbol file start end - exact definitions/references/diagnostics",
+        "api": "api symbol [pattern] - exact public signatures from a library "
+               "the task names (static declarations; absent is unknown)",
         "screenshot": "screenshot command start - capture the screen as text",
         "browser": "browser command pattern start - open a page, capture it",
         "generate_image": "generate_image prompt [file] [size] - draw one "
@@ -299,6 +301,9 @@ _SMALL_EXTRA_BULLETS = (
     ("git_diff", "- `git_diff` shows `git status --short` plus uncommitted diff."),
     ("remember", "- `remember` saves ONE durable project fact (verify against "
                  "source before relying on it)."),
+    ("api", "- `api` reads exact public signatures from a library the task "
+            "names (static declarations only; a missing symbol is unknown, "
+            "not proof it does not exist)."),
     ("task", "- `task` delegates a read-only research question to a helper agent."),
     ("question", "- `question` asks the user ONE short clarifying question when "
                  "truly ambiguous (at most twice)."),

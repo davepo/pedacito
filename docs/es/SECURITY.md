@@ -362,6 +362,7 @@ no persiga una escritura bloqueada como si fuera un error de código.
 | `verify_tests` tras una edición | Sí | Depurado | Tiempo límite de las pruebas |
 | `pedacito serve` (servidores de desarrollo en segundo plano) | **No** | Depurado | Se mantiene en ejecución hasta que se detenga |
 | `browser`, `lsp`, servidores MCP | **No** | Depurado | `lsp_timeout` (10 s), descubrimiento MCP 5 s por servidor |
+| Enriquecimiento del oráculo de API (`api_oracle_exec`) | Sí donde hay un backend | Depurado | El plazo restante de la tarea, con tope de 12 s |
 | Hooks y `auto_verify` (tus propios comandos) | **No** (por diseño) | Depurado para los hooks (+ `PEDACITO_EVENT`); `auto_verify` también depurado | Tiempo límite del hook |
 | `load_cmd` / `unload_cmd` del ciclo de vida del servidor (configuración confiable) | **No** (por diseño) | Lista permitida depurada + `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` | 120 s |
 | Pestaña **Run** de la GUI (tú haces clic) | **No** | Variables de credenciales eliminadas (ver abajo) | 15 s por defecto, o el valor que definas |
@@ -417,6 +418,21 @@ Otros límites:
   variable que la depuración eliminó. Los scripts descubiertos por el
   resolutor son datos: nada se ejecuta porque un manifiesto lo nombre, y
   `allow_shell`/la política/el sandbox siguen controlando cada ejecución real.
+- **El oráculo de API es estático por defecto.** La acción de recolección `api`
+  lee `.pyi`/`.py` y metadatos de distribución desde los `site-packages` del
+  intérprete resuelto, más archivos `*.d.ts` de un `node_modules` contenido.
+  Nunca importa el código del paquete, evalúa sus valores por defecto, ejecuta
+  un script del paquete ni usa la red, y cada candidato pasa por
+  `security.resolve_safe_path`; los enlaces que escapan de una raíz de
+  dependencias aprobada se omiten. El enriquecimiento opcional
+  (`api_oracle_exec = true`) también necesita `allow_shell` y una política que
+  lo permita antes de ejecutar `go doc`, `cargo metadata --offline --no-deps` o
+  el `inspect` del intérprete del proyecto. Esos hijos son solo argv, se
+  ejecutan con el entorno depurado y el sandbox del SO cuando existe, están
+  limitados por el plazo de la tarea (tope de 12 s) y su salida se acota y
+  redacta. La caché en `.pedacito/cache/api/` guarda solo metadatos de símbolos
+  redactados y acotados, se escribe de forma atómica, y los resultados
+  derivados de ejecución no se reutilizan después de retirar el consentimiento.
 
 La política de entorno tiene tres niveles por superficie:
 

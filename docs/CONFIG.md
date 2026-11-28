@@ -353,6 +353,34 @@ served at `GET /api/mcp/tools`. See
 [Techniques §30](../TECHNIQUES.md#30-pruned-permission-gated-mcp-bridges-named-servers--mcp_call)
 for why the pruning is shaped this way.
 
+## Offline API oracle (`api_oracle_exec`)
+
+When a task names a library that the project's manifests declare exactly, the
+gather loop offers a read-only `api` action. It answers with the package
+version and exact public signatures from static declarations: Python `.pyi`
+and `.py` files plus distribution metadata, and contained
+`node_modules/**/*.d.ts` files. It never imports package code, runs a package
+script or makes a network request, and a miss is reported as **unknown** — not
+as proof that the API does not exist.
+
+`api_oracle_exec = true` (off by default) optionally enriches a static miss by
+executing the resolved toolchain: `go doc`, `cargo metadata --offline
+--no-deps`, or the project interpreter's `inspect`. That path also requires
+`allow_shell` and an allowing policy; the commands are argv-only, bounded by
+the task deadline, capped in output and labelled as execution-derived in the
+answer. A project config cannot turn it on until you run `pedacito trust`.
+
+```toml
+api_oracle_exec = true   # only with allow_shell; static indexing needs neither
+```
+
+The index is cached under `.pedacito/cache/api/` by package, environment
+identity, version and declaration/lockfile content hashes. Cache records hold
+only symbol metadata, are secret-redacted, are capped in size and items, and
+are replaced atomically; a version or declaration change invalidates the old
+key. The cache is not a substitute for reading the project's own source, and
+an execution-derived result is never reused after consent is withdrawn.
+
 ## Hooks
 
 Hooks run your own program at well-defined moments:
@@ -919,6 +947,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_shell` | false | `run` and `diagnose`. From a project's own config: ignored until `pedacito trust`. |
 | `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. A server that prints one later still gets it recorded, on the next `procs`/`logs` look. |
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
+| `api_oracle_exec` | false | Opt-in execution enrichment for the read-only `api` gather action: `go doc`, `cargo metadata --offline --no-deps`, or the resolved interpreter's `inspect`. It also requires `allow_shell` and an allowing policy. Static `.pyi`/`.py`/`.d.ts` indexing never imports package code, runs a script or uses the network. From a project's own config: ignored until `pedacito trust`. |
 | `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. From a project's own config: ignored until `pedacito trust`. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |
 | `modality` | `""` | What kind of model a profile serves: `""` (auto-detect from the model id and server metadata), `"text"`, `"image"`, `"audio"` or `"embedding"`. Only `"image"` opens the [local image generation](#local-image-generation-image_profile-allow_image_gen) path. |

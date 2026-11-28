@@ -351,6 +351,38 @@ se sirve en `GET /api/mcp/tools`. Consulta
 [Técnicas §30](../../TECHNIQUES.es.md)
 para saber por qué la poda tiene esta forma.
 
+## Oráculo de API sin conexión (`api_oracle_exec`)
+
+Cuando una tarea nombra una biblioteca que los manifiestos del proyecto
+declaran exactamente, el ciclo de recolección ofrece una acción `api` de solo
+lectura. Responde con la versión del paquete y las firmas públicas exactas de
+las declaraciones estáticas: archivos `.pyi` y `.py` de Python más metadatos de
+distribución, y archivos `node_modules/**/*.d.ts` contenidos en el proyecto.
+Nunca importa el código del paquete, ejecuta un script del paquete ni hace una
+petición de red, y una búsqueda sin resultados se informa como **desconocida**,
+no como prueba de que la API no exista.
+
+`api_oracle_exec = true` (desactivado por defecto) enriquece opcionalmente un
+fallo estático ejecutando la cadena de herramientas resuelta: `go doc`,
+`cargo metadata --offline --no-deps` o el `inspect` del intérprete del
+proyecto. Esa ruta también necesita `allow_shell` y una política que lo
+permita; los comandos son solo argv, están limitados por el plazo de la tarea,
+su salida está acotada y se etiquetan como derivados de ejecución en la
+respuesta. La configuración de un proyecto no puede activarlo hasta que
+ejecutes `pedacito trust`.
+
+```toml
+api_oracle_exec = true   # solo con allow_shell; la indexación estática no necesita ninguno
+```
+
+El índice se cachea en `.pedacito/cache/api/` por paquete, identidad del
+entorno, versión y hashes de contenido de declaraciones/archivos de bloqueo.
+Los registros de caché solo guardan metadatos de símbolos, se redactan sus
+secretos, tienen límites de tamaño y elementos y se reemplazan de forma
+atómica; un cambio de versión o de declaración invalida la clave anterior. La
+caché no sustituye la lectura del código fuente del proyecto, y un resultado
+derivado de ejecución nunca se reutiliza después de retirar el consentimiento.
+
 ## Hooks
 
 Los hooks ejecutan tu propio programa en momentos bien definidos:
@@ -920,6 +952,7 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `allow_shell` | false | `run` y `diagnose`. Desde la configuración propia de un proyecto: se ignora hasta `pedacito trust`. |
 | `allow_serve` / `serve_wait` | false / 3.0 | Servidores de desarrollo en segundo plano (acción `serve`, `pedacito serve`); segundos de espera por una URL impresa. Un servidor que imprime una más tarde igual la tiene registrada, en la siguiente consulta de `procs`/`logs`. |
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Definición/referencias/hover/diagnósticos exactos mediante un servidor de lenguaje; los comandos por extensión anulan la detección en PATH. |
+| `api_oracle_exec` | false | Enriquecimiento opcional con ejecución para la acción de recolección de solo lectura `api`: `go doc`, `cargo metadata --offline --no-deps` o el `inspect` del intérprete resuelto. También necesita `allow_shell` y una política que lo permita. La indexación estática de `.pyi`/`.py`/`.d.ts` nunca importa el código del paquete, ejecuta un script ni usa la red. Desde la configuración propia de un proyecto: se ignora hasta `pedacito trust`. |
 | `allow_screenshots` / `allow_browser` | false | Captura de pantalla y de navegador headless. Desde la configuración propia de un proyecto: se ignora hasta `pedacito trust`. |
 | `vision_model` | `""` | Modelo multimodal usado para describir las capturas. |
 | `modality` | `""` | Qué tipo de modelo sirve un perfil: `""` (autodetección por el id del modelo y los metadatos del servidor), `"text"`, `"image"`, `"audio"` o `"embedding"`. Solo `"image"` abre la ruta de [generación local de imágenes](#generación-local-de-imágenes-image_profile-allow_image_gen). |

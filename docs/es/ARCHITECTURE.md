@@ -433,6 +433,7 @@ El modelo trabaja con un conjunto pequeño de acciones:
 | `todo` | Lista de verificación corta `- [ ]` guardada en `.pedacito/todo.md` y mostrada en el prompt de respuesta. |
 | `question` | Te hace *a ti* una pregunta corta (solo en sesiones interactivas, como máximo dos veces por tarea). |
 | `run_test` | Ejecuta una verificación de prueba acotada (pytest, Node/Vitest, Go o Cargo, elegidos según el objetivo) y lee el traceback condensado. Activado por defecto; consulta [Ejecuciones de pruebas acotadas](#ejecuciones-de-pruebas-acotadas-durante-la-investigación) |
+| `api` | Lee firmas públicas exactas de una biblioteca que la tarea nombra y los manifiestos del proyecto declaran. Primero `.pyi`/`.py`/metadatos de distribución y `node_modules/**/*.d.ts` contenidos; un fallo es desconocido, nunca prueba de ausencia. Consulta [Oráculo de API sin conexión](#oráculo-de-api-sin-conexión-api_oracle_exec) |
 | `done` | Deja de recolectar y responde. |
 
 Repetir una búsqueda de solo lectura (incluso muchos pasos después) sobre la que nada ha cambiado
@@ -533,6 +534,51 @@ el traceback en vivo esté frente al modelo antes de que escriba el parche.
 Está activado por defecto (`enable_run_test_in_gather = true`). Defínelo en `false` para que
 cada ejecución pregunte primero en el diálogo **Permission requested** bajo **Test Execution**.
 Una ejecución simple de CLI no tiene diálogo, así que allí la herramienta informa que está deshabilitada.
+
+### Oráculo de API sin conexión (`api_oracle_exec`)
+
+`api_oracle.py` responde una pregunta concreta durante la recolección: *¿cuál es
+la firma pública exacta de este símbolo en una biblioteca que la tarea nombró?*
+Se ofrece como la acción de solo lectura `api` únicamente cuando el texto de la
+tarea nombra una biblioteca que los manifiestos del propio proyecto (metadatos
+y requisitos de Python, `package.json`, `go.mod`, `Cargo.toml`/`Cargo.lock`)
+declaran exactamente. Las tareas que no nombran esa dependencia nunca ven la
+acción, así que su esquema y su prompt quedan idénticos byte a byte.
+
+La ruta por defecto es estática y acotada:
+
+- primero archivos `.pyi` de Python, luego `.py` y metadatos de distribución
+  (`*.dist-info/METADATA`, `top_level.txt`) bajo los directorios
+  `site-packages` del intérprete resuelto;
+- `package.json` y declaraciones `*.d.ts` de un `node_modules` contenido
+  (incluida la alternativa `@types/<nombre>`);
+- las firmas se extraen con `ast` o analizando líneas de declaración, nunca
+  importando el paquete ni evaluando sus valores por defecto.
+
+`env_resolve.dependency_roots` entrega las raíces aprobadas: el proyecto, su
+workspace, los `site-packages` del intérprete resuelto y un `node_modules`
+contenido. Cada archivo candidato pasa por `security.resolve_safe_path`, y el
+recorrido omite symlinks/junctions, de modo que un enlace de declaración que
+escapa de una raíz aprobada se ignora en vez de leerse.
+
+El enriquecimiento opcional está doblemente condicionado por `api_oracle_exec`
+(un ajuste de `EXEC_FIELDS`, por defecto `false`) y el consentimiento existente
+`allow_shell` más el motor de políticas: `go doc -all PAQUETE` (con
+`GOPROXY=off`), `cargo metadata --offline --no-deps --format-version 1` o el
+`inspect` del intérprete resuelto. Esos hijos son solo argv, se ejecutan con `env_resolve.command_env` y el manejo
+de sandbox/plazo de `proc.run`, y su salida está acotada, redactada y etiquetada
+`go-doc`/`cargo-metadata`/`python-inspect`. Con el indicador apagado, esas rutas
+devuelven `unknown`, no una "API faltante" inventada.
+
+El índice vive en `.pedacito/cache/api/`. Su clave es un SHA-256 sobre el nombre
+del paquete, la identidad del entorno resuelto (tipo, intérprete, directorios
+bin, workspace), la versión y los hashes de contenido de las declaraciones y
+archivos de bloqueo inspeccionados. `fileio.write_bytes` hace el reemplazo
+atómico, así que un lector concurrente ve un registro completo viejo o nuevo, y
+una versión o declaración cambiada simplemente falla la clave y poda la
+anterior. Los registros guardan solo metadatos de paquete/símbolos (redactados,
+con topes de 512 KB y 900 símbolos), nunca código fuente, prompts ni salida de
+herramientas.
 
 ### Lecciones de reparación y trampas del repositorio
 

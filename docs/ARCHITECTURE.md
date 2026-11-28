@@ -435,6 +435,7 @@ The model works through a small set of actions:
 | `todo` | Short `- [ ]` checklist saved to `.pedacito/todo.md` and shown in the answer prompt. |
 | `question` | Ask *you* one short question (interactive sessions only, at most twice a task). |
 | `run_test` | Run one scoped test check (pytest, Node/Vitest, Go, or Cargo, chosen from the target) and read the condensed traceback. On by default; see [Scoped test runs](#scoped-test-runs-during-investigation) |
+| `api` | Read exact public signatures for a library the task names and the project's manifests declare. Static `.pyi`/`.py`/distribution metadata and contained `node_modules/**/*.d.ts` first; a miss is unknown, never proof of absence. See [Offline API oracle](#offline-api-oracle) |
 | `done` | Stop gathering and answer. |
 
 Repeating a read-only lookup (even many steps later) that nothing has changed
@@ -534,6 +535,51 @@ the live traceback is in front of the model before it writes the patch.
 It is on by default (`enable_run_test_in_gather = true`). Set it to `false` to make
 every run ask first in the **Permission requested** dialog under **Test Execution**.
 A plain CLI run has no dialog, so there the tool reports that it is disabled.
+
+### Offline API oracle
+
+`api_oracle.py` answers one narrow question during gather: *what is the exact
+public signature of this symbol in a library the task named?* It is offered as
+the read-only `api` action only when the task text names a library that the
+project's own manifests (Python project metadata/requirements, `package.json`,
+`go.mod`, `Cargo.toml`/`Cargo.lock`) declare exactly. Tasks that name no such
+dependency never see the action, so their schema and prompt stay
+byte-identical.
+
+The default path is static and bounded:
+
+- Python `.pyi` files first, then `.py` files and distribution metadata
+  (`*.dist-info/METADATA`, `top_level.txt`) under the resolved interpreter's
+  `site-packages` directories;
+- contained `node_modules` `package.json` plus `*.d.ts` declarations
+  (including the `@types/<name>` fallback);
+- signatures are extracted with `ast` or declaration-line parsing, never by
+  importing the package or evaluating its defaults.
+
+`env_resolve.dependency_roots` supplies the approved roots: the project,
+its workspace, the resolved interpreter's site-packages, and a contained
+`node_modules`. Every file candidate passes `security.resolve_safe_path`, and
+the walk skips symlinks/junctions, so a declaration link that escapes an
+approved root is ignored rather than read.
+
+Optional enrichment is double-gated by `api_oracle_exec` (an `EXEC_FIELDS`
+setting, default `false`) and the existing `allow_shell` consent plus the
+policy engine: `go doc -all PACKAGE` (with `GOPROXY=off`), `cargo metadata
+--offline --no-deps --format-version 1`, or the resolved interpreter's
+`inspect`. Those children
+are argv-only, run with `env_resolve.command_env` and `proc.run`'s sandbox and
+deadline handling, and their output is capped, redacted and labelled
+`go-doc`/`cargo-metadata`/`python-inspect`. With the flag off, those paths
+return `unknown`, not a fabricated "missing API".
+
+The index lives in `.pedacito/cache/api/`. Its key is a SHA-256 over the
+package name, the resolved environment identity (kind, interpreter, bin dirs,
+workspace), the version, and content hashes of the declaration and lock files
+that were inspected. `fileio.write_bytes` performs the atomic replacement, so
+a concurrent reader sees a complete old or new record, and a changed version
+or declaration simply misses and prunes the old key. Cache records store only
+package/symbol metadata (redacted, capped at 512 KB and 900 symbols), never
+raw source, prompts or tool output.
 
 ### Repair lessons and repo gotchas
 

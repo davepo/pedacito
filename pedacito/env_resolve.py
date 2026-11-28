@@ -52,8 +52,10 @@ from . import safety, security
 __all__ = [
     "ResolvedEnvironment",
     "command_env",
+    "dependency_roots",
     "find_executable",
     "resolve_environment",
+    "site_packages_dirs",
 ]
 
 # A bound on metadata reads: manifests are small, but a generated file or a
@@ -866,3 +868,121 @@ def find_executable(resolved: ResolvedEnvironment, name: str, *,
         found = (shutil.which(name, path=path_value) if path_value
                  else shutil.which(name))
     return Path(found) if found else None
+
+
+# ---------------------------------------------------------------------------
+# Dependency roots (read-only material for the API oracle)
+# ---------------------------------------------------------------------------
+
+def _site_dirs_of(anchor: Path) -> list[Path]:
+    """Existing `site-packages` dirs directly under one interpreter prefix.
+
+    Both Python layouts are checked without executing anything:
+    ``<prefix>/lib/pythonX.Y/site-packages`` on POSIX/conda and
+    ``<prefix>/Lib/site-packages`` on Windows. Every candidate resolves
+    through :func:`_contained`, so a site-packages symlink/junction that aims
+    outside its own interpreter prefix is ignored.
+    """
+    out: list[Path] = []
+    candidates = [anchor / "Lib" / "site-packages",
+                  anchor / "lib" / "site-packages"]
+    for lib_name in ("lib", "lib64", "Lib"):
+        lib = anchor / lib_name
+        try:
+            if not lib.is_dir():
+                continue
+            children = sorted(lib.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for child in children:
+            if re.match(r"(?i)^python\d", child.name) and child.is_dir():
+                candidates.append(child / "site-packages")
+    for raw in candidates:
+        safe = _contained(anchor, raw)
+        if safe is not None and safe.is_dir() \
+                and safe.name.lower() == "site-packages":
+            if safe not in out:
+                out.append(safe)
+    return out
+
+
+def site_packages_dirs(resolved: ResolvedEnvironment) -> tuple[Path, ...]:
+    """Existing `site-packages` directories of the resolved interpreter.
+
+    This is detection only: no import, no execution, no network. The
+    interpreter's own prefix is the approval boundary -- an explicitly active
+    outside ``VIRTUAL_ENV``/``CONDA_PREFIX`` is user state and remains
+    allowed, while a site-packages link that leaves *that* prefix is skipped.
+    """
+    anchors: list[Path] = []
+    if resolved.python is not None:
+        anchors.append(_venv_root(resolved.python) or resolved.python.parent)
+    for directory in resolved.bin_dirs:
+        anchors.append(directory.parent)
+    anchors.extend((resolved.workspace_root, resolved.root))
+    out: list[Path] = []
+    for anchor in anchors:
+        try:
+            if not anchor.is_dir():
+                continue
+        except OSError:
+            continue
+        for found in _site_dirs_of(anchor):
+            if found not in out:
+                out.append(found)
+    if not out:
+        # The resolver chose "system": the interpreter running Pedacito is
+        # then the ambient interpreter the project would use. Its own
+        # site-packages are still dependency material, read-only.
+        try:
+            import sys
+            import sysconfig
+            ambient = (resolved.python is None
+                       or _same_path(resolved.python, Path(sys.executable)))
+            if ambient:
+                for key in ("purelib", "platlib"):
+                    raw = str(sysconfig.get_path(key) or "").strip()
+                    if not raw:
+                        continue
+                    candidate = Path(raw)
+                    if candidate.is_dir() and candidate not in out:
+                        out.append(candidate)
+        except (OSError, ValueError, KeyError):
+            pass
+    return tuple(out)
+
+
+def dependency_roots(resolved: ResolvedEnvironment) -> tuple[Path, ...]:
+    """Read-only roots an API index may inspect for this environment.
+
+    The project and workspace roots come first, then the resolved
+    interpreter's site-packages directories and a contained ``node_modules``.
+    Nothing outside these explicitly approved roots is traversed; callers must
+    still reject links that escape a root while walking it.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path) -> None:
+        try:
+            safe = path.resolve()
+        except OSError:
+            return
+        if not safe.is_dir():
+            return
+        marker = os.path.normcase(str(safe))
+        if marker in seen:
+            return
+        seen.add(marker)
+        out.append(safe)
+
+    add(resolved.root)
+    add(resolved.workspace_root)
+    for directory in site_packages_dirs(resolved):
+        add(directory)
+    for base in (resolved.root, resolved.workspace_root):
+        node_modules = base / "node_modules"
+        safe = _contained(base, node_modules)
+        if safe is not None:
+            add(safe)
+    return tuple(out)

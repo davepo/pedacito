@@ -2803,6 +2803,39 @@ GUI_TOPICS = [
         "cli": ["tests", "ask"],
     },
     {
+        "id": "api-oracle",
+        "title": "Look up exact library signatures before writing code",
+        "summary": "When a task names a library that the project's manifests "
+                   "declare exactly, the read-only api gather action returns "
+                   "the package version and exact public signatures from static "
+                   "Python .pyi/.py files plus distribution metadata, and from "
+                   "contained node_modules *.d.ts declarations. It never imports "
+                   "package code or uses the network by default. A miss is "
+                   "unknown, not proof the API is missing.",
+        "steps": [
+            "Nothing to click: the api action appears only when the task names "
+            "a declared dependency such as requests or react",
+            "The model calls action=api with symbol=<library> and an optional "
+            "pattern such as Session or useState; the answer lists exact "
+            "signatures and the declaration source label",
+            "⚙ Settings → All settings → search api_oracle_exec (off by default) "
+            "to permit optional go doc, cargo metadata --offline --no-deps or "
+            "Python inspect enrichment; it also needs allow_shell and an "
+            "allowing policy",
+            "Static results are cached under .pedacito/cache/api by package, "
+            "environment, version and declaration hashes; a version or "
+            "declaration change invalidates the old entry",
+            "When the answer says unknown, confirm with read/grep or the "
+            "library's own docs; do not assume the API does not exist",
+        ],
+        "keywords": ["api", "api oracle", "library", "signature", "signatures",
+                     "stub", "pyi", "d.ts", "typescript declarations", "go doc",
+                     "cargo metadata", "inspect", "api_oracle_exec", "offline",
+                     "hallucination", "exact api"],
+        "settings": ["api_oracle_exec", "allow_shell"],
+        "cli": ["ask", "chat"],
+    },
+    {
         "id": "frontend-contracts",
         "title": "Catch broken page assets and DOM id mismatches",
         "summary": "For HTML and JavaScript projects Pedacito checks, before the tests "
