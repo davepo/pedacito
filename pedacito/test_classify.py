@@ -69,6 +69,7 @@ _FAIL_TALLY_RE = re.compile(
 
 @dataclass(frozen=True)
 class TestClassification:
+    __test__ = False
     kind: str
     node_id: str
     baseline: str

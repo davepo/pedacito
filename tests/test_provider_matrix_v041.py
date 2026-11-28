@@ -9,7 +9,7 @@ import json
 import threading
 import time
 from dataclasses import FrozenInstanceError
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -24,6 +24,7 @@ from pedacito import providers
 from pedacito.config import Config
 from pedacito.gui import settings_api
 from pedacito.llm import LLMClient
+from pedacito.local_server import LocalHTTPServer
 from pedacito import transport_anthropic, transport_gemini, transport_openai
 
 
@@ -123,7 +124,7 @@ def fake_openai():
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LocalHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

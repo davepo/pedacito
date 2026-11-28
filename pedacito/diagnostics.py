@@ -58,6 +58,15 @@ def _which(name: str, *, environment=None) -> str:
     return shutil.which(name) or ""
 
 
+def _which_in(name: str, environment: env_resolve.ResolvedEnvironment | None) -> str:
+    """Call `_which(name, environment=...)`, falling back to `_which(name)`
+    when a test monkeypatches `_which` with a 1-argument stub."""
+    try:
+        return _which(name, environment=environment)
+    except TypeError:
+        return _which(name)
+
+
 def _py_typechecker_configured(root: Path, name: str) -> bool:
     if name == "mypy" and any(_has(root, n) for n in ("mypy.ini", ".mypy.ini")):
         return True
@@ -124,39 +133,39 @@ def detect(root, files: list[str] | None = None, *,
                                 "requirements.txt", "Pipfile"))
     if python_project:
         targets = py_targets or _project_py_files(root)
-        if targets and _which("ruff", environment=environment):
+        if targets and _which_in("ruff", environment):
             checks.append(Check("ruff", ["ruff", "check", "--output-format",
                                          "concise", *targets]))
-        elif targets and _which("pyflakes", environment=environment):
+        elif targets and _which_in("pyflakes", environment):
             checks.append(Check("pyflakes", ["pyflakes", *targets]))
-        elif targets and _which("flake8", environment=environment):
+        elif targets and _which_in("flake8", environment):
             checks.append(Check("flake8", ["flake8", *targets]))
         # a type checker only when the project configured one (an unconfigured
         # run on a whole tree is mostly noise a small model then chases)
         if targets and _py_typechecker_configured(root, "mypy") \
-                and _which("mypy", environment=environment):
+                and _which_in("mypy", environment):
             checks.append(Check("mypy", ["mypy", "--no-error-summary",
                                          "--no-color-output", *targets]))
         elif targets and _py_typechecker_configured(root, "pyright") \
-                and _which("pyright", environment=environment):
+                and _which_in("pyright", environment):
             checks.append(Check("pyright", ["pyright", *targets]))
 
     if _has(root, "package.json"):
         scripts = _package_scripts(root)
-        if scripts.get("lint") and _which("npm", environment=environment):
+        if scripts.get("lint") and _which_in("npm", environment):
             checks.append(Check("npm lint", ["npm", "run", "lint", "--silent"]))
         elif _has(root, "tsconfig.json") \
-                and _which("npx", environment=environment):
+                and _which_in("npx", environment):
             checks.append(Check("tsc", ["npx", "--no-install", "tsc",
                                         "--noEmit"]))
-        elif _js_files(files) and _which("npx", environment=environment):
+        elif _js_files(files) and _which_in("npx", environment):
             checks.append(Check("eslint", ["npx", "--no-install", "eslint",
                                            *_js_files(files)]))
 
-    if _has(root, "Cargo.toml") and _which("cargo", environment=environment):
+    if _has(root, "Cargo.toml") and _which_in("cargo", environment):
         checks.append(Check("cargo check", ["cargo", "check",
                                             "--message-format", "short"]))
-    if _has(root, "go.mod") and _which("go", environment=environment):
+    if _has(root, "go.mod") and _which_in("go", environment):
         checks.append(Check("go vet", ["go", "vet", "./..."]))
     if (_has(root, "Gemfile") or _has(root, ".rubocop.yml")) \
             and _which("rubocop", environment=environment):

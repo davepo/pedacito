@@ -137,9 +137,9 @@ def test_cancellation_cascade_isolates_sibling_sessions(tmp_path):
 
 
 def test_node_modules_symlink_fallback_skips_cleanly(tmp_path, monkeypatch):
-    """A Windows `OSError(WinError 1314)` on the node_modules symlink must not
-    crash mirror creation: `_link_node_modules` falls back (junction) and,
-    when that fails too, skips cleanly."""
+    """A Windows `OSError(WinError 1314)` on symlink creation must not crash
+    mirror creation: `VirtualWorkspace.exec_root()` copies safely without
+    symlinking or junctioning `node_modules` (WP-4105F)."""
     from pedacito import workspace_overlay as wo
 
     root = tmp_path / "proj"
@@ -152,21 +152,14 @@ def test_node_modules_symlink_fallback_skips_cleanly(tmp_path, monkeypatch):
         raise OSError(1314, "A required privilege is not held by the client")
 
     monkeypatch.setattr(wo.Path, "symlink_to", boom)
-    monkeypatch.setattr(
-        wo.subprocess, "run",
-        lambda *a, **k: (_ for _ in ()).throw(OSError("junction failed")))
 
-    link = tmp_path / "nm_link"
-    target = tmp_path / "nm_real"
-    target.mkdir()
-    wo._link_node_modules(link, target)   # must not raise
-    assert not link.exists()
-
-    # And a full dry-run mirror still builds fine with a node_modules present.
+    # A full dry-run mirror builds fine with node_modules present and never
+    # requires symlinks or junctions.
     ws = wo.VirtualWorkspace(root, apply=False)
     try:
         with ws.exec_root() as mirror:
             assert (mirror / "a.py").exists()
+            assert not (mirror / "node_modules").is_symlink()
     finally:
         ws.close()
 
