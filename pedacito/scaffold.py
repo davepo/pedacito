@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -2031,6 +2032,283 @@ def verify_and_fix(client, cfg, idx: Index, py_rels, project_name: str,
     return False, last
 
 
+# ---------------------------------------------------------------------------
+# Console-script entry points (R2-BUG-03)
+# ---------------------------------------------------------------------------
+
+_SCRIPT_TABLES = ("scripts", "gui-scripts")
+_SCRIPT_HEADER_RE = re.compile(
+    r"^\s*\[project\.(scripts|gui-scripts)\]\s*(?:#.*)?$")
+_TOML_KEY_RE = re.compile(
+    r"""^\s*(?P<key>"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)\s*=""")
+
+
+@dataclass(frozen=True)
+class ScriptFinding:
+    """One console-script entry whose target does not resolve in the project."""
+
+    table: str
+    name: str
+    target: str
+    reason: str
+
+    def __str__(self) -> str:
+        return (f"project.{self.table} {self.name!r} -> {self.target!r}: "
+                f"{self.reason}")
+
+
+def _parse_script_target(value: Any) -> tuple[str, str] | None:
+    """Split `"package.module:callable"` (optionally `... [extra]`) into parts.
+
+    Returns None for a value that is not a well-formed entry-point reference;
+    the caller still reports it, so a malformed target is never silently kept.
+    """
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s*\[[^\]]*\]\s*$", "", value.strip()).strip()
+    module, sep, attr = text.partition(":")
+    module, attr = module.strip(), attr.strip()
+    if not sep or not module or not attr:
+        return None
+    if any(not part.isidentifier() for part in module.split(".")):
+        return None
+    if any(not part.isidentifier() for part in attr.split(".")):
+        return None
+    return module, attr
+
+
+def _rel(root: Path, path: Path) -> str:
+    """A child path as the project-relative slash form used on screen."""
+    try:
+        return str(path.relative_to(root)).replace("\\", "/")
+    except ValueError:                  # pragma: no cover - callers pass children
+        return str(path)
+
+
+def _script_module_files(root: Path, module: str) -> list[Path]:
+    """Every file that could provide `module`: flat and `src/` layouts."""
+    rel = module.replace(".", "/")
+    return [root / f"{rel}.py", root / rel / "__init__.py",
+            root / "src" / f"{rel}.py", root / "src" / rel / "__init__.py"]
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    """Names bound by one assignment target, through tuple/list unpacking."""
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in node.elts:
+            names |= _target_names(element)
+        return names
+    if isinstance(node, ast.Starred):
+        return _target_names(node.value)
+    return set()
+
+
+def _top_level_names(body) -> set[str]:
+    """Names a module binds at import time: definitions, assignments and
+    imports at top level, including the bodies of top-level if/try blocks.
+    Nested function/class bodies are deliberately not scanned: an entry point
+    must name a module-level symbol, not a private local of some function."""
+    names: set[str] = set()
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names |= _target_names(target)
+        elif isinstance(node, ast.AnnAssign):
+            names |= _target_names(node.target)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.If, ast.Try, ast.TryStar)):
+            names |= _top_level_names(node.body)
+            names |= _top_level_names(node.orelse)
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                for handler in node.handlers:
+                    names |= _top_level_names(handler.body)
+                names |= _top_level_names(node.finalbody)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                names |= _top_level_names(case.body)
+    return names
+
+
+def _script_target_error(root: Path, module: str, attr: str) -> str | None:
+    """Why `module:attr` does not resolve in this tree, or None when it does."""
+    candidates = _script_module_files(root, module)
+    files = [path for path in candidates if path.is_file()]
+    if not files:
+        looked = ", ".join(_rel(root, path) for path in candidates)
+        return f"module {module!r} not found (looked for {looked})"
+    top = attr.split(".")[0]
+    unreadable: list[str] = []
+    for path in files:
+        try:
+            tree = ast.parse(fileio.read_text(path))
+        except (OSError, SyntaxError, ValueError):
+            unreadable.append(_rel(root, path))
+            continue
+        if top in _top_level_names(tree.body):
+            return None
+    if len(unreadable) == len(files):
+        return f"could not parse {', '.join(unreadable)} to verify {top!r}"
+    checked = [_rel(root, path) for path in files
+               if _rel(root, path) not in unreadable]
+    return f"{', '.join(checked)} does not define or import {top!r}"
+
+
+def script_entry_findings(root: Path) -> list[ScriptFinding]:
+    """Every `[project.scripts]` / `[project.gui-scripts]` target in
+    `pyproject.toml` that does not resolve in the scaffolded project.
+
+    `pytest -q` never imports a console script, so a scaffold could ship
+    `[project.scripts] addition-module = "main:main"` with no `main.py` and
+    still verify green (R2-BUG-03). Each target is resolved statically, in a
+    flat or `src/` layout, and its top-level symbol is checked in the module's
+    AST (an imported name counts as bound)."""
+    root = Path(root)
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return []
+    try:
+        data = tomllib.loads(fileio.read_text(pyproject))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return []
+    findings: list[ScriptFinding] = []
+    for table in _SCRIPT_TABLES:
+        entries = project.get(table)
+        if not isinstance(entries, dict):
+            continue
+        for name, value in entries.items():
+            parsed = _parse_script_target(value)
+            reason = ("not a 'module:function' target" if parsed is None
+                      else _script_target_error(root, *parsed))
+            if reason:
+                target = value if isinstance(value, str) else repr(value)
+                findings.append(ScriptFinding(table, str(name), target,
+                                              reason))
+    return findings
+
+
+def _toml_key(line: str) -> str | None:
+    """The bare key of a `key = value` line, or None for any other line."""
+    match = _TOML_KEY_RE.match(line)
+    if match is None:
+        return None
+    key = match.group("key")
+    return key[1:-1] if key[:1] in "\"'" else key
+
+
+def prune_broken_script_entries(root: Path,
+                                findings: list[ScriptFinding]
+                                ) -> list[ScriptFinding]:
+    """Drop `findings` from the standard script tables of `pyproject.toml`.
+
+    Only `[project.scripts]` / `[project.gui-scripts]` table syntax is
+    rewritten. An entry written some other way (an inline table under
+    `[project]`) is left alone and returned, so the caller reports it instead
+    of pretending it is resolved. Returns the findings still in the file."""
+    root = Path(root)
+    pyproject = root / "pyproject.toml"
+    try:
+        text, style = fileio.read(pyproject)
+    except OSError:
+        return list(findings)
+    lines = text.splitlines(keepends=True)
+    wanted = {(finding.table, finding.name) for finding in findings}
+    tables: list[tuple[str, int, int]] = []
+    current: str | None = None
+    start = 0
+    for index, line in enumerate(lines):
+        match = _SCRIPT_HEADER_RE.match(line)
+        if match:
+            if current is not None:
+                tables.append((current, start, index))
+            current, start = match.group(1), index
+        elif current is not None and re.match(r"^\s*\[", line):
+            tables.append((current, start, index))
+            current = None
+    if current is not None:
+        tables.append((current, start, len(lines)))
+
+    drop: set[int] = set()
+    removed: set[tuple[str, str]] = set()
+    for table, start, end in tables:
+        for index in range(start + 1, end):
+            key = _toml_key(lines[index])
+            if key is not None and (table, key) in wanted:
+                drop.add(index)
+                removed.add((table, key))
+    if not drop:
+        return list(findings)
+    # An emptied table must not leave a bare `[project.scripts]` header (or a
+    # doubled blank line where it stood).
+    for _table, start, end in tables:
+        if not any(index in drop for index in range(start + 1, end)):
+            continue
+        if any(index not in drop and _toml_key(lines[index]) is not None
+               for index in range(start + 1, end)):
+            continue
+        drop.add(start)
+        if end - 1 > start and lines[end - 1].strip() == "":
+            drop.add(end - 1)
+    new_text = "".join(line for index, line in enumerate(lines)
+                       if index not in drop)
+    if new_text != text:
+        try:
+            tomllib.loads(new_text)
+        except tomllib.TOMLDecodeError:    # pragma: no cover - defensive
+            return list(findings)
+        try:
+            fileio.write(pyproject, new_text, style)
+        except OSError:
+            return list(findings)
+    return [finding for finding in findings
+            if (finding.table, finding.name) not in removed]
+
+
+def _script_entry_gate(root: Path) -> list[ScriptFinding]:
+    """Report and remove console-script entries that do not resolve.
+
+    A broken `[project.scripts]` target is worse than no console script: the
+    build and its tests can be green while the installed command dies with
+    `ModuleNotFoundError` (R2-BUG-03). Resolvable entries stay untouched;
+    broken ones are removed from `pyproject.toml` with a concrete finding.
+    Returns the findings that removal could not resolve."""
+    findings = script_entry_findings(root)
+    if not findings:
+        return []
+    remaining = prune_broken_script_entries(root, findings)
+    removed = [finding for finding in findings if finding not in remaining]
+    # Always print: removing a declared command changes the project's public
+    # surface, so a quiet run must still say so.
+    for finding in removed:
+        print(f"  [entry point removed from pyproject.toml: {finding}]",
+              file=sys.stderr)
+    for finding in remaining:
+        print(f"  [entry point: {finding}]", file=sys.stderr)
+    if removed:
+        workspace.log_event(
+            root, f"new: removed {len(removed)} broken console-script "
+                  "entry point(s) from pyproject.toml", "WARN")
+    if remaining:
+        workspace.log_event(
+            root, f"new: {len(remaining)} broken console-script entry "
+                  "point(s) remain in pyproject.toml", "ERROR")
+    return remaining
+
+
 # Top-level entries that Pedacito itself puts in a project folder: its state
 # directory, its two config names, the ignore file `files` writes, and the git
 # repository `git init` made before the first run. Their presence says nothing
@@ -2337,6 +2615,7 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         return 1
     contract_failed = False
     tests_failed = False
+    scripts_failed = False
 
     # Files are built independently, so repair cross-file import mismatches.
     n_fixed = fix_import_errors(client, cfg, idx, plan, backup_dir,
@@ -2415,6 +2694,12 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
         # A repair round may have rewritten the entry point without its guard.
         _ensure_python_cli_entrypoint(root, plan)
 
+        # R2-BUG-03: `pytest -q` never imports a console script, so a
+        # `[project.scripts]` target the build did not actually provide shipped
+        # green. Validate it statically and drop an entry that cannot resolve.
+        if _script_entry_gate(root):
+            scripts_failed = True
+
     if apply:
         # BUG-17: a freshly applied scaffold is a real project; give it a git
         # repository so `git status`/checkpoints/worktrees work immediately.
@@ -2431,7 +2716,8 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
                                     [], render_plan(plan), [], backup_dir, when)
         print(f"[session: {p.relative_to(root)}]", file=sys.stderr)
     _new_checkpoint(f"new: {plan.project_name}")
-    return 1 if summary["failed"] or contract_failed or tests_failed else 0
+    return 1 if (summary["failed"] or contract_failed or tests_failed
+                 or scripts_failed) else 0
 
 
 def verify_receipt(root: Path, explicit_cmd: str, smoke: bool,
@@ -2630,6 +2916,12 @@ def _run_complex(root: Path, cfg, client, idx, plan: Plan, spec: Spec, *,
                         code = 1
             # A repair round may have rewritten main.py without its guard.
             _ensure_python_cli_entrypoint(root, plan)
+
+    # R2-BUG-03: the loop's tests and smoke run never import a console script.
+    # Validate every `[project.scripts]` / `[project.gui-scripts]` target in
+    # the finished tree, so `new --complex` cannot ship a broken command.
+    if _script_entry_gate(root) and code == 0:
+        code = 1
 
     # The loop implemented the sources in fresh contexts; the planned docs
     # (the README) are still skeleton stubs. Describe the real project with
