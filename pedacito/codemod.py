@@ -1510,11 +1510,8 @@ def _remove_whole_statement(source: _Source, stmt: ast.stmt) -> str:
         raise _Refuse(
             f"refused: the import at line {stmt.lineno} does not start its "
             "line; remove it manually")
-    stripped = after.lstrip()
-    if stripped.startswith("#"):
-        comment = after[after.index("#"):]
-        replacement = before + comment
-        return text[:line_start] + replacement + text[line_end:]
+    # The whole physical line goes, including a trailing inline comment: a
+    # bare noqa directive left behind would suppress lint for the next line.
     # Drop exactly one following blank line when the import sat at the start
     # of the code (or after a blank line), so removing it does not leave a
     # stray leading/duplicated blank line. An import between imports or code

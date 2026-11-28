@@ -273,11 +273,37 @@ def test_remove_one_module_from_multi_import(tmp_path):
     assert path.read_text(encoding="utf-8").startswith("import sys\n")
 
 
-def test_remove_import_keeps_trailing_comment(tmp_path):
-    path = _write(tmp_path, "import os  # keep me\n\nx = 1\n")
+def test_remove_import_drops_the_whole_line_and_its_noqa_comment(tmp_path):
+    path = _write(tmp_path, "import json\n"
+                            "import os  # noqa: F401\n"
+                            "from pathlib import Path\n")
     res = apply(tmp_path, _request("remove_import", module="os"))
     assert res.ok, res.error
-    assert path.read_text(encoding="utf-8") == "# keep me\n\nx = 1\n"
+    assert path.read_text(encoding="utf-8") == (
+        "import json\nfrom pathlib import Path\n")
+
+
+def test_remove_whole_from_import_drops_its_trailing_comment(tmp_path):
+    path = _write(tmp_path, "from mod import x  # comment\n\nvalue = 1\n")
+    res = apply(tmp_path, _request("remove_import", module="mod", name="x"))
+    assert res.ok, res.error
+    assert path.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_remove_one_alias_keeps_the_trailing_comment(tmp_path):
+    path = _write(tmp_path, "import os, sys  # keep\n\nprint(sys.version)\n")
+    res = apply(tmp_path, _request("remove_import", module="os"))
+    assert res.ok, res.error
+    assert path.read_text(encoding="utf-8") == (
+        "import sys  # keep\n\nprint(sys.version)\n")
+
+
+def test_remove_last_alias_keeps_the_trailing_comment(tmp_path):
+    path = _write(tmp_path, "import os, sys  # keep\n\nx = os.name\n")
+    res = apply(tmp_path, _request("remove_import", module="sys"))
+    assert res.ok, res.error
+    assert path.read_text(encoding="utf-8") == (
+        "import os  # keep\n\nx = os.name\n")
 
 
 def test_remove_import_ambiguous_statements_refuse(tmp_path):
