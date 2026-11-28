@@ -19,15 +19,13 @@ Zero LLM tokens — pure file I/O — and every operation is bounded and
 best-effort: a step that touched nothing rolls back to nothing, and snapshot
 failures never crash the loop.
 
-Snapshots are HARD LINKS when the filesystem allows it (same-device `os.link`
-— the common case), falling back to `copy2`. A hardlinked checkpoint costs
-one directory entry and zero bytes, so keeping 25 steps of history is free.
-The contract this relies on: nothing ever writes *through* a project file's
-inode. Every Pedacito write goes through `fileio.write`, an atomic
-temp-file + `os.replace` — which swaps the path onto a fresh inode and
-leaves the checkpointed inode pristine — and `rollback` restores the same
-way. An in-place `open(path, "wb")` would truncate every link sharing that
-inode, i.e. silently rewrite history.
+Snapshots are INDEPENDENT copies (a copy-on-write reflink where the platform
+offers one, else `shutil.copy2`), never hard links. External writers —
+formatters, hooks, tests, any tool that can mutate a file in place — must not
+be able to corrupt history through a shared inode, so every snapshot file is
+verified to be a distinct inode from the source before it is accepted. This
+costs the bytes of a real copy per step; `auto_keep_checkpoints` /
+`checkpoint_quota_mb` bound that history so it cannot grow without limit.
 """
 from __future__ import annotations
 
@@ -165,19 +163,80 @@ def _iter_candidate_files(root: Path, max_files: int):
             yield (entry, False)
 
 
-def _link_or_copy(src: Path, dst: Path) -> bool:
-    """Snapshot one file: a hard link when the filesystem permits it (same
-    device, links allowed) -- free, and byte-identical by construction --
-    else a full `copy2` preserving mtime (the unmodified-file fast path in
-    `rollback` compares timestamps). Returns True for a hard link."""
+def _reflink(src: Path, dst: Path) -> bool:
+    """Copy `src` to `dst` as a copy-on-write reflink, returning success.
+
+    A reflink (Linux `FICLONE`) is a cheap independent copy: the destination is
+    a distinct inode, so an in-place writer to the source can never corrupt the
+    snapshot, but the filesystem may share extents until a write. Unsupported
+    filesystems (or any non-Linux platform) fall back to ``copy2``. Windows has
+    no stdlib reflink and is never attempted here.
+    """
+    if os.name == "nt":
+        return False
+    try:
+        import fcntl
+    except ImportError:                      # pragma: no cover - non-POSIX
+        return False
+    _FICLONE = 0x40049409
+    try:
+        with open(src, "rb") as sf:
+            with open(dst, "wb") as df:
+                try:
+                    fcntl.ioctl(df.fileno(), _FICLONE, sf.fileno())
+                except OSError:
+                    return False
+        return dst.stat().st_size == src.stat().st_size
+    except OSError:
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _verify_independent_inode(src: Path, dst: Path) -> None:
+    """Refuse a snapshot that shares its inode with the source.
+
+    A hard link would let an in-place writer truncate both files at once. This
+    check only fires where the platform reports real inode numbers (POSIX);
+    `copy2`/`reflink` already guarantee a fresh file everywhere else, and
+    reflink is never attempted on Windows.
+    """
+    try:
+        ss, ds = src.stat(), dst.stat()
+    except OSError:
+        return
+    if (ss.st_ino and ds.st_ino and ss.st_dev == ds.st_dev
+            and ss.st_ino == ds.st_ino):
+        raise OSError(
+            f"refusing a shared-inode snapshot of {src} (hard link?)")
+
+
+def _snapshot_file(src: Path, dst: Path) -> str:
+    """Snapshot one file as an independent copy; return its mode.
+
+    ``"reflink"`` when the platform reflinked it, else ``"copy"``. The
+    destination is verified to be a distinct inode from the source, so an
+    external in-place writer (a formatter, hook or test) can never corrupt the
+    checkpoint through a shared inode — the property the old hard-link scheme
+    could not guarantee.
+    """
     try:
         if dst.exists():
-            dst.unlink()          # a link cannot be created over an entry
-        os.link(src, dst)
-        return True
-    except (OSError, NotImplementedError):     # EXDEV/EPERM/FAT...
+            dst.unlink()
+    except OSError:
+        pass
+    mode = "copy"
+    try:
+        if _reflink(src, dst):
+            mode = "reflink"
+    except OSError:
+        mode = "copy"
+    if mode != "reflink":
         shutil.copy2(str(src), str(dst))
-        return False
+    _verify_independent_inode(src, dst)
+    return mode
 
 
 def begin(
@@ -236,12 +295,12 @@ def begin(
         payload = directory / rel
         try:
             payload.parent.mkdir(parents=True, exist_ok=True)
-            linked = _link_or_copy(path, payload)
+            mode = _snapshot_file(path, payload)
         except OSError:
             manifest[rel.as_posix()] = {"size": size, "skip": "unreadable"}
             continue
         manifest[rel.as_posix()] = {"size": size, "mtime_ns": mtime_ns,
-                                    "linked": linked}
+                                    "linked": False, "snapshot": mode}
     try:
         fileio.write_bytes(
             directory / "manifest.json",
@@ -337,28 +396,22 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
         if snapshot_file.is_file():
             try:
                 snap_stat = snapshot_file.stat()
-                # A snapshot is immutable by contract. If its size changed,
-                # or a hardlinked snapshot's mtime moved, an in-place writer
-                # violated the atomic-replace rule and the checkpoint no
-                # longer holds the pre-step bytes. Refuse to restore garbage
+                # A snapshot is immutable by contract: it is an independent
+                # copy (reflink or copy2) of the pre-step bytes. If its size
+                # changed, someone tampered with the checkpoint, and it no
+                # longer holds the pre-step bytes -- refuse to restore garbage
                 # and report it instead of silently rolling back to wreckage.
                 expected_size = entry.get("size") if isinstance(entry, dict) else None
                 corrupted = (expected_size is not None
                              and snap_stat.st_size != int(expected_size))
-                expected_mtime = (entry.get("mtime_ns")
-                                  if isinstance(entry, dict) else None)
-                linked = bool(entry.get("linked")) \
-                    if isinstance(entry, dict) else False
-                if (not corrupted and linked and expected_mtime is not None):
-                    corrupted = (snap_stat.st_mtime_ns != int(expected_mtime))
                 if corrupted:
                     result["skipped"].append(rel)
                     result["error"] = (
                         f"checkpoint for {rel} was modified in place; "
                         "refusing to restore corrupted snapshot bytes")
                     continue
-                # (a hardlinked or copy2'd) snapshot carries the original
-                # mtime: a file still matching it byte-size AND timestamp was
+                # A snapshot carries the original mtime (copy2/reflink preserve
+                # it): a file still matching it byte-size AND timestamp was
                 # never touched by the step, so re-restoring it would only
                 # inflate the rollback report.
                 if (target.is_file() and not target.is_symlink()
@@ -372,12 +425,9 @@ def rollback(root: Path, step: int) -> dict[str, Any]:
                 if target.is_symlink():
                     target.unlink()      # never write THROUGH a replaced link
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # Restore by REPLACE, never by copy-into: `target` may share
-                # its inode with an OLDER step's snapshot (begin hardlinked
-                # it while unchanged); an in-place copy would truncate that
-                # shared inode and rewrite the checkpointed history it stands
-                # for. `copy_file_atomic` also preserves the snapshot mtime,
-                # which the unchanged-file fast path above compares.
+                # Restore by REPLACE (atomic temp-file + rename), never an
+                # in-place copy-into, so a file that shares its inode with
+                # anything else is never truncated through that inode.
                 fileio.copy_file_atomic(snapshot_file, target)
                 result["restored"].append(rel)
             except OSError as exc:

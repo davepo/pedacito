@@ -92,6 +92,20 @@ def windows_sandbox_active(cfg=None) -> bool:
     return backend_name() == "win_restricted"
 
 
+def shadow_network_isolation(cfg=None) -> bool:
+    """Whether the active sandbox can filter outbound network for shadow tests.
+
+    ``bwrap`` (``--unshare-net``) and ``seatbelt`` (``deny network*``) can;
+    the Windows ``win_restricted`` backend cannot (its restricted token does
+    not filter outbound traffic), and a run with no backend cannot. Port
+    selection is not a network namespace, so this is never implied by merely
+    allocating loopback ports.
+    """
+    if cfg is not None and not getattr(cfg, "sandbox", True):
+        return False
+    return backend_name() in ("bwrap", "seatbelt")
+
+
 def _home() -> Path:
     # Resolve symlinks (macOS homes, /tmp -> /private/tmp) so the canonical
     # path matches what Seatbelt/bwrap rules compare against.
