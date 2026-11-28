@@ -2,12 +2,12 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
-## v0.4.2 - Unreleased
+## v0.4.1 - Unreleased
 
 ### QA fixes
 
 - **Version metadata.** The package, `pyproject.toml` and `pdc --version` now
-  report `0.4.2` on the v0.4.2 development branch.
+  report `0.4.1` on the v0.4.1 development branch.
 - **Plan dependency cycles.** A cycle finding now names every task in the
   cycle, including all members of a strongly connected component.
 - **Scorecard tolerance.** `pedacito bench compare` accepts `--tolerance` and
