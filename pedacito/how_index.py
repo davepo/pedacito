@@ -2328,6 +2328,47 @@ GUI_TOPICS = [
         "cli": ["config", "models scan", "calibrate"],
     },
     {
+        "id": "provider-registry",
+        "title": "Provider catalog, capabilities and opt-in probes",
+        "summary": "One registry in pedacito/providers.py lists the hosted "
+                   "providers and local runtimes, matches hosts exactly, and "
+                   "reports only evidenced capabilities: unknown stays "
+                   "unverified, never green.",
+        "steps": [
+            "⚙ Settings → Model discovery → Add Hosted Provider keeps the "
+            "seven-entry quick-add catalog; the full registry also covers "
+            "Groq, Cerebras, Fireworks, Together, xAI, Mistral, Moonshot/Kimi, "
+            "MiniMax, Z.ai/GLM, NVIDIA NIM, Hugging Face, LiteLLM and more",
+            "Local presets include LM Studio, Ollama, llama.cpp, vLLM, "
+            "Lemonade, Strata/Avalon, MLX-LM, SGLang, TabbyAPI, KoboldCpp "
+            "and LocalAI; an exact local runtime label counts as local, a "
+            "look-alike provider name does not",
+            "Host matching is equality or a dot-boundary suffix: "
+            "api.openai.com.attacker.test and notapi.openai.com stay custom",
+            "Capabilities are tri-state (None = unknown). A probe runs only "
+            "with explicit consent, sends one minimal bounded request, refuses "
+            "redirects and caches for 24 h beside config.toml; import and "
+            "ordinary calls never probe",
+            "Azure OpenAI, AWS Bedrock and Google Vertex are gateway-only: "
+            "they need a configured OpenAI-compatible gateway and report "
+            "unverified rather than claiming native auth",
+            "Reasoning state survives tool turns: reasoning_content, signed "
+            "Anthropic thinking blocks and Gemini thoughtSignature are replayed "
+            "as protocol metadata, never as visible content",
+        ],
+        "keywords": ["provider catalog", "provider registry", "capabilities",
+                     "capability matrix", "probe", "unverified", "azure",
+                     "bedrock", "vertex", "gateway", "litellm", "groq",
+                     "cerebras", "fireworks", "together", "xai", "mistral",
+                     "moonshot", "kimi", "minimax", "z.ai", "glm", "nvidia",
+                     "hugging face", "lm studio", "ollama", "llama.cpp", "vllm",
+                     "mlx", "sglang", "tabbyapi", "koboldcpp", "localai",
+                     "reasoning_content", "thoughtsignature", "host matching"],
+        "settings": ["base_url", "prompt_cache", "json_mode", "tier",
+                     "anthropic_native", "gemini_native", "openai_responses"],
+        "cli": ["models scan", "config"],
+    },
+    {
         "id": "find-logs",
         "title": "Find logs and terminal output",
         "summary": "The Workspace Logs tab carries everything Pedacito prints; "
@@ -3999,6 +4040,7 @@ _ES_SUMMARIES = {
     "gui:allow-tools": "Son ajustes de confianza opcionales en Todos los ajustes; permiten que el modelo ejecute comandos o escriba durante la fase de recopilación.",
     "gui:web-access": "El acceso web está desactivado por defecto. fetch_url y web_search se ejecutan si enable_web está activo, o si apruebas cada llamada en el diálogo de permisos.",
     "gui:api-key-hosted": "Pon la URL del servidor, el modelo y la clave de API en el perfil; para APIs alojadas usa api_key_env para que el secreto no quede en el archivo.",
+    "gui:provider-registry": "Un solo registro en pedacito/providers.py reúne proveedores alojados y runtimes locales, coincide con los hosts de forma exacta y solo informa capacidades con evidencia: desconocido queda como no verificado, nunca en verde. Los sondeos solo se ejecutan con consentimiento explícito, hacen una petición mínima, rechazan redirecciones y se guardan 24 horas; Azure, Bedrock y Vertex son solo pasarela y necesitan un gateway compatible con OpenAI.",
     "gui:index-project": "El botón Indexar de la barra superior construye el mapa; Mayús+clic crea un índice rápido sin resúmenes del modelo.",
     "gui:install-pedacito": "Instala desde PyPI con `pip install pedacito` (o `pipx install pedacito` para una CLI aislada); se requiere Python 3.11+. Ambos dejan `pedacito` y el alias corto `pdc` en tu PATH.",
     "gui:verify-tests": "El modo Auto puede ejecutar un comando de verificación tras cada tarea; Task/Edit puede correr las pruebas del proyecto tras las ediciones aplicadas.",

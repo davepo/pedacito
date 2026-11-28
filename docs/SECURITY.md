@@ -93,7 +93,7 @@ If you need entropy scoring for a custom token format, add it as a new rule in
 
 | Point | What happens | Setting |
 |---|---|---|
-| **Before every hosted request** | Pedacito scans the outgoing messages for unacknowledged secrets. Loopback and LAN endpoints are never scanned, because those keys do not leave the machine. | `security_outbound_mode` |
+| **Before every hosted request** | Pedacito scans the outgoing messages for unacknowledged secrets. Replayed reasoning fields (`reasoning_content`, thinking blocks, thought parts) are scanned too; a finding drops that opaque reasoning rather than sending it. Loopback and LAN endpoints are never scanned, because those keys do not leave the machine. | `security_outbound_mode` |
 | **Workspace scan** | `scan_workspace_secrets` checks indexed files. Results appear as a post-run notice and in the GUI security status (`/security` in the TUI). | Always on |
 | **Git hygiene** | `check_git_secret_hygiene` reports sensitive files that exist in the repository but are not excluded by `.gitignore`. `ensure_gitignore_entries` can add the missing lines. | `manage_gitignore` |
 | **Indexing** | Sensitive files are never indexed (see below). | Always on |
@@ -112,6 +112,25 @@ masked preview (for example `sk-ab...wxyz`), and a SHA-256 fingerprint. Only the
 preview and fingerprint are serialised. When you acknowledge a finding, its
 fingerprint is stored in `.pedacito/security_ack.json`, so the same key is not
 raised again.
+
+### Provider capability probes
+
+The capability cache and the opt-in probe follow the same outbound rules:
+
+- Importing `pedacito.providers` never contacts a network. `get_capabilities`
+  is offline unless the caller passes `allow_probe=True`, which is the explicit
+  consent signal; startup and ordinary model calls never probe.
+- A probe sends one minimal, bounded request to the configured base URL and
+  refuses redirects, so an `Authorization` or `x-api-key` header never follows a
+  redirect to another host.
+- The probe prompt is fixed (`ping`) and passes the existing outbound secret
+  scan. Project files, prompts and tool output are never included.
+- `provider_capabilities.json` stores only the normalized URL, exact model,
+  auth-identity hash and capability values, with a 24 hour TTL. It contains no
+  API key, credential, prompt or tool output.
+- Azure OpenAI, AWS Bedrock and Google Vertex are gateway-only entries and are
+  never presented as native auth adapters; their capability source says
+  `unverified` until a configured OpenAI-compatible gateway proves otherwise.
 
 ### Sensitive files are never indexed
 

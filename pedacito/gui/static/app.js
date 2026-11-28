@@ -134,8 +134,10 @@ function loadI18n() {
 // Built-in hosted-provider catalog. settings.js seeds its "Add Hosted
 // Provider" dialog from this immediately, so the provider selector renders
 // even before (or if) GET /api/providers/presets ever answers; the server's
-// reply replaces it when it arrives. Mirrors settings_api.CLOUD_PROVIDERS
-// exactly -- if a preset is added or renamed there, change it here too.
+// reply replaces it when it arrives. Mirrors providers.provider_presets() --
+// the registry is the one source of truth, and settings_api.CLOUD_PROVIDERS is
+// exactly that tuple -- so if a preset is added or renamed there, change it
+// here too.
 // The dialog probes the chosen provider live (POST /api/providers/probe) and
 // imports each ticked model as a profile NAMED AFTER THE MODEL, not the
 // vendor (POST /api/providers/import).

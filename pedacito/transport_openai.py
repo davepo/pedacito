@@ -123,6 +123,27 @@ def _tool_args_json(fn: dict) -> str:
     return "{}"
 
 
+def _reasoning_items(message: dict) -> list[dict]:
+    """Opaque reasoning carried by one assistant turn.
+
+    Responses items (`reasoning_items`, usually encrypted) are replayed as
+    returned by the API.  A chat-completions `reasoning_content` string has no
+    Responses item id or signature, so it is carried as a summary-only item
+    for gateways that understand it; either way it stays out of visible text.
+    """
+    items = list(message.get("reasoning_items")
+                 or message.get("encrypted_reasoning") or ())
+    out = [dict(item) for item in items if isinstance(item, dict)]
+    if not out:
+        content = message.get("reasoning_content")
+        if isinstance(content, str) and content:
+            out.append({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": content}],
+            })
+    return out
+
+
 def translate_messages(
     messages: list[dict],
     *,
@@ -150,10 +171,7 @@ def translate_messages(
             })
             continue
         if role == "assistant":
-            for ritem in (message.get("reasoning_items")
-                          or message.get("encrypted_reasoning") or ()):
-                if isinstance(ritem, dict):
-                    input_items.append(dict(ritem))
+            input_items.extend(_reasoning_items(message))
             text = _text_of(content)
             if text:
                 input_items.append({

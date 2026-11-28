@@ -21,6 +21,7 @@ from .. import config_editor
 from .. import fileio
 from .. import i18n
 from .. import imagegen
+from .. import providers
 from ..config import USER_CONFIG, ConfigError
 from . import settings
 from .core import STATE
@@ -1545,74 +1546,12 @@ def known_profiles() -> list[str]:
 
 # --- pre-configured hosted provider profiles -------------------------------------
 
-# The major hosted providers, spelled the way Pedacito reaches them: every
-# entry is an OpenAI-compatible chat-completions server (`llm.py` speaks that
-# one protocol, and Anthropic publishes their API behind the same
-# `/v1/chat/completions` surface). `provider` names the vendor for the UI.
-# A preset carries only public facts -- base URL, the env var that holds the
-# key, curated model ids, and a generous context budget. Nothing secret.
-CLOUD_PROVIDERS: tuple[dict, ...] = (
-    {
-        "id": "anthropic", "label": "Claude (Anthropic)", "provider": "anthropic",
-        "base_url": "https://api.anthropic.com/v1",
-        "api_key_env": "ANTHROPIC_API_KEY", "suggest": "claude",
-        "context_tokens": 200000,
-        "models": ["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5",
-                   "claude-sonnet-4-6", "claude-opus-4-6"],
-    },
-    {
-        "id": "openai", "label": "ChatGPT (OpenAI)", "provider": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY", "suggest": "openai",
-        "context_tokens": 400000,
-        "models": ["gpt-5.4", "gpt-5.4-mini", "o4-mini", "o3", "o3-mini",
-                   "gpt-4.1", "gpt-4.1-mini"],
-    },
-    {
-        "id": "deepseek", "label": "DeepSeek", "provider": "openai",
-        "base_url": "https://api.deepseek.com/v1",
-        "api_key_env": "DEEPSEEK_API_KEY", "suggest": "deepseek",
-        "context_tokens": 128000,
-        "models": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4",
-                   "deepseek-v4-flash"],
-    },
-    {
-        "id": "qwen", "label": "Qwen (DashScope)", "provider": "openai",
-        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        "api_key_env": "DASHSCOPE_API_KEY", "suggest": "qwen",
-        "context_tokens": 256000,
-        "models": ["qwen3-coder-plus", "qwen3.8-flash", "qwen-max",
-                   "qwen-plus", "qwen-flash"],
-    },
-    {
-        "id": "gemini", "label": "Google Gemini", "provider": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "api_key_env": "GEMINI_API_KEY", "suggest": "gemini",
-        "context_tokens": 1000000,
-        "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro",
-                   "gemini-3-flash"],
-    },
-    {
-        "id": "openrouter", "label": "OpenRouter", "provider": "openai",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY", "suggest": "openrouter",
-        "context_tokens": 200000,
-        "models": ["deepseek/deepseek-chat", "qwen/qwen3-coder",
-                   "anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"],
-    },
-    {
-        # A local MoE runtime is still an OpenAI-compatible server, so it gets
-        # the same one-click path as the clouds. The key is optional (Strata/
-        # Avalon only require it when their /health says so); the curated list
-        # is empty on purpose: the live /v1/models answer is the catalog.
-        "id": "strata", "label": "Strata / Avalon (Local MoE)",
-        "provider": "strata",
-        "base_url": "http://127.0.0.1:8080/v1",
-        "api_key_env": "STRATA_API_KEY", "suggest": "strata",
-        "context_tokens": 131072,
-        "models": [],
-    },
-)
+# One source of truth: the provider registry owns ids, labels, base URLs,
+# caching quirks and capability evidence; this module only exposes the
+# long-standing quick-add subset the GUI has always shipped.  A preset carries
+# public facts only -- base URL, the env var that holds the key, curated model
+# ids, and a generous context budget.  Nothing secret.
+CLOUD_PROVIDERS: tuple[dict, ...] = providers.provider_presets()
 
 # Generous gather reads for cloud windows (the `hosted` tier's own budgets are
 # the floor; a pasted key should never have to fight tiny local-model caps).

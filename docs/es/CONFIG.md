@@ -227,6 +227,48 @@ sondea el proveedor activo e informa la caché como *observed*, *not observed*
 o *explicit-only* (las cachés estilo DeepSeek persisten de forma asíncrona, así que "not
 observed" no es "unsupported").
 
+## Registro de proveedores y evidencia de capacidades
+
+Un solo registro en `pedacito/providers.py` respalda los perfiles alojados, los
+runtimes locales y el catálogo de alta rápida de la GUI. El lado alojado cubre
+OpenAI, Anthropic, Google Gemini, DeepSeek, Qwen/DashScope, OpenRouter, Groq,
+Mistral, Moonshot/Kimi, xAI, Together, Cerebras, Fireworks, MiniMax, Z.ai/GLM,
+NVIDIA NIM, Hugging Face, DeepInfra, Nebius, SambaNova, Hyperbolic, Lambda,
+Perplexity y LiteLLM. Los runtimes locales incluyen LM Studio, Ollama, llama.cpp,
+vLLM, Lemonade/lemond, Strata/Avalon, MLX-LM, SGLang, TabbyAPI, KoboldCpp y
+LocalAI. El diálogo Add Hosted Provider de la GUI conserva su subconjunto estable
+de siete entradas de alta rápida.
+
+La coincidencia de host es exacta: una entrada coincide con su nombre de host o
+con un sufijo delimitado por puntos (`.example.com`, `*.example.com`), nunca con
+una subcadena. `notapi.openai.com`, `api.openai.com.attacker.test` y
+`api.openai.com@evil.test` siguen siendo endpoints personalizados.
+
+Las capacidades son de tres estados: `None` significa desconocido, nunca
+soportado. `providers.get_capabilities(base_url, model)` combina la evidencia del
+catálogo, los metadatos de contexto/salida de models.dev en caché y los rechazos
+observados en vivo por las escaleras de JSON Schema y aceleración. No realiza
+E/S de red. Un sondeo solo se ejecuta con consentimiento explícito
+(`allow_probe=True`), envía una petición mínima y acotada, no sigue redirecciones
+(las credenciales nunca cruzan un límite de redirección) y guarda el resultado
+24 horas en `provider_capabilities.json` junto a `config.toml`. La clave de caché
+es la URL normalizada más el modelo exacto más un hash de identidad de
+autenticación; no contiene claves de API, prompts, salidas de herramientas ni
+credenciales. El uso sin conexión nunca sondea automáticamente.
+
+Azure OpenAI, AWS Bedrock y Google Vertex son entradas del catálogo marcadas
+**solo pasarela**: sus protocolos nativos de autenticación y endpoint no están
+implementados aquí, así que solo funcionan detrás de una pasarela compatible con
+OpenAI configurada y se informan como `unverified`, no como verdes. No cuentan
+como integraciones nativas soportadas.
+
+El estado de razonamiento se conserva entre turnos de herramientas del asistente
+en todos los transportes: `reasoning_content` compatible con OpenAI, bloques de
+pensamiento de Anthropic con sus firmas, y partes de pensamiento de Gemini /
+`thoughtSignature`. Se reproduce como metadatos del protocolo, nunca se mezcla
+con el contenido visible ni se escribe en registros o en la caché de
+capacidades.
+
 ## Las APIs alojadas conservan su propio muestreo
 
 Un proveedor alojado ajusta el muestreo por modelo por sí mismo, así que Pedacito deja de dictarlo:
