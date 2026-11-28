@@ -45,6 +45,7 @@ import difflib
 import hashlib
 import io
 import keyword
+import os
 import tokenize
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,6 +54,9 @@ from typing import Any
 
 from . import fileio, safety, security
 from .edits import Edit, apply_edits_atomic, syntax_error
+from .imports import (FileSet, module_name, python_import_bindings,
+                      raw_imports, relative_specifier,
+                      resolve as _import_resolve)
 
 __all__ = ["CodemodRequest", "CodemodResult", "apply", "list_recipes",
            "preview"]
@@ -139,8 +143,10 @@ def _recipe(recipe_id: str, title: str, description: str, *,
 _RECIPES: tuple[dict[str, Any], ...] = (
     _recipe(
         "add_param", "Add a parameter",
-        "Add a parameter to a uniquely resolved function and provable callers.",
-        implemented=False, symbol="required",
+        "Add a parameter to a uniquely resolved function and update only "
+        "provable call sites; a required parameter refuses when any provable "
+        "caller exists (pass a default to keep them working).",
+        implemented=True, symbol="required",
         options=[
             _opt("name", "Parameter name.", required=True),
             _opt("annotation", "Optional annotation source."),
@@ -150,7 +156,7 @@ _RECIPES: tuple[dict[str, Any], ...] = (
     _recipe(
         "remove_param", "Remove a parameter",
         "Remove a parameter and update only provable call sites.",
-        implemented=False, symbol="required",
+        implemented=True, symbol="required",
         options=[_opt("name", "Parameter name.", required=True)],
     ),
     _recipe(
@@ -180,8 +186,9 @@ _RECIPES: tuple[dict[str, Any], ...] = (
     ),
     _recipe(
         "wrap_try", "Wrap in try/except",
-        "Wrap a uniquely resolved statement or symbol in try/except.",
-        implemented=False, symbol="required",
+        "Wrap the body of a uniquely resolved function or method in "
+        "try/except that re-raises (an error-handling seam to edit further).",
+        implemented=True, symbol="required",
         options=[
             _opt("exception", "Exception type expression to catch.",
                  default="Exception"),
@@ -189,8 +196,9 @@ _RECIPES: tuple[dict[str, Any], ...] = (
     ),
     _recipe(
         "wrap_context", "Wrap in a context manager",
-        "Wrap a uniquely resolved statement or symbol in a with-block.",
-        implemented=False, symbol="required",
+        "Wrap the body of a uniquely resolved function or method in a "
+        "with-block.",
+        implemented=True, symbol="required",
         options=[_opt("manager", "Context-manager expression.", required=True)],
     ),
     _recipe(
@@ -237,22 +245,26 @@ _RECIPES: tuple[dict[str, Any], ...] = (
     ),
     _recipe(
         "move_symbol", "Move a symbol",
-        "Move a uniquely resolved symbol and update resolved imports.",
-        implemented=False, symbol="required",
+        "Move a uniquely resolved top-level function or class into another "
+        "file and update only resolved imports.",
+        implemented=True, symbol="required",
         options=[_opt("to_file", "Destination project-relative path.",
                       required=True)],
     ),
     _recipe(
         "move_file", "Move a file",
-        "Move a source file and update resolved imports.",
-        implemented=False, symbol="ignored",
+        "Move a Python source file to a new path and update only resolved "
+        "imports; no delete until every staged path validates.",
+        implemented=True, symbol="ignored",
         options=[_opt("to_path", "Destination project-relative path.",
                       required=True)],
     ),
     _recipe(
         "replace_deprecated", "Replace a deprecated symbol",
-        "Replace a deprecated API at resolved references.",
-        implemented=False, symbol="required",
+        "Replace a deprecated API name at resolved references in the target "
+        "file (strings and comments untouched); refuse when the binding is "
+        "ambiguous.",
+        implemented=True, symbol="optional",
         options=[
             _opt("old", "Deprecated name.", required=True),
             _opt("new", "Replacement name.", required=True),
@@ -260,8 +272,10 @@ _RECIPES: tuple[dict[str, Any], ...] = (
     ),
     _recipe(
         "add_reexport", "Add a re-export",
-        "Re-export a name from a module without touching callers.",
-        implemented=False, symbol="ignored",
+        "Re-export a name from a module by adding a from-import to the target "
+        "file (usually a package __init__.py); verifies the name is defined "
+        "in the source module.",
+        implemented=True, symbol="ignored",
         options=[
             _opt("name", "Name to re-export.", required=True),
             _opt("from_module", "Module that defines the name.", required=True),
@@ -304,9 +318,9 @@ def apply(root: Path, request: CodemodRequest, *, index=None,
           cfg=None) -> CodemodResult:
     """Apply a codemod through one all-or-nothing atomic transaction.
 
-    The preview is recomputed from current bytes, the file's preimage hash is
-    verified again by ``apply_edits_atomic`` immediately before commit, and a
-    policy/protection/sensitive-path failure leaves every file untouched.
+    The preview is recomputed from current bytes, every touched file's preimage
+    hash is verified again by ``apply_edits_atomic`` immediately before commit,
+    and a policy/protection/sensitive-path failure leaves every file untouched.
     """
     allow = getattr(cfg, "allow_write", None) if cfg is not None else None
     try:
@@ -340,11 +354,23 @@ def apply(root: Path, request: CodemodRequest, *, index=None,
                 f"refused to apply: could not create the snapshot directory "
                 f"({exc}); nothing was written")
 
-    edit = Edit(plan.rel, plan.before, plan.after, exact=True)
+    edits: list[Edit] = []
+    expected_sha256: dict[str, str] = {}
+    for change in plan.changes:
+        if change.delete:
+            edits.append(Edit(change.rel, "", "", delete=True))
+            if change.existed:
+                expected_sha256[change.rel] = change.raw_sha
+        elif not change.existed:
+            edits.append(Edit(change.rel, "", change.after, exact=True))
+        else:
+            edits.append(Edit(change.rel, change.before, change.after,
+                              exact=True))
+            expected_sha256[change.rel] = change.raw_sha
     try:
         outcomes = apply_edits_atomic(
-            plan.root, [edit], backup=backup, backup_dir=backup_dir, cfg=cfg,
-            expected_sha256={plan.rel: plan.raw_sha})
+            plan.root, edits, backup=backup, backup_dir=backup_dir, cfg=cfg,
+            expected_sha256=expected_sha256)
     except OSError as exc:
         return CodemodResult(
             False, {}, (), result.warnings,
@@ -361,18 +387,32 @@ def apply(root: Path, request: CodemodRequest, *, index=None,
 # Preparation
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class _Plan:
-    root: Path
+class _FileChange:
+    """One file's planned transformation within a codemod batch.
+
+    ``rel`` is a project-relative POSIX path. ``before``/``after`` are the
+    LF-normalised preimage/postimage text; ``before`` is empty for a creation
+    and ``after`` empty for a deletion. ``raw_sha`` pins the file's on-disk
+    bytes (empty for a creation) so a stale apply can be refused.
+    """
+
     rel: str
     before: str
     after: str
     raw_sha: str
+    existed: bool
+    delete: bool = False
+
+
+@dataclass(frozen=True)
+class _Plan:
+    root: Path
+    changes: tuple[_FileChange, ...]
     result: CodemodResult
 
 
 def _prepare(root: Path, request: CodemodRequest, *, cfg, for_write: bool,
              index=None) -> _Plan:
-    del index                         # reserved for cross-file recipes
     if not isinstance(request, CodemodRequest):
         raise _Refuse("codemod request must be a CodemodRequest")
     recipe_id = str(request.recipe or "").strip()
@@ -383,7 +423,7 @@ def _prepare(root: Path, request: CodemodRequest, *, cfg, for_write: bool,
         raise _Refuse(f"unknown codemod recipe '{recipe_id}'; known recipes: "
                       + ", ".join(r["id"] for r in _RECIPES))
     handler = _HANDLERS.get(recipe_id)
-    if handler is None:
+    if handler is None and recipe_id not in _MULTI_HANDLERS:
         raise _Refuse(
             f"recipe '{recipe_id}' is catalogued but not implemented in this "
             "release (unverified); nothing was written")
@@ -397,32 +437,78 @@ def _prepare(root: Path, request: CodemodRequest, *, cfg, for_write: bool,
             f"'{loaded.rel}' has unsupported extension "
             f"'{loaded.suffix or '(none)'}' (language support is unverified) "
             "-- nothing was written")
-    if loaded.text.strip() == "":
-        tree = ast.parse("", filename=loaded.rel)
-    else:
-        tree = _parse_python(loaded.text, loaded.rel)
+    tree = (_parse_python(loaded.text, loaded.rel)
+            if loaded.text.strip() else ast.parse("", filename=loaded.rel))
     source = _Source(loaded.text, tree, loaded.rel)
+
+    if recipe_id in _MULTI_HANDLERS:
+        multi = _MULTI_HANDLERS[recipe_id](
+            root, request, loaded, source, options, cfg=cfg,
+            for_write=for_write, index=index)
+        return _finalize_plan(loaded, multi.changes, multi.warnings)
 
     outcome = handler(source, str(request.symbol or "").strip(), options)
     warnings = list(outcome.warnings)
     if outcome.text == loaded.text:
         warnings.append("no change: the requested transformation is already "
                         "present")
-        return _Plan(
-            loaded.root, loaded.rel, loaded.text, loaded.text, loaded.raw_sha,
-            CodemodResult(True, {}, (), tuple(warnings)))
+        return _finalize_plan(
+            loaded, (), tuple(warnings), no_change=True)
+    change = _FileChange(loaded.rel, loaded.text, outcome.text,
+                         loaded.raw_sha, True)
+    return _finalize_plan(loaded, (change,), tuple(warnings))
 
-    bad = syntax_error(loaded.path, outcome.text)
-    if bad:
-        raise _Refuse(
-            f"refused: the codemod would leave {loaded.rel} with {bad}; "
-            "nothing was written")
 
-    diff = _unified_diff(loaded.rel, loaded.text, outcome.text)
-    result = CodemodResult(
-        True, {loaded.rel: diff}, (loaded.rel,), tuple(warnings))
-    return _Plan(loaded.root, loaded.rel, loaded.text, outcome.text,
-                 loaded.raw_sha, result)
+def _finalize_plan(loaded: _Loaded, changes: tuple[_FileChange, ...],
+                   warnings: tuple[str, ...], *, no_change: bool = False
+                   ) -> _Plan:
+    """Validate a batch of file changes and build the result plan.
+
+    Every produced text is syntax-checked, no-op changes are dropped, and the
+    diffs/changed set are assembled deterministically (sorted by path).
+    """
+    root = loaded.root
+    warnings = list(warnings)
+    kept: list[_FileChange] = []
+    for change in changes:
+        if change.delete:
+            if not change.existed:
+                continue
+            kept.append(change)
+            continue
+        if change.existed and change.before == change.after:
+            continue
+        if not change.existed and change.after == "":
+            continue
+        bad = syntax_error(root / change.rel, change.after)
+        if bad:
+            raise _Refuse(
+                f"refused: the codemod would leave {change.rel} with {bad}; "
+                "nothing was written")
+        kept.append(change)
+    if not kept:
+        if no_change or not changes:
+            warnings.append("no change: the requested transformation is "
+                            "already present")
+        else:
+            warnings.append("no change: the requested transformation produced "
+                            "nothing")
+        return _Plan(root, (),
+                     CodemodResult(True, {}, (), tuple(warnings)))
+
+    diffs: dict[str, str] = {}
+    changed: list[str] = []
+    for change in kept:
+        if change.delete:
+            diff = _unified_diff(change.rel, change.before, "")
+            diffs[change.rel] = diff
+        else:
+            diffs[change.rel] = _unified_diff(change.rel, change.before,
+                                              change.after)
+        changed.append(change.rel)
+    changed.sort()
+    result = CodemodResult(True, diffs, tuple(changed), tuple(warnings))
+    return _Plan(root, tuple(kept), result)
 
 
 def _validate_options(recipe: Mapping[str, Any],
@@ -1970,7 +2056,1137 @@ def _find_variable_assignment(scope_node: ast.AST, name: str
 
 
 # ---------------------------------------------------------------------------
-# Handler registry (WP-4102B extends this mapping)
+# Cross-file machinery (WP-4102B)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _MultiOutcome:
+    """A batch of file changes plus warnings, produced by a multi-file recipe."""
+
+    changes: tuple[_FileChange, ...]
+    warnings: tuple[str, ...] = ()
+
+
+def _single(outcome: _Outcome, loaded: _Loaded) -> _MultiOutcome:
+    change = _FileChange(loaded.rel, loaded.text, outcome.text,
+                         loaded.raw_sha, True)
+    return _MultiOutcome((change,), outcome.warnings)
+
+
+_SKIP_DIRS = frozenset({
+    "node_modules", "__pycache__", ".venv", "venv", "env", ".tox", ".nox",
+    "dist", "build", "target", "site-packages", "dist-packages", "vendor",
+    ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".idea", ".vscode",
+})
+
+
+def _iter_py_files(root: Path) -> list[str]:
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIRS and not d.startswith(".")
+            and not d.endswith(".egg-info"))
+        for f in sorted(filenames):
+            if f.endswith(".py"):
+                p = Path(dirpath) / f
+                try:
+                    out.append(p.relative_to(root).as_posix())
+                except ValueError:
+                    continue
+    return out
+
+
+def _resolve_project_path(root: Path, file: str, cfg, for_write: bool, *,
+                          must_exist: bool = False) -> tuple[Path, str]:
+    """Resolve a project-relative path safely, returning (path, rel)."""
+    try:
+        root_resolved = Path(root).expanduser().resolve()
+    except OSError as exc:
+        raise _Refuse(f"project root could not be resolved: {root} ({exc})")
+    raw = fileio.normalise_rel(file)
+    if not raw:
+        raise _Refuse("a project-relative path is required")
+    try:
+        path = security.resolve_safe_path(root_resolved, raw)
+    except security.SecurityError as exc:
+        raise _Refuse(f"refused: {exc}; nothing was written")
+    try:
+        rel = path.relative_to(root_resolved).as_posix()
+    except ValueError:
+        raise _Refuse(f"refused: path escapes the project root: {file}")
+    why = safety.is_protected(rel, cfg, write=for_write)
+    if why:
+        raise _Refuse(f"refused: {why}; nothing was written")
+    if security.is_sensitive_path(rel):
+        raise _Refuse(f"refused: {rel} is a sensitive file and is never "
+                      "written by a codemod")
+    if must_exist and not path.is_file():
+        raise _Refuse(
+            f"refused: {rel} is not a regular file in the project; nothing "
+            "was written")
+    return path, rel
+
+
+def _load_extra(root: Path, rel: str, cfg, for_write: bool) -> _Loaded:
+    return _load(root, rel, "", cfg=cfg, for_write=for_write)
+
+
+def _importers(root: Path, rel: str, index) -> list[str]:
+    """Files that import ``rel``'s module: from the resolved graph when there
+    is an index, otherwise a deterministic textual scan of the project."""
+    if index is not None:
+        try:
+            mapped = index.resolve_file(rel) or rel
+            return sorted(f for f in index.importers_of(mapped) if f != mapped)
+        except Exception:
+            pass
+    fs = FileSet(_iter_py_files(root))
+    out: list[str] = []
+    for cand in _iter_py_files(root):
+        if cand == rel:
+            continue
+        try:
+            text = fileio.read_text(root / cand)
+        except (OSError, UnicodeDecodeError):
+            continue
+        for spec in raw_imports(cand, text):
+            if rel in _import_resolve(cand, spec, fs):
+                out.append(cand)
+                break
+    return sorted(out)
+
+
+def _resolve_function_qual(source: _Source, symbol: str
+                           ) -> tuple[ast.AST, str]:
+    """Resolve a uniquely named function/method, returning (node, qualname)."""
+    wanted = (symbol or "").strip()
+    if not wanted:
+        raise _Refuse("this recipe needs a symbol naming a function")
+    matches = [(q, n) for q, n in _definitions(source.tree)
+               if q == wanted
+               and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if not matches:
+        known = sorted({q for q, n in _definitions(source.tree)
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})[:8]
+        raise _Refuse(
+            f"symbol '{wanted}' was not found as a unique function"
+            + (f"; known functions: {', '.join(known)}" if known else "")
+            + "; nothing was written")
+    if len(matches) > 1:
+        where = ", ".join(f"line {getattr(n, 'lineno', '?')}"
+                          for _q, n in matches[:6])
+        raise _Refuse(
+            f"symbol '{wanted}' is ambiguous ({len(matches)} functions: "
+            f"{where}); refuse to guess which one to edit")
+    return matches[0][1], matches[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Parameter helpers (add_param / remove_param)
+# ---------------------------------------------------------------------------
+def _positional_params(fn: ast.AST) -> list[ast.arg]:
+    return list(fn.args.posonlyargs) + list(fn.args.args)
+
+
+def _open_paren_offset(source: _Source, fn: ast.AST) -> int:
+    start = source.line_start(getattr(fn, "lineno", 1))
+    seen_def = False
+    for tok in source.tokens():
+        if tok.end <= start:
+            continue
+        if tok.type == tokenize.NAME and tok.string == "def":
+            seen_def = True
+            continue
+        if not seen_def:
+            continue
+        if tok.type == tokenize.OP and tok.string == "(":
+            return tok.end
+    raise _Refuse(
+        f"refused: could not locate the parameter list of "
+        f"{getattr(fn, 'name', 'the function')}")
+
+
+def _param_text(name: str, annotation: str, default: str) -> str:
+    if annotation:
+        result = f"{name}: {annotation}"
+        if default:
+            result += f" = {default}"
+        return result
+    if default:
+        return f"{name}={default}"
+    return name
+
+
+def _arg_has_default(fn: ast.AST, index: int, positional: list[ast.arg]) -> bool:
+    ndefaults = len(fn.args.defaults)
+    return index >= len(positional) - ndefaults
+
+
+def _insert_param(source: _Source, fn: ast.AST, name: str, annotation: str,
+                  default: str) -> str:
+    """Return the source with `name` inserted at a valid parameter position."""
+    if fn.args.vararg is not None or fn.args.kwarg is not None:
+        raise _Refuse(
+            "refused: the function has *args/**kwargs; the call-site arity is "
+            "not statically known, so a parameter cannot be added or removed "
+            "mechanically")
+    positional = _positional_params(fn)
+    has_default = bool(default)
+    text = source.text
+    if positional:
+        if has_default:
+            last = positional[-1]
+            offset = source.span(last)[1]
+            return text[:offset] + ", " + _param_text(name, annotation, default) \
+                + text[offset:]
+        first_default = None
+        for idx, arg in enumerate(positional):
+            if _arg_has_default(fn, idx, positional):
+                first_default = arg
+                break
+        if first_default is not None:
+            offset = source.span(first_default)[0]
+            return text[:offset] + _param_text(name, annotation, default) + ", " \
+                + text[offset:]
+        last = positional[-1]
+        offset = source.span(last)[1]
+        return text[:offset] + ", " + _param_text(name, annotation, default) \
+            + text[offset:]
+    # no positional parameters: insert after the opening paren
+    offset = _open_paren_offset(source, fn)
+    suffix = ", " if fn.args.kwonlyargs else ""
+    return text[:offset] + _param_text(name, annotation, default) + suffix \
+        + text[offset:]
+
+
+def _remove_param_def(source: _Source, fn: ast.AST, arg: ast.arg) -> str:
+    """Return the source with one parameter (and its comma) removed."""
+    text = source.text
+    start, end = source.span(arg)
+    tokens = source.tokens()
+    commas = [t for t in tokens
+              if t.type == tokenize.OP and t.string == ","
+              and t.start >= end and t.start <= source.line_end(arg.lineno)]
+    if commas:
+        # delete the arg plus the following comma and any spaces
+        stop = commas[0].end
+        while stop < len(text) and text[stop] in " \t":
+            stop += 1
+        return text[:start] + text[stop:]
+    commas_before = [t for t in tokens
+                     if t.type == tokenize.OP and t.string == ","
+                     and t.end <= start
+                     and t.start >= _open_paren_offset(source, fn)]
+    if commas_before:
+        return text[:commas_before[-1].start] + text[end:]
+    return text[:start] + text[end:]
+
+
+def _expr_path(node: ast.AST) -> str:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    else:
+        return ""
+    return ".".join(reversed(parts))
+
+
+def _inside_class(node: ast.AST, class_leaf: str,
+                  parents: Mapping[ast.AST, ast.AST]) -> bool:
+    cur = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, ast.ClassDef) and cur.name == class_leaf:
+            return True
+        cur = parents.get(cur)
+    return False
+
+
+def _local_shadowed(tree: ast.Module, parents: Mapping[ast.AST, ast.AST],
+                    fn: ast.AST, name: str, node: ast.AST) -> bool:
+    """True when `name` resolves to a local binding (not the target `fn`) at
+    `node`'s position in a nested scope."""
+    cur = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if cur is fn:
+                if name in {a.arg for a in _function_args(cur)}:
+                    return True
+            else:
+                if name in {a.arg for a in _function_args(cur)}:
+                    return True
+                if name in _scope_bindings(cur.body):
+                    return True
+        elif isinstance(cur, ast.ClassDef):
+            if name in _scope_bindings(cur.body):
+                return True
+        cur = parents.get(cur)
+    return False
+
+
+def _module_rebound_before(tree: ast.Module, name: str, lineno: int) -> bool:
+    for stmt in tree.body:
+        if getattr(stmt, "lineno", 0) >= lineno:
+            break
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = stmt.targets if isinstance(stmt, ast.Assign) \
+                else [stmt.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                return True
+    return False
+
+
+def _find_call_sites(source: _Source, fn: ast.AST, qualname: str
+                     ) -> tuple[list[tuple[ast.Call, int]], list[str],
+                                list[str]]:
+    """(calls, dynamic_lines, issues) for a function's provable call sites.
+
+    Each entry in `calls` is ``(call, receiver_offset)``: the number of leading
+    parameters that are implicit at that call site (1 for ``self.m``/``cls.m``
+    on a method, 0 for a bare or static ``C.m`` call), so the caller can map a
+    parameter index onto the call's positional argument list. `dynamic_lines`
+    are bare references to the name that are not calls (aliases/callbacks);
+    `issues` are sites that could not be proven (shadowing, dynamic receivers).
+    """
+    tree = source.tree
+    leaf = qualname.rsplit(".", 1)[-1]
+    is_method = "." in qualname
+    class_leaf = qualname.rsplit(".", 1)[0].rsplit(".", 1)[-1] if is_method else ""
+    parents = _parent_map(tree)
+    calls: list[tuple[ast.Call, int]] = []
+    dynamic: list[str] = []
+    issues: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == leaf and not is_method:
+                if _local_shadowed(tree, parents, fn, leaf, node) \
+                        or _module_rebound_before(tree, leaf, node.lineno):
+                    issues.append(f"line {node.lineno}: '{leaf}' is shadowed")
+                else:
+                    calls.append((node, 0))
+            elif isinstance(func, ast.Name) and func.id == leaf and is_method:
+                # A bare `m(...)` resolves to a module/global name, never the
+                # method `C.m`, so it is not a call site for this method.
+                continue
+            elif isinstance(func, ast.Attribute) and func.attr == leaf \
+                    and is_method:
+                path = _expr_path(func.value)
+                if path in ("self", "cls", "this"):
+                    if _inside_class(node, class_leaf, parents):
+                        calls.append((node, 1))
+                    else:
+                        issues.append(
+                            f"line {node.lineno}: self.{leaf} outside "
+                            f"{class_leaf}")
+                elif path.endswith("." + class_leaf) or path == class_leaf:
+                    calls.append((node, 0))
+                else:
+                    issues.append(
+                        f"line {node.lineno}: dynamic receiver `{path or '(...)'}"
+                        f".{leaf}` is not provable")
+        elif isinstance(node, ast.Name) and node.id == leaf \
+                and isinstance(node.ctx, ast.Load):
+            parent = parents.get(node)
+            if isinstance(parent, ast.Call) and parent.func is node:
+                continue
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)) and parent.name == leaf:
+                continue
+            if isinstance(parent, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(parent, ast.arg) and parent.annotation is node:
+                continue
+            dynamic.append(f"line {node.lineno}")
+
+    return calls, dynamic, issues
+
+
+def _call_positional_count_ok(call: ast.Call) -> str | None:
+    """An error when a call site's arguments cannot be mapped by position."""
+    if call.keywords:
+        names = ", ".join(k.arg or "**" for k in call.keywords)
+        return f"keyword argument(s) {names}"
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return "*args"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# wrap_try / wrap_context (shared body wrapper)
+# ---------------------------------------------------------------------------
+def _indent_unit(source: _Source, fn: ast.AST) -> str:
+    """One level of indentation for the function body (4 spaces or a tab),
+    derived from the gap between the `def` and its first body statement."""
+    fn_line = source.lines[fn.lineno - 1]
+    fn_indent = fn_line[: len(fn_line) - len(fn_line.lstrip())]
+    for stmt in fn.body:
+        if _is_docstring_stmt(stmt):
+            continue
+        line = source.lines[stmt.lineno - 1]
+        lead = line[: len(line) - len(line.lstrip())]
+        if lead.startswith(fn_indent) and len(lead) > len(fn_indent):
+            unit = lead[len(fn_indent):]
+            if "\t" in unit:
+                return "\t"
+            return unit
+    return "    "
+
+
+def _reindent_block(text: str, cur: str, new: str) -> str:
+    out: list[str] = []
+    for ln in text.split("\n"):
+        if not ln.strip():
+            out.append(ln)
+        elif ln.startswith(cur):
+            out.append(new + ln[len(cur):])
+        else:
+            out.append(new + ln.lstrip())
+    return "\n".join(out)
+
+
+def _wrap_fn_body(source: _Source, fn: ast.AST, opener: str,
+                  footer: str) -> str:
+    """Wrap a function's non-docstring body: `opener` (a single header line)
+    goes at the body's base indent, the body shifts one level deeper, and
+    `footer` (a multi-line string with its own relative indentation) closes
+    the block at the base indent."""
+    start, end, body_text, base, unit = _fn_body_info(source, fn)
+    inner = base + unit
+    opener_indented = base + opener + "\n"
+    wrapped = opener_indented + _reindent_block(body_text, base, inner)
+    if footer:
+        footer_lines = [base + ln if ln.strip() else ln
+                        for ln in footer.split("\n")]
+        wrapped += "\n".join(footer_lines) + "\n"
+    return source.text[:start] + wrapped + source.text[end:]
+
+
+def _fn_body_info(source: _Source, fn: ast.AST
+                  ) -> tuple[int, int, str, str, str]:
+    """(start, end, body_text, base_indent, unit) for a function's body."""
+    body = list(fn.body)
+    start_idx = 1 if body and _is_docstring_stmt(body[0]) else 0
+    if start_idx >= len(body):
+        raise _Refuse(
+            f"refused: the body of {getattr(fn, 'name', 'the function')} is "
+            "empty or only a docstring; nothing to wrap")
+    first = body[start_idx]
+    last = body[-1]
+    if first.lineno == getattr(fn, "lineno", first.lineno):
+        raise _Refuse(
+            f"refused: {getattr(fn, 'name', 'the function')} has a one-line "
+            "body; wrap it manually")
+    start = source.line_start(first.lineno)
+    end = source.line_end(last.end_lineno or last.lineno)
+    body_text = source.text[start:end]
+    unit = _indent_unit(source, fn)
+    fn_line = source.lines[fn.lineno - 1]
+    fn_indent = fn_line[: len(fn_line) - len(fn_line.lstrip())]
+    base = fn_indent + unit
+    return start, end, body_text, base, unit
+
+
+# ---------------------------------------------------------------------------
+# wrap_try
+# ---------------------------------------------------------------------------
+def _recipe_wrap_try(source: _Source, symbol: str,
+                     options: Mapping[str, str]) -> _Outcome:
+    fn, _qual = _resolve_function_qual(source, symbol)
+    exception = (options.get("exception") or "Exception").strip()
+    if not exception or "\n" in exception or "\r" in exception:
+        raise _Refuse("option 'exception' must be a single-line expression")
+    try:
+        ast.parse(exception, mode="eval")
+    except SyntaxError as exc:
+        raise _Refuse(f"option 'exception' is not a valid expression: {exc.msg}")
+    unit = _indent_unit(source, fn)
+    new_text = _wrap_fn_body(
+        source, fn, "try:",
+        f"except {exception}:\n{unit}raise")
+    return _Outcome(new_text, _warn(
+        f"wrapped the body of {fn.name} in try/except {exception}"))
+
+
+# ---------------------------------------------------------------------------
+# wrap_context
+# ---------------------------------------------------------------------------
+def _recipe_wrap_context(source: _Source, symbol: str,
+                         options: Mapping[str, str]) -> _Outcome:
+    fn, _qual = _resolve_function_qual(source, symbol)
+    manager = (options.get("manager") or "").strip()
+    if not manager or "\n" in manager or "\r" in manager:
+        raise _Refuse("option 'manager' must be a single-line expression")
+    try:
+        ast.parse(manager, mode="eval")
+    except SyntaxError as exc:
+        raise _Refuse(f"option 'manager' is not a valid expression: {exc.msg}")
+    new_text = _wrap_fn_body(source, fn, f"with {manager}:", "")
+    return _Outcome(new_text, _warn(
+        f"wrapped the body of {fn.name} in `with {manager}:`"))
+
+
+# ---------------------------------------------------------------------------
+# replace_deprecated
+# ---------------------------------------------------------------------------
+def _recipe_replace_deprecated(source: _Source, symbol: str,
+                               options: Mapping[str, str]) -> _Outcome:
+    old = (options.get("old") or "").strip()
+    new = (options.get("new") or "").strip()
+    if not old:
+        raise _Refuse("option 'old' is required and may not be empty")
+    if not new:
+        raise _Refuse("option 'new' is required and may not be empty")
+    if old == new:
+        raise _Refuse("the old and new names are the same; nothing to replace")
+    _identifier(old, "old name")
+    _identifier(new, "new name")
+
+    bindings = _all_bindings(source.tree)
+    shadow = bindings.get(old, "")
+    if shadow and shadow not in ("import", "definition"):
+        raise _Refuse(
+            f"refused: '{old}' is bound as {shadow} in this module; replacing "
+            "it mechanically could hit a local variable, not the deprecated "
+            "API")
+
+    scope = source.tree
+    if symbol.strip():
+        found = _matching_scope(source.tree, symbol)
+        if found is None:
+            raise _Refuse(
+                f"symbol '{symbol}' was not found as a unique scope")
+        scope = found
+
+    parents = _parent_map(source.tree)
+    hits: list[tuple[int, int]] = []
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name) and node.id == old:
+            parent = parents.get(node)
+            if isinstance(parent, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)) and parent.name == old:
+                continue
+            if isinstance(parent, ast.Attribute) and parent.attr == old \
+                    and parent.value is node:
+                continue
+            hits.append(source.span(node))
+    if not hits:
+        return _Outcome(source.text, _warn(
+            f"found no reference to '{old}'"
+            + (f" in '{symbol}'" if symbol else " in the file")
+            + "; nothing to change"))
+    edits = [(s, e, new) for s, e in hits]
+    new_text = _apply_text_edits(source.text, edits)
+    return _Outcome(new_text, _warn(
+        f"replaced {len(hits)} reference(s) to '{old}' with '{new}'"))
+
+
+# ---------------------------------------------------------------------------
+# add_reexport (multi: validates the source module)
+# ---------------------------------------------------------------------------
+def _recipe_add_reexport(root, request, loaded, source, options, *, cfg,
+                         for_write, index):
+    del request, index
+    name = _identifier(options.get("name", ""), "name")
+    from_module = (options.get("from_module") or "").strip()
+    if not from_module or not all(part.isidentifier() for part in
+                                  from_module.split(".")):
+        raise _Refuse(f"option 'from_module' '{from_module}' is not a dotted "
+                      "module name")
+    fs = FileSet(_iter_py_files(root))
+    targets = _import_resolve(loaded.rel, from_module, fs)
+    if not targets:
+        raise _Refuse(
+            f"refused: module '{from_module}' could not be resolved to a "
+            "project file; a re-export must point at a provable definition")
+    if len(targets) > 1:
+        raise _Refuse(
+            f"refused: module '{from_module}' is ambiguous ({len(targets)} "
+            "files); name it unambiguously")
+    target_rel = targets[0]
+    target_loaded = _load_extra(root, target_rel, cfg, for_write)
+    target_tree = (_parse_python(target_loaded.text, target_rel)
+                   if target_loaded.text.strip()
+                   else ast.parse("", filename=target_rel))
+    if name not in _module_scope_bindings(target_tree):
+        raise _Refuse(
+            f"refused: '{name}' is not defined at module scope in "
+            f"{target_rel}; a re-export would be unverified")
+
+    line, _local = _import_line(from_module, name, "")
+    already, conflict = _existing_import(source.tree, from_module, name, "")
+    if conflict:
+        raise _Refuse(conflict + "; nothing was written")
+    if already:
+        return _MultiOutcome((), _warn(f"re-export already present: {line}"))
+    new_text = _insert_top(source, [line], purpose="import")
+    return _single(_Outcome(new_text, _warn(
+        f"re-exported {name} from {from_module}")), loaded)
+
+
+# ---------------------------------------------------------------------------
+# add_param / remove_param (multi: definition + provable callers)
+# ---------------------------------------------------------------------------
+def _cross_file_callers(root: Path, def_rel: str, qualname: str, index, cfg,
+                        for_write: bool) -> tuple[dict[str, list[ast.Call]],
+                                                  list[str]]:
+    """(calls_by_file, issues) for callers of `qualname` in files that import
+    `def_rel` via a from-import of the function's bare name."""
+    leaf = qualname.rsplit(".", 1)[-1]
+    importers = _importers(root, def_rel, index)
+    fs = FileSet(_iter_py_files(root))
+    calls_by_file: dict[str, list[ast.Call]] = {}
+    issues: list[str] = []
+    for rel in importers:
+        loaded = _load_extra(root, rel, cfg, for_write)
+        tree = _parse_python(loaded.text, rel)
+        local_names = set()
+        for binding in python_import_bindings(loaded.text, tree):
+            if binding.kind != "from":
+                continue
+            spec = ("." * binding.level) + binding.module
+            try:
+                targets = _import_resolve(rel, spec, fs) if spec else []
+            except Exception:
+                targets = []
+            if def_rel in targets:
+                for n, asn in binding.names:
+                    if n == leaf:
+                        local_names.add(asn or n)
+        if not local_names:
+            continue
+        parents = _parent_map(tree)
+        found: list[ast.Call] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in local_names:
+                if _local_shadowed(tree, parents, None, func.id, node):
+                    issues.append(f"{rel}:{node.lineno}: '{func.id}' is shadowed")
+                    continue
+                found.append(node)
+        if found:
+            calls_by_file[rel] = found
+    return calls_by_file, issues
+
+
+def _recipe_add_param(root, request, loaded, source, options, *, cfg,
+                      for_write, index):
+    symbol = str(request.symbol or "").strip()
+    fn, qualname = _resolve_function_qual(source, symbol)
+    name = _identifier(options.get("name", ""), "parameter name")
+    annotation = ""
+    if options.get("annotation"):
+        annotation = _parse_annotation(options["annotation"])
+    default = (options.get("default") or "").strip()
+    if default:
+        if "\n" in default or "\r" in default:
+            raise _Refuse("option 'default' must be a single-line expression")
+        try:
+            ast.parse(default, mode="eval")
+        except SyntaxError as exc:
+            raise _Refuse(f"option 'default' is not a valid expression: {exc.msg}")
+    if name in {a.arg for a in _function_args(fn)}:
+        raise _Refuse(f"refused: '{name}' is already a parameter of {fn.name}")
+
+    calls, _dynamic, _issues = _find_call_sites(source, fn, qualname)
+    xcalls, _xissues = _cross_file_callers(root, loaded.rel, qualname, index,
+                                           cfg, for_write)
+    all_calls = [c for c, _off in calls]
+    all_calls += [c for cs in xcalls.values() for c in cs]
+
+    # A caller that already passes the new name by keyword is a conflict.
+    for call in all_calls:
+        if any(k.arg == name for k in call.keywords):
+            raise _Refuse(
+                f"refused: a call at line {call.lineno} already passes "
+                f"'{name}=' as a keyword argument; the new parameter would "
+                "collide with it")
+
+    total = len(all_calls)
+    if not default and total:
+        raise _Refuse(
+            f"refused: adding a required parameter would break {total} "
+            "provable call site(s); pass option default=... so callers keep "
+            "working, or update them manually")
+
+    new_text = _insert_param(source, fn, name, annotation, default)
+    warnings = [f"added parameter '{name}' to {fn.name}"]
+    if default:
+        warnings.append(f"{total} provable call site(s) stay valid via the "
+                        "default value")
+    else:
+        warnings.append("no provable call sites; the required parameter is "
+                        "safe to add")
+    return _single(_Outcome(new_text, _warn(*warnings)), loaded)
+
+
+def _remove_item_span(source: _Source, start: int, end: int, scope_start: int,
+                      scope_end: int) -> tuple[int, int]:
+    """The delete span for `[start, end)` folded together with one adjacent
+    comma inside `[scope_start, scope_end)`."""
+    text = source.text
+    commas = [t for t in source.tokens()
+              if t.type == tokenize.OP and t.string == ","
+              and scope_start <= t.start < scope_end]
+    after = [t for t in commas if t.start >= end]
+    if after:
+        stop = after[0].end
+        while stop < scope_end and text[stop] in " \t":
+            stop += 1
+        return start, stop
+    before = [t for t in commas if t.end <= start]
+    if before:
+        return before[-1].start, end
+    return start, end
+
+
+def _remove_call_arg_span(source: _Source, call: ast.Call,
+                          arg: ast.AST) -> tuple[int, int]:
+    start, end = source.span(arg)
+    cs, ce = source.span(call)
+    return _remove_item_span(source, start, end, cs, ce)
+
+
+def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
+                         for_write, index):
+    symbol = str(request.symbol or "").strip()
+    fn, qualname = _resolve_function_qual(source, symbol)
+    name = _identifier(options.get("name", ""), "parameter name")
+    if fn.args.vararg is not None or fn.args.kwarg is not None:
+        raise _Refuse(
+            "refused: the function has *args/**kwargs; the call-site arity is "
+            "not statically known, so a parameter cannot be removed "
+            "mechanically")
+    positional = _positional_params(fn)
+    leaf = qualname.rsplit(".", 1)[-1]
+    index_in_pos = None
+    arg_node = None
+    for i, a in enumerate(positional):
+        if a.arg == name:
+            index_in_pos, arg_node = i, a
+            break
+    if arg_node is None:
+        if any(a.arg == name for a in fn.args.kwonlyargs):
+            raise _Refuse(
+                f"refused: '{name}' is a keyword-only parameter; call sites "
+                "pass it by keyword and cannot be updated mechanically")
+        known = ", ".join(a.arg for a in _function_args(fn)) or "(none)"
+        raise _Refuse(
+            f"refused: '{name}' is not a parameter of {fn.name}; parameters: "
+            f"{known}")
+    has_default = _arg_has_default(fn, index_in_pos, positional)
+
+    calls, dynamic, issues = _find_call_sites(source, fn, qualname)
+    xcalls, xissues = _cross_file_callers(root, loaded.rel, qualname, index,
+                                          cfg, for_write)
+    if dynamic:
+        raise _Refuse(
+            f"refused: '{leaf}' is referenced as a value at {dynamic[0]}; that "
+            "reference cannot be updated mechanically (the signature changed)")
+    problems = list(issues) + list(xissues)
+    if problems:
+        shown = "; ".join(problems[:3])
+        raise _Refuse(
+            f"refused: {len(problems)} call site(s) are not provable "
+            f"({shown}); removing a parameter needs every caller to be known")
+
+    n_params = len(positional)
+
+    def check_call(call: ast.Call, recv_off: int = 0) -> ast.AST | None:
+        err = _call_positional_count_ok(call)
+        if err:
+            raise _Refuse(
+                f"refused: a call at line {call.lineno} uses {err}; the "
+                "argument cannot be mapped by position")
+        n_args = len(call.args)
+        call_idx = index_in_pos - recv_off
+        if n_args > call_idx:
+            return call.args[call_idx]
+        if not has_default:
+            raise _Refuse(
+                f"refused: a call at line {call.lineno} passes {n_args} "
+                f"argument(s) for {n_params - recv_off} parameter(s); the "
+                "arity does not match, so the removed argument cannot be "
+                "located")
+        return None
+
+    edits: list[tuple[int, int, str]] = []
+    for call, recv_off in calls:
+        target = check_call(call, recv_off)
+        if target is not None:
+            edits.append((*_remove_call_arg_span(source, call, target), ""))
+    open_off = _open_paren_offset(source, fn)
+    colon = _function_colon(source, fn)
+    aspan = source.span(arg_node)
+    edits.append((*_remove_item_span(source, aspan[0], aspan[1], open_off,
+                                     colon), ""))
+    new_text = _apply_text_edits(source.text, edits)
+
+    changes: list[_FileChange] = []
+    changes.append(_FileChange(loaded.rel, loaded.text, new_text,
+                               loaded.raw_sha, True))
+    removed = 1
+    for rel, calls_in_file in sorted(xcalls.items()):
+        imp = _load_extra(root, rel, cfg, for_write)
+        isrc = _Source(imp.text, _parse_python(imp.text, rel), rel)
+        iedits: list[tuple[int, int, str]] = []
+        for call in calls_in_file:
+            target = check_call(call)
+            if target is not None:
+                iedits.append((*_remove_call_arg_span(isrc, call, target), ""))
+                removed += 1
+        if iedits:
+            changes.append(_FileChange(rel, imp.text,
+                                       _apply_text_edits(imp.text, iedits),
+                                       imp.raw_sha, True))
+    warnings = [f"removed parameter '{name}' from {fn.name}; updated "
+                f"{removed} call site(s)"]
+    return _MultiOutcome(tuple(changes), _warn(*warnings))
+
+
+# ---------------------------------------------------------------------------
+# move_symbol / move_file (cross-file)
+# ---------------------------------------------------------------------------
+def _symbol_block(source: _Source, node: ast.AST
+                  ) -> tuple[int, int, int]:
+    """(move_start, move_end, remove_end) for a top-level symbol: the block to
+    copy (decorators + definition) and the span to delete (plus one blank)."""
+    start_line = _statement_start_line(node)
+    end_line = node.end_lineno or node.lineno
+    start = source.line_start(start_line)
+    end = source.line_end(end_line)
+    stop = end
+    while stop < len(source.text) and source.text[stop:stop + 1] == "\n":
+        stop += 1
+    return start, end, stop
+
+
+def _new_specifier(imp_rel: str, dest_rel: str, is_relative: bool) -> str:
+    if is_relative:
+        spec = relative_specifier(imp_rel, dest_rel)
+        if spec is None:
+            raise _Refuse(
+                "refused: no clean relative import path exists from the "
+                "importer to the destination")
+        return spec
+    return module_name(dest_rel) or dest_rel
+
+
+def _import_module_span(source: _Source, node: ast.ImportFrom
+                        ) -> tuple[int, int] | None:
+    start, end = source.span(node)
+    tokens = [t for t in source.tokens() if start <= t.start < end]
+    from_tok = next((t for t in tokens
+                     if t.type == tokenize.NAME and t.string == "from"), None)
+    import_tok = next((t for t in tokens
+                       if t.type == tokenize.NAME and t.string == "import"
+                       and (from_tok is None or t.start > from_tok.start)),
+                      None)
+    if from_tok is None or import_tok is None:
+        return None
+    s, e = from_tok.end, import_tok.start
+    text = source.text
+    while s < e and text[s] in " \t":
+        s += 1
+    while e > s and text[e - 1] in " \t":
+        e -= 1
+    return (s, e) if s < e else None
+
+
+def _import_name_span(source: _Source, node: ast.Import, name: str
+                      ) -> tuple[int, int] | None:
+    start, end = source.span(node)
+    text = source.text
+    tokens = [t for t in source.tokens() if start <= t.start < end]
+    import_tok = next((t for t in tokens
+                       if t.type == tokenize.NAME and t.string == "import"),
+                      None)
+    if import_tok is None:
+        return None
+    as_tok = next((t for t in tokens
+                   if t.type == tokenize.NAME and t.string == "as"
+                   and t.start > import_tok.start), None)
+    s, e = import_tok.end, as_tok.start if as_tok is not None else end
+    while s < e and text[s] in " \t":
+        s += 1
+    while e > s and text[e - 1] in " \t":
+        e -= 1
+    if s >= e or text[s:e] != name:
+        return None
+    return s, e
+
+
+def _rewrite_move_imports(loaded: _Loaded, src_rel: str, dest_rel: str,
+                          fs: FileSet) -> tuple[str, int]:
+    source = _Source(loaded.text, _parse_python(loaded.text, loaded.rel),
+                     loaded.rel)
+    src_mod = module_name(src_rel)
+    edits: list[tuple[int, int, str]] = []
+    n = 0
+    for node in ast.walk(source.tree):
+        if isinstance(node, ast.ImportFrom):
+            spec = "." * node.level + (node.module or "")
+            try:
+                targets = _import_resolve(loaded.rel, spec, fs) if spec else []
+            except Exception:
+                targets = []
+            if src_rel not in targets:
+                continue
+            if any(a.name == "*" for a in node.names):
+                raise _Refuse(f"star import at line {node.lineno}")
+            span = _import_module_span(source, node)
+            if span is None:
+                raise _Refuse(
+                    f"could not locate the import specifier at line "
+                    f"{node.lineno}")
+            edits.append((span[0], span[1],
+                          _new_specifier(loaded.rel, dest_rel, node.level > 0)))
+            n += 1
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == src_mod:
+                    if len(node.names) != 1:
+                        raise _Refuse(
+                            f"multi-name `import` at line {node.lineno}; "
+                            "qualified references cannot be rewritten")
+                    if not alias.asname:
+                        raise _Refuse(
+                            f"bare `import {alias.name}` at line {node.lineno}; "
+                            "qualified references cannot be updated "
+                            "mechanically")
+                    span = _import_name_span(source, node, alias.name)
+                    if span is None:
+                        raise _Refuse(
+                            f"could not locate '{alias.name}' at line "
+                            f"{node.lineno}")
+                    edits.append((span[0], span[1], module_name(dest_rel)))
+                    n += 1
+    if not edits:
+        return loaded.text, 0
+    return _apply_text_edits(source.text, edits), n
+
+
+def _symbol_importers(root: Path, src_rel: str, symbol: str, index
+                      ) -> list[str]:
+    if index is not None:
+        try:
+            from .graph import symbol_importers
+            return symbol_importers(index, src_rel, symbol)
+        except Exception:
+            pass
+    fs = FileSet(_iter_py_files(root))
+    out: list[str] = []
+    for cand in _iter_py_files(root):
+        if cand == src_rel:
+            continue
+        try:
+            text = fileio.read_text(root / cand)
+        except (OSError, UnicodeDecodeError):
+            continue
+        tree = _parse_python(text, cand) if text.strip() else ast.parse("")
+        for binding in python_import_bindings(text, tree):
+            if binding.kind != "from":
+                continue
+            spec = "." * binding.level + binding.module
+            try:
+                targets = _import_resolve(cand, spec, fs) if spec else []
+            except Exception:
+                targets = []
+            if src_rel in targets and any(n == symbol
+                                          for n, _a in binding.names):
+                out.append(cand)
+                break
+    return sorted(out)
+
+
+def _rewrite_symbol_import(loaded: _Loaded, src_rel: str, dest_rel: str,
+                           symbol: str, fs: FileSet) -> tuple[str, int]:
+    source = _Source(loaded.text, _parse_python(loaded.text, loaded.rel),
+                     loaded.rel)
+    edits: list[tuple[int, int, str]] = []
+    insertions: list[tuple[int, str]] = []      # (offset, line)
+    n = 0
+    for node in ast.walk(source.tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        spec = "." * node.level + (node.module or "")
+        try:
+            targets = _import_resolve(loaded.rel, spec, fs) if spec else []
+        except Exception:
+            targets = []
+        if src_rel not in targets:
+            continue
+        names = [a for a in node.names if a.name == symbol]
+        if not names:
+            continue
+        if any(a.name == "*" for a in node.names):
+            raise _Refuse(f"star import at line {node.lineno}")
+        if len(node.names) == 1 and names[0] is node.names[0]:
+            span = _import_module_span(source, node)
+            if span is None:
+                raise _Refuse(
+                    f"could not locate the import specifier at line "
+                    f"{node.lineno}")
+            edits.append((span[0], span[1],
+                          _new_specifier(loaded.rel, dest_rel, node.level > 0)))
+            n += 1
+            continue
+        # multi-name: remove the alias from the source import and add a new
+        # from-import of the symbol from the destination.
+        got = names[0]
+        new_line = (f"from {_new_specifier(loaded.rel, dest_rel, node.level > 0)}"
+                    f" import {symbol}")
+        if got.asname:
+            new_line += f" as {got.asname}"
+        new_text = _remove_alias(source, got, node)
+        insert_off = source.line_end(node.end_lineno or node.lineno)
+        insertions.append((insert_off, new_line))
+        edits.append((0, len(source.text), new_text))
+        n += 1
+    if not edits and not insertions:
+        return loaded.text, 0
+    text = _apply_text_edits(source.text, edits)
+    # insert new lines right-to-left to keep offsets stable
+    for offset, line in sorted(insertions, key=lambda t: -t[0]):
+        if not line.endswith("\n"):
+            line += "\n"
+        text = text[:offset] + line + text[offset:]
+    return text, n
+
+
+def _recipe_move_symbol(root, request, loaded, source, options, *, cfg,
+                        for_write, index):
+    symbol = str(request.symbol or "").strip()
+    to_file = (options.get("to_file") or "").strip()
+    raw_dest = fileio.normalise_rel(to_file)
+    if raw_dest.lower() == loaded.rel.lower() and raw_dest != loaded.rel:
+        raise _Refuse("refused: the destination differs only by case; a "
+                      "case-only move is rejected")
+    dest_path, dest_rel = _resolve_project_path(root, to_file, cfg, for_write)
+    if dest_rel == loaded.rel:
+        raise _Refuse("refused: source and destination are the same file")
+    if dest_rel.lower() == loaded.rel.lower():
+        raise _Refuse("refused: the destination differs only by case; a "
+                      "case-only move is rejected")
+    if not dest_rel.endswith(".py"):
+        raise _Refuse("refused: to_file must be a .py file")
+
+    matches = [(q, n) for q, n in _definitions(source.tree) if q == symbol]
+    if not matches:
+        known = sorted({q for q, _n in _definitions(source.tree)})[:8]
+        raise _Refuse(
+            f"symbol '{symbol}' was not found as a unique definition"
+            + (f"; known: {', '.join(known)}" if known else ""))
+    if len(matches) > 1:
+        raise _Refuse(f"symbol '{symbol}' is ambiguous")
+    qual, node = matches[0]
+    if "." in qual:
+        raise _Refuse(
+            f"refused: '{symbol}' is not a top-level symbol (it is '{qual}'); "
+            "move only module-level functions and classes")
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+        raise _Refuse("refused: move_symbol supports top-level functions and "
+                      "classes only")
+
+    move_start, move_end, remove_end = _symbol_block(source, node)
+    symbol_text = source.text[move_start:move_end]
+    new_source = source.text[:move_start] + source.text[remove_end:]
+
+    # destination text (append, or create)
+    if dest_path.is_file():
+        dest_loaded = _load_extra(root, dest_rel, cfg, for_write)
+        dest_before = dest_loaded.text
+        dest_text = dest_before
+        if dest_text.strip() and not dest_text.endswith("\n"):
+            dest_text += "\n"
+        if dest_text.strip() and not dest_text.endswith("\n\n"):
+            dest_text += "\n"
+        dest_after = dest_text + symbol_text
+        if not dest_after.endswith("\n"):
+            dest_after += "\n"
+        dest_existed = True
+        dest_sha = dest_loaded.raw_sha
+    else:
+        dest_before = ""
+        dest_after = symbol_text
+        if not dest_after.endswith("\n"):
+            dest_after += "\n"
+        dest_existed = False
+        dest_sha = ""
+
+    fs = FileSet(_iter_py_files(root))
+    importers = _symbol_importers(root, loaded.rel, qual, index)
+    changes: list[_FileChange] = []
+    for imp_rel in importers:
+        imp = _load_extra(root, imp_rel, cfg, for_write)
+        new_imp, _n = _rewrite_symbol_import(imp, loaded.rel, dest_rel, qual,
+                                             fs)
+        changes.append(_FileChange(imp_rel, imp.text, new_imp, imp.raw_sha,
+                                   True))
+    changes.append(_FileChange(loaded.rel, loaded.text, new_source,
+                               loaded.raw_sha, True))
+    if dest_existed:
+        changes.append(_FileChange(dest_rel, dest_before, dest_after, dest_sha,
+                                   True))
+    else:
+        changes.append(_FileChange(dest_rel, "", dest_after, "", False))
+    return _MultiOutcome(tuple(changes), _warn(
+        f"moved '{qual}' from {loaded.rel} to {dest_rel}; updated "
+        f"{len(importers)} importer(s)"))
+
+
+def _recipe_move_file(root, request, loaded, source, options, *, cfg,
+                      for_write, index):
+    del request, source
+    to_path = (options.get("to_path") or "").strip()
+    raw_dest = fileio.normalise_rel(to_path)
+    if raw_dest.lower() == loaded.rel.lower() and raw_dest != loaded.rel:
+        raise _Refuse("refused: the destination differs only by case; a "
+                      "case-only move is rejected")
+    dest_path, dest_rel = _resolve_project_path(root, to_path, cfg, for_write)
+    if dest_rel == loaded.rel:
+        raise _Refuse("refused: source and destination are the same path")
+    if dest_rel.lower() == loaded.rel.lower():
+        raise _Refuse("refused: the destination differs only by case; a "
+                      "case-only move is rejected")
+    if not dest_rel.endswith(".py"):
+        raise _Refuse("refused: to_path must be a .py file")
+    if dest_path.exists():
+        raise _Refuse(
+            f"refused: destination {dest_rel} already exists; nothing was "
+            "written")
+
+    fs = FileSet(_iter_py_files(root))
+    importers = _importers(root, loaded.rel, index)
+    changes: list[_FileChange] = []
+    updated = 0
+    updated_files = 0
+    for imp_rel in importers:
+        imp = _load_extra(root, imp_rel, cfg, for_write)
+        new_text, n = _rewrite_move_imports(imp, loaded.rel, dest_rel, fs)
+        if n:
+            changes.append(_FileChange(imp_rel, imp.text, new_text,
+                                       imp.raw_sha, True))
+            updated += n
+            updated_files += 1
+    changes.append(_FileChange(dest_rel, "", loaded.text, "", False))
+    changes.append(_FileChange(loaded.rel, loaded.text, "",
+                               loaded.raw_sha, True, delete=True))
+    return _MultiOutcome(tuple(changes), _warn(
+        f"moved {loaded.rel} to {dest_rel}; rewrote {updated} import "
+        f"statement(s) in {updated_files} file(s)"))
+
+
+# ---------------------------------------------------------------------------
+# Handler registries
 # ---------------------------------------------------------------------------
 _HANDLERS = {
     "add_import": _recipe_add_import,
@@ -1978,4 +3194,15 @@ _HANDLERS = {
     "print_to_logger": _recipe_print_to_logger,
     "extract_constant": _recipe_extract_constant,
     "add_annotation": _recipe_add_annotation,
+    "wrap_try": _recipe_wrap_try,
+    "wrap_context": _recipe_wrap_context,
+    "replace_deprecated": _recipe_replace_deprecated,
+}
+
+_MULTI_HANDLERS = {
+    "add_param": _recipe_add_param,
+    "remove_param": _recipe_remove_param,
+    "move_symbol": _recipe_move_symbol,
+    "move_file": _recipe_move_file,
+    "add_reexport": _recipe_add_reexport,
 }

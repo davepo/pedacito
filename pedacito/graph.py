@@ -414,3 +414,44 @@ def symbol_pagerank(index, seeds=None, *, iterations: int = 25,
     if seeds is None:
         g._sym_pr = result
     return result
+
+
+def symbol_importers(index, rel: str, symbol: str) -> list[str]:
+    """Importers of ``rel`` that import ``symbol`` from it via a from-import.
+
+    Resolved through the import graph (``index.graph.importers_of``) and each
+    importer's parsed import bindings, so a from-import of a same-named symbol
+    from ANOTHER module is never mistaken for this one. Used by cross-file
+    codemods (``move_symbol``) to find the import statements that must be
+    rewritten. Returns project-relative POSIX paths, sorted.
+    """
+    from . import fileio
+    from .imports import FileSet, python_import_bindings, resolve
+
+    try:
+        importers = index.graph.importers_of(rel)
+    except Exception:
+        return []
+    if not importers:
+        return []
+    fs = FileSet(index.files)
+    out: list[str] = []
+    for f in importers:
+        if not f.endswith(".py"):
+            continue
+        try:
+            text = fileio.read_text(index.root / f)
+        except (OSError, UnicodeDecodeError):
+            continue
+        for binding in python_import_bindings(text):
+            if binding.kind != "from":
+                continue
+            spec = ("." * binding.level) + binding.module
+            try:
+                targets = resolve(f, spec, fs) if spec else []
+            except Exception:
+                targets = []
+            if rel in targets and any(n == symbol for n, _a in binding.names):
+                out.append(f)
+                break
+    return sorted(out)

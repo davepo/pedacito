@@ -73,17 +73,11 @@ def test_catalog_is_exact_and_documented():
             assert option["description"]
 
 
-def test_first_five_recipes_are_implemented_and_rest_are_unverified():
+def test_all_thirteen_recipes_are_implemented():
     by_id = {r["id"]: r for r in list_recipes()}
-    for recipe_id in ("add_import", "remove_import", "print_to_logger",
-                      "extract_constant", "add_annotation"):
+    for recipe_id in EXPECTED_IDS:
         assert by_id[recipe_id]["implemented"] is True
         assert by_id[recipe_id]["status"] == "implemented"
-    for recipe_id in ("add_param", "remove_param", "wrap_try", "wrap_context",
-                      "move_symbol", "move_file", "replace_deprecated",
-                      "add_reexport"):
-        assert by_id[recipe_id]["implemented"] is False
-        assert by_id[recipe_id]["status"] == "unverified"
 
 
 def test_catalog_returns_a_deep_copy():
@@ -101,18 +95,17 @@ def test_codemod_result_is_frozen():
         result.ok = False                   # type: ignore[misc]
 
 
-def test_unknown_recipe_and_unimplemented_recipe_refuse(tmp_path):
+def test_unknown_recipe_refuses(tmp_path):
     _write(tmp_path, "x = 1\n")
     unknown = preview(tmp_path, _request("does_not_exist"))
     assert not unknown.ok
     assert "unknown codemod recipe" in unknown.error
     assert unknown.changed == () and unknown.diffs == {}
 
-    pending = preview(tmp_path, _request("add_param", symbol="f",
-                                         name="x"))
+    pending = preview(tmp_path, _request("add_param", symbol="f", name="x"))
     assert not pending.ok
-    assert "not implemented" in pending.error
-    assert "unverified" in pending.error
+    assert "not found as a unique function" in pending.error
+    assert pending.changed == () and pending.diffs == {}
 
 
 def test_unknown_option_refuses(tmp_path):
