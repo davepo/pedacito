@@ -18,6 +18,7 @@ Usage
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import shutil
@@ -2330,6 +2331,10 @@ class TaskResult:
     clauses: dict = field(default_factory=dict)
     clause_texts: dict = field(default_factory=dict)
     unaccepted: list = field(default_factory=list)
+    # Exit-code verdict overriding a clean finish: False when a protected,
+    # sensitive or policy guard refused a gather-phase write (BUG-03). None means
+    # no objection was recorded.
+    ok: bool | None = None
     # Per-task usage: tokens, cache-hit ratio, seconds, cost (see _task_stats).
     stats: dict = field(default_factory=dict)
     # True when the task stopped early because it hit max_task_seconds or
@@ -2402,6 +2407,51 @@ def _run_tests(idx, cfg, files: list[str]):
     if desc == "no test command detected":
         return None
     return ok, out, desc
+
+
+def _run_shadow_tests(root, idx, cfg, files: list[str]):
+    """`_run_tests` inside an isolated shadow copy (`shadow_tests`, §3.7): the
+    impacted tests run in an independent no-link copy of the project with a
+    private HOME/TMP and a scrubbed environment. The copy is removed after the
+    run. Returns (passed, output, description), or None as `_run_tests` does."""
+    from . import env_resolve, workspace_overlay
+    root = Path(root)
+    shadow = workspace_overlay.build_shadow_copy(root, cfg=cfg)
+    home = None
+    try:
+        resolved = env_resolve.resolve_environment(root)
+        home, _tmp, env = proc_mod.shadow_environment(
+            shadow, cfg=cfg, bin_dirs=resolved.bin_dirs)
+        shadow_idx = copy.copy(idx)
+        shadow_idx.root = shadow
+        ok, out, desc = testsel.run_impacted(shadow_idx, cfg, files, env=env)
+    finally:
+        shutil.rmtree(shadow, ignore_errors=True)
+        if home is not None:
+            shutil.rmtree(home.parent, ignore_errors=True)
+    if desc == "no test command detected":
+        return None
+    events_mod.get(root, cfg).emit(
+        "shadow_tests", status="ran", ok=bool(ok), files=len(files))
+    return ok, out, f"{desc} (isolated shadow copy)"
+
+
+def _shadow_unavailable(root, cfg, files, collect, reason: str) -> None:
+    """`shadow_tests` was requested but the impacted tests could not run in an
+    isolated copy: say so on stderr and in the event stream, and leave the
+    change UNVERIFIED (a red finding), never green."""
+    from . import sandbox, verify as verify_mod
+    msg = (f"shadow_tests is on but the impacted tests could not run in an "
+           f"isolated copy: {reason}. The tests were NOT run, so this change "
+           "is UNVERIFIED.")
+    print(f"  [shadow tests: unavailable -- {reason}; the run stays "
+          "unverified]", file=sys.stderr)
+    workspace.log_event(Path(root), msg, "ERROR")
+    events_mod.get(root, cfg).emit(
+        "shadow_tests", status="unavailable", ok=False, files=len(files),
+        backend=sandbox.backend_name())
+    if collect is not None:
+        collect.append(verify_mod.Finding("tests", "error", "", msg))
 
 
 @dataclass(frozen=True)
@@ -3235,7 +3285,7 @@ def _run_autofix_pass(root, cfg, results, reply, changed):
 
 
 def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
-                     baseline, edit_files, collect=None):
+                     baseline, edit_files, collect=None, lsp=()):
     """After edits were written, run the impacted tests (`verify_tests`).
 
     Before every subprocess run the dry-applied buffers are parsed in-process:
@@ -3275,7 +3325,7 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
              or _test_run_consent(cfg))
     gates_wanted = (_static_enabled(cfg) or _frontend_enabled(cfg)
                     or bool(getattr(cfg, "interface_lock", True))
-                    or _dom_wanted(cfg))
+                    or _dom_wanted(cfg) or bool(lsp))
     if not (tests_wanted or gates_wanted):
         _note_tests_not_run(root, cfg, task)
         return results, reply, None, False
@@ -3361,6 +3411,9 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     pending_lesson: list = []      # (kind, text) this task broke and can mend
     lesson_kinds: set = set()      # every distilled failure kind this run saw
     injected = _injected_lessons(root)   # lessons this run's prompt carried
+    lsp_pending = list(lsp or ())  # LSP gate findings for this batch (once)
+    if collect is not None:
+        collect.extend(f for f in lsp_pending if f.severity != "error")
     for round_ in range(max_rounds + 1):
         syntax = verify_mod.check_syntax(results)
         if syntax:
@@ -3550,6 +3603,43 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             changed = sorted({fileio_norm(r.file) for r in results if r.ok})
             continue
 
+        # LSP diagnostics gate (WP-4103C, opt-in): NEW error-level diagnostics
+        # on lines this batch changed are repaired like any gate finding. The
+        # batch's diagnostics are collected once, so the list is consumed here.
+        if lsp_pending:
+            blockers = [f for f in lsp_pending if f.severity == "error"]
+            lsp_pending = []
+            if blockers:
+                tests_ok = False
+                lines = [f"- {f.file}:{f.line}: {f.message}" for f in blockers[:20]]
+                print(f"  [lsp gate: {len(blockers)} new diagnostic(s) on "
+                      "changed lines -- tests/lint subprocess skipped until they "
+                      "are fixed]", file=sys.stderr)
+                workspace.log_event(
+                    root, "LSP diagnostics gate found new diagnostics on the "
+                          "changed lines; test/lint subprocess skipped", "ERROR")
+                if round_ >= max_rounds:
+                    unresolved('lsp', blockers)
+                    break
+                finding = verify_mod.Finding(
+                    "lsp", "error", "",
+                    "after your edits the language server reports NEW "
+                    "diagnostics on lines you changed. No test or lint process "
+                    "was run. Fix these first:\n" + "\n".join(lines))
+                fixed = agent._repair_from_findings(task, reply, [finding],
+                                                    results)
+                if not fixed:
+                    unresolved('lsp', blockers)     # BUG-311: keep the blocker
+                    break
+                new = agent._apply_once(fixed, False, backup_dir)
+                if not any(r.ok for r in new):
+                    unresolved('lsp', blockers)
+                    break
+                results = _merge_repair_results(results, new)
+                reply = (reply.rstrip() + "\n\n" + fixed)
+                changed = sorted({fileio_norm(r.file) for r in results if r.ok})
+                continue
+
         # Headless DOM smoke gate (TECHNIQUES.md #45, opt-in): the static
         # gates above prove the contracts the browser enforces at LOAD;
         # this one proves the page actually MOUNTS. It runs the entry page
@@ -3614,7 +3704,26 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             _note_lesson_run(root, cfg, lesson_kinds, injected)
             _note_tests_not_run(root, cfg, task)
             return results, reply, tests_ok, False
-        got = _run_tests(idx, cfg, changed)
+        if getattr(cfg, "shadow_tests", False):
+            from . import sandbox
+            if not sandbox.shadow_network_isolation(cfg):
+                _shadow_unavailable(
+                    root, cfg, changed, collect,
+                    f"the `{sandbox.backend_name() or 'no'}` sandbox cannot "
+                    "enforce network isolation on this platform")
+                tests_ok = False
+                break
+            try:
+                got = _run_shadow_tests(root, idx, cfg, changed)
+            except Exception as exc:
+                _shadow_unavailable(
+                    root, cfg, changed, collect,
+                    f"the isolated copy could not be built "
+                    f"({type(exc).__name__}: {exc})")
+                tests_ok = False
+                break
+        else:
+            got = _run_tests(idx, cfg, changed)
         if got is None:
             # Boundary open (tests_wanted), nothing to run: say so honestly.
             _note_lesson_run(root, cfg, lesson_kinds, injected)
@@ -3754,15 +3863,20 @@ def _lsp_gate_texts(root: Path, rels) -> dict:
     return out
 
 
-def _lsp_gate_begin(root, cfg, files) -> _LSPGate | None:
+def _lsp_gate_begin(root, cfg, files, *, written: bool = False) -> _LSPGate | None:
     """Baseline diagnostics before a symbol batch lands. Returns None when the
-    gate is off (lsp_diagnostics_gate and allow_lsp are both required)."""
+    gate is off (lsp_diagnostics_gate and allow_lsp are both required).
+    `written` marks files a gather-phase action already changed: their
+    pre-edit state is gone, so the gate reports `unavailable` for them rather
+    than inventing a baseline."""
     if not (getattr(cfg, "lsp_diagnostics_gate", False)
             and getattr(cfg, "allow_lsp", False)):
         return None
     from . import env_resolve, lsp as lsp_mod
     root = Path(root).resolve()
     rels = tuple(sorted({fileio_norm(f) for f in files if f}))
+    if written:
+        return _LSPGate(rels, None, {}, "unavailable", (), 0.0)
     env = env_resolve.resolve_environment(root)
     texts = _lsp_gate_texts(root, rels)
     deadline = time.monotonic() + lsp_mod.GATE_BUDGET_SECONDS
@@ -3823,6 +3937,14 @@ def _lsp_gate_finish(gate, root, cfg) -> list:
     except Exception:
         pass
     return findings
+
+
+def _lsp_gate_settle(root, cfg, *gates) -> list:
+    """Actionable findings of every LSP gate a task ran (None entries skipped)."""
+    out: list = []
+    for gate in gates:
+        out.extend(_lsp_gate_finish(gate, root, cfg))
+    return out
 
 
 def _post_edit_lint_incremental(root, cfg, agent, task, results, reply,
@@ -5141,12 +5263,9 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
                 delattr(cfg, "_task_images")
 
 
-def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,
-                      idx=None):
-    bdir = getattr(attempt_tr, "backup_dir", None) if attempt_tr else None
-    cur_idx = idx if idx is not None else getattr(attempt_tr, "idx", None)
-    if not bdir:
-        return cur_idx
+def _restore_backups(root: Path, cfg, bdir, cur_idx=None):
+    """Put every file a backup directory holds back to its pre-task bytes and
+    remove the files it created; re-index what came back. Returns the index."""
     bpath = Path(bdir)
     if not bpath.is_dir():
         return cur_idx
@@ -5159,6 +5278,15 @@ def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,
             except Exception:
                 pass
     return cur_idx
+
+
+def _rollback_attempt(root: Path, cfg, attempt_tr: TaskResult | None,
+                      idx=None):
+    bdir = getattr(attempt_tr, "backup_dir", None) if attempt_tr else None
+    cur_idx = idx if idx is not None else getattr(attempt_tr, "idx", None)
+    if not bdir:
+        return cur_idx
+    return _restore_backups(root, cfg, bdir, cur_idx)
 
 
 def _run_ladder(root: Path, cfg, client, agent, idx, task: str, *,
@@ -5374,6 +5502,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     todo_mod.clear(root)          # a fresh checklist per task; auto has PLAN.md
     _fire(cfg, root, "pre_task", task=task[:500])
     print("\n--- looking things up ---", file=sys.stderr)
+    cfg._task_refusals = []       # guard refusals of THIS attempt (BUG-03)
     gathered = agent.gather(task, backup_dir=backup_dir, is_repair=is_repair)
     blueprint = str(getattr(cfg, "_hybrid_blueprint", "") or "")
     if blueprint:
@@ -5388,6 +5517,9 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     # the deepclitest pattern -- produces no answer-phase edit blocks, and
     # its mutations used to bypass post-edit verification entirely.
     gather_mut = list(getattr(cfg, "_task_mutations", None) or ())
+    gather_refused = list(getattr(cfg, "_task_refusals", None) or ())
+    gather_gate = (_lsp_gate_begin(root, cfg, gather_mut, written=True)
+                   if gather_mut else None)
     tests_ok = None
     tests_preexisting_only = False
     print("--- answering ---\n", file=sys.stderr)
@@ -5447,6 +5579,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                         f"{pre.message}") for f in edit_files]
             reply = raw_reply
         else:
+            lsp_gate = (_lsp_gate_begin(root, cfg, edit_files)
+                        if apply and not review and edit_files else None)
             results, reply = agent.apply(
                 raw_reply, dry_run=review or not apply, task=task,
                 gathered=gathered, backup_dir=None if review else backup_dir)
@@ -5460,7 +5594,11 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, baseline_tests,
                         sorted(set(edit_files) | set(gather_mut)),
-                        collect=findings)
+                        collect=findings,
+                        lsp=_lsp_gate_settle(
+                            root, cfg,
+                            lsp_gate if any(r.ok for r in results) else None,
+                            gather_gate))
     elif incremental:
         # One symbol hunk at a time, each dry-applied and verified
         # before it is written. The full impacted-test/lint pass runs once,
@@ -5505,10 +5643,10 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     root, f"incremental batch PARTIALLY applied: {landed} of "
                           f"{len(results)} block(s) landed; not applied: "
                           f"{missing}", "WARN")
-            findings = verify_mod.dedupe_findings(
-                list(findings) + _lsp_gate_finish(
-                    lsp_gate if any(r.ok for r in results) else None,
-                    root, cfg))
+            lsp_items = _lsp_gate_settle(
+                root, cfg, lsp_gate if any(r.ok for r in results) else None,
+                gather_gate)
+            findings = verify_mod.dedupe_findings(list(findings))
             for f in findings:
                 workspace.log_event(root, f"verify: {f.render()}",
                                     "WARN" if f.severity == "warn" else "ERROR")
@@ -5520,7 +5658,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     root, cfg, agent, idx, task, results, reply,
                     backup_dir, baseline_tests,
                     sorted(set(edit_files) | set(gather_mut)),
-                    collect=findings)
+                    collect=findings, lsp=lsp_items)
                 results, reply = _post_edit_lint_incremental(
                     root, cfg, agent, task, results, reply, backup_dir,
                     lint_baseline)
@@ -5592,6 +5730,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                            for f in edit_files]
                 reply = raw_reply
             else:
+                lsp_gate = (_lsp_gate_begin(root, cfg, edit_files)
+                            if apply and not review and edit_files else None)
                 results, reply = agent.apply(
                     raw_reply, dry_run=review or not apply, task=task,
                     gathered=gathered,
@@ -5630,7 +5770,11 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                         root, cfg, agent, idx, task, results, reply,
                         backup_dir, baseline_tests,
                         sorted(set(edit_files) | set(gather_mut)),
-                        collect=findings)
+                        collect=findings,
+                        lsp=_lsp_gate_settle(
+                            root, cfg,
+                            lsp_gate if any(r.ok for r in results) else None,
+                            gather_gate))
             if not results and getattr(agent, "noop_discards", None):
                 # The reply's only blocks were null edits (SEARCH == REPLACE)
                 # dropped by parse_edits: the model had concluded no edit was
@@ -5710,6 +5854,29 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                           verify_mod.REQ_READ)]
     # One finding per clause, not per gate that re-checked it (BUG-207).
     findings = verify_mod.dedupe_findings(findings)
+    task_ok = False if gather_refused else None
+    if gather_refused and apply and not review:
+        from .config import atomic_edits_enabled
+        print(f"  [refused by a protected/sensitive/policy guard: "
+              f"{', '.join(gather_refused[:8])}]", file=sys.stderr)
+        workspace.log_event(
+            root, "gather-phase write refused by a protected/sensitive/policy "
+                  f"guard: {', '.join(gather_refused[:8])}", "ERROR")
+        if atomic_edits_enabled(cfg):
+            if backup_dir is not None:
+                idx = _restore_backups(root, cfg, backup_dir, idx)
+                results = [Result(False, r.file, "rolled back: a write in this "
+                                  "task was refused (atomic_edits)")
+                           for r in results]
+                gather_mut = []
+                print("  [atomic_edits: a refused write rolled back every "
+                      "change this task made]", file=sys.stderr)
+                workspace.log_event(root, "atomic_edits: rolled back the "
+                                          "task's changes after a refused write",
+                                    "ERROR")
+            else:
+                print("  [atomic_edits: backups are off, so the partial "
+                      "changes could not be rolled back]", file=sys.stderr)
     applied = False
     if review:
         if not parse_edits(reply):
@@ -5821,7 +5988,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                       tests_preexisting_only=tests_preexisting_only,
                       budget_hit=bool(getattr(agent, "_task_budget_hit", False)),
                       clauses=clauses, clause_texts=clause_texts,
-                      unaccepted=unaccepted)
+                      unaccepted=unaccepted, ok=task_ok)
 
 
 # Corrective re-runs are one-shot: a second identical failure is a verdict,

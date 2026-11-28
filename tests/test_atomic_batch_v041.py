@@ -14,14 +14,17 @@ import errno
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import fileio, journal, security
+from pedacito import fileio, journal, loop, security
+from pedacito import tools as tools_mod
+from pedacito import verify as verify_mod
 from pedacito.config import Config, atomic_edits_enabled
-from pedacito.edits import apply_edits_atomic, parse_edits
+from pedacito.edits import Result, apply_edits_atomic, parse_edits
 from pedacito.workspace_overlay import VirtualWorkspace
 
 
@@ -337,3 +340,158 @@ def test_overlay_batch_applies_atomically_on_disk(tmp_path):
     assert all(r.ok for r in results)
     assert (proj / "a.py").read_text(encoding="utf-8") == "A = 2\n"
     assert (proj / "b.py").read_text(encoding="utf-8") == "B = 2\n"
+
+
+# --------------------------------------- refused gather writes (BUG-03, run_task)
+
+PROTECTED = ".pedacito.toml"
+
+
+class _GatherWriter:
+    """Gather phase that appends through the real write tool. Each append is
+    one gather-phase mutation; the protected config append is refused."""
+
+    steps_log: list = []
+
+    def __init__(self, root, cfg, appends):
+        self.root, self.cfg, self.appends = root, cfg, appends
+
+    def gather(self, task, backup_dir=None, **kw):
+        self.cfg._backup_dir = backup_dir
+        idx = SimpleNamespace(root=self.root, files=[])
+        for rel, text in self.appends:
+            tools_mod.tool_write(idx, self.cfg, rel, text, append=True)
+        return "gathered source"
+
+    def answer(self, task, gathered, **kw):
+        return "Both requested edits are done."
+
+    def apply(self, reply, **kw):
+        return [], reply
+
+
+def _task_cfg(**kw) -> Config:
+    cfg = _cfg(**kw)
+    cfg.backup = True
+    cfg.allow_write = True
+    cfg.verify_tests = False
+    return cfg
+
+
+def _project(tmp_path):
+    _write(tmp_path, "currency.py", "X = 1\n")
+    _write(tmp_path, PROTECTED, "max_total_model_calls = 1\n")
+    return tmp_path
+
+
+def _run(tmp_path, cfg, agent, task="Apply two edits"):
+    return loop.run_task(tmp_path, cfg, None, agent,
+                         SimpleNamespace(root=tmp_path, files=[]), task,
+                         apply=True)
+
+
+def test_refused_protected_append_rolls_back_partial_gather_writes(tmp_path):
+    root = _project(tmp_path)
+    cfg = _task_cfg(atomic_edits=True)
+    agent = _GatherWriter(root, cfg, [
+        ("currency.py", "# atomic probe\n"),
+        (PROTECTED, "max_total_model_calls = 99\n"),
+    ])
+    tr = _run(root, cfg, agent)
+    assert (root / "currency.py").read_text(encoding="utf-8") == "X = 1\n"
+    assert (root / PROTECTED).read_text(encoding="utf-8") == \
+        "max_total_model_calls = 1\n"
+    assert tr.applied is False
+    assert tr.ok is False
+    assert tr.changed == []
+
+
+def test_refused_write_without_atomic_is_still_not_ok(tmp_path):
+    root = _project(tmp_path)
+    cfg = _task_cfg(atomic_edits=False)
+    agent = _GatherWriter(root, cfg, [
+        ("currency.py", "# atomic probe\n"),
+        (PROTECTED, "max_total_model_calls = 99\n"),
+    ])
+    tr = _run(root, cfg, agent)
+    # Legacy apply keeps the change that landed, but the refusal is not a
+    # clean success: the verdict says so.
+    assert "# atomic probe" in (root / "currency.py").read_text(encoding="utf-8")
+    assert tr.ok is False
+
+
+def test_clean_gather_write_stays_ok(tmp_path):
+    root = _project(tmp_path)
+    cfg = _task_cfg(atomic_edits=True)
+    agent = _GatherWriter(root, cfg, [("currency.py", "# atomic probe\n")])
+    tr = _run(root, cfg, agent)
+    assert "# atomic probe" in (root / "currency.py").read_text(encoding="utf-8")
+    assert tr.applied is True
+    assert tr.ok is None
+
+
+def test_refusal_ledger_is_per_attempt(tmp_path):
+    root = _project(tmp_path)
+    cfg = _task_cfg(atomic_edits=True)
+    cfg._task_refusals = ["stale-from-earlier-attempt"]
+    agent = _GatherWriter(root, cfg, [("currency.py", "# atomic probe\n")])
+    tr = _run(root, cfg, agent)
+    assert tr.ok is None
+    assert "# atomic probe" in (root / "currency.py").read_text(encoding="utf-8")
+
+
+class _Requirement:
+    is_edit = True
+    state = verify_mod.REQ_UNLOCATED
+
+    def __init__(self, req_id):
+        self.req_id = req_id
+        self.text = req_id
+
+
+class _Tracker:
+    def __init__(self, task, reqs):
+        self.task = task
+        self._reqs = reqs
+
+    def __iter__(self):
+        return iter(self._reqs)
+
+    def clause_map(self):
+        return {}
+
+    def clause_texts(self):
+        return {}
+
+
+class _LegacyEditor:
+    steps_log: list = []
+    REPLY = ("--- FILE: currency.py\n<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n"
+             ">>>>>>> REPLACE\n")
+
+    def __init__(self, root, task, reqs):
+        self.root = root
+        self.requirements = _Tracker(task, reqs)
+
+    def gather(self, task, **kw):
+        return "gathered source"
+
+    def answer(self, task, gathered, **kw):
+        return self.REPLY
+
+    def apply(self, reply, **kw):
+        (self.root / "currency.py").write_text("X = 2\n", encoding="utf-8")
+        return [Result(True, "currency.py", "applied")], reply
+
+
+def test_unaccepted_clause_without_a_refusal_keeps_the_verdict(tmp_path):
+    """An applied edit whose requirement clause went unevidenced is not a
+    refusal: the verdict stays as BUG-212 defined it (landed work exits 0)."""
+    root = _project(tmp_path)
+    cfg = _task_cfg(atomic_edits=False)
+    task = "Change X and also rename Y"
+    agent = _LegacyEditor(root, task, [_Requirement("R1")])
+    tr = _run(root, cfg, agent, task=task)
+    assert (root / "currency.py").read_text(encoding="utf-8") == "X = 2\n"
+    assert tr.applied is True and tr.unaccepted == ["R1"]
+    assert tr.ok is None
