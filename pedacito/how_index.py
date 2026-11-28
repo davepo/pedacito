@@ -1962,7 +1962,7 @@ CLI_COMMANDS = [
         "name": "bench",
         "usage": "pedacito bench [BENCHMARK|all] [--list | --recent] "
                  "[--dir DIR] [--json] [--strict] | pedacito bench compare "
-                 "BASELINE CURRENT [--json]",
+                 "BASELINE CURRENT [--json] [--tolerance FLOAT] [--strict]",
         "summary": "Run the six-project diagnostic benchmark suite with its "
                    "hidden holdout rubric, or list the benchmarks and recent "
                    "runs. A run builds the project through the normal loop, "
@@ -1976,6 +1976,7 @@ CLI_COMMANDS = [
             "pedacito bench all --json --strict",
             "pedacito bench rpn_expression_calc --dir ~/benchmarks --json",
             "pedacito bench compare before.json after.json",
+            "pedacito bench compare before.json after.json --strict",
         ],
         "flags": [
             {"flag": "BENCHMARK",
@@ -1987,6 +1988,9 @@ CLI_COMMANDS = [
              "help": "compare: allowed prompt-token growth (default 0)"},
             {"flag": "--max-time-growth FRAC",
              "help": "compare: allowed seconds growth (default 0.50)"},
+            {"flag": "--tolerance FLOAT",
+             "help": "compare: allowed pass/locate/first-apply drop in "
+                     "task-equivalents (default 1.0); 0 gates any drop"},
             {"flag": "--list", "help": "list the six benchmarks and exit"},
             {"flag": "--recent",
              "help": "list recent runs under the benchmarks root and exit"},
@@ -1995,7 +1999,8 @@ CLI_COMMANDS = [
             {"flag": "--json",
              "help": "print structured JSON on stdout for CI"},
             {"flag": "--strict",
-             "help": "exit 1 unless model tests and holdout rubric both pass"},
+             "help": "exit 1 unless model tests and holdout rubric both "
+                     "pass; with compare, same as --tolerance 0"},
             {"flag": "--model-timeout SEC",
              "help": "timeout for the generated project's own tests"},
             {"flag": "--holdout-timeout SEC",

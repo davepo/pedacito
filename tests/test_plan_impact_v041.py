@@ -196,6 +196,30 @@ def test_dependency_cycle_and_later_task_dependency_are_errors(tmp_path):
     assert plan.check_plan_exit_code(issues) == 1
 
 
+def test_dependency_cycle_names_every_participating_task(tmp_path):
+    root, idx = _build_project(tmp_path)
+    # Two cycles share task 2; the finding must name the whole group, not
+    # only one DFS back-edge (the QA report saw a partial "between tasks 2").
+    path = _plan(root,
+                 "- [ ] first (depends on 2)\n"
+                 "- [ ] second (depends on 1, 3)\n"
+                 "- [ ] third (depends on 2)")
+    issues, _impact = plan.check_plan(root, path, idx)
+    cycle = next(i for i in issues if i.code == "task_dependency_cycle")
+    assert cycle.message == "dependency cycle between tasks 1, 2, 3"
+
+
+def test_a_two_task_cycle_names_both_tasks(tmp_path):
+    root, idx = _build_project(tmp_path)
+    path = _plan(root,
+                 "- [ ] first\n"
+                 "- [ ] second (depends on 3)\n"
+                 "- [ ] third (depends on 2)")
+    issues, _impact = plan.check_plan(root, path, idx)
+    cycle = next(i for i in issues if i.code == "task_dependency_cycle")
+    assert cycle.message == "dependency cycle between tasks 2 and 3"
+
+
 def test_missing_dependency_number_is_an_error(tmp_path):
     root, idx = _build_project(tmp_path)
     path = _plan(root, "- [ ] only task depends_on: 3")

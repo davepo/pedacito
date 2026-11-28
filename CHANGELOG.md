@@ -2,6 +2,19 @@
 
 All notable changes to Pedacito (`pdc`) are documented here.
 
+## v0.4.2 - Unreleased
+
+### QA fixes
+
+- **Version metadata.** The package, `pyproject.toml` and `pdc --version` now
+  report `0.4.2` on the v0.4.2 development branch.
+- **Plan dependency cycles.** A cycle finding now names every task in the
+  cycle, including all members of a strongly connected component.
+- **Scorecard tolerance.** `pedacito bench compare` accepts `--tolerance` and
+  `--strict`, so CI can fail on a single-task regression.
+- **API oracle.** A dotted attribute such as `requests.get` now resolves to
+  its declared root package `requests`.
+
 ## v0.4.0 — 2026-11-26
 
 ### Session Foundation, Isolation Contract, Sandbox, Daemon and Parallel Subagents

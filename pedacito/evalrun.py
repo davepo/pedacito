@@ -1018,7 +1018,8 @@ _RATE_METRICS = (
 def compare_reports(baseline: dict, current: dict,
                     max_token_growth: float = 0.20,
                     max_time_growth: float = 0.50,
-                    notes: list[str] | None = None
+                    notes: list[str] | None = None,
+                    pass_tolerance: float = 1.0
                     ) -> tuple[list[str], list[str]]:
     """A/B gate: regressions and improvements in two `eval --out` reports.
 
@@ -1030,8 +1031,9 @@ def compare_reports(baseline: dict, current: dict,
 
     Rates are compared from the per-task rows, over the tasks both reports ran
     and over all their repeats. A drop is a regression only when it is more
-    than one task-equivalent (one task fewer passing, in every repeat), so a
-    single task flipping, even across every repeat, is noted and not gated.
+    than `pass_tolerance` task-equivalents (default: one task fewer passing,
+    in every repeat), so a single task flipping, even across every repeat, is
+    noted and not gated by default. `pass_tolerance=0` gates any drop at all.
     A report without rows falls back to the exact summary rates.
 
     A failure label the baseline's taxonomy could not emit is information, not
@@ -1077,11 +1079,15 @@ def compare_reports(baseline: dict, current: dict,
                 return
             old, new = sum(bv) / len(bv), sum(cv) / len(cv)
             items = min(len(bv) / b_n, len(cv) / c_n)
-            # One task-equivalent, or twice the standard error of the two
-            # runs' repeat-to-repeat spread when that is larger: a noisy
-            # model widens its own margin instead of failing on a coin flip.
-            tol = max(1.0 / max(1.0, items), 2 * _std_error(
-                _repeat_means(b_sel, fn), _repeat_means(c_sel, fn)))
+            # One task-equivalent (or the caller's tolerance), or twice the
+            # standard error of the two runs' repeat-to-repeat spread when
+            # that is larger: a noisy model widens its own margin instead of
+            # failing on a coin flip. Strict mode (0) gates any measured drop.
+            if pass_tolerance <= _TOLERANCE_EPS:
+                tol = 0.0
+            else:
+                tol = max(pass_tolerance / max(1.0, items), 2 * _std_error(
+                    _repeat_means(b_sel, fn), _repeat_means(c_sel, fn)))
             drop = old - new
             if drop > tol + _TOLERANCE_EPS:
                 regressions.append(
@@ -1796,6 +1802,7 @@ def _legacy_view(card: dict) -> dict:
 def compare_scorecards(baseline: dict, current: dict, *,
                        max_prompt_growth: float = 0.0,
                        max_time_growth: float = 0.50,
+                       pass_tolerance: float = 1.0,
                        notes: list[str] | None = None
                        ) -> tuple[list[str], list[str]]:
     """Regressions and improvements between two scorecards.
@@ -1804,11 +1811,14 @@ def compare_scorecards(baseline: dict, current: dict, *,
     `_COMPARE_FIELDS` (corpus, task set, seeds, model, profile, tokenizer,
     thinking mode and metric versions); otherwise ScorecardError is raised and
     nothing is synthesised. Prompt-token growth beyond `max_prompt_growth`
-    (default: none) is a regression. Time and the other rates go through
-    `compare_reports`. Per-stratum rates go to `notes`, which is not gated.
+    (default: none) is a regression. Pass/locate/first-apply drops beyond
+    `pass_tolerance` task-equivalents (default: one; 0 gates any drop) and
+    time growth go through `compare_reports`. Per-stratum rates go to `notes`,
+    which is not gated.
     """
     for name, tolerance in (("max_prompt_growth", max_prompt_growth),
-                            ("max_time_growth", max_time_growth)):
+                            ("max_time_growth", max_time_growth),
+                            ("pass_tolerance", pass_tolerance)):
         if not _type_ok(tolerance, "number") or not math.isfinite(tolerance) \
                 or tolerance < 0:
             raise ScorecardError(f"{name} must be a finite number >= 0, "
@@ -1852,7 +1862,8 @@ def compare_scorecards(baseline: dict, current: dict, *,
         improvements.append(f"mean prompt tokens: {old:.1f} -> {new:.1f}")
     reg, imp = compare_reports(b_view, c_view,
                                max_token_growth=float("inf"),
-                               max_time_growth=max_time_growth, notes=info)
+                               max_time_growth=max_time_growth,
+                               pass_tolerance=pass_tolerance, notes=info)
     for stratum in STRATA:
         b = baseline["summary"]["by_stratum"][stratum]
         c = current["summary"]["by_stratum"][stratum]

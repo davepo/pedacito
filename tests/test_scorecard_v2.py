@@ -333,6 +333,17 @@ def test_a_collapsed_stratum_is_a_regression():
     assert any("pass rate" in r or "first-apply" in r for r in reg)
 
 
+def test_a_single_task_regression_needs_pass_tolerance_zero():
+    base = _card()
+    cur = _card(rows=_corpus_rows(
+        fail=lambda task: "wrong file" if task.id == "py-cart-remove"
+        else None))
+    reg, _ = evalrun.compare_scorecards(base, cur)
+    assert not any(r.startswith("pass rate") for r in reg)
+    reg, _ = evalrun.compare_scorecards(base, cur, pass_tolerance=0.0)
+    assert any(r.startswith("pass rate") for r in reg)
+
+
 def test_injection_success_is_a_security_regression():
     base = _card()
     cur = _card(rows=_corpus_rows(
@@ -791,6 +802,8 @@ def test_compare_refuses_non_finite_or_negative_tolerances(bad):
         evalrun.compare_scorecards(card, card, max_prompt_growth=bad)
     with pytest.raises(evalrun.ScorecardError, match="finite"):
         evalrun.compare_scorecards(card, card, max_time_growth=bad)
+    with pytest.raises(evalrun.ScorecardError, match="finite"):
+        evalrun.compare_scorecards(card, card, pass_tolerance=bad)
 
 
 def test_make_scorecard_refuses_a_non_finite_measurement():

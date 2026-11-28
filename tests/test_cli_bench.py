@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import site
 import sys
 from pathlib import Path
 
@@ -11,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import benchmarks
 from pedacito.cli import main
+
+# Captured before the autouse fixture moves APPDATA, so child interpreters can
+# still import the per-user site-packages holding this environment's pytest.
+_USER_SITE = site.getusersitepackages()
 
 
 def _isolate(monkeypatch, tmp_path):
@@ -96,6 +102,10 @@ def _config_file(tmp_path) -> Path:
 def test_bench_one_benchmark_json_with_injected_generator(
         monkeypatch, tmp_path, capsys):
     _isolate(monkeypatch, tmp_path)
+    # The suite isolates APPDATA, which hides user-site pytest from the
+    # benchmark's child interpreter; put it back on the child's path.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
+        p for p in (_USER_SITE, os.environ.get("PYTHONPATH", "")) if p))
     cfgfile = _config_file(tmp_path)
     real = benchmarks.run_benchmark
 
@@ -157,6 +167,19 @@ def test_bench_compare_identical_scorecards_pass(monkeypatch, tmp_path, capsys):
     code = main(["bench", "compare", str(base), str(cur)])
     assert code == 0
     assert "result: PASS" in capsys.readouterr().out
+
+
+def test_bench_compare_one_task_regression_fails_with_tolerance_zero(
+        monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    base = _write(tmp_path / "base.json", _card())
+    cur = _write(tmp_path / "cur.json", _card(rows=_corpus_rows(
+        fail=lambda task: "wrong file" if task.id == "py-cart-remove"
+        else None)))
+    assert main(["bench", "compare", str(base), str(cur)]) == 0
+    assert main(["bench", "compare", str(base), str(cur),
+                 "--tolerance", "0"]) == 1
+    assert main(["bench", "compare", str(base), str(cur), "--strict"]) == 1
 
 
 def test_bench_compare_regression_exits_one(monkeypatch, tmp_path, capsys):
@@ -248,6 +271,10 @@ def test_eval_parser_accepts_scorecard_and_bench_compare_parses():
                             "--max-time-growth", "0.2"])
     assert ns.benchmark == "compare" and ns.bench_args == ["a.json", "b.json"]
     assert ns.max_time_growth == 0.2 and ns.max_prompt_growth == 0.0
+    assert ns.tolerance == 1.0 and ns.strict is False
+    ns = parser.parse_args(["bench", "compare", "a.json", "b.json",
+                            "--tolerance", "0", "--strict"])
+    assert ns.tolerance == 0.0 and ns.strict is True
 
 
 @pytest.mark.parametrize("flag,value", [
@@ -256,6 +283,9 @@ def test_eval_parser_accepts_scorecard_and_bench_compare_parses():
     ("--max-time-growth", "-Infinity"),
     ("--max-time-growth", "-0.1"),
     ("--max-time-growth", "abc"),
+    ("--tolerance", "nan"),
+    ("--tolerance", "-0.1"),
+    ("--tolerance", "abc"),
 ])
 def test_bench_compare_refuses_bad_tolerances_at_parse_time(
         monkeypatch, tmp_path, flag, value):

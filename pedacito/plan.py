@@ -758,26 +758,51 @@ def _task_rows(text: str) -> list[tuple[int, str, str]]:
 
 def _dependency_cycles(deps: dict[int, tuple[int, ...]]
                        ) -> list[tuple[int, ...]]:
-    color: dict[int, int] = {}
+    """Strongly connected task groups: every participant in a dependency cycle.
+
+    Reporting the whole component (rather than each DFS back-edge cycle) keeps
+    the diagnostic complete when several cycles share tasks, e.g. 1 <-> 2 and
+    2 <-> 3 are one group and must all be named.
+    """
+    graph = {
+        node: tuple(dep for dep in sorted(set(deps.get(node, ())))
+                    if dep in deps)
+        for node in deps
+    }
+    index: dict[int, int] = {}
+    low: dict[int, int] = {}
     stack: list[int] = []
-    found: set[tuple[int, ...]] = set()
+    on_stack: set[int] = set()
+    found: list[tuple[int, ...]] = []
+    counter = 0
 
     def visit(node: int) -> None:
-        color[node] = 1
+        nonlocal counter
+        index[node] = low[node] = counter
+        counter += 1
         stack.append(node)
-        for dep in deps.get(node, ()):
-            if dep not in deps:
-                continue
-            if color.get(dep, 0) == 1:
-                start = stack.index(dep)
-                found.add(tuple(sorted(stack[start:])))
-            elif color.get(dep, 0) == 0:
+        on_stack.add(node)
+        for dep in graph.get(node, ()):
+            if dep not in index:
                 visit(dep)
-        stack.pop()
-        color[node] = 2
+                low[node] = min(low[node], low[dep])
+            elif dep in on_stack:
+                low[node] = min(low[node], index[dep])
+        if low[node] != index[node]:
+            return
+        component: list[int] = []
+        while True:
+            member = stack.pop()
+            on_stack.remove(member)
+            component.append(member)
+            if member == node:
+                break
+        component.sort()
+        if len(component) > 1 or node in graph.get(node, ()):
+            found.append(tuple(component))
 
     for node in sorted(deps):
-        if color.get(node, 0) == 0:
+        if node not in index:
             visit(node)
     return sorted(found, key=lambda c: (c[0], len(c), c))
 
@@ -813,7 +838,10 @@ def _structured_errors(root: Path, text: str
                             f"loop executes top-down, so the dependency cannot "
                             f"be satisfied"))
     for cycle in _dependency_cycles(deps):
-        label = ", ".join(str(n) for n in cycle)
+        if len(cycle) == 2:
+            label = f"{cycle[0]} and {cycle[1]}"
+        else:
+            label = ", ".join(str(n) for n in cycle)
         issues.append(_issue(
             "task_dependency_cycle", ERROR, min(cycle),
             message=f"dependency cycle between tasks {label}"))

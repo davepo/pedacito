@@ -215,7 +215,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito parsers prefetch [--languages ...]` | Pre-warm the tree-sitter grammars for offline or air-gapped use and report ok or failed per language |
 | `pedacito eval` | Score the harness on fixture repositories. Use `--baseline` as a regression gate |
 | `pedacito bench [BENCHMARK\|all]` | Run the six-project diagnostic benchmark suite and hidden holdout rubric. `--list` and `--recent` need no model; `--json` and `--strict` fit CI |
-| `pedacito bench compare BASELINE CURRENT` | Gate two eval scorecards written by `pedacito eval --scorecard`: exit 0 pass, 1 regression, 2 invalid or incomparable. Needs no model; `--max-prompt-growth` defaults to 0 |
+| `pedacito bench compare BASELINE CURRENT` | Gate two eval scorecards written by `pedacito eval --scorecard`: exit 0 pass, 1 regression, 2 invalid or incomparable. Needs no model; `--max-prompt-growth` defaults to 0, and `--strict` (or `--tolerance 0`) gates any pass-rate drop |
 | `pedacito memory`, `skills`, `prune`, `reset`, `trust`, `worktree`, `serve`, `procs`, `lsp`, `mcp`, `diagnose`, `tests`, `webcheck`, `domcheck` | Upkeep and specialist tools. `mcp list` shows the named MCP servers' tools and trust flags |
 
 Benchmarks also run from the GUI through the **Benchmarks** button; the CLI
