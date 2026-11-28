@@ -514,6 +514,8 @@ const S = {
         updateDrawerOpen: false, updateManual: '', updateRunHidden: false },
   peek: null,
   how: { query: '', answer: null, loading: false, error: '', useModel: true },
+  prompt: { report: null, reports: [], diff: null, loading: false,
+            error: '', compare: '', runId: '' },
 };
 PDC.S = S;
 
@@ -762,6 +764,7 @@ function applyStatus(s) {
   if (!j && lastJobId) {
     collapseDone(); loadPlan(); loadReview(); loadFiles(); loadBackups();
     loadPreview(true); loadRunnerTargets(true); loadCheckpoints(true);
+    if (S.ws.tab === 'prompt') loadPromptReport(true);
   }
   if (!j && S.ui.planGenerating && !S.ui.planGenFrom) {
     S.ui.planGenerating = false;
@@ -777,9 +780,12 @@ function applyStatus(s) {
   if ((s.root || '') !== (prev.root || '')) {
     loadPreview();                              // project opened/switched
     S.ws.targets = null; S.ws.runOut = null;
+    S.prompt.report = null; S.prompt.reports = []; S.prompt.diff = null;
+    S.prompt.error = ''; S.prompt.compare = ''; S.prompt.runId = '';
     loadRunnerTargets(true);
     S.cp.loaded = false;
     loadCheckpoints(true);
+    if (S.ws.tab === 'prompt' && s.root) loadPromptReport(true);
   }
   if ((s.files_sig || '') !== lastFilesSig) {   // index or workspace changed
     lastFilesSig = s.files_sig || '';
@@ -2266,6 +2272,7 @@ function setWsTab(t) {
     else if (t === 'backups') loadBackups(true);
     else if (t === 'preview') loadPreview(true);  // click again = reload page
     else if (t === 'runner') { loadRunnerTargets(true); S.ws.runRev++; emit(); }
+    else if (t === 'prompt') loadPromptReport(true);
     return;
   }
   S.ws.tab = t;
@@ -2275,6 +2282,7 @@ function setWsTab(t) {
   if (t === 'backups') loadBackups();
   if (t === 'preview') loadPreview();
   if (t === 'runner') loadRunnerTargets(true);
+  if (t === 'prompt') loadPromptReport();
   if (t === 'logs' && term) { term.follow = S.ui.termFollow; term.schedule(); }
   emit();
 }
@@ -2357,6 +2365,43 @@ function loadPlan() {
     applyPlanPayload(j);
   });
 }
+
+// ---- prompt budget inspector (read-only provenance) ----
+function loadPromptReport(force) {
+  if (!S.status.root) {
+    S.prompt.report = null;
+    S.prompt.reports = [];
+    S.prompt.diff = null;
+    S.prompt.error = '';
+    emit();
+    return Promise.resolve();
+  }
+  if (S.prompt.loading && !force) return Promise.resolve();
+  S.prompt.loading = true;
+  emit();
+  const parts = [];
+  if (S.prompt.runId) parts.push('run_id=' + encodeURIComponent(S.prompt.runId));
+  if (S.prompt.compare) parts.push('compare=' + encodeURIComponent(S.prompt.compare));
+  const url = '/api/prompt/report' + (parts.length ? '?' + parts.join('&') : '');
+  return PDC.api(url).then((j) => {
+    S.prompt.loading = false;
+    if (j._status !== 200 || !j.ok) {
+      S.prompt.error = j.detail || 'Could not load the prompt report.';
+      emit();
+      return;
+    }
+    S.prompt.report = j.report || null;
+    S.prompt.reports = j.reports || [];
+    S.prompt.diff = j.diff || null;
+    S.prompt.error = j.report ? '' : (j.detail || '');
+    emit();
+  }, () => {
+    S.prompt.loading = false;
+    S.prompt.error = 'Could not load the prompt report.';
+    emit();
+  });
+}
+PDC.loadPromptReport = loadPromptReport;
 function savePlan() {
   const text = planEdit.current ? planEdit.current.value : '';
   PDC.api('/api/plan', { text: text }).then((j) => {
@@ -6095,7 +6140,9 @@ function WorkspacePane() {
   }, []);
   const tabs = [['files', PDC.t('gui.panel.files', null, 'Files')], ['runner', '\u25B6 ' + PDC.t('gui.run', null, 'Run')]]
     .concat(S.ws.pages.length ? [['preview', '\uD83C\uDF10 ' + PDC.t('gui.panel.preview', null, 'Preview')]] : [])
-    .concat([['backups', PDC.t('gui.panel.backups', null, 'Backups')], ['logs', PDC.t('gui.panel.logs', null, 'Logs')]]);
+    .concat([['prompt', '\uD83E\uDDEA ' + PDC.t('gui.panel.prompt', null, 'Prompt')],
+             ['backups', PDC.t('gui.panel.backups', null, 'Backups')],
+             ['logs', PDC.t('gui.panel.logs', null, 'Logs')]]);
   let tab = S.ws.tab;
   if (tab === 'preview' && !S.ws.pages.length) tab = 'runner';  // saved tab, no pages
   const idxSet = S.ws.indexedSet || new Set();
@@ -6133,7 +6180,8 @@ function WorkspacePane() {
           ${tab === 'files' ? (s.root ? PDC.fmtInt(S.ws.indexed.length) + ' of ' + PDC.fmtInt(all.length) + ' files indexed' : 'no project open')
           : tab === 'backups' ? 'undo a Task/Edit or Auto write'
           : tab === 'runner' ? 'preview + one-click commands'
-          : tab === 'preview' ? 'read-only \u00B7 reloads when a run finishes'
+          : tab === 'prompt' ? PDC.t('gui.prompt.subtitle', null, 'read-only \\u00b7 hashes and counts, no prompt text')
+          : tab === 'preview' ? 'read-only \\u00B7 reloads when a run finishes'
           : 'live output'}
         </span>
         ${tab === 'logs' ? html`
@@ -6232,6 +6280,70 @@ function WorkspacePane() {
               </div>` : null}
           `;
         })()}
+      </div>
+      <div class="ws-body" id="wsPrompt" hidden=${tab !== 'prompt'}>
+        <div class="ws-tools">
+          <select class="grow" title="report run" value=${S.prompt.runId}
+                  onchange=${(e) => { S.prompt.runId = e.target.value; loadPromptReport(true); }}>
+            <option value="">${PDC.t('gui.prompt.latest', null, 'latest report')}</option>
+            ${S.prompt.reports.map((id) => html`<option key=${id} value=${id}>${id}</option>`)}
+          </select>
+          <select title="compare with" value=${S.prompt.compare}
+                  onchange=${(e) => { S.prompt.compare = e.target.value; loadPromptReport(true); }}>
+            <option value="">${PDC.t('gui.prompt.no_compare', null, 'no comparison')}</option>
+            ${S.prompt.reports.filter((id) => id !== (S.prompt.report && S.prompt.report.run_id))
+              .map((id) => html`<option key=${id} value=${id}>${id}</option>`)}
+          </select>
+          <button class="small" disabled=${S.prompt.loading}
+                  onClick=${() => loadPromptReport(true)}>\u27F3 ${PDC.t('gui.prompt.refresh', null, 'Refresh')}</button>
+        </div>
+        ${!s.root ? html`<div class="tip">${PDC.t('gui.prompt.no_project', null, 'Open a project to inspect its prompt reports.')}</div>`
+        : S.prompt.loading && !S.prompt.report ? html`<div class="tip">${PDC.t('gui.prompt.loading', null, 'Loading the prompt report\u2026')}</div>`
+        : !S.prompt.report ? html`<div class="tip">${S.prompt.error || PDC.t('gui.prompt.empty', null, 'No prompt report yet \u2014 run a Task or Auto job; the report stores hashes and counts only.')}</div>`
+        : (() => {
+            const r = S.prompt.report;
+            const sections = r.sections || [];
+            const total = sections.reduce((n, x) => n + (x.token_count || 0), 0);
+            const diff = S.prompt.diff;
+            return html`
+              <div class="prompt-summary">
+                <span class="prompt-model">${r.model || '-'}</span>
+                <span class="muted small-text">${r.run_id}</span>
+                <span class="grow"></span>
+                <span class="muted small-text">${PDC.t('gui.prompt.prefix', { count: r.prefix_message_count }, 'prefix ' + r.prefix_message_count + ' msg')} \u00B7 #${String(r.prefix_hash || '').slice(0, 12)}</span>
+                <span class="prompt-total">${PDC.fmtInt(total)} ${PDC.t('gui.prompt.tokens', null, 'tokens')}</span>
+              </div>
+              <div class="prompt-actions">
+                <span class="muted small-text">${(r.schema_actions || []).length + ' ' + PDC.t('gui.prompt.schema', null, 'actions') + ' \u00B7 ' + ((r.pruned && Object.keys(r.pruned).length) || 0) + ' ' + PDC.t('gui.prompt.pruned', null, 'pruned')}</span>
+              </div>
+              <div class="prompt-list">
+                <div class="prompt-head">
+                  <span>#</span><span>${PDC.t('gui.prompt.section', null, 'section')}</span><span>${PDC.t('gui.prompt.tokens', null, 'tokens')}</span><span>${PDC.t('gui.prompt.method', null, 'method')}</span><span>${PDC.t('gui.prompt.disposition', null, 'state')}</span><span>hash</span>
+                </div>
+                ${sections.map((x) => html`
+                  <div key=${x.name} class="prompt-row" title=${x.reason || ''}>
+                    <span class="prompt-ord">${x.ordinal}</span>
+                    <span class="prompt-name">${x.name}${x.reason ? html`<span class="prompt-reason">${x.reason}</span>` : null}</span>
+                    <span class="prompt-num">${x.token_count == null ? '-' : PDC.fmtInt(x.token_count)}</span>
+                    <span class="prompt-method">${x.count_method}</span>
+                    <span class=${'prompt-disp ' + (x.disposition || '')}>${x.disposition}</span>
+                    <span class="prompt-hash mono">${'#' + String(x.content_hash || '').slice(0, 10)}</span>
+                  </div>`)}
+              </div>
+              ${r.pruned && Object.keys(r.pruned).length ? html`
+                <div class="prompt-pruned">
+                  <b>${PDC.t('gui.prompt.pruned', null, 'pruned / dropped')}</b>
+                  ${Object.keys(r.pruned).map((k) => html`<div key=${k} class="prompt-pruned-row"><code>${k}</code><span>${r.pruned[k]}</span></div>`)}
+                </div>` : null}
+              ${diff ? html`
+                <div class="prompt-diff">
+                  <b>${PDC.t('gui.prompt.compare', null, 'Compared with') + ' ' + diff.compare_run_id}</b>
+                  <span class="muted small-text">${(diff.sections.added || []).length + ' ' + PDC.t('gui.prompt.added', null, 'added') + ' \u00B7 ' + (diff.sections.removed || []).length + ' ' + PDC.t('gui.prompt.removed', null, 'removed') + ' \u00B7 ' + (diff.sections.changed || []).length + ' ' + PDC.t('gui.prompt.changed', null, 'changed') + ' \u00B7 ' + (diff.totals.delta >= 0 ? '+' : '') + diff.totals.delta + ' ' + PDC.t('gui.prompt.tokens', null, 'tokens')}</span>
+                  ${(diff.sections.changed || []).slice(0, 40).map((c) => html`
+                    <div key=${c.name} class="prompt-pruned-row"><code>${c.name}</code><span>${c.fields.join(', ')} \u00B7 ${c.before.token_count} \u2192 ${c.after.token_count}</span></div>`)}
+                </div>` : null}
+            `;
+          })()}
       </div>
       <div class="ws-body" id="wsBackups" hidden=${tab !== 'backups'}>
         <div class="ws-tools">

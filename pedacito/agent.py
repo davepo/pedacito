@@ -57,6 +57,7 @@ from . import imagegen as imagegen_mod
 from . import instructions as instructions_mod
 from . import mcp as mcp_mod
 from . import memory as memory_mod
+from . import prompt_inspect as prompt_inspect_mod
 from . import prompts as prompts_mod
 from . import safety
 from . import select as select_mod
@@ -1465,6 +1466,13 @@ class Agent:
         self.live_evidence_kinds: set[str] = set()
         # Telemetry sink (events.EventLog); bound on first gather.
         self.events = None
+        # Prompt budget provenance for the last gather/answer (PromptReport):
+        # hashes and counts only, never section text. `_prompt_capture` is
+        # reactivated across the two phases so answer sections append to the
+        # same run report.
+        self.prompt_report = None
+        self._prompt_capture = None
+        self._prompt_prev = None
         # Gather conversation kept for answer continuation (see answer()).
         self._messages: list[dict] = []
         # Content-addressed evidence store and the read ledger:
@@ -1723,6 +1731,65 @@ class Agent:
     def _emit(self, kind: str, **fields) -> None:
         if self.events is not None:
             self.events.emit(kind, **fields)
+
+    # ------------------------------------------------- prompt provenance
+    def _prompt_begin(self, root) -> None:
+        """Start (or restart) this run's prompt capture.
+
+        The capture stores hashes, lengths, dispositions and rule/skill/
+        memory IDs only; section text is hashed and discarded immediately.
+        It never changes a message, a prompt prefix or a request body.
+        """
+        session_id = ""
+        try:
+            from . import session_ctx
+            sess = session_ctx.current_session()
+            if sess is not None:
+                session_id = sess.session_id
+        except Exception:
+            session_id = ""
+        actions: tuple[str, ...] = ()
+        try:
+            actions = tools_mod.schema_action_names(schema_for(self.cfg))
+        except Exception:
+            actions = ()
+        self._prompt_prev = prompt_inspect_mod.current_capture()
+        self._prompt_capture = prompt_inspect_mod.begin_capture(
+            model=str(getattr(self.cfg, "model", "") or ""),
+            root=root,
+            session_id=session_id,
+            schema_actions=actions,
+        )
+
+    def _prompt_rest(self) -> None:
+        """Restore whatever capture was active before this agent's phase."""
+        prompt_inspect_mod.activate(self._prompt_prev)
+
+    def _prompt_finish(self) -> None:
+        """Persist + emit the current report; never fail the task."""
+        capture = self._prompt_capture
+        if capture is None:
+            return
+        try:
+            self.prompt_report = capture.report()
+            capture.save(force=True)
+            events_mod.emit_prompt_report(self.events, self.prompt_report)
+        except Exception:
+            pass
+
+    def _prompt_resume(self):
+        """Reactivate this run's capture for the answer phase."""
+        capture = self._prompt_capture
+        if capture is None:
+            try:
+                root = getattr(self.index, "root", None)
+            except Exception:
+                root = None
+            self._prompt_begin(root)
+            capture = self._prompt_capture
+        if capture is None:
+            return None
+        return prompt_inspect_mod.activate(capture)
 
     def _run_cancelled(self) -> bool:
         """True when the active run's cancel token was set (GUI Stop/TUI
@@ -2388,6 +2455,8 @@ class Agent:
         root = self.index.root
         self.cfg._root = str(root)
         self.cfg._is_git = gitinfo.is_repo(root)
+        # Prompt provenance for this run (hash/length metadata only).
+        self._prompt_begin(root)
         # Dynamic tool pruning reads the task text for trigger words and the
         # repository's per-tool task counters. A task start bumps the counter;
         # dispatch records actual uses while this gather runs.
@@ -2480,43 +2549,98 @@ class Agent:
                        for p in self.pinned_items])
         hint = {"flat": FLAT_HINT, "cards": CARDS_HINT,
                 "ranked": RANKED_HINT}.get(tier, DIRS_HINT)
-        system = prompts_mod.gather_system(
-            self.cfg, base if base is not None else GATHER_BASE, TOOL_HELP) + hint
+        gather_text = prompts_mod.gather_system(
+            self.cfg, base if base is not None else GATHER_BASE, TOOL_HELP)
+        pack = prompts_mod.pack_for(self.cfg)
+        override = prompts_mod.override_source(self.cfg, "gather")
+        try:
+            rules_block = prompts_mod.project_rules_block(self.cfg, root)
+        except Exception:
+            rules_block = ""
+        rules_id = "rule:.pedacito/rules.md" if rules_block else ""
+        prompt_inspect_mod.note_section(
+            "system:gather", gather_text,
+            reason=(f"pack={pack}; override={override or 'builtin'}; "
+                    f"rules={rules_id or 'none'}; tool_help={pack}"),
+            matched=((rules_id,) if rules_id else ()))
+        prompt_inspect_mod.note_section(
+            "system:map-hint", hint, reason=f"map_tier={tier}")
+        system = gather_text + hint
         if getattr(self.cfg, "tool_mode", "grammar") == "plain":
             # The plain-word step protocol replaces the JSON grammar: tell the
             # model the exact words instead of relying on response_format.
             # R4-BUG-03: do not advertise write/append while gather is
             # read-only; small models otherwise try an edit step and get it
             # rejected. Edits belong to the answer phase after `action done`.
-            system += tools_mod.plain_step_instructions(
+            plain_text = tools_mod.plain_step_instructions(
                 allow_write=bool(getattr(self.cfg, "allow_write", False)))
+            system += plain_text
+            prompt_inspect_mod.note_section(
+                "system:plain-steps", plain_text, reason="tool_mode=plain")
+        else:
+            prompt_inspect_mod.note_disabled(
+                "system:plain-steps", "tool_mode=grammar")
         project_notes = instructions_mod.render(root, self.cfg)
         todo_notes = todo_mod.render(root, self.cfg,
                                      limit=int(getattr(
                                          self.cfg, "max_todo_chars", 1500)))
         if project_notes:
             system += "\n\n" + project_notes
+            prompt_inspect_mod.note_section(
+                "system:project-instructions", "\n\n" + project_notes,
+                reason="project instruction files")
+        else:
+            prompt_inspect_mod.note_disabled(
+                "system:project-instructions", "no project instructions")
         memory_notes = memory_mod.render(root, self.cfg)
         if memory_notes:
             system += "\n\n" + memory_notes
+            prompt_inspect_mod.note_section(
+                "system:memory", "\n\n" + memory_notes,
+                reason="project/global memory entries",
+                matched=prompt_inspect_mod.memory_ids(memory_notes))
+        else:
+            prompt_inspect_mod.note_disabled("system:memory", "no memory entries")
         try:
             micro_notes = memory_mod.render_micro_facts(root, self.cfg)
         except Exception:
             micro_notes = ""
         if micro_notes:
             system += "\n\n" + micro_notes
+            prompt_inspect_mod.note_section(
+                "system:memory-micro", "\n\n" + micro_notes,
+                reason="micro-fact entries",
+                matched=prompt_inspect_mod.memory_ids(micro_notes))
         try:
             lesson_notes = memory_mod.render_anti_patterns(root, self.cfg)
         except Exception:
             lesson_notes = ""
         if lesson_notes:
             system += "\n\n" + lesson_notes
+            prompt_inspect_mod.note_section(
+                "system:memory-lessons", "\n\n" + lesson_notes,
+                reason="anti-pattern lessons",
+                matched=prompt_inspect_mod.memory_ids(lesson_notes))
         if "skill" in schema_for(self.cfg)["properties"]["action"]["enum"]:
             skill_notes = skills_mod.catalog(root, self.cfg, task=task)
             if skill_notes:
                 system += "\n\n" + skill_notes
+                prompt_inspect_mod.note_section(
+                    "system:skills", "\n\n" + skill_notes,
+                    reason="skill catalog (task-ranked)",
+                    matched=prompt_inspect_mod.skill_ids(skill_notes))
+            else:
+                prompt_inspect_mod.note_disabled(
+                    "system:skills", "no skill catalog entries")
+        else:
+            prompt_inspect_mod.note_disabled(
+                "system:skills", "skill action not offered")
         if todo_notes:
             system += "\n\n" + todo_notes
+            prompt_inspect_mod.note_section(
+                "system:todo", "\n\n" + todo_notes, reason="todo checklist")
+        else:
+            prompt_inspect_mod.note_disabled("system:todo", "no todo checklist")
         mcp_notes = (mcp_mod.render(self.cfg)
                      if getattr(self.cfg, "allow_mcp", False) else "")
         # Named-server path: only the handful of the servers'
@@ -2525,6 +2649,10 @@ class Agent:
         mcp_notes = "\n\n".join(x for x in (mcp_notes, named_notes) if x)
         if mcp_notes:
             system += "\n\n" + mcp_notes
+            prompt_inspect_mod.note_section(
+                "system:mcp", "\n\n" + mcp_notes, reason="MCP server notes")
+        else:
+            prompt_inspect_mod.note_disabled("system:mcp", "no MCP notes")
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -2560,6 +2688,29 @@ class Agent:
             + pinned_section \
             + f"PROJECT MAP\n\n{repo_map}\n\n" \
             + (examples + "\n\n" if examples else "") + f"TASK\n{task}"
+        if lead:
+            prompt_inspect_mod.note_section(
+                "user0:lead", lead + "\n\n", reason="git/index orientation")
+        else:
+            prompt_inspect_mod.note_disabled("user0:lead", "no orientation notes")
+        if pinned_section:
+            prompt_inspect_mod.note_section(
+                "user0:pinned", pinned_section, reason="explicit @file/@symbol pins",
+                matched=[f"{p.kind}:{p.path or p.symbol_name}"
+                         for p in self.pinned_items])
+        else:
+            prompt_inspect_mod.note_disabled("user0:pinned", "no explicit pins")
+        prompt_inspect_mod.note_section(
+            "user0:map", f"PROJECT MAP\n\n{repo_map}\n\n",
+            reason=f"map_tier={tier}")
+        if examples:
+            prompt_inspect_mod.note_section(
+                "user0:fewshot", examples + "\n\n",
+                reason="few-shot step examples")
+        else:
+            prompt_inspect_mod.note_disabled("user0:fewshot", "few-shot disabled")
+        prompt_inspect_mod.note_section("user0:task", f"TASK\n{task}",
+                                         reason="user task text")
         if safety.has_secret(task) and is_hosted(self.cfg) \
                 and getattr(self.cfg, "redact_secrets", True):
             print("  [warning: the task text looks like it contains a secret "
@@ -2567,6 +2718,12 @@ class Agent:
         active_images = (list(images) if images is not None
                          else list(getattr(self.cfg, "_task_images", None) or ()))
         self._task_images = active_images
+        if active_images:
+            prompt_inspect_mod.note_section(
+                "user0:images", None, disposition="kept",
+                reason=f"count={len(active_images)}; vision input",
+                token_count=len(active_images) * IMAGE_TOKENS_ESTIMATE,
+                count_method="estimate:fixed-per-image")
         user0_content = imagegen_mod.make_multimodal_content(user0, active_images)
         messages = [
             {"role": "system", "content": system},
@@ -3661,6 +3818,26 @@ class Agent:
         self._emit("gather_done", steps=step, files_read=len(spans),
                    folds=self.fold_count, lossy=self._lossy,
                    gathered_chars=len(self.gathered_source))
+        # The live conversation after user0 (tool steps + results). Hashing it
+        # lets the report show whether folding/eviction changed the request
+        # without retaining a single line of its content.
+        try:
+            history = messages[2:] if len(messages) > 2 else []
+            if history:
+                prompt_inspect_mod.note_section(
+                    "gather:history",
+                    json.dumps(history, ensure_ascii=False, default=str),
+                    disposition=("truncated"
+                                 if (self._lossy or self.fold_count) else "kept"),
+                    reason=(f"messages={len(history)}; folds={self.fold_count}; "
+                            f"lossy={self._lossy}"))
+            else:
+                prompt_inspect_mod.note_disabled(
+                    "gather:history", "no lookup turns")
+        except Exception:
+            pass
+        self._prompt_finish()
+        self._prompt_rest()
         return "\n\n".join(new_items)
 
     def _read_digest(self, spans: dict) -> str:
@@ -3934,9 +4111,17 @@ class Agent:
         self._creative_task = self._creative_for(task)
         if self._creative_task:
             self._emit_creative_mode()
-        with self._phase_temp("temperature_answer"):
-            return self._answer(task, gathered, stream, system, max_tokens,
-                                include_edit_format, images=images)
+        token = self._prompt_resume()
+        try:
+            with self._phase_temp("temperature_answer"):
+                return self._answer(task, gathered, stream, system, max_tokens,
+                                    include_edit_format, images=images)
+        finally:
+            self._prompt_finish()
+            if token is not None:
+                prompt_inspect_mod.deactivate(token)
+            else:
+                self._prompt_rest()
 
     def _emit_creative_mode(self) -> None:
         """Record the effective answer temperature for a Creative/design task
@@ -5266,6 +5451,19 @@ class Agent:
                  + (digest + "\n\n" if digest else "")
                  + "ANSWER INSTRUCTIONS\n" + brief
                  + (_NEED_HINT if self._rehydration_rounds_left() else ""))
+        try:
+            prompt_inspect_mod.note_section(
+                "answer:system", brief, reason="continued answer brief",
+                matched=("prompt:answer",))
+            prompt_inspect_mod.note_section(
+                "answer:continue-instruction", final,
+                reason="continues the cached gather conversation")
+            prompt_inspect_mod.note_section(
+                "answer:gather-history",
+                json.dumps(msgs, ensure_ascii=False, default=str),
+                reason=f"messages={len(msgs)}; prefix reused")
+        except Exception:
+            pass
         msgs.append({"role": "user", "content": final})
         est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
         print(f"[answer continues the lookup conversation, "
@@ -5326,6 +5524,7 @@ class Agent:
         if mcp_notes:
             notes_prefix += mcp_notes + "\n\n"
         src = gathered or "(nothing was looked up)"
+        dropped = 0
         need_hint = _NEED_HINT if self._rehydration_rounds_left() else ""
         # Pinned source is rendered as its own section before the map/source,
         # so automatic packing can trim only the automatic evidence below it.
@@ -5427,6 +5626,69 @@ class Agent:
             self._emit("degrade", notices=notices)
         img_tokens = len(images or ()) * IMAGE_TOKENS_ESTIMATE
         print(f"[answer context ~{est(user) + img_tokens} tokens]", file=sys.stderr)
+        # Record the final assembly (not an earlier draft): the section
+        # counts/hashes describe exactly the text built above, after any
+        # degradation. No section text is retained.
+        try:
+            brief_override = prompts_mod.override_source(self.cfg, "answer")
+            fmt_override = prompts_mod.override_source(self.cfg, "edit_format")
+            prompt_inspect_mod.note_section(
+                "answer:system", brief,
+                reason=(f"pack={prompts_mod.pack_for(self.cfg)}; "
+                        f"answer_override={brief_override or 'builtin'}; "
+                        f"edit_format_override={fmt_override or 'builtin'}"),
+                matched=("prompt:answer",))
+            if notes_prefix:
+                prompt_inspect_mod.note_section(
+                    "answer:notes", notes_prefix,
+                    reason="project instructions, memory, todo, MCP notes",
+                    matched=(prompt_inspect_mod.memory_ids(notes_prefix)
+                             + (("instructions",) if project_notes else ())
+                             + (("todo",) if todo_notes else ())
+                             + (("mcp",) if mcp_notes else ())))
+            else:
+                prompt_inspect_mod.note_section(
+                    "answer:notes", None, disposition="pruned",
+                    reason="omitted: answer prompt over budget")
+                for name in ("answer:notes:project-instructions",
+                             "answer:notes:memory", "answer:notes:todo",
+                             "answer:notes:mcp"):
+                    prompt_inspect_mod.note_section(
+                        name, None, disposition="pruned",
+                        reason="omitted: answer prompt over budget")
+            if pin_section:
+                prompt_inspect_mod.note_section(
+                    "answer:pinned", pin_section,
+                    reason="explicit pins kept ahead of packed source")
+            else:
+                prompt_inspect_mod.note_disabled(
+                    "answer:pinned", "no explicit pins")
+            prompt_inspect_mod.note_section(
+                "answer:map", f"PROJECT MAP\n\n{repo_map}\n\n",
+                reason=f"map_tier={_tier}")
+            prompt_inspect_mod.note_section(
+                "answer:source", f"SOURCE YOU REQUESTED\n\n{src}\n\n",
+                disposition=("truncated" if dropped else "kept"),
+                reason=(f"items_dropped={dropped}; packer=utility"
+                        if dropped else "all gathered items kept"))
+            prompt_inspect_mod.note_section(
+                "answer:task", f"TASK\n{task}" + need_hint,
+                reason="user task text")
+            if dropped:
+                prompt_inspect_mod.current_capture().set_pruned(
+                    "answer:source", f"{dropped} older source item(s) trimmed")
+            for notice in notices:
+                if "omitted" in notice:
+                    prompt_inspect_mod.current_capture().set_pruned(
+                        "answer:notes", notice)
+                elif "map shrunk" in notice:
+                    prompt_inspect_mod.current_capture().set_pruned(
+                        "answer:map", notice)
+                elif "reply budget" in notice:
+                    prompt_inspect_mod.current_capture().set_pruned(
+                        "answer:reply-budget", notice)
+        except Exception:
+            pass
         user_content = imagegen_mod.make_multimodal_content(user, images)
         return self._chat_needs(
             lambda m: self.client.chat(

@@ -1146,6 +1146,7 @@ solo el mapa está desactualizado.
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero (o `--spec FILE`); `--no-complex` (alias `--single`) desactiva la escalada automática a Complex |
 | `pedacito auto PROJ -t "..."` | Planifica una meta y luego la implementa tarea por tarea |
 | `pedacito plan --check PLAN.md PROJ` | Valida una lista de tareas contra el índice antes de que se ejecute Auto o Complex (`--impact` previsualiza llamadores y pruebas; sale con 0 limpio/advertencias, 1 errores y 2 inválido) |
+| `pedacito prompt --explain --last PROJ` | Muestra el presupuesto y la procedencia del prompt de la última ejecución (orden de secciones, conteos de tokens, método de conteo, hashes, disposiciones). `--compare RUN_ID` compara solo ids/hashes/conteos; nunca el texto del prompt |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito recover list [PROJ]` | Muestra los diarios de tareas inacabadas por UUID. `recover rollback ID PROJ` previsualiza una reversión vinculada de forma segura; añade `--apply` para realizarla |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Renombra un símbolo en todo el proyecto. Sin llamada al modelo; vista previa por defecto; `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba |

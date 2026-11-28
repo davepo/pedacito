@@ -188,6 +188,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito plan --check [PLAN] [PROJECT]` | Validate a checklist against the index before an Auto or Complex run; `--impact` previews callers and tests. Exit 0 clean/warnings, 1 definite errors, 2 invalid |
+| `pedacito prompt --explain [--last] [--compare RUN_ID] [PROJECT]` | Show a run's prompt budget and provenance: section order, token counts, counting method, hashes and dispositions. `--compare` diffs ids/hashes/counts against an earlier run; never prompt text |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
@@ -237,6 +238,33 @@ or a symlink/junction escape is refused before any source file is touched.
 validated durable resume boundary or authoritative cross-process
 ownership/liveness proof exists. A refusal exits 1 and leaves the journal and
 your files untouched.
+
+### Inspecting the prompt budget
+
+Every Task or Auto run writes a prompt provenance report under
+`.pedacito/prompt_reports/`. It describes the actual assembly boundaries:
+section order, token count, the counting method, a content hash and the
+section's disposition (`kept`, `truncated`, `pruned`, `dropped`, `disabled` or
+`sent`), plus matched rule, skill and memory IDs. The report does **not** store
+the prompt, source files, tool output or credentials.
+
+```bash
+pedacito prompt --explain --last .                 # newest report
+pedacito prompt --explain --last . --json          # machine-readable
+pedacito prompt --explain --compare pr-20260101-120000-ab12cd34 .
+```
+
+`--compare RUN_ID` prints a diff built from section IDs, hashes and counts; it
+never prints source text. A count is labelled `estimate:<name>` when it comes
+from a character heuristic (`estimate:chars-div-3.6` is the default) and
+`exact:<name>` only when the provider reported the usage (`exact:provider-usage`
+for the serialized request total). The command is local-only: it reads the
+report files and never contacts a model server.
+
+The GUI exposes the same read-only view in the Workspace panel's **🧪 Prompt**
+tab (`GET /api/prompt/report`), scoped to the current session. Pick a run (and
+optionally a comparison run) to see the section table, the pruned entries and
+the metadata-only diff.
 
 ## Built-in help: `pedacito how`
 

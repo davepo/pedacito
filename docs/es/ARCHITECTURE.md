@@ -910,6 +910,7 @@ micro_facts.json      commands confirmed to work here, and repair lessons
 rules/*.md            path-scoped rules       skills/           your skills
                                              (NAME/SKILL.md or NAME.md)
 prompts/*.md          prompt overrides        fetch/              fetch cache
+prompt_reports/       prompt provenance (hashes/counts; no text)
 todo.md               current task checklist
 log.txt               timestamped event trace
 ```
@@ -1138,6 +1139,33 @@ creaciones planificadas y pruebas ausentes. Un índice ausente o una dependencia
 sin resolver hacen la vista previa más pequeña y explícitamente desconocida,
 nunca verde. Las advertencias no bloquean; solo los errores definitivos detienen
 una ejecución, y un plan inválido se asigna al código de salida 2.
+
+### Procedencia del presupuesto del prompt
+
+`prompt_inspect` captura los límites reales del ensamblado en lugar de
+reconstruir una aproximación después. `Agent.gather` registra los bloques del
+sistema (prompt de recolección, pista del mapa, instrucciones del proyecto,
+memoria, catálogo de skills, todo, MCP) y el primer turno del usuario
+(orientación, pines explícitos, mapa del proyecto, few-shot, tarea);
+`Agent.answer` registra el brief, las notas, los pines, el mapa, el fuente
+empaquetado y la tarea después de cualquier degradación. Los dos primeros
+mensajes se hashean una vez como prefijo estable, y `llm._http_post` hashea la
+carga serializada *después* del redactado de salida (o de la traducción al
+transporte nativo). `_account` asciende la sección de transporte a
+`exact:provider-usage` solo cuando el proveedor informó un conteo de tokens de
+entrada; todo lo demás se etiqueta `estimate:chars-div-3.6`.
+
+Una `PromptSection` guarda nombre, ordinal, conteo de tokens, método de conteo,
+hash de contenido, disposición y un motivo acotado con IDs de reglas, skills y
+memoria coincidentes. Nunca guarda el texto de la sección, así que un informe no
+puede filtrar un prompt, archivo fuente, salida de herramienta ni credencial.
+Los informes viven en `.pedacito/prompt_reports/`, resuelven cada ruta con
+`security.resolve_safe_path`, llevan la etiqueta de la sesión que los escribió y
+se podan a los 40 más recientes. `pedacito prompt --explain [--last]
+[--compare RUN_ID]` y la pestaña Prompt de la GUI (`GET /api/prompt/report`) leen
+los mismos archivos; una diferencia compara solo IDs, hashes y conteos. Explain
+nunca construye un cliente de modelo ni hace una llamada de red, y la captura no
+añade ninguna instrucción, mensaje ni byte de prefijo a ninguna petición.
 
 ## Límites conocidos
 

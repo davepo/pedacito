@@ -1668,6 +1668,69 @@ def _cmd_plan(args) -> int:
     return code
 
 
+def _cmd_prompt(args) -> int:
+    """`pedacito prompt --explain`: report a run's prompt provenance.
+
+    This is a local read-only operation: it never loads a config, contacts a
+    model server, or prints section text (the report stores hashes/counts
+    only). `--compare RUN_ID` diffs IDs, hashes and counts against an earlier
+    run; the newer report is the explained one.
+    """
+    from . import prompt_inspect as prompt_mod
+
+    explain = bool(getattr(args, "explain", False))
+    compare_id = (getattr(args, "compare", None) or "").strip()
+    last = bool(getattr(args, "last", False))
+    if not (explain or compare_id or last):
+        print(i18n.t("cli.prompt.usage"), file=sys.stderr)
+        return 2
+    if compare_id and not prompt_mod.valid_run_id(compare_id):
+        print(i18n.t("cli.prompt.invalid_run", run_id=compare_id), file=sys.stderr)
+        return 2
+    root = _root(args)
+    if not root.is_dir():
+        print(i18n.t("cli.prompt.no_report", project=str(root)),
+              file=sys.stderr)
+        return 1
+    report = prompt_mod.latest_report(root)
+    if report is None:
+        detail = i18n.t("cli.prompt.no_report", project=str(root))
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "project": str(root),
+                              "detail": detail}, ensure_ascii=False))
+        else:
+            print(detail, file=sys.stderr)
+        return 1
+    diff = None
+    other = None
+    if compare_id:
+        other = prompt_mod.load_report(root, compare_id)
+        if other is None:
+            detail = i18n.t("cli.prompt.no_compare", run_id=compare_id,
+                            project=str(root))
+            if getattr(args, "json", False):
+                print(json.dumps({"ok": False, "project": str(root),
+                                  "detail": detail}, ensure_ascii=False))
+            else:
+                print(detail, file=sys.stderr)
+            return 1
+        diff = prompt_mod.compare_reports(report, other)
+    if getattr(args, "json", False):
+        payload = {"ok": True, "project": str(root),
+                   "report": prompt_mod.report_to_dict(report)}
+        if diff is not None:
+            payload["compare"] = prompt_mod.report_to_dict(other)
+            payload["diff"] = diff
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(i18n.t("cli.prompt.project", project=str(root)))
+    print("\n".join(prompt_mod.render_report(report, i18n.t)))
+    if diff is not None:
+        print()
+        print("\n".join(prompt_mod.render_diff(diff, i18n.t)))
+    return 0
+
+
 def _cmd_explain(args, client, agent, images: list[dict] | None = None) -> int:
     """`pedacito explain`: answer questions about the indexed project in prose
     (no edits). `main()` has already checked that an index exists."""
@@ -4991,6 +5054,17 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_plan.add_argument("--json", action="store_true",
                         help=t("cli.plan.opt.json"))
 
+    p_prompt = sub.add_parser("prompt", help=t("cli.cmd.prompt"))
+    _add_common(p_prompt, paths_nargs="*")
+    p_prompt.add_argument("--explain", action="store_true",
+                          help=t("cli.prompt.opt.explain"))
+    p_prompt.add_argument("--last", action="store_true",
+                          help=t("cli.prompt.opt.last"))
+    p_prompt.add_argument("--compare", metavar="RUN_ID", default=None,
+                          help=t("cli.prompt.opt.compare"))
+    p_prompt.add_argument("--json", action="store_true",
+                          help=t("cli.prompt.opt.json"))
+
     p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
     p_chat.add_argument("--apply", action="store_true")
@@ -5648,6 +5722,7 @@ def _main(argv=None) -> int:
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
              "skills": _cmd_skills, "plan": _cmd_plan,
+             "prompt": _cmd_prompt,
              "rename": _cmd_rename,
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,

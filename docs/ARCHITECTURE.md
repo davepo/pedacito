@@ -911,6 +911,7 @@ micro_facts.json      commands confirmed to work here, and repair lessons
 rules/*.md            path-scoped rules       skills/           your skills
                                              (NAME/SKILL.md or NAME.md)
 prompts/*.md          prompt overrides        fetch/              fetch cache
+prompt_reports/       prompt provenance (hashes/counts; no text)
 todo.md               current task checklist
 log.txt               timestamped event trace
 ```
@@ -1140,6 +1141,31 @@ dynamic imports, approximate bare-name callers, unindexed files, planned
 creations and missing tests. An absent index or an unresolved dependency makes
 the preview smaller and explicitly unknown, never green. Warnings do not block;
 only definite errors stop a run, and an invalid plan maps to exit code 2.
+
+### Prompt budget provenance
+
+`prompt_inspect` captures the real assembly boundaries rather than rebuilding
+an approximation afterwards. `Agent.gather` records the system blocks (gather
+prompt, map hint, project instructions, memory, skills catalog, todo, MCP) and
+the first user turn (orientation, explicit pins, project map, few-shot, task);
+`Agent.answer` records the brief, notes, pins, map, packed source and task after
+any degradation. The first two messages are hashed once as the stable prefix,
+and `llm._http_post` hashes the serialized payload *after* outbound redaction
+(or native transport translation). `_account` upgrades the transport section to
+`exact:provider-usage` only when the provider reported an input-token count;
+everything else is labelled `estimate:chars-div-3.6`.
+
+A `PromptSection` stores a name, ordinal, token count, counting method,
+content hash, disposition and a bounded reason with matched rule/skill/memory
+IDs. It never stores the section text, so a report cannot leak a prompt, source
+file, tool output or credential. Reports live under
+`.pedacito/prompt_reports/`, resolve every path through
+`security.resolve_safe_path`, are tagged with the writing session, and are
+pruned to the newest 40. `pedacito prompt --explain [--last] [--compare RUN_ID]`
+and the GUI Prompt tab (`GET /api/prompt/report`) read the same files; a diff
+compares IDs, hashes and counts only. Explain never loads a model client or
+makes a network call, and the capture adds no instruction, message or prefix
+byte to any request.
 
 ## Known limits
 

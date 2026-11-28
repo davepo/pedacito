@@ -451,6 +451,39 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "prompt",
+        "usage": "pedacito prompt --explain [--last] [--compare RUN_ID] [PROJECT]",
+        "summary": "Report the last run's prompt assembly: section order, "
+                   "token counts, counting method, hashes and dispositions. "
+                   "--compare RUN_ID diffs ids, hashes and counts against an "
+                   "earlier run -- never prompt or source text.",
+        "keywords": ["prompt", "prompt budget", "prompt report", "provenance",
+                     "token counts", "context budget", "pruned", "truncated",
+                     "compare runs", "hashes", "estimate", "exact"],
+        "examples": [
+            "pedacito prompt --explain --last .",
+            "pedacito prompt --explain --last . --json",
+            "pedacito prompt --explain --compare pr-20260101-120000-ab12cd34 .",
+        ],
+        "flags": [
+            {"flag": "--explain", "help": "explain the latest captured report"},
+            {"flag": "--last", "help": "use the newest report (the default)"},
+            {"flag": "--compare RUN_ID", "help": "diff against an earlier run "
+                                                 "by ids, hashes and counts"},
+            {"flag": "--json", "help": "print the report or diff as JSON"},
+            {"flag": "PROJECT", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+        ],
+        "notes": [
+            "Reports live under .pedacito/prompt_reports/ and are "
+            "session-scoped. A section stores a hash, length, method and "
+            "disposition, never its text. count_method is estimate:<name> "
+            "for character heuristics and exact:<name> only for a provider's "
+            "reported usage. No model server or network is contacted.",
+        ],
+        "common": False,
+    },
+    {
         "name": "new",
         "usage": 'pedacito new DIR -t "PROJECT IDEA" [--apply]',
         "summary": "Start a project from scratch: plan, scaffold, then build. "
@@ -1901,6 +1934,29 @@ GUI_TOPICS = [
                      "/attach", "--image"],
         "settings": [],
         "cli": ["ask", "new", "tui"],
+    },
+    {
+        "id": "prompt-inspector",
+        "title": "Inspect the prompt budget and provenance",
+        "summary": "See what the last run actually sent: every prompt section "
+                   "in assembly order with its token count, counting method, "
+                   "content hash and kept/pruned/truncated state. Reports "
+                   "store hashes and counts, never prompt or source text.",
+        "steps": [
+            "GUI: open the Workspace panel and choose the \U0001F9EA Prompt tab",
+            "Run a Task or Auto job; the tab refresh shows the newest "
+            "session-scoped report (Refresh reloads it)",
+            "Pick a report and an optional comparison to diff ids, hashes and "
+            "counts; no prompt text is displayed or stored",
+            "CLI: pedacito prompt --explain --last . (add --compare RUN_ID "
+            "to diff an earlier run, --json for machine output)",
+        ],
+        "keywords": ["prompt", "prompt budget", "prompt report",
+                     "prompt inspector", "token counts", "context budget",
+                     "provenance", "pruned", "truncated", "compare runs",
+                     "hashes", "estimate"],
+        "settings": [],
+        "cli": ["prompt"],
     },
     {
         "id": "switch-model",

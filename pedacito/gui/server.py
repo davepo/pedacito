@@ -28,6 +28,7 @@ from .. import __version__ as PED_VERSION
 from .. import checkpoints as checkpoints_mod
 from .. import gitops
 from .. import i18n
+from .. import prompt_inspect as prompt_inspect_mod
 from .. import review as review_mod
 from .. import prompts as prompts_mod
 from .. import runner as runner_mod
@@ -1218,6 +1219,59 @@ def _review_file(q, body=None):
 @get("/api/plan")
 def _plan(q, body=None):
     return 200, plan_payload()
+
+
+@get("/api/prompt/report")
+def _prompt_report(q, body=None):
+    """Read-only provenance for this session's latest prompt report.
+
+    Reports are project-local and session-tagged: a report written by another
+    session (or another project) is never returned here. Only hashes, counts,
+    IDs and dispositions are exposed -- the inspector stores no prompt text.
+    """
+    with STATE.lock:
+        root = STATE.root
+        session_id = STATE.session_id
+    if root is None:
+        return 200, {"ok": True, "report": None, "reports": [],
+                     "detail": "No project is open."}
+    run_id = str((q.get("run_id") or [""])[0] or "").strip()
+    compare_id = str((q.get("compare") or [""])[0] or "").strip()
+    reports = prompt_inspect_mod.list_reports(root, session_id=session_id,
+                                              limit=20)
+    if run_id:
+        if not prompt_inspect_mod.valid_run_id(run_id):
+            return 400, {"ok": False, "detail": "Invalid run id."}
+        report = prompt_inspect_mod.load_report(
+            root, run_id, session_id=session_id)
+        if report is None:
+            return 404, {"ok": False,
+                         "detail": f"No prompt report {run_id!r} in this session."}
+    else:
+        report = prompt_inspect_mod.latest_report(
+            root, session_id=session_id)
+    payload = {
+        "ok": True,
+        "session_id": session_id,
+        "reports": reports,
+        "report": (prompt_inspect_mod.report_to_dict(report)
+                   if report is not None else None),
+    }
+    if report is None:
+        payload["detail"] = ("No prompt report for this session yet; run a "
+                             "task first.")
+        return 200, payload
+    if compare_id:
+        other = (prompt_inspect_mod.load_report(root, compare_id,
+                                                session_id=session_id)
+                 if prompt_inspect_mod.valid_run_id(compare_id) else None)
+        if other is None:
+            payload["detail"] = (f"No prompt report {compare_id!r} in this "
+                                 "session to compare with.")
+        else:
+            payload["compare"] = prompt_inspect_mod.report_to_dict(other)
+            payload["diff"] = prompt_inspect_mod.compare_reports(report, other)
+    return 200, payload
 
 
 @get("/api/settings")

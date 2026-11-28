@@ -524,6 +524,25 @@ Algunos registros tienen su propio rastro de auditoría. `sessions/<stamp>.md` r
 se buscó y qué cambió. `events/<stamp>.jsonl` registra cada paso, llamada al modelo,
 pliegue y verificación. `log.txt` es una traza con marcas de tiempo. Todos enmascaran los secretos.
 
+### Informes de procedencia del prompt
+
+`prompt_inspect` escribe un informe acotado por ejecución en
+`.pedacito/prompt_reports/`. Un informe guarda, para cada sección ensamblada,
+nombre, ordinal, conteo de tokens, método de conteo, hash de contenido SHA-256,
+disposición y un motivo redactado, además de los IDs de reglas, skills y memoria
+que coincidieron y el hash de la petición serializada. Nunca guarda el texto del
+prompt, archivos fuente, salida de herramientas ni credenciales, y no copia el
+texto de las secciones al flujo de eventos de sesión.
+
+Cada ruta del informe se resuelve con `security.resolve_safe_path`; se rechazan
+el recorrido y los escapes por symlink/junction. El archivo lleva la etiqueta de
+la sesión que lo escribió, y `GET /api/prompt/report` solo devuelve un informe
+cuya etiqueta coincida con la sesión activa de la GUI. Los informes se podan a
+los 40 más recientes. Explain y compare solo leen archivos locales, no cargan un
+cliente de modelo y no hacen ninguna llamada de red. La captura es observacional:
+no añade instrucciones ni mensajes, nunca modifica los dos primeros mensajes de
+recolección y no cambia ningún prefijo del prompt.
+
 ### Inspecciona antes de deshacer
 
 `pdc` es un alias corto de `pedacito`, y ambos aceptan los mismos comandos.
