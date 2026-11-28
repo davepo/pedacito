@@ -3633,6 +3633,25 @@ def _note_mutation(cfg, *rels: str) -> None:
             seen.append(rel)
 
 
+def _note_refusal(cfg, *rels: str) -> None:
+    """Record that a gather-phase mutation of `rels` was refused by a
+    protected-path, sensitive-path or policy guard. The task loop reads the
+    ledger (cfg._task_refusals, reset per attempt): a refused write must not
+    leave the task reported as a clean success."""
+    if cfg is None or not rels:
+        return
+    seen = getattr(cfg, "_task_refusals", None)
+    if seen is None:
+        seen = []
+        try:
+            cfg._task_refusals = seen
+        except AttributeError:
+            return
+    for rel in rels:
+        if rel and rel not in seen:
+            seen.append(rel)
+
+
 def _parse_error(path: Path, text: str) -> str:
     """'' when `text` parses as this file's language (or the language is
     unknown), else a short description of the syntax error."""
@@ -3673,7 +3692,10 @@ def _protected_error(cfg, rel: str, verb: str) -> str:
     """ERROR observation when `rel` is a path the model may never write
     (.git/, .pedacito/, the plan file, protected_paths), else ''."""
     why = safety.is_protected(rel, cfg)
-    return f"ERROR: {verb} refused: {why}." if why else ""
+    if not why:
+        return ""
+    _note_refusal(cfg, rel)
+    return f"ERROR: {verb} refused: {why}."
 
 
 def _task_allowlist_error(index, cfg, rel: str, verb: str) -> str:
@@ -3709,6 +3731,8 @@ def _policy_denied(cfg, capability: str, target: str, root=None) -> str:
         # FAIL CLOSED: a policy evaluation error is a denial, never "".
         return (f"ERROR: denied by policy: policy evaluation error: {exc}")
     if d is not None and d.decision == "deny":
+        if capability in ("write", "delete"):
+            _note_refusal(cfg, target)
         return (f"ERROR: denied by policy ({d.matched_rule}): {d.reason}")
     return ""
 
@@ -3753,6 +3777,7 @@ def tool_write(index, cfg, file: str, content: str,
     allowed, sensitive_error = security.check_sensitive_write(
         root, rel, action=verb, policy=getattr(cfg, "policy", None))
     if not allowed:
+        _note_refusal(cfg, rel)
         return f"ERROR: {sensitive_error}"
     err = _protected_error(cfg, rel, verb) \
         or _task_allowlist_error(index, cfg, rel, verb)

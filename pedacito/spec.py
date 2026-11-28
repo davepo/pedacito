@@ -2372,9 +2372,12 @@ def verify_cross_file_contracts(root: Path,
                         if isinstance(t, ast.Name):
                             shadowed.add(t.id)
             from .apicheck import _arity_error
+            expected = _expected_raise_call_ids(tree)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Name)):
+                    continue
+                if id(node) in expected:
                     continue
                 name = node.func.id
                 if name in shadowed or name not in local_imports:
@@ -2455,6 +2458,38 @@ def _test_arity_error(call: ast.Call, node: ast.AST, drop_self: bool):
         return None
     n = len(call.args) + len(call.keywords)
     return n, _requires_text(sig)
+
+
+_RAISES_CALLEES = {"raises", "assertRaises", "assertRaisesRegex",
+                   "assertRaisesRegexp"}
+
+
+def _expects_raise(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+    return name in _RAISES_CALLEES
+
+
+def _expected_raise_call_ids(tree: ast.AST) -> set[int]:
+    """ids of the calls an exception expectation runs on purpose: the body of
+    `with pytest.raises(...)` / `with self.assertRaises(...)`, and the
+    arguments of a direct `pytest.raises(Exc, fn, ...)`. An invalid arity
+    there is the assertion itself, not contract drift, so the checker skips
+    them."""
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            if any(_expects_raise(i.context_expr) for i in node.items):
+                for stmt in node.body:
+                    out.update(id(c) for c in ast.walk(stmt)
+                               if isinstance(c, ast.Call))
+        elif _expects_raise(node):
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                out.update(id(c) for c in ast.walk(arg)
+                           if isinstance(c, ast.Call))
+    return out
 
 
 def _incoming_test_caller_errors(root: Path,
@@ -2601,10 +2636,11 @@ def _incoming_test_caller_errors(root: Path,
         base_map = {v: class_imports[c] for v, c in _local_types(tree).items()
                     if c in class_imports}
         walk_scope(tree, base_map)
+        expected = _expected_raise_call_ids(tree)
 
         for node, vmap in sorted(calls, key=lambda t: t[0].lineno):
             f = node.func
-            if not isinstance(f, ast.Attribute):
+            if not isinstance(f, ast.Attribute) or id(node) in expected:
                 continue          # bare from-import calls: existing pass
             chain: list[str] = []
             cur: ast.AST = f

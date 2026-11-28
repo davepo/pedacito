@@ -25,6 +25,7 @@ import shutil
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,7 +40,9 @@ from pedacito import (  # noqa: E402
     workspace_overlay,
 )
 from pedacito import config as config_mod  # noqa: E402
+from pedacito import loop, testsel  # noqa: E402
 from pedacito.config import Config  # noqa: E402
+from pedacito.edits import Result  # noqa: E402
 
 
 def _sha(p: Path) -> str:
@@ -384,3 +387,109 @@ def test_shadow_network_isolation_is_honest(monkeypatch):
     assert sandbox.shadow_network_isolation(cfg) is True
     monkeypatch.setattr(sandbox, "backend_name", lambda: "")
     assert sandbox.shadow_network_isolation(cfg) is False
+
+
+# ------------------------------------------------ shadow_tests in post-edit runs
+
+class _Events:
+    def __init__(self):
+        self.calls = []
+
+    def emit(self, name, **fields):
+        self.calls.append((name, fields))
+
+
+def _post_edit_project(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    _py(root, "a.py", "VALUE = 2\n")
+    _py(root, "tests/test_a.py", "from a import VALUE\n")
+    idx = SimpleNamespace(root=root, files=["a.py", "tests/test_a.py"],
+                          graph=None)
+    cfg = Config()
+    cfg.verify_tests = True
+    cfg.allow_shell = True
+    cfg.shadow_tests = True
+    return root, idx, cfg
+
+
+def _run_post_edit(root, idx, cfg, collect=None):
+    results = [Result(True, "a.py", "applied")]
+    return loop._post_edit_tests(
+        root, cfg, None, idx, "change VALUE", results, "", None, None,
+        ["a.py"], collect=collect)
+
+
+def test_shadow_tests_run_in_isolated_copy_and_clean_up(tmp_path, monkeypatch):
+    root, idx, cfg = _post_edit_project(tmp_path)
+    seen = {}
+
+    def fake_impacted(index, cfg_, changed, *, env=None):
+        shadow = Path(index.root)
+        seen["root"] = shadow
+        seen["env"] = env
+        seen["exists"] = shadow.is_dir()
+        seen["copy_has_src"] = (shadow / "a.py").is_file()
+        (shadow / "a.py").write_text("VALUE = 999\n", encoding="utf-8")
+        return True, "1 passed", "`pytest -q` -- impacted tests"
+
+    events = _Events()
+    monkeypatch.setattr(sandbox, "shadow_network_isolation", lambda c=None: True)
+    monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
+    monkeypatch.setattr(loop.events_mod, "get", lambda r, c: events)
+
+    _results, _reply, tests_ok, _pre = _run_post_edit(root, idx, cfg)
+
+    assert tests_ok is True
+    assert seen["root"] != root and seen["exists"] and seen["copy_has_src"]
+    assert not seen["root"].exists()                  # shadow removed after
+    assert (root / "a.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert seen["env"]["HOME"] != str(Path.home())
+    assert seen["env"]["TMP"] == seen["env"]["TEMP"]
+    assert ("shadow_tests", {"status": "ran", "ok": True, "files": 1}) in events.calls
+
+
+def test_shadow_tests_unavailable_on_windows_refuses_green(tmp_path, monkeypatch,
+                                                           capsys):
+    root, idx, cfg = _post_edit_project(tmp_path)
+
+    def must_not_run(*_a, **_k):
+        raise AssertionError("tests ran without isolation")
+
+    events = _Events()
+    collect = []
+    monkeypatch.setattr(sandbox, "backend_name", lambda: "win_restricted")
+    monkeypatch.setattr(sandbox, "shadow_network_isolation", lambda c=None: False)
+    monkeypatch.setattr(testsel, "run_impacted", must_not_run)
+    monkeypatch.setattr(loop.events_mod, "get", lambda r, c: events)
+
+    _results, _reply, tests_ok, preexisting = _run_post_edit(
+        root, idx, cfg, collect=collect)
+
+    assert tests_ok is False and preexisting is False
+    assert ("shadow_tests", {"status": "unavailable", "ok": False,
+                             "files": 1, "backend": "win_restricted"}) \
+        in events.calls
+    assert any(f.kind == "tests" and f.severity == "error"
+               and "UNVERIFIED" in f.message for f in collect)
+    assert "shadow tests: unavailable" in capsys.readouterr().err
+
+
+def test_shadow_tests_off_keeps_ordinary_project_run(tmp_path, monkeypatch):
+    root, idx, cfg = _post_edit_project(tmp_path)
+    cfg.shadow_tests = False
+    seen = {}
+
+    def fake_impacted(index, cfg_, changed, *, env=None):
+        seen["root"] = Path(index.root)
+        seen["env"] = env
+        return True, "1 passed", "`pytest -q` -- impacted tests"
+
+    monkeypatch.setattr(testsel, "run_impacted", fake_impacted)
+    monkeypatch.setattr(sandbox, "shadow_network_isolation",
+                        lambda c=None: pytest.fail("no shadow check when off"))
+
+    _results, _reply, tests_ok, _pre = _run_post_edit(root, idx, cfg)
+
+    assert tests_ok is True
+    assert seen == {"root": root, "env": None}

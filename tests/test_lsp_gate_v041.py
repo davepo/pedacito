@@ -6,16 +6,19 @@ real language server is needed.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import time
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import env_resolve, lsp, loop
+from pedacito import env_resolve, lsp, loop, tools as tools_mod
 from pedacito.config import EXEC_FIELDS, Config, project_template
+from pedacito.edits import Result
 from pedacito.lsp import Diagnostic
 
 FAKE_GATE_SERVER = r'''
@@ -406,3 +409,106 @@ def test_loop_gate_is_off_by_default_and_unverified_stays_silent(tmp_path):
     assert gate is not None and gate.before_status == "timeout"
     assert loop._lsp_gate_finish(gate, root, cfg) == []
     lsp.close_all()
+
+
+# ------------------------------------------- run_task wiring (BUG-04, all paths)
+
+LEGACY_REPLY = ("--- FILE: a.py\n<<<<<<< SEARCH\ny = 2\n=======\ny = 2\n"
+                "BUG new\n>>>>>>> REPLACE\n")
+NEW_TEXT = "x = 1\nBUG old\ny = 2\nBUG new\n"
+
+
+class _EditAgent:
+    """Scripted agent: answer() returns `reply`, apply() writes `new_text`
+    to a.py, and every finding handed to repair is recorded."""
+
+    steps_log: list = []
+
+    def __init__(self, root, reply, cfg=None, new_text=NEW_TEXT):
+        self.root, self.reply, self.cfg, self.new_text = root, reply, cfg, new_text
+        self.repairs: list = []
+
+    def gather(self, task, **kw):
+        return "gathered source"
+
+    def answer(self, task, gathered, **kw):
+        return self.reply
+
+    def apply(self, reply, **kw):
+        (self.root / "a.py").write_text(self.new_text, encoding="utf-8")
+        return [Result(True, "a.py", "applied")], reply
+
+    def _repair_from_findings(self, task, reply, findings, results):
+        self.repairs.extend(findings)
+        return ""
+
+
+def _run_lsp_task(root, cfg, agent, task):
+    lsp.close_all()
+    try:
+        return loop.run_task(root, cfg, None, agent,
+                             SimpleNamespace(root=root), task, apply=True)
+    finally:
+        lsp.close_all()
+
+
+def test_run_task_legacy_edit_routes_new_lsp_diagnostic_to_repair(tmp_path):
+    root = _root(tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.verify_tests = False
+    agent = _EditAgent(root, LEGACY_REPLY)
+    tr = _run_lsp_task(root, cfg, agent, "Add a BUG line after y in a.py")
+    assert tr.applied
+    assert [f.kind for f in agent.repairs] == ["lsp"]
+    assert "bug: BUG new" in agent.repairs[0].message
+    assert tr.tests_ok is False
+    assert any(f.kind == "lsp" and f.severity == "error" for f in tr.findings)
+
+
+def test_run_task_structured_edit_routes_new_lsp_diagnostic_to_repair(tmp_path):
+    root = _root(tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.verify_tests = False
+    cfg.edit_mode = "structured"
+    reply = json.dumps({"version": 1, "intents": [], "edits": [{
+        "edit_action": "replace_symbol", "file": "a.py", "symbol": "",
+        "search": "y = 2", "replacement": "y = 2\nBUG new"}]})
+    assert loop._structured_files(reply) == ["a.py"]
+    agent = _EditAgent(root, reply, cfg)
+    tr = _run_lsp_task(root, cfg, agent, "Add a BUG line after y in a.py")
+    assert tr.applied
+    assert [f.kind for f in agent.repairs] == ["lsp"]
+    assert tr.tests_ok is False
+
+
+def test_run_task_gather_write_invokes_gate_and_never_reports_green(
+        tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.verify_tests = False
+    seen = {"begin": [], "finish": []}
+    real_begin, real_finish = loop._lsp_gate_begin, loop._lsp_gate_finish
+
+    def begin(r, c, files, **kw):
+        seen["begin"].append((tuple(files), kw))
+        return real_begin(r, c, files, **kw)
+
+    def finish(gate, r, c):
+        seen["finish"].append(gate.before_status if gate else None)
+        return real_finish(gate, r, c)
+
+    class GatherAgent(_EditAgent):
+        def gather(self, task, **kw):
+            (self.root / "a.py").write_text(NEW_TEXT, encoding="utf-8")
+            tools_mod._note_mutation(self.cfg, "a.py")
+            return "gathered source"
+
+    monkeypatch.setattr(loop, "_lsp_gate_begin", begin)
+    monkeypatch.setattr(loop, "_lsp_gate_finish", finish)
+    agent = GatherAgent(root, "The edit is already in place.", cfg)
+    tr = _run_lsp_task(root, cfg, agent, "Add a BUG line after y in a.py")
+    assert tr.applied and tr.changed == ["a.py"]
+    assert seen["begin"] == [(("a.py",), {"written": True})]
+    assert seen["finish"].count("unavailable") == 1
+    assert agent.repairs == []
+    assert tr.tests_ok is not True

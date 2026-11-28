@@ -370,10 +370,10 @@ def _argv(command: str) -> list[str]:
         return command.split()
 
 
-def run_command(root, cfg, command: str, timeout: int | None = None
-                ) -> tuple[bool, str]:
+def run_command(root, cfg, command: str, timeout: int | None = None, *,
+                env: dict | None = None) -> tuple[bool, str]:
     """Run a test command as an argv (no shell) with the scrubbed environment;
-    (passed, output)."""
+    (passed, output). `env` replaces that environment (isolated shadow runs)."""
     argv = _argv(command)
     if not argv:
         return False, "(empty test command)"
@@ -395,7 +395,7 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     rc, out, stopped, _el = proc.run(
         argv, cwd=Path(root), timeout=timeout, idle_timeout=0,
         max_output=int(getattr(cfg, "max_shell_output_chars", 8000) or 8000) * 2,
-        env=env_resolve.command_env(resolved, cfg),
+        env=env if env is not None else env_resolve.command_env(resolved, cfg),
         windows_sandbox=sandbox.windows_sandbox_active(cfg),
         bin_dirs=resolved.bin_dirs)
     if box and rc not in (0, None) and not stopped:
@@ -423,10 +423,12 @@ def impacted_base(root, cfg, changed: list[str]) -> str:
     return _language_base(Path(root), changed, cfg, base)
 
 
-def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
+def run_impacted(index, cfg, changed: list[str], *,
+                 env: dict | None = None) -> tuple[bool, str, str]:
     """Run the tests a change can break: impacted ones first, then (if they
     pass and the command could be narrowed) nothing more -- the full suite is
-    the user's `--verify`. Returns (passed, output, description)."""
+    the user's `--verify`. Returns (passed, output, description). `env`
+    replaces the child environment (shadow runs, §3.7)."""
     base = detect_test_command(index.root, cfg)
     if not base:
         return True, "", "no test command detected"
@@ -455,7 +457,8 @@ def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
         # cannot be assumed pre-existing (BUG-206). Keep the verdict
         # edit-caused so repair sees the failures this run created.
         was_failing = False
-    ok, out = run_command(index.root, cfg, cmd)
+    ok, out = (run_command(index.root, cfg, cmd, env=env) if env is not None
+               else run_command(index.root, cfg, cmd))
     if not ok and was_failing:
         desc += f" -- {PRE_EXISTING_LABEL}"
     if ok and "node --test" in cmd and _NODE_ZERO_TESTS_RE.search(out or ""):
