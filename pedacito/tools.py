@@ -1060,6 +1060,29 @@ def inspect_tools(cfg, index, task: str, *,
     return tuple(out)
 
 
+def schema_action_names(schema: dict | None) -> tuple[str, ...]:
+    """Enabled action IDs in a step schema, in schema order.
+
+    The prompt inspector reads the SAME schema the request sends, so a
+    report cannot claim an action the model could not choose. Any shape
+    without the action enum yields an empty tuple rather than inventing
+    names.
+    """
+    if not isinstance(schema, dict):
+        return ()
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return ()
+    action = props.get("action")
+    if not isinstance(action, dict):
+        return ()
+    enum = action.get("enum")
+    if not isinstance(enum, (list, tuple)):
+        return ()
+    return tuple(str(name) for name in enum
+                 if isinstance(name, str) and name.strip())
+
+
 def _as_text(value) -> str:
     """String coercion for model-supplied step fields (a salvaged step can
     carry null/number/list values; one bad field must not kill the run)."""

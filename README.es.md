@@ -49,6 +49,7 @@ Primero inicia un servidor de modelos (LM Studio, Ollama, Lemonade o llama.cpp).
 | **Daemon de sesiones** | `pedacito daemon` es un servicio de loopback protegido por token con repetición de eventos por sesión | [USAGE.md](docs/es/USAGE.md#la-cli-de-un-vistazo) |
 | **Subagentes paralelos** | `subagent_max_parallel` acota los subagentes concurrentes; los roles de solo lectura siguen siendo de solo lectura | [CONFIG.md](docs/es/CONFIG.md) |
 | **Manifiesto de paquete** | `pedacito-package.toml` declara lo que necesita un paquete de extensión o habilidad | [SKILLS_AND_TOOLS.md](docs/es/SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml) |
+| **Inspector del presupuesto del prompt** | `pedacito prompt --explain --last` y la pestaña **Prompt** de la GUI muestran el orden, conteo de tokens, método de conteo, hash y estado de cada sección de la petición. Los informes guardan hashes/conteos, nunca el texto del prompt; `--compare RUN_ID` compara ids/hashes/conteos | [USAGE.md](docs/es/USAGE.md#inspeccionar-el-presupuesto-del-prompt) |
 
 Notas completas: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
 

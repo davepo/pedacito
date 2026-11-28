@@ -534,6 +534,23 @@ Some logs have their own audit trail. `sessions/<stamp>.md` records what was ask
 was looked up, and what changed. `events/<stamp>.jsonl` records each step, model call,
 fold and verification. `log.txt` is a timestamped trace. All of them mask secrets.
 
+### Prompt provenance reports
+
+`prompt_inspect` writes one bounded report per run under
+`.pedacito/prompt_reports/`. A report stores a name, ordinal, token count,
+counting method, SHA-256 content hash, disposition and a redacted reason for
+each assembled section, plus matched rule/skill/memory IDs and the hash of the
+serialized request. It never stores the prompt text, source files, tool output
+or credentials, and it does not copy section text into the session event stream.
+
+Every report path is resolved with `security.resolve_safe_path`; traversal and
+symlink/junction escapes are refused. The file is tagged with the writing
+session, and `GET /api/prompt/report` only returns a report whose session tag
+matches the active GUI session. Reports are pruned to the newest 40. Explain and
+compare read local files only, do not load a model client and make no network
+call. The capture is observational: it adds no instruction or message, never
+mutates the first two gather messages, and does not change any prompt prefix.
+
 ### Inspect before you undo
 
 `pdc` is a short alias for `pedacito`, and both accept the same commands.

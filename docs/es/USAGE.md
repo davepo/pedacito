@@ -192,6 +192,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito autopsy --last [PROJECT]` | Clasifica por qué falló la última ejecución, a partir de sus eventos tipados registrados; solo lectura, sin llamar al modelo. Sale siempre con 0 |
 | `pedacito tools [PROJECT] [--task TEXTO]` | Muestra qué herramientas se ofrecen al modelo para una tarea, el motivo de cada una (activa o no) y su permiso; solo lectura. `--allow-tool NAME` en `ask`/`auto` restaura una herramienta podada solo para esa tarea |
 | `pedacito plan --check [PLAN] [PROJECT]` | Valida una lista de tareas contra el índice antes de una ejecución Auto o Complex; `--impact` previsualiza llamadores y pruebas. Sale con 0 si está limpio o solo hay advertencias, 1 ante errores definitivos y 2 si el plan no es válido |
+| `pedacito prompt --explain [--last] [--compare RUN_ID] [PROJECT]` | Muestra el presupuesto y la procedencia del prompt de una ejecución: orden de secciones, conteos de tokens, método de conteo, hashes y disposiciones. `--compare` compara ids/hashes/conteos con una ejecución anterior; nunca muestra texto del prompt |
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero |
 | `pedacito chat PROJ` | Sesión interactiva que mantiene caliente el índice (`--rpc` convierte la sesión en un protocolo de máquina) |
 | `pedacito tui PROJ` | TUI en pantalla dividida: transcripción, barra lateral de actividad/plan en vivo y un pie de telemetría con Context Meter / consumo de tokens / tok/s. Suite completa de comandos slash; `--headless` es programable |
@@ -243,6 +244,35 @@ de tocar cualquier archivo fuente. `resume` y `cleanup` se rechazan con una
 explicación en esta versión, porque no existe un límite de reanudación duradero
 validado ni una prueba autoritativa de propiedad o vivacidad entre procesos. Un
 rechazo sale con código 1 y deja intactos el diario y tus archivos.
+
+### Inspeccionar el presupuesto del prompt
+
+Cada ejecución Task o Auto escribe un informe de procedencia del prompt en
+`.pedacito/prompt_reports/`. Describe los límites reales de ensamblado: orden
+de secciones, conteo de tokens, método de conteo, hash de contenido y la
+disposición de la sección (`kept`, `truncated`, `pruned`, `dropped`, `disabled`
+o `sent`), además de los IDs de reglas, skills y memoria que coincidieron. El
+informe **no** guarda el prompt, archivos fuente, salida de herramientas ni
+credenciales.
+
+```bash
+pedacito prompt --explain --last .                 # informe más reciente
+pedacito prompt --explain --last . --json          # legible por máquina
+pedacito prompt --explain --compare pr-20260101-120000-ab12cd34 .
+```
+
+`--compare RUN_ID` imprime una diferencia construida con IDs, hashes y conteos
+de sección; nunca imprime texto fuente. Un conteo se etiqueta
+`estimate:<nombre>` cuando proviene de una heurística de caracteres
+(`estimate:chars-div-3.6` es el valor por defecto) y `exact:<nombre>` solo
+cuando el proveedor informó el uso (`exact:provider-usage` para el total de la
+petición serializada). El comando es local: lee los archivos del informe y
+nunca contacta a un servidor de modelos.
+
+La GUI expone la misma vista de solo lectura en la pestaña **🧪 Prompt** del
+panel Workspace (`GET /api/prompt/report`), acotada a la sesión actual. Elige
+una ejecución (y opcionalmente otra para comparar) para ver la tabla de
+secciones, las entradas podadas y la diferencia de solo metadatos.
 
 ## Ayuda integrada: `pedacito how`
 

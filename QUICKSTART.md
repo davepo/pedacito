@@ -1151,6 +1151,7 @@ only the map is stale.
 | `pedacito plan --check PLAN.md PROJ` | Validate a checklist against the index before Auto or Complex runs (`--impact` previews callers and tests; exit 0 clean/warnings, 1 errors, 2 invalid) |
 | `pedacito autopsy --last PROJ` | Classify why the last run failed, from its recorded typed events (read-only, no model call; `--json` for scripts) |
 | `pedacito tools PROJ [--task "..."] [--allow-tool NAME]` | Show which tools the model is offered for a task, the reason each is on or off, and its permission; `--allow-tool` restores one pruned tool for that task only |
+| `pedacito prompt --explain --last PROJ` | Show the last run's prompt budget and provenance (section order, token counts, counting method, hashes, dispositions). `--compare RUN_ID` diffs ids/hashes/counts only; never prompt text |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito recover list [PROJ]` | Show unfinished task journals by UUID. `recover rollback ID PROJ` previews a safely bound rollback; add `--apply` to perform it |
 | `pedacito commit [--all] [-m MSG] [-y]` | Secret-scan the staged diff, then create a local commit. Never pushes; `--no-model` drafts offline and `--allow-secrets` is the explicit override |

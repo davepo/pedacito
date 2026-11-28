@@ -1148,6 +1148,7 @@ solo el mapa está desactualizado.
 | `pedacito autopsy --last PROJ` | Clasifica por qué falló la última ejecución, a partir de sus eventos tipados registrados (solo lectura, sin llamar al modelo; `--json` para scripts) |
 | `pedacito tools PROJ [--task "..."] [--allow-tool NAME]` | Muestra qué herramientas se ofrecen al modelo para una tarea, el motivo de cada una (activa o no) y su permiso; `--allow-tool` restaura una herramienta podada solo para esa tarea |
 | `pedacito plan --check PLAN.md PROJ` | Valida una lista de tareas contra el índice antes de que se ejecute Auto o Complex (`--impact` previsualiza llamadores y pruebas; sale con 0 limpio/advertencias, 1 errores y 2 inválido) |
+| `pedacito prompt --explain --last PROJ` | Muestra el presupuesto y la procedencia del prompt de la última ejecución (orden de secciones, conteos de tokens, método de conteo, hashes, disposiciones). `--compare RUN_ID` compara solo ids/hashes/conteos; nunca el texto del prompt |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito recover list [PROJ]` | Muestra los diarios de tareas inacabadas por UUID. `recover rollback ID PROJ` previsualiza una reversión vinculada de forma segura; añade `--apply` para realizarla |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Renombra un símbolo en todo el proyecto. Sin llamada al modelo; vista previa por defecto; `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba |

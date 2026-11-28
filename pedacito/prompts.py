@@ -248,6 +248,18 @@ def _compact_tool_help(cfg) -> str:
     return "\n".join(lines[a] for a in lines if a in enabled)
 
 
+def tool_help_block(cfg, full_help: str, pack: str | None = None) -> str:
+    """The exact tool-help listing the gather prompt uses for this pack.
+
+    The prompt inspector records this block's hash/length; the text still
+    comes from the same code path that builds the request, so the report
+    cannot drift from what was actually sent.
+    """
+    pack = pack or pack_for(cfg)
+    return (_compact_tool_help(cfg) if pack in ("tiny", "small")
+            else tool_help(cfg, full_help))
+
+
 # --------------------------------------------------------------------------
 # Gather system prompt
 # --------------------------------------------------------------------------
@@ -407,19 +419,20 @@ def gather_system(cfg, base: str, tool_help_full: str, pack: str | None = None
         extras = [t for k, t in _EXTRA_BULLETS if k in enabled
                   and k in ("context", "remember", "git", "question")] + [_TRUST_RULE]
         return with_project_rules(_TINY_GATHER.format(
-            help=_compact_tool_help(cfg),
+            help=tool_help_block(cfg, tool_help_full, pack),
             extra="\n".join(extras)), cfg)
     if pack == "small":
         extras = [t for k, t in _SMALL_EXTRA_BULLETS if k in enabled] + [_TRUST_RULE]
         return with_project_rules(_SMALL_GATHER.format(
-            help=_compact_tool_help(cfg),
+            help=tool_help_block(cfg, tool_help_full, pack),
             extra="\n".join(extras)), cfg)
     head, bullets = _split_base(base)
     head = head.replace("{help}", "")
     # The `Actions:` listing inside `base` already embeds the full TOOL_HELP;
     # swap it for the filtered one.
     if tool_help_full and tool_help_full in head:
-        head = head.replace(tool_help_full, tool_help(cfg, tool_help_full))
+        head = head.replace(tool_help_full,
+                            tool_help_block(cfg, tool_help_full, pack))
     kept: list[str] = []
     for b in bullets:
         gate = next((fn for prefix, fn in _GATED_BULLETS
@@ -1090,6 +1103,21 @@ def load_override(cfg, name: str) -> str:
             continue
         _override_cache[key] = (st.st_mtime_ns, text)
         return text
+    return ""
+
+
+def override_source(cfg, name: str) -> str:
+    """Where `name`'s override came from: "project", "user", or "".
+
+    The prompt inspector records this ID (never the override text) so a
+    report can explain which prompt layer was in play.
+    """
+    for i, d in enumerate(_override_dirs(cfg)):
+        try:
+            if (d / f"{name}.md").is_file():
+                return "project" if i == 0 else "user"
+        except OSError:
+            continue
     return ""
 
 

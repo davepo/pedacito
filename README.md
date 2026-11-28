@@ -49,6 +49,7 @@ Start a model server first (LM Studio, Ollama, Lemonade or llama.cpp), then in t
 | **Session daemon** | `pedacito daemon` is a token-protected loopback service with per-session event replay | [USAGE.md](docs/USAGE.md#the-cli-at-a-glance) |
 | **Parallel subagents** | `subagent_max_parallel` bounds concurrent subagents; read-only roles stay read-only | [CONFIG.md](docs/CONFIG.md) |
 | **Package manifest** | `pedacito-package.toml` declares what an extension or skill package needs | [SKILLS_AND_TOOLS.md](docs/SKILLS_AND_TOOLS.md#package-manifests-pedacito-packagetoml) |
+| **Prompt budget inspector** | `pedacito prompt --explain --last` and the GUI **Prompt** tab show each request section's order, token count, counting method, hash and kept/pruned state. Reports store hashes/counts, never prompt text; `--compare RUN_ID` diffs ids/hashes/counts | [USAGE.md](docs/USAGE.md#inspecting-the-prompt-budget) |
 
 Full notes: [CHANGELOG.md](CHANGELOG.md#v040--2026-11-26).
 

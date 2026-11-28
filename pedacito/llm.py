@@ -2180,6 +2180,20 @@ class LLMClient:
         """`requests.post` through this client's pooled session (a fresh TCP/TLS
         handshake per call is pure latency on hosted APIs), unless a caller
         replaced `requests.post`."""
+        payload = kw.get("json")
+        if payload is not None:
+            # Hash-only provenance of the exact payload that leaves this
+            # client (after the outbound secret guard for the OpenAI path and
+            # after native translation elsewhere). Nothing is stored.
+            try:
+                from . import prompt_inspect
+                messages = (payload.get("messages")
+                            if isinstance(payload, dict) else None)
+                prompt_inspect.note_transport(
+                    payload, provider=self.provider_label(),
+                    message_count=len(messages or ()))
+            except Exception:
+                pass
         fn = requests.post
         if fn is not _REAL_POST:
             return fn(url, **kw)
@@ -3044,6 +3058,7 @@ class LLMClient:
         usage = usage or {}
         pt = int(usage.get("prompt_tokens") or 0)
         ct = int(usage.get("completion_tokens") or 0)
+        reported_prompt = pt
         if not pt and not ct:
             # The server reported nothing: keep estimates so budgets and the
             # per-task summary still mean something.
@@ -3114,6 +3129,13 @@ class LLMClient:
                   "provider": self.provider_label(),
                   "finish": self.last_finish_reason}
         try:
+            from . import prompt_inspect
+            # Only a provider-reported input count is exact; the estimate
+            # fallback above must stay labelled as an estimate.
+            prompt_inspect.note_exact_usage(reported_prompt)
+        except Exception:
+            pass
+        try:
             from . import events
             events.note_call(record)
         except Exception:
@@ -3177,6 +3199,14 @@ class LLMClient:
         if self._token_set(external_cancel):
             raise RunCancelledError(
                 "Cancelled before the request left; nothing was sent.")
+        # Prompt provenance: record the stable prefix and the schema this
+        # request actually uses. No message is copied or modified; outside an
+        # Agent run the capture is absent and this is a no-op.
+        try:
+            from . import prompt_inspect
+            prompt_inspect.note_request(messages, schema)
+        except Exception:
+            pass
         # Native provider transports: OpenAI /v1/responses, Anthropic
         # /v1/messages, and Google Gemini /v1beta generateContent. The outbound
         # secret guard, replay digest, telemetry and cost accounting still run

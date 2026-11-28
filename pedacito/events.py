@@ -404,6 +404,26 @@ def attach(client, log: EventLog | _SessionEventAdapter) -> None:
         client.on_start = lambda info: log.emit("llm_start", **info)
 
 
+def emit_prompt_report(log, report) -> None:
+    """Emit one bounded `prompt_report` event for a PromptReport.
+
+    The payload carries run/section IDs, counts, hashes and dispositions --
+    never section text, source or credentials. Inspection failures must never
+    break a run, so every error here is swallowed.
+    """
+    if log is None or report is None:
+        return
+    try:
+        from . import prompt_inspect
+        payload = prompt_inspect.event_payload(report)
+    except Exception:
+        return
+    try:
+        log.emit("prompt_report", **payload)
+    except Exception:
+        pass
+
+
 class RunTelemetry:
     """Aggregated LLM usage for ONE run (a /new, /auto or task job), kept
     session/context-scoped so concurrent jobs never mix their numbers while
