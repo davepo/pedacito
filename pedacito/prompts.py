@@ -813,6 +813,58 @@ def edit_format(cfg, full: str, pack: str | None = None,
 
 
 # --------------------------------------------------------------------------
+# Structured edit mode (WP-4101B)
+# --------------------------------------------------------------------------
+# When `edit_mode = "structured"` the answer brief replaces the search/replace
+# blocks with a single strict JSON object. It is requested through the engine's
+# structured-output ladder (json_schema -> json_object -> prompt), and the reply
+# is ALWAYS re-validated locally by `edits.parse_structured_reply` +
+# `verify.validate_structured_reply`, so a server without a strict sampler is
+# never trusted on the schema alone.
+STRUCTURED_EDIT_FORMAT = """\
+If the task requires changing code, reply with ONE JSON object and nothing else
+(no prose, no code fence). The object has exactly three keys:
+
+{
+  "version": 1,
+  "intents": [ {"file": "...", "symbol": "...", "why": "..."}, ... ],
+  "edits":   [ {"edit_action": "...", "file": "...", "symbol": "...",
+               "search": "...", "replacement": "..."}, ... ]
+}
+
+Rules:
+- `version` is always the integer 1. No other top-level keys are allowed.
+- `intents` names each change (1 to 8 entries): the relative file path, the
+  symbol you are changing ("" only when creating a new file or appending to
+  the whole file), and a short nonblank `why` (at most 300 characters).
+- `edits` lists 1 to 8 concrete actions. Each `edit_action` is one of:
+  `replace_symbol`    replace the whole definition named by `symbol`;
+  `insert_after_symbol` insert new code right after that definition;
+  `search_replace`    replace `search` (must occur exactly once INSIDE the
+                      named symbol) with `replacement`;
+  `append`            append `replacement` to the end of the file
+                      (`symbol` and `search` empty);
+  `delete_symbol`     delete the whole definition (`replacement` empty).
+- Unused string fields are the empty string "". A replacement that is empty on
+  `replace_symbol`/`insert_after_symbol`/`append` is refused (use
+  `delete_symbol` to remove a symbol).
+- Every edit must match a declared intent (same file and same symbol).
+- Only change code you actually read; quote `search` text exactly from what
+  you saw. Never guess at a file or symbol you have not seen.
+- You are in the FINAL answer phase: no tools are available. If you cannot
+  name the exact file/symbol/search from what you read, say so with an empty
+  reply object instead of inventing one.
+- A reply that changes nothing is exactly {"version":1,"intents":[],"edits":[]}.
+If the task is a question rather than a change, answer it in prose and output no JSON."""
+
+
+def structured_edit_format(cfg, task: str = "") -> str:
+    """The structured-mode answer brief (constant text; no pack/creative
+    variation -- structured JSON replaces the quote/anchor block syntax)."""
+    return STRUCTURED_EDIT_FORMAT
+
+
+# --------------------------------------------------------------------------
 # Value-bound test rules
 # --------------------------------------------------------------------------
 # Rides along with the answer brief for tasks that touch tests. A
@@ -998,8 +1050,11 @@ def answer_system(cfg, full_edit_format: str, task: str = "",
                "specific\nsource you asked to see. Complete the user's task.")
     # Project rules ride directly after the persona, before the (task-shaped)
     # edit brief: that keeps them in the stable prefix of every answer call.
-    text = with_project_rules(persona, cfg) + "\n\n" \
-        + edit_format(cfg, full_edit_format, creative=creative)
+    if getattr(cfg, "edit_mode", "legacy") == "structured":
+        brief = structured_edit_format(cfg, task)
+    else:
+        brief = edit_format(cfg, full_edit_format, creative=creative)
+    text = with_project_rules(persona, cfg) + "\n\n" + brief
     if creative:
         craft = creative_craft_directives(task)
         if craft:

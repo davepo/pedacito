@@ -96,7 +96,7 @@ El reintento que vuelve a anclar un bloque fallido ofrece una forma que el model
 
 ### 7. Valores por defecto adaptativos a partir de una tarjeta medida
 
-`pedacito calibrate` ejecuta una breve batería con guion (elección de herramientas, adherencia a JSON, formato de edición, inyección plantada y honestidad, recuperación de contexto largo, continuación, un A/B de pensamiento y capacidades) y guarda una tarjeta por modelo. Luego la tarjeta elige `prompt_pack`, `answer_mode`, `best_of`, `verify_answer`, `tool_mode`, `fuzzy_match` y `edit_style` *solo para los ajustes que el usuario dejó en su valor por defecto*, y un valor explícito de configuración siempre gana. La dirección es deliberada: los modelos *más débiles* reciben la *mayor* red de seguridad.
+`pedacito calibrate` ejecuta una breve batería con guion (elección de herramientas, adherencia a JSON, formato de edición, inyección plantada y honestidad, recuperación de contexto largo, continuación, un A/B de pensamiento y capacidades) y guarda una tarjeta por modelo. Luego la tarjeta elige `prompt_pack`, `answer_mode`, `best_of`, `verify_answer`, `tool_mode`, `fuzzy_match`, `edit_style` y `edit_mode` *solo para los ajustes que el usuario dejó en su valor por defecto*, y un valor explícito de configuración siempre gana. El formato de edición se mide como tres brazos emparejados — cita (legacy), ancla y estructurado — y un brazo no legacy solo se adopta cuando supera al brazo legacy por la mejora mínima (0,05), con los empates a favor del brazo legacy actual. La dirección es deliberada: los modelos *más débiles* reciben la *mayor* red de seguridad.
 
 ### 8. Disposición de la caché de prompt
 
@@ -629,7 +629,27 @@ archivos tocados, límites entre módulos, palabras de arquitectura abiertas) es
 un solo archivo. Ambas vías se ejecutan una vez por tarea, y la opción está desactivada por defecto, así que el
 comportamiento reactivo existente no cambia.
 
-## Referencia rápida: técnicas 5, 11, 17 a 51
+### 57. Modo de edición estructurado: una única respuesta JSON estricta, validada antes de escribir
+
+**Problema.** Una respuesta libre de búsqueda/reemplazo deja al arnés salvar lo que pueda de la prosa, los bloques
+a medio escribir y las citas casi acertadas. La salida estructurada (la respuesta *es* el esquema) solo es fiable
+cuando se conoce cada escalón de la escalera de la petición y la respuesta se vuelve a comprobar localmente.
+
+**Técnica.** Con `edit_mode = "structured"`, la respuesta es un único objeto JSON estricto —
+`{"version":1,"intents":[...],"edits":[...]}` con `additionalProperties: false` y las cinco acciones
+(`replace_symbol`, `insert_after_symbol`, `search_replace`, `append`, `delete_symbol`). La petición usa la misma
+escalera `json_schema -> json_object -> prompt` que toda llamada estructurada (§27), y el escalón realmente
+honrado se registra como `schema_enforcement` (`strict` / `json_object` / `prompt_only`), de modo que una
+degradación solo de prompt nunca se etiqueta como impuesta por el muestreador. La respuesta se analiza
+estrictamente (sin salvamento) y pasa por la misma protección local que toda edición (`validate_structured_reply`:
+coincidencia de intenciones, contención, sensible/protegido/política, resolución de símbolo/búsqueda, no-op/
+solapamiento/alcance, sintaxis y la compuerta de nombres sin definir) antes de materializarse en ediciones legacy
+de archivo completo y aplicarse a través de la transacción atómica (§20). Una respuesta rechazada se vuelve a
+pedir un número acotado de veces y se registra como evento `schema_rejection` sin persistir la respuesta cruda.
+`edit_mode` lo elige `pedacito calibrate` a partir de los tres brazos emparejados solo cuando el modelo mide mejor
+que el brazo legacy; el prompt legacy y las tarjetas legacy no cambian en la ruta por defecto.
+
+## Referencia rápida: técnicas 5, 11, 17 a 51, 57
 
 | Técnica | Sección | Cómo desactivarla | Dónde se ve |
 |---|---|---|---|
@@ -672,6 +692,7 @@ comportamiento reactivo existente no cambia.
 | Cambio de estrategia cuando no existe un rol `escalate` | §49 | `auto_escalate = false` | Evento `strategy_shift`; un reintento con el mismo modelo con el estilo de edición invertido tras un motivo de escalamiento |
 | Autoenrutamiento a especialistas + traspaso limpio de VRAM | §50 | `auto_route_specialties = false` (por defecto), o `--no-auto-route` por ejecución | Eventos `specialist_routed` / `model_swap`; **✦ Auto-route** en la barra superior de la GUI; columna Specialties en `pedacito profiles` |
 | Limpieza del árbol de procesos en Windows (envoltorio de job suspendido + handle retenido + recorrido de huérfanos) | §51 | Ninguna (siempre activo; es el camino `stop` de Windows) | `job_note` / `born_ft` / `descendants` / `stop_note` / `stop_incomplete` en `.pedacito/procs/*.json`; el crisol de huérfanos + pruebas de portabilidad con kernel32 falso |
+| Modo de edición estructurado (una única respuesta JSON estricta, validada localmente y aplicada de forma atómica) | §57 | `edit_mode = "legacy"` (por defecto) | `edit_mode = "structured"`; eventos `schema_enforcement` (`strict`/`json_object`/`prompt_only`) y `schema_rejection`; los `edit_mode_scores` de tres brazos en la tarjeta del modelo |
 
 ## Técnicas que existen pero no encajan bien
 

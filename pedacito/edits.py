@@ -2343,6 +2343,55 @@ _INTENT_KEYS = frozenset({"file", "symbol", "why"})
 _EDIT_KEYS = frozenset({"edit_action", "file", "symbol", "search",
                         "replacement"})
 
+# The strict JSON schema requested in structured mode (WP-4101A/B). It mirrors
+# `parse_structured_reply`: one object, `additionalProperties: false`, required
+# `version`/`intents`/`edits`; `version` is the integer 1; `intents`/`edits`
+# are 0-8 objects (the explicit no-change reply is empty arrays). The local
+# guard still enforces every operation-specific field, so a server whose
+# schema support is incomplete is never trusted on the schema alone.
+STRUCTURED_SCHEMA_NAME = "structured_edits"
+STRUCTURED_SCHEMA: dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["version", "intents", "edits"],
+    "properties": {
+        "version": {"type": "integer", "const": 1},
+        "intents": {
+            "type": "array",
+            "maxItems": _MAX_STRUCTURED,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["file", "symbol", "why"],
+                "properties": {
+                    "file": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "why": {"type": "string", "minLength": 1,
+                            "maxLength": _WHY_MAX},
+                },
+            },
+        },
+        "edits": {
+            "type": "array",
+            "maxItems": _MAX_STRUCTURED,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["edit_action", "file", "symbol", "search",
+                             "replacement"],
+                "properties": {
+                    "edit_action": {"type": "string",
+                                    "enum": list(STRUCTURED_ACTIONS)},
+                    "file": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "search": {"type": "string"},
+                    "replacement": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
 
 @dataclass(frozen=True)
 class StructuredIntent:

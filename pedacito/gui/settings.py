@@ -170,6 +170,13 @@ FIELD_META: dict[str, FieldMeta] = {
         description="Show a concise active-development update reminder on "
                     "interactive TUI/chat exit and a subtle dismissible "
                     "notice in the GUI."),
+    "edit_mode": FieldMeta(
+        label="Edit Reply Mode",
+        description="How the model returns edits: 'legacy' search/replace "
+                    "blocks (with the quote/anchor style below), or "
+                    "'structured' -- one strict JSON object that is locally "
+                    "validated and applied atomically. The model card picks "
+                    "this only when you leave it unset."),
 }
 
 _GROUP_RE = re.compile(r"^\s{4}#\s*---+\s*(.*?)\s*-+\s*$")

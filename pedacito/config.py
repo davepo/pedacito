@@ -600,10 +600,15 @@ class Config:
     # Model cards make it an explicit choice for weaker edit-format scores;
     # an explicit false here wins and keeps the ordinary single-reply path.
     incremental_edit_loop: bool = True
+    # Edit reply mode: "legacy" (search/replace blocks, the default) or
+    # "structured" (one strict JSON object with `version`/`intents`/`edits`,
+    # locally validated and applied atomically). An explicit user value beats
+    # the model card (`pedacito calibrate` measures all three arms).
+    edit_mode: str = "legacy"
     # Edit block style: "quote" (SEARCH quoting is the default), "anchor"
     # (SYMBOL anchors with a full new definition are the default; SEARCH only
     # for small edits outside a definition), or None = the model card decides
-    # (`pedacito calibrate` measures both).
+    # (`pedacito calibrate` measures both). Only used in `edit_mode = "legacy"`.
     edit_style: str | None = None
     # Creative/design mode: a Senior Product Engineer & Visual Designer
     # persona, warmer answer sampling (>= 0.6 on local servers), an >= 8192
@@ -1283,6 +1288,7 @@ _ENUM_FIELDS = {
     "gui_theme": ("slate", "light", "daylight", "nord", "midnight",
                   "jazz_solo", "trapper_keeper", "memphis_arcade", "windbreaker"),
     "reasoning_effort": ("default", "low", "medium", "high"),
+    "edit_mode": ("legacy", "structured"),
     "execution_mode": ("two_phase", "interleaved", "auto"),
     "update_channel": ("stable", "any"),
     "language": ("en", "es"),

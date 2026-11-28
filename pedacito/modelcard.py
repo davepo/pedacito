@@ -316,7 +316,7 @@ def apply(cfg) -> dict | None:
 
     for name in ("best_of", "verify_answer", "fold_tail_steps", "plan_threshold",
                  "tool_mode", "disable_thinking", "step_reasoning_first",
-                 "fewshot_steps", "fuzzy_match", "edit_style",
+                 "fewshot_steps", "fuzzy_match", "edit_style", "edit_mode",
                  "incremental_edit_loop"):
         if name in ch and unset(name):
             setattr(cfg, name, ch[name])
@@ -520,6 +520,24 @@ def _t_tool_choice_plain(client, cfg) -> tuple[float, float, list[str]]:
 _FIXTURE = ("def is_leech(self, lapses):\n    return lapses >= 8\n\n"
             "def next_due(self):\n    return self.queue[0]\n")
 
+# The paired edit-format fixtures shared by the quote (legacy), anchor and
+# structured arms: identical tasks and acceptance checks, so the three scores
+# are directly comparable (WP-4101B).
+_EDIT_TASKS: list[tuple[str, ...]] = [
+    ("Change the leech threshold from 8 to self.threshold.",
+     lambda t: "self.threshold" in t and "lapses >= 8" not in t),
+    ("Make next_due return None when self.queue is empty.",
+     lambda t: "None" in t),
+    ("Rename is_leech to is_due.",
+     lambda t: "def is_due" in t and "is_leech" not in t),
+    ("Make next_due raise IndexError when the queue is empty.",
+     lambda t: "IndexError" in t),
+    ("Add a docstring to next_due explaining it returns the next due item.",
+     lambda t: "next due" in t.lower() and '"""' in t),
+    ("Replace the literal 8 in is_leech with the constant THRESHOLD.",
+     lambda t: "THRESHOLD" in t),
+]
+
 
 def _t_edit_format(client, cfg, anchor: bool = False) -> tuple[float, list[str]]:
     from .agent import EDIT_FORMAT
@@ -528,23 +546,9 @@ def _t_edit_format(client, cfg, anchor: bool = False) -> tuple[float, list[str]]
     numbered = "\n".join(f"{i:>3} | {ln}" for i, ln in
                          enumerate(_FIXTURE.splitlines(), 1))
     system = "You are a code assistant. Complete the task.\n\n" + brief
-    tasks = [
-        ("Change the leech threshold from 8 to self.threshold.",
-         lambda t: "self.threshold" in t and "lapses >= 8" not in t),
-        ("Make next_due return None when self.queue is empty.",
-         lambda t: "None" in t),
-        ("Rename is_leech to is_due.",
-         lambda t: "def is_due" in t and "is_leech" not in t),
-        ("Make next_due raise IndexError when the queue is empty.",
-         lambda t: "IndexError" in t),
-        ("Add a docstring to next_due explaining it returns the next due item.",
-         lambda t: "next due" in t.lower() and '"""' in t),
-        ("Replace the literal 8 in is_leech with the constant THRESHOLD.",
-         lambda t: "THRESHOLD" in t),
-    ]
     good = 0
     notes = []
-    for task, check in tasks:
+    for task, check in _EDIT_TASKS:
         try:
             reply = client.chat(
                 [{"role": "system", "content": system},
@@ -563,7 +567,58 @@ def _t_edit_format(client, cfg, anchor: bool = False) -> tuple[float, list[str]]
             good += 1
         else:
             notes.append(f"'{task[:30]}...': block did not anchor or apply")
-    return good / len(tasks), notes
+    return good / len(_EDIT_TASKS), notes
+
+
+def _t_edit_format_structured(client, cfg) -> tuple[float, list[str]]:
+    """The structured arm of the edit-mode probe: the same paired tasks and
+    checks, but the model must reply as ONE strict JSON object that parses with
+    `parse_structured_reply` and materializes against the fixture on disk."""
+    import tempfile
+    from .edits import STRUCTURED_SCHEMA, StructuredReplyError
+    from .prompts import STRUCTURED_EDIT_FORMAT
+    rel = "src/m.py"
+    numbered = "\n".join(f"{i:>3} | {ln}" for i, ln in
+                         enumerate(_FIXTURE.splitlines(), 1))
+    system = "You are a code assistant. Complete the task.\n\n" \
+        + STRUCTURED_EDIT_FORMAT
+    good = 0
+    notes = []
+    with tempfile.TemporaryDirectory(prefix="pedacito-struct-") as td:
+        root = Path(td)
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_FIXTURE, encoding="utf-8")
+        for task, check in _EDIT_TASKS:
+            try:
+                raw = client.chat(
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content":
+                      f"SOURCE YOU REQUESTED\n\n{rel} lines 1-5:\n{numbered}\n\n"
+                      f"TASK\n{task}"}],
+                    max_tokens=cfg.max_tokens_answer,
+                    json_schema=STRUCTURED_SCHEMA, stream=False)
+            except LLMError as e:
+                notes.append(f"structured edit call failed: {str(e)[:60]}")
+                continue
+            try:
+                intents, edits = edits_mod.parse_structured_reply(raw or "")
+            except StructuredReplyError as e:
+                notes.append(f"'{task[:30]}...': not strict JSON "
+                             f"({str(e).splitlines()[0][:60]})")
+                continue
+            mat = edits_mod.materialize_structured_edits(root, intents, edits,
+                                                         cfg=cfg)
+            if not mat.ok:
+                first = (mat.errors[0][:60] if mat.errors else "rejected")
+                notes.append(f"'{task[:30]}...': {first}")
+                continue
+            applied = mat.buffers.get(rel)
+            if applied is not None and check(applied):
+                good += 1
+            else:
+                notes.append(f"'{task[:30]}...': edit did not anchor or apply")
+    return good / len(_EDIT_TASKS), notes
 
 
 def _def_span(text: str, symbol: str) -> tuple[int, int] | None:
@@ -1152,6 +1207,10 @@ def specialty_tags_from_measurements(model_id: str, measured: dict,
 
 
 _ARM_GAIN = 0.1
+# Minimum improvement for the three-arm edit-mode comparison (WP-4101B): a
+# non-legacy arm (anchor or structured) is adopted only when it beats the
+# quote arm by at least this much, and ties prefer the current legacy arm.
+_EDIT_MODE_GAIN = 0.05
 
 
 def _arm_wins(measured: dict, arm: str, tc: float, js: float) -> bool:
@@ -1221,8 +1280,27 @@ def choose(measured: dict, hosted: bool) -> dict:
     if ed < 1.0 or overall < 0.8:
         ch["incremental_edit_loop"] = True
     # The anchor-first brief wins when it measures clearly better at producing
-    # correctly-anchored edits than the quote-first brief.
-    if measured.get("edit_format_anchor", 0.0) + 1e-9 >= ed + _ARM_GAIN:
+    # correctly-anchored edits than the quote-first brief, and structured mode
+    # when it measures better than both (WP-4101B). New cards carry the paired
+    # `edit_mode_scores` table (quote/legacy, anchor, structured) and switch on
+    # a 0.05 minimum improvement; older cards fall back to the flat keys and
+    # the historical 0.1 arm gain. Ties prefer the current legacy arm.
+    scores = measured.get("edit_mode_scores")
+    if isinstance(scores, dict):
+        quote = float(scores.get("quote", ed))
+        anchor = float(scores.get(
+            "anchor", measured.get("edit_format_anchor") or 0.0))
+        structured = scores.get("structured")
+        gain = _EDIT_MODE_GAIN
+    else:
+        quote = ed
+        anchor = measured.get("edit_format_anchor", 0.0)
+        structured = None
+        gain = _ARM_GAIN
+    if structured is not None and structured - quote + 1e-9 >= gain \
+            and structured >= anchor - 1e-9:
+        ch["edit_mode"] = "structured"
+    elif anchor - quote + 1e-9 >= gain:
         ch["edit_style"] = "anchor"
     # The thinking A/B verdict, persisted so every later run starts in the
     # winning mode instead of rediscovering it one empty reply at a time.
@@ -1445,6 +1523,19 @@ def calibrate(client, cfg, verbose: bool = True, quick: bool = False,
     _store(measured, "edit_format_anchor", cols[0])
     notes += [f"edit-anchor: {x}" for x in n[:3]]
     say(f"  edit format, anchor-first  {measured['edit_format_anchor']:>4.0%}")
+    cols, n = _repeat(_t_edit_format_structured, repeats, client, cfg)
+    _store(measured, "edit_format_structured", cols[0])
+    if n:
+        say(f"  edit-structured note: {n[0][:80]}")
+    say(f"  edit format, structured  {measured['edit_format_structured']:>4.0%}")
+    # The three paired arms (quote = legacy, anchor, structured) recorded as
+    # one table so `choose()` compares them with a single minimum-improvement
+    # threshold and ties prefer the current legacy arm.
+    measured["edit_mode_scores"] = {
+        "quote": measured.get("edit_format", 0.0),
+        "anchor": measured.get("edit_format_anchor", 0.0),
+        "structured": measured.get("edit_format_structured", 0.0),
+    }
     # Specialty micro-probes: six tiny calls, run ONCE (not repeated) so they
     # stay cheap; the tags ride on the card for routing. The architecture
     # library's recommended tags join the name heuristics and probe scores.

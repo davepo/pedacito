@@ -1850,6 +1850,11 @@ class LLMClient:
         self._cache_markers_rejected = False
         # "length" means cut off mid-answer: "valid JSON we never let it finish".
         self.last_finish_reason = ""
+        # Which rung of the structured-output ladder the last request actually
+        # used: "strict" (json_schema), "json_object", or "prompt_only". Read by
+        # the structured-edit path so a reply is never labelled "sampler-enforced"
+        # when the server only got a JSON-object or plain-prompt request.
+        self.last_schema_enforcement = ""
         # Calibrated chars-per-token from the server's tokenizer endpoint
         # (calibrate_tokenizer); 0.0 = uncalibrated, module heuristic applies.
         self.chars_per_token = 0.0
@@ -2896,6 +2901,9 @@ class LLMClient:
         and the request is re-sent one tier down immediately, so no call ever
         fails over server schema support differences."""
         self._check_budget()
+        # Reset the structured-output rung; a schema-less call stays "prompt_only"
+        # (the meaning of the field is the ladder a JSON request actually used).
+        self.last_schema_enforcement = "prompt_only"
         external_cancel = (cancel_event if cancel_event is not None
                            else getattr(self, "cancel_event", None))
         # `_cancel` belongs to the PREVIOUS stream (client.cancel() may be
@@ -2911,6 +2919,11 @@ class LLMClient:
         # on the OpenAI-shaped messages before they are translated.
         from . import transport_anthropic, transport_gemini, transport_openai
         if transport_openai.is_openai_responses(self.cfg):
+            # The Responses transport honours json_schema strictly when a schema
+            # is attached; Anthropic/Gemini below have no structured-output rung.
+            if json_schema is not None or (schema is not None
+                                           and self.cfg.json_mode != "object"):
+                self.last_schema_enforcement = "strict"
             return self._chat_once_openai_responses(
                 messages, max_tokens, schema=schema, stream=stream,
                 disable_thinking=disable_thinking, json_schema=json_schema,
@@ -3057,6 +3070,13 @@ class LLMClient:
                 tier = "object"
             else:
                 tier = "plain"
+            # Record which rung actually went out, so callers can label the
+            # reply's enforcement honestly (never "sampler-enforced" for the
+            # prompt-only fallback).
+            self.last_schema_enforcement = {
+                "schema": "strict", "object": "json_object",
+                "plain": "prompt_only",
+            }[tier]
             if tier == "schema":
                 payload["response_format"] = {
                     "type": "json_schema",
