@@ -26,6 +26,11 @@ ambiguity refusal; `tool_rename_symbol` wraps the engine as an agent action.
 
 Gated by `allow_write`, snapshotted like every other write (undo with
 `pedacito restore`), and the index is refreshed afterwards.
+
+The mechanical codemod recipes (imports, logger conversion, constant
+extraction, annotations) live in :mod:`pedacito.codemod`. Two thin facade
+functions keep this module's public surface the single import path for
+refactoring callers while the engine stays independently testable.
 """
 
 from __future__ import annotations
@@ -1078,3 +1083,20 @@ def tool_rename(index, cfg, old: str, new: str, file: str = "") -> str:
                    + ". Check them with `grep` and fix with edit blocks if "
                      "they refer to this symbol.")
     return "\n".join(x for x in out if x)
+
+
+# ---------------------------------------------------------------------------
+# Codemod facade (WP-4102A)
+# ---------------------------------------------------------------------------
+def codemod_preview(root, request, *, index=None, cfg=None):
+    """Preview a :class:`pedacito.codemod.CodemodRequest` without writing."""
+    from .codemod import preview
+
+    return preview(root, request, index=index, cfg=cfg)
+
+
+def codemod_apply(root, request, *, index=None, cfg=None):
+    """Apply a codemod request through the shared atomic transaction."""
+    from .codemod import apply
+
+    return apply(root, request, index=index, cfg=cfg)

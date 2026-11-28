@@ -177,6 +177,11 @@ class Edit:
     # A whole-file deletion (a `<<<<<<< DELETE` block or `DELETE_FILE: path`
     # line): the file is backed up, then unlinked. Never a rename half.
     delete: bool = False
+    # An engine-computed exact whole-file replacement (codemods): SEARCH and
+    # REPLACE are the complete preimage/postimage, so the already-applied
+    # heuristic must not reinterpret a trailing-line deletion as "the REPLACE
+    # content is already present". Model edits leave this False.
+    exact: bool = False
 
 
 @dataclass
@@ -1992,7 +1997,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                 if span is None:
                     n = text.count(e.search)
                     if n == 0 and _replace_already_present(
-                            text, e.replace, allow_single=bool(already)):
+                            text, e.replace, allow_single=bool(already)) \
+                            and not e.exact:
                         # The block was already applied -- typically a gather
                         # write landed it before the answer phase, so the SEARCH
                         # no longer matches but the REPLACE content is on disk.
@@ -2057,7 +2063,8 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
                     results.append(Result(False, rel, f"block {k}: {why}"))
                     failed = True
                     break
-                if _replace_already_present(text, e.replace, span.start):
+                if _replace_already_present(text, e.replace, span.start) \
+                        and not e.exact:
                     # The replacement already sits verbatim at the matched span:
                     # a repair round re-emitted an append-style block whose
                     # content landed in an earlier round. Applying again would
@@ -2077,10 +2084,13 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
             if failed:
                 continue
 
-            if original.strip() and not text.strip():
+            if original.strip() and not text.strip() \
+                    and not any(getattr(e, "exact", False) for e in group):
                 # The blocks deleted every line (a SEARCH quoting the whole
                 # file with an empty REPLACE): the same wipe the empty-SEARCH
-                # guard refuses, reached through the anchored path.
+                # guard refuses, reached through the anchored path. An exact
+                # engine-computed codemod (remove the last import, say) may
+                # deliberately produce an empty module.
                 results.append(Result(False, rel, _wipe_refusal(rel)))
                 continue
 
@@ -2154,7 +2164,9 @@ def _backup_one(src: Path, rel: str, backup_dir: Path | None) -> None:
 
 def apply_edits_atomic(root: Path, edits: list[Edit], *, backup: bool = True,
                        backup_dir: Path | None = None, cfg=None,
-                       allowlist: set[str] | None = None) -> list[Result]:
+                       allowlist: set[str] | None = None,
+                       expected_sha256: dict[str, str] | None = None
+                       ) -> list[Result]:
     """Staged all-or-nothing multi-file edit transaction (WP-4105C).
 
     The atomic contract, distinct from the per-file legacy apply:
@@ -2175,6 +2187,10 @@ def apply_edits_atomic(root: Path, edits: list[Edit], *, backup: bool = True,
     the failed results plus one "held" result per clean file (nothing was
     written). ``cfg.atomic_edits`` semantics (explicit value vs tier default)
     are resolved by :func:`config.atomic_edits_enabled`, not here.
+
+    ``expected_sha256`` optionally pins the raw bytes each project-relative
+    path must still have before commit, so an engine that previewed a file can
+    refuse a stale apply even when a later search/replace would still match.
     """
     from . import journal as journal_mod
 
@@ -2226,6 +2242,17 @@ def apply_edits_atomic(root: Path, edits: list[Edit], *, backup: bool = True,
             preimages[rel] = path.read_bytes()
         elif rel in write_rels:
             created.append(rel)
+
+    # A caller that previewed bytes can pin them: refuse a stale apply before
+    # the durable transaction record is even created.
+    if expected_sha256:
+        for rel, wanted in expected_sha256.items():
+            data = preimages.get(rel)
+            got = hashlib.sha256(data).hexdigest() if data is not None else ""
+            if data is None or got != str(wanted):
+                return [Result(False, rel,
+                               "atomic batch aborted: this file changed after "
+                               "the preview; nothing was written")]
 
     # Snapshot + WAL durable before writes; a snapshot failure stops the batch.
     try:
