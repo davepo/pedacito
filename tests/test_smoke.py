@@ -3243,6 +3243,7 @@ def test_calibrate_tokenizer_rejects_implausible_ratios(monkeypatch):
     assert client.chars_per_token == 0.0
 
 
+@pytest.mark.live_probe
 def test_model_info_takes_the_largest_context_length(monkeypatch):
     class GetResp:
         status_code = 404

@@ -43,7 +43,7 @@ pdc = "pedacito.cli:main"
 # pytest and ruff are core dependencies now. `dev` remains so existing
 # `pip install -e ".[dev]"` commands (including CI) keep working.
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-xdist"]
 # Screenshot capture/pixel analysis for the opt-in `screenshot` action.
 vision = ["Pillow>=10"]
 # Headless browser automation for the opt-in `browser` action. After
@@ -56,12 +56,18 @@ keyring = ["keyring>=25"]
 full = ["Pillow>=10", "playwright>=1.40", "keyring>=25"]
 
 [tool.pytest.ini_options]
-markers = ["network: tests that spawn the fake LLM server (fast, local)"]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "network: tests that spawn the fake LLM server (fast, local)",
+    "slow: heavy integration, Playwright domcheck, or crucible tests",
+    "live_probe: tests that intentionally exercise real network or server probing",
+]
 # Some environments ship a broken third-party pytest plugin (e.g. libtmux
 # versions whose own fixture carries a mark, which pytest >=8.4 rejects at
 # import time -- collection dies before any test runs). Disabling autoload
 # keeps `pytest` working everywhere; add plugins back with -p <name>.
-addopts = "-p no:cacheprovider --disable-plugin-autoload"
+addopts = "-p no:cacheprovider --disable-plugin-autoload -p xdist -n auto --dist worksteal"
 
 [tool.ruff]
 target-version = "py311"

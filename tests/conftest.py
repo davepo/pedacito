@@ -26,6 +26,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pedacito import config as config_mod
+from pedacito import llm as llm_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_probes(monkeypatch, request):
+    if request.node.get_closest_marker("live_probe") is not None:
+        return
+    monkeypatch.setenv("PEDACITO_CHECK_FOR_UPDATES", "false")
+    monkeypatch.setenv("PEDACITO_AUTO_REFRESH_MODEL_CATALOG", "false")
+    monkeypatch.setattr(llm_mod.LLMClient, "model_info", lambda self, model=None: None)
 
 
 @pytest.fixture(autouse=True)

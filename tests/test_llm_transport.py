@@ -1146,6 +1146,7 @@ def test_api_key_does_not_fall_back_for_a_dense_provider(monkeypatch):
     assert llm_mod._api_key(_cfg(provider="lemonade")) == "lm-studio"
 
 
+@pytest.mark.live_probe
 def test_model_info_absorbs_strata_health_context(monkeypatch):
     class Resp:
         def __init__(self, status, body):

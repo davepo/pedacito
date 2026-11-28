@@ -351,6 +351,7 @@ def test_too_big_for_vram():
     assert not discovery.too_big_for_vram(9 * gib, 0)  # unknown VRAM: not flagged
 
 
+@pytest.mark.live_probe
 def test_model_info_takes_an_explicit_model_id(monkeypatch):
     """B1: model_info(model) describes the given id, not just cfg.model."""
     from pedacito import llm as llm_mod
