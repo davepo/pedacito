@@ -180,7 +180,8 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito models scan` | Encuentra servidores locales, elige modelos, escribe perfiles y los mide |
 | `pedacito models [--profile NAME] [--model ID]` | Muestra los números ajustados del perfil activo (o de uno indicado); `--model` nombra el id del modelo para esa vista |
 | `pedacito models refresh` | Actualiza ahora la caché del catálogo models.dev (ventanas de contexto y precios de proveedores alojados); si la descarga falla, se conserva la caché anterior |
-| `pedacito config --check` | Prueba la conexión y la generación. `--doctor` también sondea la salida estructurada. `--setup` ejecuta la configuración inicial; `--upgrade [--dry-run]` agrega a tu archivo las opciones recién documentadas |
+| `pedacito config --check` | Prueba la conexión y la generación. `--doctor` también sondea la salida estructurada y muestra el entorno resuelto del proyecto. `--setup` ejecuta la configuración inicial; `--upgrade [--dry-run]` agrega a tu archivo las opciones recién documentadas |
+| `pedacito doctor [PROJECT]` | Alias de `pedacito config --doctor`: sondas de modelo/salida estructurada más el sandbox, el comando de pruebas detectado y el entorno resuelto sin conexión (intérprete, PATH, gestor de paquetes, evidencia). La detección nunca ejecuta un gestor de entornos |
 | `pedacito calibrate` | Mide el modelo activo (o los perfiles locales con `--all`) y guarda una tarjeta de modelo que ajusta los valores por defecto. Los modelos alojados se rechazan |
 | `pedacito profiles [--recommend]` | Lista los perfiles con sus puntuaciones y sugiere enrutamiento de roles |
 | `pedacito profile [--show\|--run\|--reset]` | Muestra la instantánea de hardware, la última sonda de velocidad y el auto-ajuste activo; `--run` fuerza una sonda, `--reset` descarta las mediciones en caché |

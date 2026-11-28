@@ -79,6 +79,8 @@ _ES_SYNONYMS = {
     "permisos": ("permission", "permissions", "permission_mode"),
     "permiso": ("permission", "permissions", "permission_mode"),
     "aprobacion": ("approval", "approve", "approval_policy"),
+    "doctor": ("environment", "environment resolver", "diagnose", "probe"),
+    "entorno": ("environment", "doctor", "interpreter", "virtualenv", "venv"),
 }
 
 
@@ -118,6 +120,9 @@ _SYNONYMS = {
     "ignore": ("exclude", "excluded", "pedacitoignore"),
     "exclude": ("ignore", "pedacitoignore"),
     "thinking": ("reasoning", "think", "disable_thinking", "no_think"),
+    "doctor": ("environment", "diagnose", "check", "probe", "config"),
+    "environment": ("venv", "virtualenv", "interpreter", "python", "doctor",
+                    "package manager", "cargo", "go"),
     "reasoning": ("thinking", "think", "disable_thinking"),
     "think": ("thinking", "reasoning", "disable_thinking"),
     "disable": ("off", "toggle", "turn"),
@@ -727,7 +732,8 @@ CLI_COMMANDS = [
         "summary": "Show every resolved setting and where it came from; create, "
                    "test, print, or add newly documented options to the config.",
         "keywords": ["config file", "config.toml", "setup", "check", "doctor",
-                     "reference", "settings", "upgrade", "up to date"],
+                     "reference", "settings", "upgrade", "up to date",
+                     "environment", "venv", "interpreter", "package manager"],
         "examples": [
             "pedacito config",
             "pedacito config --init",
@@ -749,7 +755,8 @@ CLI_COMMANDS = [
             {"flag": "--check",
              "help": "connect to the server and verify the model loads"},
             {"flag": "--doctor",
-             "help": "like --check plus structured-output and context probes"},
+             "help": "like --check plus structured-output, context and "
+                     "resolved-environment probes"},
             {"flag": "--setup",
              "help": "interactive first-run setup"},
             {"flag": "--upgrade",
@@ -763,6 +770,35 @@ CLI_COMMANDS = [
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--profile NAME", "help": "show one profile's resolution"},
             {"flag": "--config FILE", "help": "use this config file as well"},
+        ],
+    },
+    {
+        "name": "doctor",
+        "usage": "pedacito doctor [PROJECT] [--profile NAME] [--config FILE]",
+        "summary": "Alias of `pedacito config --doctor`: connects to the "
+                   "model, probes structured output, reports the sandbox and "
+                   "the detected test command, and prints the offline-resolved "
+                   "project environment (interpreter, PATH directories, "
+                   "package manager and evidence). Resolution only reads local "
+                   "metadata and executable presence: it never runs an "
+                   "activation script, uv/poetry/conda/tox/nox, npx, an "
+                   "install, or a network request.",
+        "keywords": ["doctor", "environment", "environment resolver",
+                     "venv", "virtualenv", "uv", "poetry", "pipenv", "conda",
+                     "tox", "nox", "pnpm", "yarn", "bun", "cargo", "go",
+                     "interpreter", "python", "health check", "diagnose"],
+        "examples": [
+            "pedacito doctor .",
+            "pedacito doctor --profile big",
+            "pedacito config --doctor",
+        ],
+        "flags": [
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--profile NAME",
+             "help": "apply a [profiles.NAME] block from your config"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+            {"flag": "--lang en|es", "help": "interface language"},
         ],
     },
     {

@@ -26,14 +26,13 @@ import atexit
 import json
 import os
 import queue
-import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from . import proc, safety
+from . import env_resolve, proc, security
 
 _LANGUAGE_ID = {
     ".py": "python", ".pyi": "python",
@@ -63,7 +62,7 @@ _DEFAULT_SERVERS = {
 }
 
 _CLIENTS_LOCK = threading.Lock()
-_CLIENTS: dict[tuple[str, str, str], LSPClient] = {}
+_CLIENTS: dict[tuple[str, str, str, str], LSPClient] = {}
 _EOF = object()
 _MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB frame cap
 _MAX_NOTES = 200
@@ -113,7 +112,7 @@ def _split(command: str) -> list[str]:
             else p for p in shlex.split(command, posix=False)]
 
 
-def command_for(root, rel: str, cfg=None) -> list[str]:
+def command_for(root, rel: str, cfg=None, *, environment=None) -> list[str]:
     """Configured or PATH-detected LSP command for this file, or []."""
     ext = Path(rel).suffix.lower()
     configured = getattr(cfg, "lsp_servers", {}) or {}
@@ -121,10 +120,12 @@ def command_for(root, rel: str, cfg=None) -> list[str]:
         spec = configured.get(ext) or configured.get(_LANGUAGE_ID.get(ext, ""))
         if spec:
             return _split(str(spec))
+    if environment is None:
+        environment = env_resolve.resolve_environment(Path(root))
     for exe, args in _DEFAULT_SERVERS.get(ext, []):
-        found = shutil.which(exe)
+        found = env_resolve.find_executable(environment, exe)
         if found:
-            return [found] + list(args)
+            return [str(found)] + list(args)
     return []
 
 
@@ -152,7 +153,8 @@ def _rel(root: Path, path: str) -> str:
 class LSPClient:
     """One stdio LSP process with a request/notification reader thread."""
 
-    def __init__(self, root, command: list[str], cfg=None, timeout: float = 10):
+    def __init__(self, root, command: list[str], cfg=None, timeout: float = 10,
+                 *, environment=None):
         self.root = Path(root).resolve()
         self.command = list(command)
         self.timeout = max(1.0, float(timeout or 10))
@@ -164,6 +166,9 @@ class LSPClient:
         self._diagnostics: dict[str, list[dict]] = {}
         self._versions: dict[str, int] = {}
         self._id = 0
+        if environment is None:
+            environment = env_resolve.resolve_environment(self.root)
+        self.environment = environment
         kwargs = {}
         if os.name != "nt":
             kwargs["start_new_session"] = True
@@ -171,7 +176,7 @@ class LSPClient:
             self.proc = subprocess.Popen(
                 self.command, cwd=str(self.root), stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                env=safety.child_env(cfg), **kwargs)
+                env=env_resolve.command_env(environment, cfg), **kwargs)
         except (OSError, ValueError) as e:
             raise LSPError(f"could not start {self.command[0]}: {e}") from e
         threading.Thread(target=self._pump, daemon=True).start()
@@ -308,7 +313,10 @@ class LSPClient:
         self._initialized = True
 
     def open(self, rel: str) -> Path:
-        path = (self.root / rel).resolve()
+        try:
+            path = security.resolve_safe_path(self.root, rel)
+        except security.SecurityError as e:
+            raise LSPError(f"could not open {rel}: {e}") from e
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -469,14 +477,17 @@ def close_session(session_id: str) -> None:
 atexit.register(close_all)
 
 
-def client_for(root, rel: str, cfg=None) -> LSPClient:
-    command = command_for(root, rel, cfg)
+def client_for(root, rel: str, cfg=None, *, environment=None) -> LSPClient:
+    if environment is None:
+        environment = env_resolve.resolve_environment(Path(root))
+    command = command_for(root, rel, cfg, environment=environment)
     if not command:
         raise LSPError(
             f"no language server configured or found for {rel}. Install one "
             "(pyright-langserver/pylsp/typescript-language-server/"
             "rust-analyzer/gopls) or set lsp_servers in the profile.")
-    key = (_sid(), str(Path(root).resolve()), " ".join(command))
+    env_key = ";".join(str(d) for d in environment.bin_dirs)
+    key = (_sid(), str(Path(root).resolve()), " ".join(command), env_key)
     stale: LSPClient | None = None
     with _CLIENTS_LOCK:
         c = _CLIENTS.get(key)
@@ -490,7 +501,8 @@ def client_for(root, rel: str, cfg=None) -> LSPClient:
         except (OSError, subprocess.SubprocessError):
             pass
     c = LSPClient(root, command, cfg,
-                  timeout=float(getattr(cfg, "lsp_timeout", 10) or 10))
+                  timeout=float(getattr(cfg, "lsp_timeout", 10) or 10),
+                  environment=environment)
     prev: LSPClient | None = None
     with _CLIENTS_LOCK:
         prev = _CLIENTS.get(key)
@@ -551,14 +563,14 @@ def _fmt_diagnostics(root: Path, rel: str, diags) -> str:
 
 
 def result(root, cfg, op: str, rel: str, line: int = 1,
-           column: int = 1) -> str:
+           column: int = 1, *, environment=None) -> str:
     """Run one LSP operation and return model/CLI-friendly text."""
     root = Path(root).resolve()
     rel = (rel or "").replace("\\", "/").lstrip("/")
     if not rel:
         return "ERROR: lsp needs a file."
     try:
-        c = client_for(root, rel, cfg)
+        c = client_for(root, rel, cfg, environment=environment)
         data = c.request_for(op, rel, line, column)
     except LSPError as e:
         return f"ERROR: LSP {op} failed: {e}"

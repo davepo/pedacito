@@ -179,7 +179,8 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito models scan` | Find local servers, pick models, write profiles, and measure them |
 | `pedacito models [--profile NAME] [--model ID]` | Print the active (or a named) profile's tuned numbers; `--model` names the model id for that view |
 | `pedacito models refresh` | Refresh the cached models.dev catalog (hosted context windows and prices) now; a failed fetch keeps the old cache |
-| `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
+| `pedacito config --check` | Test the connection and generation. `--doctor` also probes structured output and reports the resolved project environment. `--setup` runs first-time setup; `--upgrade [--dry-run]` adds newly documented options to your file |
+| `pedacito doctor [PROJECT]` | Alias of `pedacito config --doctor`: model/structured-output probes plus the sandbox, detected test command and offline-resolved environment (interpreter, PATH, package manager, evidence). Detection never runs an environment manager |
 | `pedacito calibrate` | Measure the active model (or `--all` local profiles) and save a model card that tunes defaults. Hosted models are refused |
 | `pedacito profiles [--recommend]` | List profiles with their scores, and suggest role routing |
 | `pedacito profile [--show\|--run\|--reset]` | Show the hardware snapshot, last speed probe and active auto-tune; `--run` forces one probe, `--reset` drops cached measurements |

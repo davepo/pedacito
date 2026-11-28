@@ -60,7 +60,7 @@ from html import unescape as _html_unescape
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import browser, fileio, proc, safety, sandbox, security, sessions, vision
+from . import browser, env_resolve, fileio, proc, safety, sandbox, security, sessions, vision
 from . import edits as edits_mod
 
 TOOL_HELP = """\
@@ -3080,7 +3080,8 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
     if not getattr(cfg, "allow_lsp", False):
         return ("ERROR: `lsp` is disabled (config allow_lsp = false). "
                 "Enable it to use a language server.")
-    from . import lsp
+    from . import env_resolve, lsp
+    resolved = env_resolve.resolve_environment(index.root)
     op = (_as_text(symbol).strip() or "definition").lower()
     rel = index.resolve_file(_as_text(file)) or _root_rel(index, _as_text(file))
     if not rel:
@@ -3093,7 +3094,7 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
     # H7: spawning an external language server is execution; gate it with the
     # unified policy engine (a trusted `[commands].deny` or `plan` mode refuses
     # it) while read-only `lsp` with no server stays allowed.
-    lsp_cmd = lsp.command_for(index.root, rel, cfg)
+    lsp_cmd = lsp.command_for(index.root, rel, cfg, environment=resolved)
     if lsp_cmd:
         policy_err = _policy_denied(cfg, "run", " ".join(lsp_cmd),
                                     root=index.root)
@@ -3101,7 +3102,8 @@ def tool_lsp(index, cfg, symbol: str = "", file: str = "",
             return policy_err
     return lsp.result(index.root, cfg, op, rel,
                       line=_as_int(start, 1) or 1,
-                      column=_as_int(end, 1) or 1)
+                      column=_as_int(end, 1) or 1,
+                      environment=resolved)
 
 
 def tool_serve(index, cfg, symbol: str = "", command: str = "",
@@ -4042,7 +4044,6 @@ def tool_run(index, cfg, command: str) -> str:
     timeout = max(1, _as_int(getattr(cfg, "shell_timeout", 120), 120))
     idle = max(0, _as_int(getattr(cfg, "shell_idle_seconds", 10), 10))
     cap = max(200, _as_int(getattr(cfg, "max_shell_output_chars", 8000), 8000))
-    env = _child_env(cfg)
     gate_err = _run_gate(cfg, cmd, index.root)
     if gate_err:
         return gate_err
@@ -4050,10 +4051,12 @@ def tool_run(index, cfg, command: str) -> str:
         run_argv, box = sandbox.wrap(argv, cfg, index.root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
+    resolved, env = _resolved_execution_env(cfg, index.root)
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=index.root, timeout=timeout, idle_timeout=idle,
         max_output=cap, env=env,
-        windows_sandbox=sandbox.windows_sandbox_active(cfg))
+        windows_sandbox=sandbox.windows_sandbox_active(cfg),
+        bin_dirs=resolved.bin_dirs)
     if stopped == "error":
         return f"ERROR: could not run command: {out}"
 
@@ -4163,10 +4166,19 @@ def tool_run(index, cfg, command: str) -> str:
     return f"{head}\nOUTPUT:\n{out}{tail}"
 
 
-def _child_env(cfg=None) -> dict:
+def _child_env(cfg=None, root=None) -> dict:
     """Environment for launched commands: no colour, no pagers, and (unless
-    `scrub_env` is off) no ambient API keys or tokens."""
-    return safety.child_env(cfg)
+    `scrub_env` is off) no ambient API keys or tokens. With `root`, the
+    project's resolved interpreter/bin directories join PATH (detect-only)."""
+    if root is None:
+        return safety.child_env(cfg)
+    return env_resolve.command_env(env_resolve.resolve_environment(root), cfg)
+
+
+def _resolved_execution_env(cfg, root) -> tuple:
+    """(resolved environment, scrubbed child env) for one project root."""
+    resolved = env_resolve.resolve_environment(root)
+    return resolved, env_resolve.command_env(resolved, cfg)
 
 
 # ------------------------------------------------------------ run_test ----
@@ -4225,9 +4237,10 @@ def _pytest_runner_ok(argv: list[str], root: Path, cfg) -> bool:
     if hit is not None:
         return True
     try:
-        rc, _out, stopped, _el = proc.run(argv + ["--version"], cwd=root,
-                                          timeout=15, max_output=4096,
-                                          env=_child_env(cfg))
+        resolved, env = _resolved_execution_env(cfg, root)
+        rc, _out, stopped, _el = proc.run(
+            argv + ["--version"], cwd=root, timeout=15, max_output=4096,
+            env=env, bin_dirs=resolved.bin_dirs)
     except Exception:
         return False
     if rc == 0 and not stopped:
@@ -4258,21 +4271,30 @@ def _run_test_runner(root: Path, cfg) -> list[str] | None:
     bare python, then `pytest` from PATH. Each candidate is proven with a
     `--version` probe; none works: None (the caller explains that instead of
     running a guaranteed crash)."""
-    candidates: list[list[str]] = [[sys.executable, "-m", "pytest"]]
+    candidates: list[list[str]] = []
+    try:
+        resolved = env_resolve.resolve_environment(root)
+    except Exception:
+        resolved = None
+    if resolved is not None and resolved.python is not None:
+        candidates.append([str(resolved.python), "-m", "pytest"])
+    candidates.append([sys.executable, "-m", "pytest"])
     det = ""
     try:
         from . import testsel
         det = testsel.detect_test_command(root, cfg) or ""
     except Exception:
         det = ""
+    explicit = bool((getattr(cfg, "test_command", "") or "").strip())
     if det and "pytest" in det.lower():
         try:
             argv = _split_command(det)
         except ValueError:
             argv = []
         if argv:
-            if Path(argv[0]).name.lower().rstrip(".exe") in ("python", "python3",
-                                                              "py"):
+            if (not explicit
+                    and Path(argv[0]).name.lower().rstrip(".exe") in (
+                        "python", "python3", "py")):
                 argv[0] = sys.executable
             candidates.append(argv)
     if shutil.which("pytest"):
@@ -4378,7 +4400,6 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
                          _RUN_TEST_TIMEOUT_CAP))
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
-    env = _child_env(cfg)
     gate_err = _run_gate(cfg, display, root)
     if gate_err:
         return gate_err
@@ -4386,10 +4407,12 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
+    resolved, env = _resolved_execution_env(cfg, root)
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
         max_output=cap, env=env,
-        windows_sandbox=sandbox.windows_sandbox_active(cfg))
+        windows_sandbox=sandbox.windows_sandbox_active(cfg),
+        bin_dirs=resolved.bin_dirs)
     if stopped == "error":
         return f"ERROR: could not run the Node tests: {str(out)[:300]}"
     try:
@@ -4544,7 +4567,6 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
                          _RUN_TEST_TIMEOUT_CAP))
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
-    env = _child_env(cfg)
     gate_err = _run_gate(cfg, display, root)
     if gate_err:
         return gate_err
@@ -4552,10 +4574,12 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
+    resolved, env = _resolved_execution_env(cfg, root)
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
         max_output=cap, env=env,
-        windows_sandbox=sandbox.windows_sandbox_active(cfg))
+        windows_sandbox=sandbox.windows_sandbox_active(cfg),
+        bin_dirs=resolved.bin_dirs)
     if stopped == "error":
         return f"ERROR: could not run the tests: {str(out)[:300]}"
     try:
@@ -4784,7 +4808,6 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
                          _RUN_TEST_TIMEOUT_CAP))
     cap = max(2000, _as_int(getattr(cfg, "max_shell_output_chars", 8000),
                              8000))
-    env = _child_env(cfg)
     gate_err = _run_gate(cfg, display, root)
     if gate_err:
         return gate_err
@@ -4792,10 +4815,12 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
         run_argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return f"ERROR: {e}"
+    resolved, env = _resolved_execution_env(cfg, root)
     rc, out, stopped, _elapsed = proc.run(
         run_argv, cwd=root, timeout=timeout, idle_timeout=timeout,
         max_output=cap, env=env,
-        windows_sandbox=sandbox.windows_sandbox_active(cfg))
+        windows_sandbox=sandbox.windows_sandbox_active(cfg),
+        bin_dirs=resolved.bin_dirs)
     if stopped == "error":
         return f"ERROR: could not run pytest: {str(out)[:300]}"
 
@@ -4965,7 +4990,7 @@ def tool_screenshot(index, cfg, client, command: str = "", file: str = "",
     out = out_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".png")
     delay = start or _as_int(getattr(cfg, "screenshot_wait_seconds", 5), 5)
     delay = max(0, min(delay, 60))
-    env = _child_env(cfg)
+    env = _child_env(cfg, root)
 
     launched = None
     exit_code = None
@@ -5087,7 +5112,7 @@ def tool_browser(index, cfg, client, command: str = "", pattern: str = "",
         return f"ERROR: no screenshot named '{file}' under the project root."
 
     root = Path(index.root).resolve()
-    env = _child_env(cfg)
+    env = _child_env(cfg, root)
     server = None
     server_url = ""
     if re.match(r"^(?:https?://|localhost(?::\d+)?(?:/|$)|"

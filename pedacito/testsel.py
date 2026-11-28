@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import proc, safety, sandbox, testlinks
+from . import env_resolve, proc, sandbox, testlinks
 
 _NPM_PLACEHOLDER = re.compile(r"no test specified", re.IGNORECASE)
 
@@ -111,11 +111,16 @@ def _python_test_command(root: Path) -> str:
     we can actually launch, and fall back to unittest rather than emit a
     command that cannot run."""
     for cand in (root / ".venv" / "bin" / "pytest",
-                 root / ".venv" / "Scripts" / "pytest.exe"):
+                 root / ".venv" / "Scripts" / "pytest.exe",
+                 root / "venv" / "bin" / "pytest",
+                 root / "venv" / "Scripts" / "pytest.exe"):
         if cand.is_file():
             return f"{shlex.quote(str(cand))} -q"
     if _unittest_only(_py_test_files(root)):
         return _unittest_command()
+    resolved = env_resolve.resolve_environment(root)
+    if resolved.python is not None:
+        return f"{shlex.quote(str(resolved.python))} -m pytest -q"
     if shutil.which("pytest"):
         return "pytest -q"
     # A PATH `python` is not necessarily the interpreter running Pedacito:
@@ -386,11 +391,13 @@ def run_command(root, cfg, command: str, timeout: int | None = None
         argv, box = sandbox.wrap(argv, cfg, root)
     except sandbox.SandboxRefused as e:
         return False, f"could not run `{command}`: {e}"
+    resolved = env_resolve.resolve_environment(root)
     rc, out, stopped, _el = proc.run(
         argv, cwd=Path(root), timeout=timeout, idle_timeout=0,
         max_output=int(getattr(cfg, "max_shell_output_chars", 8000) or 8000) * 2,
-        env=safety.child_env(cfg),
-        windows_sandbox=sandbox.windows_sandbox_active(cfg))
+        env=env_resolve.command_env(resolved, cfg),
+        windows_sandbox=sandbox.windows_sandbox_active(cfg),
+        bin_dirs=resolved.bin_dirs)
     if box and rc not in (0, None) and not stopped:
         out += (f"\n[ran in a sandbox ({box}); a failure from a blocked write "
                 "outside the project or no network is the sandbox, not the "

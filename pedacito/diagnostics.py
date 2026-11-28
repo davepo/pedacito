@@ -37,7 +37,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import proc
+from . import env_resolve, proc
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,11 @@ def _has(root: Path, name: str) -> bool:
     return (root / name).exists()
 
 
-def _which(name: str) -> str:
+def _which(name: str, *, environment=None) -> str:
+    if environment is not None:
+        found = env_resolve.find_executable(environment, name)
+        if found is not None:
+            return str(found)
     return shutil.which(name) or ""
 
 
@@ -105,9 +109,12 @@ def _package_scripts(root: Path) -> dict:
         return {}
 
 
-def detect(root, files: list[str] | None = None) -> list[Check]:
+def detect(root, files: list[str] | None = None, *,
+           environment=None) -> list[Check]:
     """The checks applicable to this project (or these files)."""
     root = Path(root)
+    if environment is None:
+        environment = env_resolve.resolve_environment(root)
     checks: list[Check] = []
     files = list(files or [])
 
@@ -117,62 +124,68 @@ def detect(root, files: list[str] | None = None) -> list[Check]:
                                 "requirements.txt", "Pipfile"))
     if python_project:
         targets = py_targets or _project_py_files(root)
-        if targets and _which("ruff"):
+        if targets and _which("ruff", environment=environment):
             checks.append(Check("ruff", ["ruff", "check", "--output-format",
                                          "concise", *targets]))
-        elif targets and _which("pyflakes"):
+        elif targets and _which("pyflakes", environment=environment):
             checks.append(Check("pyflakes", ["pyflakes", *targets]))
-        elif targets and _which("flake8"):
+        elif targets and _which("flake8", environment=environment):
             checks.append(Check("flake8", ["flake8", *targets]))
         # a type checker only when the project configured one (an unconfigured
         # run on a whole tree is mostly noise a small model then chases)
         if targets and _py_typechecker_configured(root, "mypy") \
-                and _which("mypy"):
+                and _which("mypy", environment=environment):
             checks.append(Check("mypy", ["mypy", "--no-error-summary",
                                          "--no-color-output", *targets]))
         elif targets and _py_typechecker_configured(root, "pyright") \
-                and _which("pyright"):
+                and _which("pyright", environment=environment):
             checks.append(Check("pyright", ["pyright", *targets]))
 
     if _has(root, "package.json"):
         scripts = _package_scripts(root)
-        if scripts.get("lint") and _which("npm"):
+        if scripts.get("lint") and _which("npm", environment=environment):
             checks.append(Check("npm lint", ["npm", "run", "lint", "--silent"]))
-        elif _has(root, "tsconfig.json") and _which("npx"):
+        elif _has(root, "tsconfig.json") \
+                and _which("npx", environment=environment):
             checks.append(Check("tsc", ["npx", "--no-install", "tsc",
                                         "--noEmit"]))
-        elif _js_files(files) and _which("npx"):
+        elif _js_files(files) and _which("npx", environment=environment):
             checks.append(Check("eslint", ["npx", "--no-install", "eslint",
                                            *_js_files(files)]))
 
-    if _has(root, "Cargo.toml") and _which("cargo"):
+    if _has(root, "Cargo.toml") and _which("cargo", environment=environment):
         checks.append(Check("cargo check", ["cargo", "check",
                                             "--message-format", "short"]))
-    if _has(root, "go.mod") and _which("go"):
+    if _has(root, "go.mod") and _which("go", environment=environment):
         checks.append(Check("go vet", ["go", "vet", "./..."]))
     if (_has(root, "Gemfile") or _has(root, ".rubocop.yml")) \
-            and _which("rubocop"):
+            and _which("rubocop", environment=environment):
         checks.append(Check("rubocop", ["rubocop", "--format", "simple"]))
     return checks
 
 
-def run(root, cfg=None, files: list[str] | None = None) -> tuple[bool, str]:
+def run(root, cfg=None, files: list[str] | None = None, *,
+        environment=None) -> tuple[bool, str]:
     """Run every detected check. Returns (passed, report). No detected
     checker is a pass: absence of a linter must not fail a task."""
     root = Path(root)
-    checks = detect(root, files)
+    if environment is None:
+        environment = env_resolve.resolve_environment(root)
+    checks = detect(root, files, environment=environment)
     if not checks:
         return True, ("No linter/type checker detected (looked for ruff, "
                       "pyflakes, flake8, mypy, pyright, npm lint, tsc, cargo, go vet, "
                       "rubocop).")
     timeout = int(getattr(cfg, "diagnostics_timeout", 90) or 90)
     cap = int(getattr(cfg, "max_diagnostics_chars", 8000) or 8000)
+    child_env = env_resolve.command_env(environment, cfg)
     ok = True
     chunks: list[str] = []
     for check in checks:
         rc, out, stopped, secs = proc.run(
             check.argv, cwd=root, timeout=timeout, idle_timeout=0,
-            max_output=cap)
+            max_output=cap, env=child_env,
+            bin_dirs=environment.bin_dirs)
         bad = stopped in ("timeout", "error") or (rc not in (0, None))
         if bad:
             ok = False
@@ -190,9 +203,10 @@ def run(root, cfg=None, files: list[str] | None = None) -> tuple[bool, str]:
     return ok, report
 
 
-def run_changed(root, cfg, changed: list[str] | None = None) -> tuple[bool, str]:
+def run_changed(root, cfg, changed: list[str] | None = None, *,
+                environment=None) -> tuple[bool, str]:
     """Convenience wrapper for the automatic post-edit check."""
-    return run(root, cfg, files=list(changed or []))
+    return run(root, cfg, files=list(changed or []), environment=environment)
 
 
 # ---------------------------------------------------------------------------
@@ -463,20 +477,24 @@ def _undefined_names(tree: ast.AST, rel: str) -> list[str]:
     return found
 
 
-def _quick_python(root: Path, rel: str) -> list[str]:
+def _quick_python(root: Path, rel: str, *, environment=None) -> list[str]:
     """One Python file: the first installed linter run on just that file,
     else a plain ast.parse plus the conservative undefined-name pass.
     Finding lines keep their `rel:line:col:` prefix."""
+    if environment is None:
+        environment = env_resolve.resolve_environment(root)
     # --quiet suppresses ruff's "All checks passed!" banner: only diagnostics
     # belong in the result, and a clean file must produce zero findings.
     for argv in (("ruff", "check", "--quiet", "--output-format", "concise"),
                  ("pyflakes",),
                  ("flake8",)):
-        if not _which(argv[0]):
+        if not _which(argv[0], environment=environment):
             continue
         rc, out, stopped, _secs = proc.run(
             [*argv, rel], cwd=root, timeout=_QUICK_TIMEOUT,
-            idle_timeout=0, max_output=20000)
+            idle_timeout=0, max_output=20000,
+            env=env_resolve.command_env(environment, None),
+            bin_dirs=environment.bin_dirs)
         if stopped in ("timeout", "error"):
             return []          # an unusable linter must not block edits
         if rc == 0:
@@ -509,7 +527,8 @@ def _quick_js(root: Path, rel: str) -> list[str]:
     return []
 
 
-def quick_findings(root, files: list[str]) -> dict[str, list[str]]:
+def quick_findings(root, files: list[str], *, environment=None
+                   ) -> dict[str, list[str]]:
     """Cheap per-file syntax/lint findings as {rel: [finding lines]}.
 
     Python files go to the first installed linter (ruff, pyflakes, flake8)
@@ -518,6 +537,8 @@ def quick_findings(root, files: list[str]) -> dict[str, list[str]]:
     tree-sitter syntax check. Other languages have no cheap per-file checker
     and are skipped. Never raises; an unreadable file maps to no findings."""
     root = Path(root)
+    if environment is None:
+        environment = env_resolve.resolve_environment(root)
     out: dict[str, list[str]] = {}
     for rel in files or []:
         rel = str(rel).strip()
@@ -526,7 +547,7 @@ def quick_findings(root, files: list[str]) -> dict[str, list[str]]:
         suffix = Path(rel).suffix.lower()
         try:
             if suffix in (".py", ".pyi"):
-                out[rel] = _quick_python(root, rel)
+                out[rel] = _quick_python(root, rel, environment=environment)
             elif suffix in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
                 out[rel] = _quick_js(root, rel)
         except Exception:

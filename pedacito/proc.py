@@ -52,26 +52,36 @@ def venv_bin_dirs(root) -> list[str]:
     return out
 
 
-def with_venv_path(env: dict | None, root) -> dict:
+def with_venv_path(env: dict | None, root, *,
+                   bin_dirs: tuple | list | None = None) -> dict:
     """The child environment with the project's venv bin dirs prepended to
     PATH, so a bare `pytest -q` / `ruff check .` resolves when the tool lives
     in `.venv/bin` (or Pedacito's own venv) rather than the global PATH.
     Everything else passes through untouched; an explicit env stays explicit
-    (a copy, never the caller's dict)."""
+    (a copy, never the caller's dict).
+
+    `bin_dirs` (from `env_resolve.ResolvedEnvironment.bin_dirs`) replaces the
+    legacy `.venv`/`venv`/interpreter probe when a caller already resolved the
+    project environment. Passing an empty tuple is meaningful: use exactly no
+    extra directories, never silently fall back to the legacy probe."""
     base = dict(os.environ if env is None else env)
-    dirs = venv_bin_dirs(root)
+    dirs = ([str(d) for d in bin_dirs] if bin_dirs is not None
+            else venv_bin_dirs(root))
     if dirs:
-        path = base.get("PATH") or os.environ.get("PATH", "")
+        path_key = "PATH" if "PATH" in base else next(
+            (k for k in base if k.upper() == "PATH"), "PATH")
+        path = base.get(path_key) or os.environ.get(path_key, "")
         parts = path.split(os.pathsep) if path else []
         prepend = [d for d in dirs if d not in parts]
         if prepend:
-            base["PATH"] = os.pathsep.join(prepend + parts)
+            base[path_key] = os.pathsep.join(prepend + parts)
     return base
 
 
 def spawn(command, *, cwd, env: dict | None = None,
           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          suspended: bool = False) -> subprocess.Popen:
+          suspended: bool = False, bin_dirs: tuple | list | None = None
+          ) -> subprocess.Popen:
     """Start a child in its own process group without waiting for it.
 
     Used by the screenshot and browser actions, which later `terminate()` the
@@ -88,7 +98,8 @@ def spawn(command, *, cwd, env: dict | None = None,
         kwargs["creationflags"] = _CREATE_SUSPENDED
     return subprocess.Popen(
         command, cwd=str(cwd), stdin=subprocess.DEVNULL,
-        stdout=stdout, stderr=stderr, env=with_venv_path(env, cwd), **kwargs)
+        stdout=stdout, stderr=stderr,
+        env=with_venv_path(env, cwd, bin_dirs=bin_dirs), **kwargs)
 
 
 def terminate(proc: subprocess.Popen) -> None:
@@ -183,12 +194,13 @@ def _cancel_requested_proc(cancel_event: threading.Event | None) -> bool:
 
 
 def _run_windows_sandboxed(command, *, cwd, timeout, idle_timeout, max_output,
-                           env, stdin_text, cancel_event, writable_dirs=()):
+                           env, stdin_text, cancel_event, writable_dirs=(),
+                           bin_dirs=None):
     """Run `command` through the Windows Job Object + restricted-token sandbox
     and map the result onto `run()`'s (rc, output, stopped, seconds) shape."""
     from . import sandbox_win
     started = time.monotonic()
-    full_env = with_venv_path(env, cwd)
+    full_env = with_venv_path(env, cwd, bin_dirs=bin_dirs)
     try:
         rc, out, _err, _elapsed, stopped = sandbox_win._run_nt(
             list(command), cwd=Path(cwd), env=full_env,
@@ -208,6 +220,7 @@ def run(command, *, cwd, timeout: float | None = None,
         cancel_event: threading.Event | None = None,
         windows_sandbox: bool = False,
         writable_dirs: tuple = (),
+        bin_dirs: tuple | list | None = None,
         ) -> tuple[int | None, str, str, float]:
     """Run `command` and return (returncode, output, stopped, seconds).
 
@@ -226,12 +239,15 @@ def run(command, *, cwd, timeout: float | None = None,
     Object + restricted-token sandbox instead of a plain `Popen`.
     `writable_dirs` (Windows sandbox only) lists extra directories the child
     may write; they come from `cfg.sandbox_writable`.
+    `bin_dirs` overrides the legacy venv PATH probe with a resolved
+    environment's bin directories (see `env_resolve.command_env`).
     """
     if windows_sandbox and os.name == "nt":
         return _run_windows_sandboxed(
             command, cwd=cwd, timeout=timeout, idle_timeout=idle_timeout,
             max_output=max_output, env=env, stdin_text=stdin_text,
-            cancel_event=cancel_event, writable_dirs=writable_dirs)
+            cancel_event=cancel_event, writable_dirs=writable_dirs,
+            bin_dirs=bin_dirs)
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
     cap = max(200, int(max_output or 8000))
@@ -247,7 +263,8 @@ def run(command, *, cwd, timeout: float | None = None,
             command, cwd=str(cwd),
             stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            shell=shell, env=with_venv_path(env, cwd), **kwargs)
+            shell=shell, env=with_venv_path(env, cwd, bin_dirs=bin_dirs),
+            **kwargs)
     except (OSError, ValueError) as e:
         return None, str(e), "error", time.monotonic() - started
     resource_id = _register_subprocess(p, command)

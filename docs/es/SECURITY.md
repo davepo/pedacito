@@ -403,6 +403,20 @@ Otros límites:
   `env_passthrough = ["DATABASE_URL", "AWS_*"]`.
 - **`eval` del navegador** ejecuta JavaScript escrito por el modelo, así que está restringido a los hosts de
   `browser_eval_hosts`.
+- **La resolución del entorno es solo de detección.** `env_resolve` lee
+  marcadores locales (`.venv`, metadatos de uv/poetry/pipenv/conda, entornos
+  de tox/nox, archivos de bloqueo de pnpm/yarn/bun, manifiestos de Cargo/Go)
+  y comprueba si existe un intérprete o una herramienta. Nunca carga un script
+  de activación, ejecuta `uv`/`poetry`/`conda`/`tox`/`nox`/`npx`, instala un
+  paquete ni hace una petición de red. Las rutas descubiertas en el proyecto
+  pasan por `security.resolve_safe_path`, así que un enlace simbólico o
+  junction de `.venv` que escape del proyecto se rechaza; un
+  `VIRTUAL_ENV`/`CONDA_PREFIX` explícito sigue siendo estado del usuario y
+  puede vivir fuera. `command_env` compone `safety.child_env`, de modo que
+  anteponer los directorios bin del proyecto no puede volver a agregar una
+  variable que la depuración eliminó. Los scripts descubiertos por el
+  resolutor son datos: nada se ejecuta porque un manifiesto lo nombre, y
+  `allow_shell`/la política/el sandbox siguen controlando cada ejecución real.
 
 La política de entorno tiene tres niveles por superficie:
 

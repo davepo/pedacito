@@ -470,6 +470,30 @@ Trátalas como una
 decisión de confianza, pero consulta [Seguridad](SECURITY.md): `run` está en sandbox por
 defecto donde el sistema operativo lo permite, y el resto del radio de impacto también está limitado.
 
+### Resolución del entorno
+
+`env_resolve.resolve_environment` es un detector sin conexión. Lee marcadores
+del proyecto (`.venv`, metadatos de uv/poetry/pipenv/conda, entornos de
+tox/nox, archivos de bloqueo de pnpm/yarn/bun, manifiestos de Cargo/Go) y
+rutas de intérpretes existentes; nunca ejecuta un script de activación,
+`uv`/`poetry`/`conda`/`tox`/`nox`, `npx`, una instalación ni una petición de
+red. La precedencia es fija: un intérprete existente del proyecto, un
+`VIRTUAL_ENV`/`CONDA_PREFIX` activo explícito, los metadatos del gestor de
+paquetes y por último el `PATH` ambiental. El resultado es un
+`ResolvedEnvironment(kind, python, bin_dirs, package_manager, workspace_root,
+evidence)` congelado; los entornos competidores se nombran en la línea de
+evidencia `ambiguous:` en lugar de descartarse en silencio. Las rutas
+descubiertas en el proyecto pasan por `security.resolve_safe_path`, así que un
+enlace simbólico o junction de `.venv` que escape del proyecto se rechaza.
+
+`env_resolve.command_env` parte de `safety.child_env` y solo antepone los
+directorios bin resueltos, de modo que `run_test`, `diagnose`, los servidores
+LSP, los comandos laterales y los hijos de `run` ven las herramientas del
+proyecto mientras la depuración con lista permitida sigue eliminando secretos
+ambientales. Un `test_command` explícito sigue siendo autoritativo y nunca se
+reescribe. Los scripts y manifiestos descubiertos por el resolutor son datos,
+nunca comandos: nada se ejecuta solo porque un manifiesto lo nombre.
+
 ### Ejecuciones de pruebas acotadas durante la investigación
 
 Un modelo que solo lee código tiene que adivinar qué hará una corrección. `run_test` le permite

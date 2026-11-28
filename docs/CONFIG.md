@@ -842,6 +842,29 @@ max_tokens = 0
 max_steps = 0
 ```
 
+## Environment resolution
+
+Pedacito resolves the project's environment without executing anything.
+`resolve_environment` reads local markers (`.venv`, `uv.lock`,
+`poetry.lock`, `Pipfile`, `conda-meta`, `tox.ini`/`.tox`,
+`noxfile.py`/`.nox`, pnpm/yarn/bun lockfiles, `Cargo.toml`, `go.mod`) and
+existing interpreters, then applies a fixed precedence: an existing project
+interpreter first, an explicitly active `VIRTUAL_ENV`/`CONDA_PREFIX` next,
+then package-manager metadata, then the ambient `PATH`. Ambiguity is reported
+in `pedacito doctor`'s evidence line; the choice is still deterministic. On
+Windows, `Scripts` is used instead of `bin` and `PATHEXT` executable
+extensions are checked.
+
+`test_command` remains authoritative: an explicit command is never rewritten.
+Detected commands, `run_test`, `diagnose`, LSP servers and the `run`
+launches receive the resolved bin directories prepended to `PATH` and the
+usual scrubbed child environment (`scrub_env` / `env_passthrough` still
+apply), so project tools win without leaking ambient secrets. An explicit
+`test_command` may still say `python`; the child `PATH` keeps the project's
+venv directories, but the command text is unchanged. `pedacito doctor` (the
+documented alias of `pedacito config --doctor`) prints the resolved kind,
+interpreter, `PATH` directories, package manager and evidence.
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito

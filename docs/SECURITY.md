@@ -403,6 +403,18 @@ Other limits:
   `env_passthrough = ["DATABASE_URL", "AWS_*"]`.
 - **Browser `eval`** runs model-written JavaScript, so it is restricted to the hosts in
   `browser_eval_hosts`.
+- **Environment resolution is detect-only.** `env_resolve` reads local markers
+  (`.venv`, uv/poetry/pipenv/conda metadata, tox/nox environments,
+  pnpm/yarn/bun lockfiles, Cargo/Go manifests) and checks whether an
+  interpreter or tool exists. It never sources an activation script, runs
+  `uv`/`poetry`/`conda`/`tox`/`nox`/`npx`, installs a package or makes a
+  network request. Project-discovered paths pass `security.resolve_safe_path`,
+  so a `.venv` symlink/junction that escapes the project is rejected; an
+  explicitly set `VIRTUAL_ENV`/`CONDA_PREFIX` remains user state and may live
+  outside. `command_env` composes `safety.child_env`, so prepending the
+  project's bin directories cannot re-add a variable the scrub removed.
+  Resolver-discovered scripts are data: nothing runs because a manifest names
+  it, and `allow_shell`/policy/sandbox still gate every actual execution.
 
 The environment policy has three per-surface tiers:
 

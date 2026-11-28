@@ -472,6 +472,29 @@ Treat them as a
 trust decision, but see [Safety](SECURITY.md): `run` is sandboxed by
 default where the OS allows, and the rest of the blast radius is limited too.
 
+### Environment resolution
+
+`env_resolve.resolve_environment` is an offline detector. It reads project
+markers (`.venv`, uv/poetry/pipenv/conda metadata, tox/nox environments,
+pnpm/yarn/bun lockfiles, Cargo/Go manifests) and existing interpreter paths;
+it never runs an activation script, `uv`/`poetry`/`conda`/`tox`/`nox`, `npx`,
+an install or a network request. Precedence is fixed: an existing project
+interpreter, an explicitly active `VIRTUAL_ENV`/`CONDA_PREFIX`, package-manager
+metadata, then the ambient `PATH`. The result is a frozen
+`ResolvedEnvironment(kind, python, bin_dirs, package_manager, workspace_root,
+evidence)`; competing environments are named on the `ambiguous:` evidence
+line rather than silently dropped. Project-discovered paths pass
+`security.resolve_safe_path`, so a `.venv` symlink or junction that escapes
+the project is rejected.
+
+`env_resolve.command_env` starts from `safety.child_env` and only prepends the
+resolved bin directories, so `run_test`, `diagnose`, LSP servers, side
+commands and `run` children see the project's tools while the existing
+allow-list scrub still removes ambient secrets. An explicit `test_command`
+remains authoritative and is never rewritten. Resolver-discovered scripts and
+manager manifests are data, never commands: nothing executes merely because a
+manifest names it.
+
 ### Scoped test runs during investigation
 
 A model that only reads code has to guess what a fix will do. `run_test` lets it

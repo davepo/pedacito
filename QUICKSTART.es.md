@@ -540,6 +540,11 @@ pedacito config --doctor
 Repite la verificación y luego sondea qué modos de salida estructurada admite el servidor,
 recomienda un `json_mode`, informa la ventana de contexto real y verifica
 si tree-sitter está activo. Las respuestas se recuerdan por una semana.
+`pedacito doctor` es el mismo informe con un nombre más corto; además imprime el
+entorno resuelto del proyecto sin conexión (intérprete, directorios del PATH,
+gestor de paquetes y la evidencia de la elección). La detección solo lee metadatos
+locales: nunca ejecuta un script de activación, uv/poetry/conda/tox/nox, `npx`,
+una instalación ni una petición de red.
 
 Después de actualizar Pedacito, `pedacito config --upgrade` agrega a tu configuración las
 opciones recién documentadas, comentadas, sin tocar tus

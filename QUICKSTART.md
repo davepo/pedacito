@@ -541,6 +541,11 @@ pedacito config --doctor
 It repeats the check, then probes which structured-output modes the server
 supports, recommends a `json_mode`, reports the real context window, and checks
 whether tree-sitter is active. The answers are remembered for a week.
+`pedacito doctor` is the same report under a shorter name; it also prints the
+offline-resolved project environment (interpreter, PATH directories, package
+manager and the evidence behind the choice). Detection reads local metadata
+only: it never runs an activation script, uv/poetry/conda/tox/nox, `npx`, an
+install or a network request.
 
 After upgrading Pedacito, `pedacito config --upgrade` appends any newly
 documented options to your config, commented out, without touching your

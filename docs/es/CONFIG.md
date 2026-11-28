@@ -841,6 +841,31 @@ max_tokens = 0
 max_steps = 0
 ```
 
+## Resolución del entorno
+
+Pedacito resuelve el entorno del proyecto sin ejecutar nada.
+`resolve_environment` lee marcadores locales (`.venv`, `uv.lock`,
+`poetry.lock`, `Pipfile`, `conda-meta`, `tox.ini`/`.tox`,
+`noxfile.py`/`.nox`, archivos de bloqueo de pnpm/yarn/bun, `Cargo.toml`,
+`go.mod`) e intérpretes existentes, y aplica una precedencia fija: primero un
+intérprete existente del proyecto, después un `VIRTUAL_ENV`/`CONDA_PREFIX`
+activo explícito, luego los metadatos del gestor de paquetes y por último el
+`PATH` ambiental. La ambigüedad se informa en la línea de evidencia de
+`pedacito doctor`; la elección sigue siendo determinista. En Windows se usa
+`Scripts` en lugar de `bin` y se comprueban las extensiones ejecutables de
+`PATHEXT`.
+
+`test_command` sigue siendo autoritativo: un comando explícito nunca se
+reescribe. Los comandos detectados, `run_test`, `diagnose`, los servidores LSP
+y los lanzamientos de `run` reciben los directorios bin resueltos al principio
+del `PATH` y el entorno hijo depurado habitual (`scrub_env` /
+`env_passthrough` siguen aplicándose), así que las herramientas del proyecto
+ganan sin filtrar secretos ambientales. Un `test_command` explícito puede
+seguir diciendo `python`; el `PATH` hijo conserva los directorios del venv del
+proyecto, pero el texto no cambia. `pedacito doctor` (el alias documentado de
+`pedacito config --doctor`) imprime el tipo resuelto, el intérprete, los
+directorios del `PATH`, el gestor de paquetes y la evidencia.
+
 ## Referencia de configuración
 
 `pedacito config` lista cada ajuste con su valor y origen; `pedacito

@@ -505,6 +505,31 @@ def _tree_sitter_report() -> str:
             "them back.")
 
 
+def _environment_report(root, cfg) -> str:
+    """The `--doctor` environment block: detected kind, interpreter, PATH
+    directories and bounded evidence. Detection only; nothing is executed."""
+    from . import env_resolve
+    resolved = env_resolve.resolve_environment(Path(root))
+    none = i18n.t("cli.doctor.env.none")
+
+    def display(path: Path) -> str:
+        try:
+            return path.relative_to(resolved.root).as_posix()
+        except ValueError:
+            return str(path)
+
+    python = display(resolved.python) if resolved.python is not None else none
+    bins = ", ".join(display(d) for d in resolved.bin_dirs) or none
+    evidence = "; ".join(resolved.evidence) or none
+    return "\n".join((
+        i18n.t("cli.doctor.env.header", kind=resolved.kind,
+               package_manager=resolved.package_manager or none),
+        i18n.t("cli.doctor.env.interpreter", python=python),
+        i18n.t("cli.doctor.env.bins", bins=bins),
+        i18n.t("cli.doctor.env.evidence", evidence=evidence),
+    ))
+
+
 def _cmd_config(args, cfg) -> int:
     """`pedacito config`: write a starter (--init) or the reference template,
     else show each resolved setting and its origin; --check also tests the
@@ -639,6 +664,9 @@ def _cmd_config(args, cfg) -> int:
               "`--doctor` to also probe its structured-output modes.",
               file=sys.stderr)
         return 0
+
+    if doctor:
+        print("\n" + _environment_report(root, cfg))
 
     print(f"\nConnecting to {cfg.base_url} ...")
     client = LLMClient(cfg)
@@ -4388,8 +4416,9 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         help="like --check, plus probe which structured-output "
                              "mode (json_schema / json_object / plain prompting) "
                              "this server+model actually supports, and report "
-                             "its context length, tokenizer ratio and the "
-                             "tree-sitter syntax-check status")
+                             "its context length, tokenizer ratio, the "
+                             "tree-sitter syntax-check status and the resolved "
+                             "project environment")
     p_conf.add_argument("--setup", action="store_true",
                         help="interactive first-run setup: finds a local server, "
                              "writes and validates a minimal config")
@@ -4407,6 +4436,17 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     p_conf.add_argument("--profile", metavar="NAME")
     p_conf.add_argument("paths", nargs="*", default=["."], help=argparse.SUPPRESS)
     p_conf.add_argument("--config", metavar="FILE")
+
+    p_doctor = sub.add_parser("doctor", help=t("cli.cmd.doctor"))
+    p_doctor.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                          default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    p_doctor.add_argument("paths", nargs="*", default=["."],
+                          help="the project (default: current directory)")
+    p_doctor.add_argument("--root", default=None, help="project root")
+    p_doctor.add_argument("--profile", metavar="NAME",
+                          help="apply a [profiles.NAME] block from your config")
+    p_doctor.add_argument("--config", metavar="FILE",
+                          help="use this config file as well")
 
     p_how = sub.add_parser(
         "how", help=t("cli.cmd.how"))
@@ -5315,6 +5355,20 @@ def _main(argv=None) -> int:
     args = build_parser(lang=active_lang).parse_args(argv)
     if getattr(args, "lang", None):
         i18n.set_current_lang(args.lang)
+    # `pdc doctor` is the documented alias of `pdc config --doctor`: map it
+    # onto the config surface before path/config resolution so both share one
+    # implementation (and one set of probes).
+    if getattr(args, "cmd", "") == "doctor":
+        args.cmd = "config"
+        args.doctor = True
+        args.check = True
+        args.init = False
+        args.path = None
+        args.force = False
+        args.setup = False
+        args.reference = False
+        args.upgrade = False
+        args.dry_run = False
     ask_json = bool(getattr(args, "cmd", "") == "ask"
                     and getattr(args, "json", False))
     if ask_json and getattr(args, "jsonl", False):
