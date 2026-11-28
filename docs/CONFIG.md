@@ -932,6 +932,29 @@ venv directories, but the command text is unchanged. `pedacito doctor` (the
 documented alias of `pedacito config --doctor`) prints the resolved kind,
 interpreter, `PATH` directories, package manager and evidence.
 
+## Flaky tests and quarantine (`.pedacito/flakes.json`)
+
+After an edit, a red test run goes back to the model only when a failing test is attributable to the change. A failing node such as `tests/test_x.py::test_y` that was not failing in the pre-edit baseline is rerun once, with the same runner and command. If the same assertion fails again, the failure is a real failure and is sent to repair. A passing rerun is recorded as a flake. A timeout, a collection error, a missing dependency or any other infrastructure stop is never rerun and never repaired.
+
+Every outcome other than a real failure leaves the run red and unverified, and it is never reported as green. Each decision is recorded as a `test_category` event.
+
+Only pytest's `path::node` id is rerun. Other runners (npm, `node --test`, cargo, go) have no node rerun in this version, so their new failures stop as unverified instead of being repaired. Pedacito does not invent their syntax.
+
+To tolerate a known flaky test for a while, add an explicit, dated entry yourself:
+
+```json
+{
+  "quarantine": [
+    {"test_id": "tests/test_x.py::test_y", "reason": "tracked in issue 12", "expires": "2027-01-31"}
+  ]
+}
+```
+
+- `reason` and `expires` (`YYYY-MM-DD`) are required. An entry without a valid, unexpired date is ignored, with a warning in the run log.
+- A quarantined failure is shown as a finding and as a `test_category` event. It is not rerun and not sent to repair. The run stays red.
+- The file is read only from inside the project. A symlink or junction that leads outside is refused.
+- The file only changes repair routing. It cannot enable a tool, a command or a permission.
+
 ## Configuration reference
 
 `pedacito config` lists every setting with its value and origin; `pedacito

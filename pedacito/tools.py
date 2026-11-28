@@ -4956,6 +4956,15 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
                      "NOT in these tests. Do not re-run to watch it pass "
                      "again.")
     else:
+        from . import loop as loop_mod
+        from . import test_classify
+        infra = test_classify.classify_output_kind(
+            raw, has_node_failures=test_classify.has_test_node(
+                loop_mod.failure_identities(raw)))
+        if infra:
+            lines.append(f"CATEGORY: {infra} -- the run stopped before a "
+                         "verdict on the code, so it is unverified, not a "
+                         "failing test. Do not edit working code to chase it.")
         budget_tokens = max(200, _as_int(getattr(cfg, "max_read_tokens",
                                                  1200), 1200))
         condensed = _condense_failures(raw, int(budget_tokens

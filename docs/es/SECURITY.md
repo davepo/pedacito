@@ -742,6 +742,12 @@ evento `permission_decision`) o `auto-safe` (`pytest`, `ruff`, `git status` y `g
 demás pide aprobación). Las sesiones en segundo plano y sin interfaz se deniegan de forma determinista en
 lugar de esperar a una persona.
 
+## Reejecuciones de pruebas inestables y cuarentena (v0.4.1)
+
+Una reejecución de una prueba inestable usa el mismo runner, argv, entorno, verificación de permisos y sandbox que la ejecución original, una vez por nodo fallido. No añade permisos de red, escritura ni shell. La única entrada del proyecto que llega hasta ella es un identificador de nodo de pytest, que debe ser una ruta relativa `.py` con partes `::`, sin recorridos, espacios ni sintaxis de shell; el archivo debe resolverse dentro del proyecto.
+
+`.pedacito/flakes.json` lo escribe el proyecto. Solo puede sacar un fallo nombrado del enrutamiento de la reparación, y solo hasta su caducidad con fecha. Se lee mediante `resolve_safe_path`, y un enlace simbólico o una unión que salga del proyecto se rechaza. Un fallo en cuarentena se sigue mostrando como hallazgo y mantiene la ejecución en rojo. Nada en el archivo concede permisos ni activa herramientas. Las reejecuciones, la cuarentena y los motivos de categoría se redactan y se acotan antes de llegar a los eventos.
+
 ## Límites conocidos y brechas
 
 Estos son límites reales. Léelos antes de depender de Pedacito para código no confiable.

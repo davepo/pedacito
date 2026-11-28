@@ -619,6 +619,18 @@ Es JSON simple. Léelo, edítalo o elimínalo para olvidar todo lo que ha
 aprendido. `micro_facts = false` desactiva el registro y la inyección, y
 `max_micro_fact_tokens` limita cuánto de él llega al prompt.
 
+### Ejecuciones en rojo: pruebas inestables, infraestructura y enrutamiento de la reparación
+
+`pedacito/test_classify.py` decide qué fallos de una ejecución de pruebas en rojo posterior a una edición pueden llegar a la reparación del modelo. Solo puede hacerlo `real_failure`. Las identidades de fallo y las diferencias con la línea base provienen del mismo `loop.failure_identities` que usa el paquete de reparación.
+
+- Un timeout, un error de recolección, una dependencia ausente u otra parada de infraestructura se clasifica antes de cualquier reejecución. Nunca se vuelve a ejecutar ni se repara.
+- Un nodo de pytest nuevo que falla se vuelve a ejecutar como máximo una vez por verificación, con el runner original y el mismo argv y sandbox; como máximo se reejecutan tres nodos. Una reejecución que pasa y muestra evidencia de paso es un `flake`. La misma aserción que vuelve a fallar es un `real_failure`. Cualquier otro caso es `unknown`.
+- Los runners sin identificador de nodo estable (npm, `node --test`, cargo, go) nunca reciben sintaxis de pytest inventada, así que sus fallos nuevos son `unknown` y se detienen como no verificados.
+- Los identificadores en cuarentena de `.pedacito/flakes.json` se informan y no se reejecutan. Un fallo en cuarentena nunca convierte una ejecución en verde.
+- Cada decisión es un evento `test_category` con un motivo redactado y acotado. Los resultados no verificados se registran como un hallazgo de error que indica que la ejecución no está verificada. Nunca se registran como aprobados.
+
+Esto no afirma que una reejecución demuestre determinismo. Una reejecución que pasa es evidencia de inestabilidad, no prueba de que la prueba esté bien. El sandbox de Windows no cambia esta ruta.
+
 ## Qué se indexa
 
 Los archivos de código se analizan en funciones, clases y métodos con rangos de línea

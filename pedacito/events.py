@@ -28,6 +28,7 @@ from typing import Any, Callable
 from . import safety, session_ctx
 
 EVENT_DIR = "events"
+TEST_CATEGORY_KIND = "test_category"
 
 
 def _clean_value(v: Any, *, redact: bool, cap: int) -> Any:
@@ -491,6 +492,18 @@ def note_call(rec: dict) -> None:
             run.note(rec)
         except Exception:
             pass
+
+
+def emit_test_category(log, *, round_: int, category: str, node_id: str,
+                       baseline: str, rerun: str, reason: str,
+                       quarantined: bool = False) -> None:
+    """One `test_category` event: why a red test run was or was not sent to
+    repair (WP-4105D). `category` is a test_classify kind or `quarantined`;
+    the field is not called `kind`, which is the event's own name."""
+    log.emit(TEST_CATEGORY_KIND, round=int(round_), category=str(category),
+             node_id=str(node_id or "")[:300], baseline=str(baseline),
+             rerun=str(rerun), reason=str(reason or "")[:300],
+             quarantined=bool(quarantined))
 
 
 def run_line(summary: dict) -> str:

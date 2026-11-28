@@ -414,6 +414,15 @@ def run_command(root, cfg, command: str, timeout: int | None = None
     return rc == 0, out
 
 
+def impacted_base(root, cfg, changed: list[str]) -> str:
+    """The unnarrowed runner `run_impacted` would use for `changed`, '' when no
+    test command exists. A node rerun uses this same runner (WP-4105D)."""
+    base = detect_test_command(root, cfg)
+    if not base:
+        return ""
+    return _language_base(Path(root), changed, cfg, base)
+
+
 def run_impacted(index, cfg, changed: list[str]) -> tuple[bool, str, str]:
     """Run the tests a change can break: impacted ones first, then (if they
     pass and the command could be narrowed) nothing more -- the full suite is

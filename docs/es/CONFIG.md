@@ -940,6 +940,29 @@ proyecto, pero el texto no cambia. `pedacito doctor` (el alias documentado de
 `pedacito config --doctor`) imprime el tipo resuelto, el intérprete, los
 directorios del `PATH`, el gestor de paquetes y la evidencia.
 
+## Pruebas inestables y cuarentena (`.pedacito/flakes.json`)
+
+Tras una edición, una ejecución de pruebas en rojo solo vuelve al modelo cuando un test fallido es atribuible al cambio. Un nodo fallido, como `tests/test_x.py::test_y`, que no fallaba en la línea base previa a la edición se vuelve a ejecutar una vez, con el mismo runner y comando. Si vuelve a fallar la misma aserción, es un fallo real y se envía a la reparación. Una nueva ejecución que pasa se registra como inestable. Un timeout, un error de recolección, una dependencia ausente o cualquier otra parada de infraestructura nunca se vuelve a ejecutar ni se repara.
+
+Todo resultado distinto de un fallo real deja la ejecución en rojo y no verificada, y nunca se informa como verde. Cada decisión se registra como un evento `test_category`.
+
+Solo se vuelve a ejecutar el identificador `ruta::nodo` de pytest. Otros runners (npm, `node --test`, cargo, go) no tienen reejecución de nodos en esta versión, así que sus fallos nuevos se detienen como no verificados en lugar de repararse. Pedacito no inventa su sintaxis.
+
+Para tolerar una prueba inestable conocida durante un tiempo, añade tú mismo una entrada explícita con fecha:
+
+```json
+{
+  "quarantine": [
+    {"test_id": "tests/test_x.py::test_y", "reason": "seguido en la incidencia 12", "expires": "2027-01-31"}
+  ]
+}
+```
+
+- `reason` y `expires` (`AAAA-MM-DD`) son obligatorios. Una entrada sin fecha válida y no caducada se ignora, con una advertencia en el registro de la ejecución.
+- Un fallo en cuarentena se muestra como hallazgo y como evento `test_category`. No se vuelve a ejecutar ni se envía a la reparación. La ejecución sigue en rojo.
+- El archivo solo se lee desde dentro del proyecto. Un enlace simbólico o una unión que salga fuera se rechaza.
+- El archivo solo cambia el enrutamiento de la reparación. No puede activar una herramienta, un comando ni un permiso.
+
 ## Referencia de configuración
 
 `pedacito config` lista cada ajuste con su valor y origen; `pedacito
