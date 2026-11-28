@@ -24,7 +24,7 @@
   "cli.error": "Error: {message}",
   "cli.config_error": "Config error: {message}",
   "cli.cancelled": "Cancelled.",
-  "cli.bench.compare.usage": "usage: pedacito bench compare BASELINE.json CURRENT.json [--json] [--max-prompt-growth FRAC] [--max-time-growth FRAC]",
+  "cli.bench.compare.usage": "usage: pedacito bench compare BASELINE.json CURRENT.json [--json] [--tolerance FLOAT] [--strict] [--max-prompt-growth FRAC] [--max-time-growth FRAC]",
   "cli.bench.compare.unreadable": "Cannot read scorecard {path}: {error}",
   "cli.bench.compare.incomparable": "Invalid or incomparable scorecards: {message}",
   "cli.bench.extra_args": "bench takes one benchmark id; only `bench compare` takes two scorecard paths.",

@@ -514,6 +514,22 @@ def test_named_libraries_requires_an_exact_declared_name(tmp_path):
         ("python-dateutil",), "python-dateutil") == "python-dateutil"
 
 
+def test_named_libraries_recognizes_a_dotted_attribute_root(tmp_path):
+    _write(tmp_path / "pyproject.toml",
+           '[project]\nname = "app"\nversion = "0.1.0"\n'
+           'dependencies = ["requests>=2.31"]\n')
+    api_oracle.named_libraries.cache_clear()
+    assert api_oracle.named_libraries(
+        tmp_path, "Use requests.get to fetch a URL") == ("requests",)
+    assert api_oracle.named_libraries(
+        tmp_path, "Use requests.Session for the call") == ("requests",)
+    # Only a declared root matches: a different dotted root stays unknown.
+    assert api_oracle.named_libraries(
+        tmp_path, "Use requestsx.get to fetch a URL") == ()
+    assert api_oracle.named_libraries(
+        tmp_path, "Use nonexistentlib.get to fetch a URL") == ()
+
+
 def test_injection_is_static_only_and_bounded(tmp_path, monkeypatch):
     venv, site = _python_fixture(tmp_path)
     _write(tmp_path / "pyproject.toml",

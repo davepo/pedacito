@@ -1001,12 +1001,14 @@ def _placeholders(text: str) -> set[str]:
 class TestGate12BilingualDocsAndI18nParity:
     """Versions agree, both languages document every public surface, how works."""
 
-    def test_versions_agree_at_040(self):
-        assert __version__ == "0.4.0"
+    def test_versions_agree(self):
+        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+        assert match is not None
+        assert __version__ == match.group(1)
+        assert __version__.startswith("0.4.")
         assert rpc.PROTOCOL_VERSION == "0.4.0"
         assert daemon.DAEMON_PROTOCOL_VERSION == "0.4.0"
-        pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
-        assert re.search(r'^version\s*=\s*"0\.4\.0"', pyproject, re.M)
 
     def test_locale_keys_and_placeholders_match(self):
         en = json.loads((REPO / "pedacito" / "locales" / "en.json").read_text(encoding="utf-8"))

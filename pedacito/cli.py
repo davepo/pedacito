@@ -3881,11 +3881,14 @@ def _cmd_bench_compare(args) -> int:
                          error=str(e)), file=sys.stderr)
             return 2
     notes: list[str] = []
+    tolerance = 0.0 if getattr(args, "strict", False) \
+        else float(getattr(args, "tolerance", 1.0))
     try:
         regressions, improvements = evalrun.compare_scorecards(
             cards[0], cards[1],
             max_prompt_growth=float(getattr(args, "max_prompt_growth", 0.0)),
             max_time_growth=float(getattr(args, "max_time_growth", 0.50)),
+            pass_tolerance=tolerance,
             notes=notes)
     except evalrun.ScorecardError as e:
         print(i18n.t("cli.bench.compare.incomparable", message=str(e)),
@@ -5825,6 +5828,11 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                          metavar="FRAC",
                          help="bench compare: allowed mean seconds growth "
                               "(default 0.50)")
+    p_bench.add_argument("--tolerance", type=_finite_fraction, default=1.0,
+                         metavar="FLOAT",
+                         help="bench compare: allowed pass/locate/first-apply "
+                              "drop in task-equivalents (default 1.0); 0 "
+                              "fails any drop")
     p_bench.add_argument("--list", action="store_true",
                          help="list the six benchmarks and exit")
     p_bench.add_argument("--recent", action="store_true",
@@ -5840,7 +5848,8 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                               "(progress stays on stderr)")
     p_bench.add_argument("--strict", action="store_true",
                          help="exit 1 unless every run's overall result is "
-                              "PASS (model tests and holdout rubric both)")
+                              "PASS (model tests and holdout rubric both); "
+                              "with bench compare: same as --tolerance 0")
     p_bench.add_argument("--model-timeout", type=int, default=180,
                          metavar="SEC",
                          help="timeout for the generated project's own tests "

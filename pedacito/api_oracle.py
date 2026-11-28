@@ -1582,8 +1582,13 @@ def _library_variants(name: str) -> tuple[str, ...]:
 
 
 def _task_tokens(task: str) -> set[str]:
-    return {token.casefold() for token in _TASK_TOKEN_RE.findall(task or "")
-            if token}
+    tokens = {token.casefold() for token in _TASK_TOKEN_RE.findall(task or "")
+              if token}
+    # A dotted attribute names its library too: `requests.get` must match the
+    # declared `requests` dependency while an undeclared root still matches
+    # nothing. Keep the exact token as well for direct lookups.
+    roots = {token.split(".", 1)[0] for token in tokens if "." in token}
+    return {token for token in tokens | roots if token}
 
 
 def _explicit_library_tokens(task: str) -> list[str]:
