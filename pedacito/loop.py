@@ -3521,6 +3521,114 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
     return results, reply, tests_ok, preexisting_only
 
 
+_LSP_GATE_MAX_BYTES = 1_048_576
+
+
+@dataclass(frozen=True)
+class _LSPGate:
+    """Baseline state of the opt-in LSP diagnostics gate for one symbol batch.
+    `texts` holds each file's pre-edit text ("" for a file the edit creates,
+    None when it could not be read or is too large to compare)."""
+    rels: tuple[str, ...]
+    env: Any
+    texts: dict
+    before_status: str
+    before: tuple
+    remaining: float
+
+
+def _lsp_gate_texts(root: Path, rels) -> dict:
+    out: dict = {}
+    for rel in rels:
+        try:
+            path = security_mod.resolve_safe_path(root, rel)
+        except security_mod.SecurityError:
+            out[rel] = None
+            continue
+        if not path.exists():
+            out[rel] = ""
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size > _LSP_GATE_MAX_BYTES:
+                out[rel] = None
+            else:
+                out[rel] = path.read_bytes().decode("utf-8", "replace")
+        except OSError:
+            out[rel] = None
+    return out
+
+
+def _lsp_gate_begin(root, cfg, files) -> _LSPGate | None:
+    """Baseline diagnostics before a symbol batch lands. Returns None when the
+    gate is off (lsp_diagnostics_gate and allow_lsp are both required)."""
+    if not (getattr(cfg, "lsp_diagnostics_gate", False)
+            and getattr(cfg, "allow_lsp", False)):
+        return None
+    from . import env_resolve, lsp as lsp_mod
+    root = Path(root).resolve()
+    rels = tuple(sorted({fileio_norm(f) for f in files if f}))
+    env = env_resolve.resolve_environment(root)
+    texts = _lsp_gate_texts(root, rels)
+    deadline = time.monotonic() + lsp_mod.GATE_BUDGET_SECONDS
+    status, before = lsp_mod.collect_gate_diagnostics(
+        root, list(rels), cfg=cfg, environment=env, deadline=deadline)
+    remaining = max(0.0, deadline - time.monotonic())
+    return _LSPGate(rels, env, texts, status, before, remaining)
+
+
+def _lsp_gate_finish(gate, root, cfg) -> list:
+    """Actionable gate findings after the batch landed, as verify Findings
+    (severity "error" feeds repair). The gate spends only the budget left from
+    the baseline, so the edit's own time does not count against it. Any
+    status other than ok is unverified: nothing is reported and an event
+    records why. Never raises."""
+    if gate is None:
+        return []
+    from . import lsp as lsp_mod, verify as verify_mod
+    root = Path(root).resolve()
+    status = gate.before_status
+    after: tuple = ()
+    actionable: tuple = ()
+    try:
+        if status == "ok":
+            deadline = time.monotonic() + gate.remaining
+            status, after = lsp_mod.collect_gate_diagnostics(
+                root, list(gate.rels), cfg=cfg, environment=gate.env,
+                deadline=deadline)
+        if status == "ok":
+            changed: dict = {}
+            maps: dict = {}
+            now = _lsp_gate_texts(root, gate.rels)
+            for rel in gate.rels:
+                old, new = gate.texts.get(rel), now.get(rel)
+                if old is None or new is None:
+                    status = "unavailable"
+                    break
+                changed[rel], maps[rel] = lsp_mod.diff_line_maps(old, new)
+            if status == "ok":
+                actionable = lsp_mod.diagnostics_delta(
+                    gate.before, after, changed, line_maps=maps)
+    except Exception:
+        status = "unavailable"
+    findings = []
+    for d in actionable:
+        findings.append(verify_mod.Finding(
+            kind="lsp",
+            severity="error" if d.severity in (1, 2) else "warn",
+            file=d.file,
+            message=f"{d.code or 'diagnostic'}: {d.message}",
+            line=d.line,
+            lines=(d.line, d.end_line)))
+    try:
+        events_mod.get(root, cfg).emit(
+            "lsp_gate", status=status, files=len(gate.rels),
+            before=len(gate.before), after=len(after),
+            actionable=len(actionable), budget_s=lsp_mod.GATE_BUDGET_SECONDS)
+    except Exception:
+        pass
+    return findings
+
+
 def _post_edit_lint_incremental(root, cfg, agent, task, results, reply,
                                 backup_dir, baseline):
     """The lint half of the post-edit check after a symbol microloop.
@@ -5135,6 +5243,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 lint_baseline = diagnostics.quick_findings(root, edit_files)
             except Exception:
                 lint_baseline = {}
+        lsp_gate = None
         if pre.denied:
             print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
                   file=sys.stderr)
@@ -5142,6 +5251,7 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                         f"{pre.message}") for f in edit_files]
             reply = raw_reply = ""
         else:
+            lsp_gate = _lsp_gate_begin(root, cfg, edit_files)
             results, reply, findings = agent.apply_edit_intents(
                 task, gathered, intents, backup_dir=backup_dir,
                 verbose=True)
@@ -5157,7 +5267,10 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                     root, f"incremental batch PARTIALLY applied: {landed} of "
                           f"{len(results)} block(s) landed; not applied: "
                           f"{missing}", "WARN")
-            findings = verify_mod.dedupe_findings(findings)
+            findings = verify_mod.dedupe_findings(
+                list(findings) + _lsp_gate_finish(
+                    lsp_gate if any(r.ok for r in results) else None,
+                    root, cfg))
             for f in findings:
                 workspace.log_event(root, f"verify: {f.render()}",
                                     "WARN" if f.severity == "warn" else "ERROR")

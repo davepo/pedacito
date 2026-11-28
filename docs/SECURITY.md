@@ -227,7 +227,8 @@ own. These settings are ignored from a project file until you read it and run
 `pedacito trust PROJECT`:
 
 - Commands and hooks: `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
-  `allow_serve`, `allow_lsp`, `lsp_servers`, `load_cmd`, `unload_cmd`.
+  `allow_serve`, `allow_lsp`, `lsp_servers`, `lsp_diagnostics_gate`, `load_cmd`,
+  `unload_cmd`.
 - Capability switches: `allow_shell`, `allow_write`, `allow_browser`,
   `allow_screenshots`, `allow_fetch`, `allow_image_gen`, `enable_mcp`, `allow_mcp`.
 - Sandbox settings (`sandbox`, `sandbox_network`, `sandbox_writable`,
@@ -380,7 +381,7 @@ does not chase a blocked write as if it were a code bug.
 | Test commands from `run_test` | Yes | Scrubbed | 15 s ceiling per run |
 | `verify_tests` after an edit | Yes | Scrubbed | Test timeout |
 | `pedacito serve` (background dev servers) | **No** | Scrubbed | Kept running until stopped |
-| `browser`, `lsp`, MCP servers | **No** | Scrubbed | `lsp_timeout` (10 s), MCP discovery 5 s per server |
+| `browser`, `lsp`, MCP servers | **No** | Scrubbed | `lsp_timeout` (10 s), MCP discovery 5 s per server; the diagnostics gate uses one 2.9 s budget per symbol batch and reaps a timed-out server |
 | Hooks and `auto_verify` (your own commands) | **No** (by design) | Scrubbed for hooks (+ `PEDACITO_EVENT`); `auto_verify` also scrubbed | Hook timeout |
 | Server lifecycle `load_cmd` / `unload_cmd` (trusted config) | **No** (by design) | Scrubbed allow-list + `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` | 120 s |
 | GUI **Run** tab (you click it) | **No** | Credential variables removed (see below) | 15 s default, or the value you set |

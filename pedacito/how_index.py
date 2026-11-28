@@ -2598,7 +2598,8 @@ GUI_TOPICS = [
         "settings": ["allow_shell", "allow_write", "allow_browser",
                      "allow_screenshots", "shell_allowlist", "shell_deny",
                      "sandbox", "sandbox_network", "scrub_env", "allow_mcp",
-                     "mcp_servers", "mcp_timeout", "allow_lsp", "lsp_servers"],
+                     "mcp_servers", "mcp_timeout", "allow_lsp", "lsp_servers",
+                     "lsp_diagnostics_gate"],
         "cli": ["config"],
     },
     {

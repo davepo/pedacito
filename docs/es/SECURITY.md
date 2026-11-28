@@ -231,7 +231,8 @@ solo. Estos ajustes se ignoran en un archivo de proyecto hasta que lo leas y eje
 `pedacito trust PROJECT`:
 
 - Comandos y hooks: `hooks`, `mcp_servers`, `auto_verify`, `test_command`,
-  `allow_serve`, `allow_lsp`, `lsp_servers`, `load_cmd`, `unload_cmd`.
+  `allow_serve`, `allow_lsp`, `lsp_servers`, `lsp_diagnostics_gate`, `load_cmd`,
+  `unload_cmd`.
 - Interruptores de capacidades: `allow_shell`, `allow_write`, `allow_browser`,
   `allow_screenshots`, `allow_fetch`, `allow_image_gen`, `enable_mcp`, `allow_mcp`.
 - Ajustes del sandbox (`sandbox`, `sandbox_network`, `sandbox_writable`,
@@ -384,7 +385,7 @@ no persiga una escritura bloqueada como si fuera un error de código.
 | Comandos de prueba de `run_test` | Sí | Depurado | Techo de 15 s por ejecución |
 | `verify_tests` tras una edición | Sí | Depurado | Tiempo límite de las pruebas |
 | `pedacito serve` (servidores de desarrollo en segundo plano) | **No** | Depurado | Se mantiene en ejecución hasta que se detenga |
-| `browser`, `lsp`, servidores MCP | **No** | Depurado | `lsp_timeout` (10 s), descubrimiento MCP 5 s por servidor |
+| `browser`, `lsp`, servidores MCP | **No** | Depurado | `lsp_timeout` (10 s), descubrimiento MCP 5 s por servidor; la puerta de diagnósticos usa un único presupuesto de 2,9 s por lote de símbolos y termina un servidor que agota el tiempo |
 | Hooks y `auto_verify` (tus propios comandos) | **No** (por diseño) | Depurado para los hooks (+ `PEDACITO_EVENT`); `auto_verify` también depurado | Tiempo límite del hook |
 | `load_cmd` / `unload_cmd` del ciclo de vida del servidor (configuración confiable) | **No** (por diseño) | Lista permitida depurada + `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` | 120 s |
 | Pestaña **Run** de la GUI (tú haces clic) | **No** | Variables de credenciales eliminadas (ver abajo) | 15 s por defecto, o el valor que definas |

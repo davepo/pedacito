@@ -958,6 +958,7 @@ config --reference` prints the annotated template. Key settings:
 | `allow_shell` | false | `run` and `diagnose`. From a project's own config: ignored until `pedacito trust`. |
 | `allow_serve` / `serve_wait` | false / 3.0 | Background dev servers (`serve` action, `pedacito serve`); seconds to wait for a printed URL. A server that prints one later still gets it recorded, on the next `procs`/`logs` look. |
 | `allow_lsp` / `lsp_servers` / `lsp_timeout` | false / `{}` / 10 | Exact definition/references/hover/diagnostics via a language server; per-extension commands override PATH detection. |
+| `lsp_diagnostics_gate` | false | Opt-in diagnostics gate for symbol edits; needs `allow_lsp` too. Compares the server's diagnostics before and after the edit within one 2.9 s budget and sends only NEW findings on changed lines to repair. A server that cannot prove freshness, a timeout or a missing server is reported as unverified, never as green. In `EXEC_FIELDS`: a project file cannot turn it on without `pedacito trust`. |
 | `allow_screenshots` / `allow_browser` | false | Screen and headless-browser capture. From a project's own config: ignored until `pedacito trust`. |
 | `vision_model` | `""` | Multimodal model used to describe captures. |
 | `modality` | `""` | What kind of model a profile serves: `""` (auto-detect from the model id and server metadata), `"text"`, `"image"`, `"audio"` or `"embedding"`. Only `"image"` opens the [local image generation](#local-image-generation-image_profile-allow_image_gen) path. |

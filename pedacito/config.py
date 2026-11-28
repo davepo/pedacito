@@ -463,6 +463,10 @@ class Config:
     allow_lsp: bool = False
     lsp_servers: dict = field(default_factory=dict)
     lsp_timeout: float = 10.0
+    # Opt-in diagnostics gate for symbol edits: compares language-server
+    # diagnostics before and after the edit within one 2.9 s budget and feeds
+    # only NEW findings on changed lines to repair. Needs allow_lsp too.
+    lsp_diagnostics_gate: bool = False
     # Let the gather loop create/overwrite files via `write`, grow them with
     # `append`, and rename/remove them with `move`/`delete`. Off by default: a
     # mid-gather write skips the edit path's syntax check and review page.
@@ -1659,7 +1663,8 @@ def _hostname(base_url: str) -> str:
 # `browser_eval_hosts`) widen what runs or where data may go, so they follow
 # the same rule.
 EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
-               "allow_serve", "allow_lsp", "lsp_servers", "sandbox",
+               "allow_serve", "allow_lsp", "lsp_servers",
+               "lsp_diagnostics_gate", "sandbox",
                "sandbox_network", "sandbox_writable", "sandbox_strict",
                "allow_shell", "allow_write", "allow_browser",
                "allow_screenshots", "enable_mcp", "allow_mcp",
@@ -3386,6 +3391,11 @@ _EXTRA_FIELD_HELP = {
     "lsp_servers": "Map file extensions to language-server commands, e.g. "
                    '{ ".py" = "pyright-langserver --stdio" }.',
     "lsp_timeout": "Seconds allowed for one language-server request.",
+    "lsp_diagnostics_gate": "Compare language-server diagnostics before and "
+                            "after a symbol edit (needs allow_lsp); only new "
+                            "findings on changed lines reach repair. Off by "
+                            "default; 'unverified' when the server cannot prove "
+                            "freshness.",
     "serve_wait": "Seconds to wait for a background server to print its "
                   "localhost URL.",
     "browser_headless": "Run the browser action headless (no visible window).",
@@ -3826,6 +3836,9 @@ mcp_timeout = 30
 allow_lsp = false
 # lsp_servers = {}          # e.g. { ".py" = "pyright-langserver --stdio" }
 lsp_timeout = 10.0
+# Opt-in: report only NEW diagnostics on changed lines after a symbol edit
+# (needs allow_lsp; unverified when the server cannot prove freshness).
+lsp_diagnostics_gate = false
 
 # Autonomous loop (`pedacito auto`).
 auto_plan_file = "PLAN.md"
@@ -4397,9 +4410,9 @@ _PROJECT_HEADER = """\
 #
 # Settings that run something are ignored until you read this file and run
 # `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
-# allow_lsp, lsp_servers, the sandbox settings, and the capability toggles
-# allow_shell, allow_write, allow_browser, allow_screenshots, enable_mcp and
-# allow_mcp. They are shown commented out here: active defaults would warn on
+# allow_lsp, lsp_servers, lsp_diagnostics_gate, the sandbox settings, and the
+# capability toggles allow_shell, allow_write, allow_browser, allow_screenshots,
+# enable_mcp and allow_mcp. They are shown commented out here: active defaults would warn on
 # every load, and once trusted they would overrule the capabilities you granted
 # at user scope.
 # Uncomment only the ones this repository genuinely needs. Everything else in
