@@ -451,6 +451,72 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "autopsy",
+        "usage": "pedacito autopsy --last [PROJECT] [--run ID] [--json]",
+        "summary": "Classify why the last run failed, from its recorded typed "
+                   "events. Read-only and deterministic: no model call, no "
+                   "re-run. The most severe typed cause wins, with its "
+                   "redacted evidence and next steps; no evidence means "
+                   "unknown.",
+        "keywords": ["autopsy", "why did this fail", "failure", "post mortem",
+                     "diagnose run", "timeout", "budget", "unread edit",
+                     "permission denied", "truncated", "partial batch"],
+        "examples": [
+            "pedacito autopsy --last .",
+            "pedacito autopsy --run SESSION_ID . --json",
+        ],
+        "flags": [
+            {"flag": "--last", "help": "classify the most recent run (default)"},
+            {"flag": "--run ID", "help": "classify this run or session id"},
+            {"flag": "--json", "help": "print the autopsy as JSON"},
+            {"flag": "--root DIR", "help": "project root"},
+        ],
+        "notes": [
+            "Categories: unread_edit, format_error, truncation, "
+            "schema_rejection, test_regression, flake, api_hallucination, "
+            "context_overflow, permission_denial, timeout, budget_stop, "
+            "partial_batch, unknown. flake and api_hallucination have no "
+            "emitter in this build: unverified, so they report unknown.",
+            "The GUI Project menu item 'Why did this fail?' reads the same "
+            "result through the read-only GET /api/autopsy route.",
+        ],
+        "common": True,
+    },
+    {
+        "name": "tools",
+        "usage": "pedacito tools [PROJECT] [--task TEXT] [--allow-tool NAME] [--json]",
+        "summary": "Show which tools the model would be offered for a task, "
+                   "whether each is on or off, the reason, and the permission "
+                   "it needs. It uses the same filter as the real schema and "
+                   "runs nothing. The TUI command /tools shows the same view.",
+        "keywords": ["tools", "tool availability", "inspect tools", "allow tool",
+                     "pruned", "why is a tool missing", "permission", "schema"],
+        "examples": [
+            "pedacito tools .",
+            "pedacito tools . --task 'fix the failing test'",
+            "pedacito tools . --allow-tool write --json",
+        ],
+        "flags": [
+            {"flag": "--task TEXT", "help": "the task text to evaluate"},
+            {"flag": "--allow-tool NAME", "help": "preview a pruned tool "
+                                                  "restored for this task "
+                                                  "(repeatable)"},
+            {"flag": "--json", "help": "print the availability as JSON"},
+            {"flag": "--root DIR", "help": "project root"},
+        ],
+        "notes": [
+            "Reasons: active, config_disabled, policy_denied, "
+            "missing_dependency, not_relevant, pruned, forced. --allow-tool "
+            "only overrides dynamic pruning; config, capability, consent and "
+            "policy still decide. The same flag works on ask and auto and "
+            "resets when the task ends.",
+            "pedacito tools reads the configured tier without probing the "
+            "model server, so a tier that only the live server reveals can "
+            "differ from a running task.",
+        ],
+        "common": True,
+    },
+    {
         "name": "new",
         "usage": 'pedacito new DIR -t "PROJECT IDEA" [--apply]',
         "summary": "Start a project from scratch: plan, scaffold, then build. "
@@ -4138,6 +4204,8 @@ _ES_SUMMARIES = {
     "cli:ask": "Ejecuta una tarea de código de principio a fin. Sin --apply es una ejecución de prueba que imprime las ediciones propuestas.",
     "cli:auto": "Convierte un objetivo en una lista de tareas y luego implementa cada una en un contexto nuevo. Sin --apply solo escribe o imprime el plan.",
     "cli:plan": "Valida una lista de tareas contra el índice antes de la ejecución Auto o Complex: contiene cada ruta nombrada, resuelve los símbolos explícitos, comprueba el orden de dependencias y previsualiza llamadores y pruebas. Las advertencias no bloquean; los errores definitivos salen con 1 y un plan inválido con 2.",
+    "cli:autopsy": "Clasifica por qué falló la última ejecución a partir de sus eventos tipados registrados. Es de solo lectura y determinista: no llama al modelo ni vuelve a ejecutar nada. Gana la causa tipada más grave, con su evidencia redactada y sus próximos pasos; sin evidencia la causa es desconocida.",
+    "cli:tools": "Muestra qué herramientas se ofrecerían al modelo para una tarea, si cada una está activa o no, el motivo y el permiso que necesita. Usa el mismo filtro que el esquema real y no ejecuta nada. El comando /tools de la TUI muestra la misma vista.",
     "cli:reset": "Borra el estado de Pedacito de este proyecto (índice, planes, cachés, sesiones y respaldos); el código y los archivos de configuración no se tocan. No es un restablecimiento de la configuración.",
     "cli:undo": "Deshace la última ejecución: restaura el espacio de trabajo al estado anterior al checkpoint activo (o a la instantánea de respaldo más reciente en proyectos antiguos).",
     "cli:recover": "Lista los diarios de tareas interrumpidas por su UUID y previsualiza o aplica una recuperación. Sin --apply no se escribe nada; resume y cleanup se rechazan cuando no se puede probar un límite duradero o una propiedad autoritativa.",

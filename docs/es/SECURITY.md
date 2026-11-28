@@ -763,6 +763,21 @@ Estos son límites reales. Léelos antes de depender de Pedacito para código no
 - **El sandbox es defensa en profundidad, no una promesa contra un adversario decidido ni contra un
   error del kernel.**
 
+## Autopsia, inspector de herramientas y `--allow-tool`
+
+- `pedacito autopsy`, el elemento de la GUI "¿Por qué falló?" y `GET /api/autopsy`
+  solo leen los registros locales de eventos tipados. Guardan y muestran ids, números de
+  secuencia, tipos y campos escalares cortos redactados, nunca observaciones en bruto,
+  prompts, salida de herramientas, cuerpos de respuesta del servidor ni credenciales. Un
+  registro ausente o antiguo da `unknown`, que no prueba que nada haya fallado.
+- `pedacito tools` y el comando `/tools` de la TUI evalúan las mismas puertas que el
+  esquema real y no ejecutan nada. Listar herramientas MCP para una oferta de `mcp_call`
+  sigue arrancando los servidores configurados, como hace la construcción real del esquema.
+- `--allow-tool NAME` (en `ask` y `auto`, local a la tarea) restaura solo una herramienta
+  que la poda dinámica quitó. Nunca anula los ajustes `allow_*`, las puertas de capacidad
+  y consentimiento, la confianza del proyecto, el motor de políticas ni el corredor de
+  permisos. Una herramienta permitida sigue pidiendo cada permiso que necesite.
+
 ## Reportar una vulnerabilidad
 
 Por favor abre un aviso de seguridad privado en el repositorio de GitHub, o escribe a

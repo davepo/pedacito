@@ -153,7 +153,7 @@ _SLASH_COMMANDS = [
     "/apply", "/verify", "/skills", "/skill", "/memory", "/procs", "/security",
     "/theme", "/lang", "/picard", "/image", "/attach",
     "/pin", "/rules", "/hybrid", "/arena",
-    "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix",
+    "/diff", "/checkpoints", "/undo", "/checkout", "/run", "/fix", "/tools",
     "/git",
     "/update",
     "/expand", "/collapse",
@@ -271,6 +271,8 @@ Pedacito TUI commands
                             guided local git: stage, scan for secrets and
                             commit (never pushes), or create a branch
   /checkpoints [N]          show the time-travel checkpoint tree
+  /tools [TASK]             show which tools the model is offered for a task,
+                            the reason each is on or off, and its permission
   /undo                     restore the state before the last run (or the
                             newest .pedacito/backups snapshot on old projects)
   /checkout ID              restore the whole workspace from a checkpoint
@@ -373,6 +375,8 @@ Comandos de Pedacito TUI
                             git local guiado: preparar, escanear secretos y
                             confirmar (nunca hace push) o crear una rama
   /checkpoints [N]          mostrar el árbol de checkpoints
+  /tools [TAREA]            muestra qué herramientas se ofrecen al modelo para una tarea,
+                            el motivo de cada una (activa o no) y su permiso
   /undo                     restaurar el estado anterior a la última ejecución
   /checkout ID              restaurar el espacio de trabajo desde un checkpoint
   /run [CMD]                ejecutar el punto de entrada detectado o CMD
@@ -4391,6 +4395,9 @@ class TuiSession:
         if cmd == "undo":
             self._undo()
             return
+        if cmd == "tools":
+            self._tools_command(arg)
+            return
         if cmd == "run":
             self._run_command(arg)
             return
@@ -5594,6 +5601,23 @@ class TuiSession:
                          "system")
         if result.get("safety_id"):
             self._append(f"  safety snapshot: {result['safety_id']}", "system")
+
+    def _tools_command(self, arg: str) -> None:
+        """/tools [TASK]: the same availability view as `pedacito tools`,
+        read-only (nothing is run)."""
+        from . import tools as tools_mod
+        try:
+            rows = tools_mod.inspect_tools(self.cfg, self.idx, arg or "")
+        except Exception as exc:
+            self._append(f"tools: {exc}", "error")
+            return
+        lines = [i18n.t("tui.tools.header", lang=self.lang)]
+        for row in rows:
+            state = (i18n.t("tui.tools.on", lang=self.lang) if row.active
+                     else i18n.t("tui.tools.off", lang=self.lang))
+            lines.append(f"  {state:<4} {row.name:<16} {row.reason:<19} "
+                         f"{row.permission}")
+        self._append("\n".join(lines), "system")
 
     def _undo(self) -> None:
         result = checkpoints_mod.undo_last_run(self.root)

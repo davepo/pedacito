@@ -188,6 +188,8 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito ask PROJ -t "..."` | Ejecuta una tarea. Simulación por defecto. Agrega `--review`, `--apply`, `--plan`, `--refine`, `--jsonl` o `--json` |
 | `pedacito explain PROJ -q "..."` | Responde una pregunta sobre el código. Nunca edita |
 | `pedacito auto PROJ -t "..."` | Convierte una meta en una lista de verificación y luego la implementa tarea por tarea |
+| `pedacito autopsy --last [PROJECT]` | Clasifica por qué falló la última ejecución, a partir de sus eventos tipados registrados; solo lectura, sin llamar al modelo. Sale siempre con 0 |
+| `pedacito tools [PROJECT] [--task TEXTO]` | Muestra qué herramientas se ofrecen al modelo para una tarea, el motivo de cada una (activa o no) y su permiso; solo lectura. `--allow-tool NAME` en `ask`/`auto` restaura una herramienta podada solo para esa tarea |
 | `pedacito plan --check [PLAN] [PROJECT]` | Valida una lista de tareas contra el índice antes de una ejecución Auto o Complex; `--impact` previsualiza llamadores y pruebas. Sale con 0 si está limpio o solo hay advertencias, 1 ante errores definitivos y 2 si el plan no es válido |
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero |
 | `pedacito chat PROJ` | Sesión interactiva que mantiene caliente el índice (`--rpc` convierte la sesión en un protocolo de máquina) |
@@ -761,6 +763,45 @@ Códigos de salida: `0` limpio o solo advertencias, `1` errores definitivos, `2`
 plan inválido (ilegible, demasiado grande, sin tareas de lista o fuera de su
 proyecto). Auto y Complex se detienen solo con `1` o `2`; las advertencias no
 bloquean una ejecución.
+
+### `autopsy` y `tools`: por qué falló una ejecución y qué herramientas se ofrecieron
+
+```bash
+pedacito autopsy --last .                      # clasifica la ejecución más reciente
+pedacito autopsy --run SESSION_ID . --json     # una ejecución o sesión, en JSON
+pedacito tools . --task "arregla la prueba que falla" # herramientas ofrecidas para una tarea
+pedacito tools . --allow-tool write --json     # previsualiza una herramienta podada
+```
+
+`autopsy` lee los eventos tipados que una ejecución ya escribió en
+`.pedacito/events/` y reporta la causa tipada más grave: `unread_edit`,
+`format_error`, `truncation`, `schema_rejection`, `test_regression`, `flake`,
+`api_hallucination`, `context_overflow`, `permission_denial`, `timeout`,
+`budget_stop` o `partial_batch`. En caso de empate gana el evento más antiguo.
+Cada causa lista su evidencia redactada (id del evento, número de secuencia,
+reloj relativo y unos pocos campos escalares cortos) y sus próximos pasos. Nunca
+llama a un modelo, nunca vuelve a ejecutar nada y nunca adivina lo que el modelo
+pretendía. Sin evidencia tipada, o con un registro ausente o antiguo, la
+respuesta es `unknown`; `incomplete` marca una ejecución sin evento de cierre o
+con huecos en su secuencia. `flake` y `api_hallucination` no tienen emisor en
+esta versión, así que no están verificados y se reportan como `unknown`. El
+elemento "¿Por qué falló?" del menú Proyecto de la GUI muestra el mismo
+resultado mediante la ruta de solo lectura `GET /api/autopsy`. `autopsy` sale
+siempre con `0`: informa, no juzga.
+
+`tools` lista cada acción que se ofrecería al modelo para una tarea. Cada fila
+es `active` o indica su motivo (`config_disabled`, `policy_denied`,
+`missing_dependency`, `not_relevant`, `pruned`, `forced`) y el permiso que
+necesita. La lista sale de la misma tabla que el esquema real, y no se ejecuta
+nada. `--allow-tool NAME` se puede repetir en `ask` y `auto`, y solo anula la
+poda dinámica. Una herramienta que la configuración, la capacidad, el
+consentimiento o la política desactivan sigue desactivada. La anulación se
+restablece al terminar la tarea. En la TUI, `/tools [TAREA]` muestra la misma
+vista.
+
+`pedacito tools` lee el nivel configurado sin consultar al servidor del modelo,
+así que un nivel que solo revela el servidor en vivo puede diferir de una tarea
+en ejecución.
 
 ### `new`: inicia un proyecto desde cero
 

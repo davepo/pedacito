@@ -10,6 +10,14 @@ rotated by `prune()`. Nothing is sent anywhere. String fields are passed
 through `safety.redact` so a secret that surfaced in a tool argument never
 lands on disk. `log.txt` stays the human-readable summary; this is the
 machine-readable record `pedacito eval` and `config --cost` read.
+
+Typed failure fields (additive; read by `autopsy.py`, never free text):
+`step.obs_code` and `tool_result.obs_code` (a harness marker category on an
+observation),
+`payload_cut` (a step's payload was cut off), `step_rejected` (a malformed
+step, `reason="malformed"`), `llm_error` (`code` is `context_overflow` or
+`schema_rejection`), and `test_result` (`ok`, `stopped`). Raw observations and
+server bodies are never written as these fields.
 """
 
 from __future__ import annotations

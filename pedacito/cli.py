@@ -155,6 +155,14 @@ def _add_execution_mode(p):
                    help=i18n.t("cli.opt.execution_mode"))
 
 
+def _add_allow_tool(p):
+    """--allow-tool NAME: restore one action dynamic pruning removed, for this
+    task only. Never overrides config, capability, consent or policy."""
+    p.add_argument("--allow-tool", dest="allow_tool", action="append",
+                   default=None, metavar="NAME",
+                   help=i18n.t("cli.opt.allow_tool"))
+
+
 def _load_cli_images(args) -> list[dict]:
     """Load and validate any --image paths passed on the CLI."""
     paths = list(getattr(args, "image", None) or ())
@@ -1666,6 +1674,89 @@ def _cmd_plan(args) -> int:
         else:
             print(i18n.t("cli.plan.clean"))
     return code
+
+
+def _allow_tool_names(args) -> tuple[str, ...] | None:
+    """The validated `--allow-tool NAME` values (repeatable), or None after
+    printing why one is not an action name."""
+    from . import tools as tools_mod
+    names: list[str] = []
+    for raw in getattr(args, "allow_tool", None) or ():
+        name = str(raw or "").strip()
+        if name not in tools_mod.ACTION_PERMISSION:
+            known = ", ".join(sorted(tools_mod.ACTION_PERMISSION))
+            print(i18n.t("cli.allow_tool.unknown", name=name, known=known),
+                  file=sys.stderr)
+            return None
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _clear_forced_tools(cfg_obj) -> None:
+    """Reset the task-local `--allow-tool` overrides once the task ends."""
+    if cfg_obj is not None:
+        cfg_obj._force_tools = ()
+
+
+def _cmd_autopsy(args) -> int:
+    """`pedacito autopsy --last`: classify the last run from its typed events
+    (read-only, no model call)."""
+    from . import autopsy as autopsy_mod
+
+    root = _root(args)
+    run_id = str(getattr(args, "run", None) or "last")
+    result = autopsy_mod.autopsy(root, run_id)
+    if getattr(args, "json", False):
+        print(json.dumps(autopsy_mod.payload(result), ensure_ascii=False,
+                         indent=2))
+        return 0
+    print(i18n.t("cli.autopsy.header", run=run_id))
+    print(i18n.t("cli.autopsy.category",
+                 category=i18n.t(f"autopsy.category.{result.category}")))
+    for item in result.evidence:
+        print("  " + autopsy_mod.render_evidence(item))
+    if result.incomplete:
+        print(i18n.t("cli.autopsy.incomplete"))
+    print(i18n.t("cli.autopsy.next"))
+    for code in result.next_steps:
+        print("  - " + i18n.t(f"autopsy.next.{code}"))
+    return 0
+
+
+def _cmd_tools(args) -> int:
+    """`pedacito tools`: the action set the model would be offered for a task,
+    with the reason each action is on or off. Read-only: nothing is run."""
+    from dataclasses import asdict
+
+    from . import tools as tools_mod
+
+    allow = _allow_tool_names(args)
+    if allow is None:
+        return 2
+    root = _root(args)
+    cfg = _light_config(args)
+    cfg._root = str(root)
+    try:
+        from . import modelcard
+        modelcard.apply(cfg)
+    except Exception:
+        pass
+    try:
+        idx = index_mod.Index.load(root)
+    except Exception:
+        idx = None
+    rows = tools_mod.inspect_tools(cfg, idx, str(getattr(args, "task", "") or ""),
+                                   force=allow)
+    if getattr(args, "json", False):
+        print(json.dumps([asdict(row) for row in rows], ensure_ascii=False,
+                         indent=2))
+        return 0
+    print(i18n.t("cli.tools.header", root=str(root)))
+    for row in rows:
+        state = i18n.t("cli.tools.on") if row.active else i18n.t("cli.tools.off")
+        print(f"  {state:<4} {row.name:<16} {row.reason:<19} {row.permission}")
+    return 0
 
 
 def _cmd_explain(args, client, agent, images: list[dict] | None = None) -> int:
@@ -4839,6 +4930,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                             "for SFT/GRPO dataset filtering; same as "
                             "record_trajectories = true for this run only")
     _add_execution_mode(p_ask)
+    _add_allow_tool(p_ask)
 
     p_explain = sub.add_parser(
         "explain", help=t("cli.cmd.explain"))
@@ -4979,6 +5071,7 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         help="assume yes: skip interactive confirmations, "
                              "including the Task-vs-Auto nudge")
     _add_execution_mode(p_auto)
+    _add_allow_tool(p_auto)
 
     p_plan = sub.add_parser("plan", help=t("cli.cmd.plan"))
     _add_common(p_plan, paths_nargs="*")
@@ -4990,6 +5083,23 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                         default=None, help=t("cli.plan.opt.plan"))
     p_plan.add_argument("--json", action="store_true",
                         help=t("cli.plan.opt.json"))
+
+    p_autopsy = sub.add_parser("autopsy", help=t("cli.cmd.autopsy"))
+    _add_common(p_autopsy, paths_nargs="?")
+    p_autopsy.add_argument("--last", action="store_true",
+                           help=t("cli.autopsy.opt.last"))
+    p_autopsy.add_argument("--run", dest="run", metavar="ID", default=None,
+                           help=t("cli.autopsy.opt.run"))
+    p_autopsy.add_argument("--json", action="store_true",
+                           help=t("cli.autopsy.opt.json"))
+
+    p_tools = sub.add_parser("tools", help=t("cli.cmd.tools"))
+    _add_common(p_tools, paths_nargs="?")
+    p_tools.add_argument("--task", default="", metavar="TEXT",
+                         help=t("cli.tools.opt.task"))
+    _add_allow_tool(p_tools)
+    p_tools.add_argument("--json", action="store_true",
+                         help=t("cli.tools.opt.json"))
 
     p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
@@ -5648,6 +5758,7 @@ def _main(argv=None) -> int:
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
              "skills": _cmd_skills, "plan": _cmd_plan,
+             "autopsy": _cmd_autopsy, "tools": _cmd_tools,
              "rename": _cmd_rename,
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,
@@ -6090,6 +6201,13 @@ def _main(argv=None) -> int:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
 
+        if args.cmd in ("ask", "auto"):
+            # --allow-tool: task-local, validated, and cleared after the run.
+            forced = _allow_tool_names(args)
+            if forced is None:
+                return 2
+            cfg._force_tools = forced
+
         if args.cmd == "explain":
             return _cmd_explain(args, client, agent, images=cli_images or None)
 
@@ -6158,6 +6276,7 @@ def _main(argv=None) -> int:
                                        plan=plan)
             finally:
                 _print_telemetry_ribbon(args, locals_ref)
+                _clear_forced_tools(locals_ref.get("cfg"))
 
         def save_checkpoint(task: str):
             """Persist what the last task actually said, for --continue/--resume."""
@@ -6362,6 +6481,7 @@ def _main(argv=None) -> int:
             try:
                 code = _cmd_auto(args, cfg, client, idx, root)
             finally:
+                _clear_forced_tools(cfg)
                 if cli_images and hasattr(cfg, "_task_images"):
                     delattr(cfg, "_task_images")
                 run_summary = events_mod.end_run()

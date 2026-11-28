@@ -2031,6 +2031,16 @@ class LLMClient:
         temperature, say) would otherwise trigger a pointless trim cascade."""
         return bool(_CONTEXT_OVERFLOW_RE.search(body or ""))
 
+    def _emit_error_code(self, code: str) -> None:
+        """A typed `llm_error` event for autopsy: the code only, never the
+        server's body text. Never raises."""
+        try:
+            from . import events as events_mod
+            events_mod.get(self._outbound_root(), self.cfg).emit(
+                "llm_error", code=code)
+        except Exception:
+            pass
+
     def _http_post(self, url: str, **kw):
         """`requests.post` through this client's pooled session (a fresh TCP/TLS
         handshake per call is pure latency on hosted APIs), unless a caller
@@ -2416,6 +2426,7 @@ class LLMClient:
                     rate_limited=not loading)
             if self._context_too_long(body):
                 # chat() catches this, trims the conversation, and retries.
+                self._emit_error_code("context_overflow")
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
@@ -3610,6 +3621,7 @@ class LLMClient:
                     f"{r.status_code}: {body[:200]}",
                     retry_after=retry_after, rate_limited=True)
             if self._context_too_long(body):
+                self._emit_error_code("context_overflow")
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
@@ -4004,6 +4016,7 @@ class LLMClient:
                     f"{r.status_code}: {body[:200]}",
                     retry_after=retry_after, rate_limited=True)
             if self._context_too_long(body):
+                self._emit_error_code("context_overflow")
                 raise ContextOverflowError(
                     f"Server says the request exceeds its context window: "
                     f"{body[:300]}")
@@ -4858,6 +4871,7 @@ class LLMClient:
         if not _json_caps(self.cfg.base_url, self.cfg.model).get(tier, True):
             return False
         _deny_json_cap(self.cfg.base_url, self.cfg.model, tier)
+        self._emit_error_code("schema_rejection")
         if tier == "schema":
             print("[engine JSON mode: this server refused json_schema; "
                   "retrying with json_object]", file=sys.stderr)

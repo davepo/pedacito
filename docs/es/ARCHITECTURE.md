@@ -1113,6 +1113,36 @@ Una extensión, una habilidad, un conjunto de comandos o un paquete de modelos s
 Pedacito que necesita. `pkg_manifest.py` valida el archivo, y una persona lo revisa antes de que se ejecute
 nada del paquete. Ver [SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md#manifiestos-de-paquete-pedacito-packagetoml).
 
+### Autopsia y disponibilidad de herramientas
+
+`autopsy.autopsy(root, run_id="last")` es una función pura sobre los registros
+de eventos tipados locales. Nunca llama a un modelo. Cada categoría proviene de
+un evento que el arnés ya escribe con un campo legible por máquina: un `step`
+con `obs_code` (en `step` o en el `tool_result` intercalado, fijado por
+`autopsy.classify_observation` ante una marca fija del arnés, nunca ante prosa
+del modelo), `payload_cut`, `step_rejected`,
+`gate_error`, `verify` (tipos de hallazgo `unread` y `syntax`), `task_budget`,
+`incremental_partial`, `llm_error` (`context_overflow` o `schema_rejection`) y
+`test_result`. Gana la categoría más grave, los empates van al `seq` más
+antiguo, y la evidencia solo contiene ids, números de secuencia, el reloj
+relativo, el tipo y una lista blanca de campos escalares cortos, todo redactado.
+Un registro ausente o antiguo, o ningún evento coincidente, da `unknown`; y
+`incomplete` marca una ejecución sin evento de cierre o con un hueco en la
+secuencia. `flake` y `api_hallucination` no tienen emisor en esta versión y se
+reportan como no verificados.
+
+`tools.inspect_tools(cfg, index, task, force=...)` lee la misma tabla
+`_offer_rows` y la misma pasada `_prune_optional_actions` que `schema_for`, así
+que el inspector no puede desviarse del esquema que recibe el modelo. Cada fila
+lleva un motivo de `active`, `config_disabled`, `policy_denied`,
+`missing_dependency`, `not_relevant`, `pruned` o `forced`, además del permiso
+que necesita. `--allow-tool` (`cfg._force_tools`, fijado por invocación de
+`ask`/`auto` y borrado al terminar la tarea) solo conserva herramientas que la
+poda dinámica habría quitado. Las puertas de configuración, capacidad,
+consentimiento y política nunca lo leen, y el inspector no puede ejecutar nada.
+Listar herramientas MCP para la disponibilidad de `mcp_call` arranca los
+servidores nombrados, como ya hace la construcción real del esquema.
+
 ### Validación de planes e impacto
 
 `plan.check_plan(root, plan_path, index)` se ejecuta antes de que Auto y Complex
