@@ -5939,7 +5939,36 @@ def _default_codemod_action(argv: list[str]) -> list[str]:
     if i + 1 < len(argv):
         nxt = argv[i + 1]
         if not nxt.startswith("-") and nxt not in _CODEMOD_ACTIONS:
-            return argv[:i + 1] + ["preview"] + argv[i + 1:]
+            argv = argv[:i + 1] + ["preview"] + argv[i + 1:]
+    # Python 3.11's argparse cannot bind a trailing optional positional
+    # (`project`, nargs="?") after intermixed options (`--file`, `--option`).
+    # Place `preview`/`apply` positionals before its known options so
+    # `codemod preview RECIPE --file F --option K=V PROJECT` parses identically
+    # across Python 3.11–3.14.
+    if i + 1 < len(argv) and argv[i + 1] in ("preview", "apply"):
+        value_opts = ("--file", "--symbol", "--option", "--root",
+                      "--config", "--profile", "--lang")
+        value_eq = tuple(opt + "=" for opt in value_opts)
+        tail = argv[i + 2:]
+        pos: list[str] = []
+        opts: list[str] = []
+        j = 0
+        while j < len(tail):
+            tok = tail[j]
+            if tok == "--":
+                opts.extend(tail[j:])
+                break
+            if tok in value_opts and j + 1 < len(tail):
+                opts.extend(tail[j:j + 2])
+                j += 2
+                continue
+            if tok.startswith(value_eq) or tok.startswith("-"):
+                opts.append(tok)
+                j += 1
+                continue
+            pos.append(tok)
+            j += 1
+        argv = argv[:i + 2] + pos + opts
     return argv
 
 
