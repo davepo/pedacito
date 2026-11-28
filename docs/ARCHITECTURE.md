@@ -1108,9 +1108,13 @@ shipped.
   listed as "not renamed" rather than guessed; receiver tracking is
   Python-only. Every multi-file write is transactional: a snapshot or disk
   error partway rolls back the files already written in that batch, so no
-  half-renamed tree survives. Several edit blocks across files are still
-  applied per file unless `atomic_edits = true` (the snapshot and
-  `pedacito restore` are the safety net either way).
+  half-renamed tree survives. Several edit blocks across files are applied per
+  file unless the staged atomic batch is active (`atomic_edits` explicitly set,
+  or auto-enabled for a local tiny/small/medium endpoint): then every candidate
+  is validated and its preimage snapshotted to a durable WAL before the first
+  write, and a crash mid-commit is rolled back on the next run -- not
+  instantaneous filesystem-wide atomic visibility. The snapshot and
+  `pedacito restore` are the safety net either way.
 - Languages: Python by AST; JS/TS, Ruby, Go, Rust, Java, C, C++, C#, PHP,
   Kotlin, Swift, Scala and Lua through tree-sitter (a grammar quirk can drop an
   occasional Swift call edge); everything else is searchable reference text.

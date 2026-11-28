@@ -464,6 +464,38 @@ class VirtualWorkspace:
         return self.apply_edit(Edit(str(rel), search or "", replace or "",
                                     lines=lines, symbol=symbol or ""))
 
+    def apply_edits_batch(self, edits: list[Edit]) -> list[Result]:
+        """Apply a list of Edits all-or-nothing (WP-4105C staged transaction).
+
+        In apply mode the batch goes through :func:`edits.apply_edits_atomic`
+        (preflight, durable WAL snapshot, preimage hash re-check, rollback on
+        write error). In overlay mode every edit is staged in memory and a
+        failure anywhere rolls the whole batch back to its snapshot."""
+        if self.apply:
+            from .edits import apply_edits_atomic
+            return apply_edits_atomic(
+                self.root, list(edits),
+                backup=bool(getattr(self.cfg, "backup", True)),
+                backup_dir=self.backup_dir, cfg=self.cfg)
+        snap = self.snapshot()
+        applied: list[Result] = []
+        for i, e in enumerate(edits):
+            r = self.apply_edit(e)
+            if r.ok:
+                applied.append(r)
+                continue
+            self.rollback(snap)
+            held = [Result(False, rr.file,
+                           "not written: another edit in this batch failed; "
+                           "fix it and resend ALL the edits")
+                    for rr in applied]
+            tail = [Result(False, e2.file,
+                           "not written: another edit in this batch failed; "
+                           "fix it and resend ALL the edits")
+                    for e2 in edits[i + 1:]]
+            return held + [r] + tail
+        return applied
+
     def write(self, rel, content: str) -> Result:
         """Create a file, or replace one wholesale (the edit engine's fragment
         and wipe guards still apply to an overwrite)."""

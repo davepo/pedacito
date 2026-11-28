@@ -64,8 +64,9 @@ from . import sessions as sessions_mod
 from . import skills as skills_mod
 from . import steering as steering_mod
 from . import todo as todo_mod
-from .config import is_hosted
-from .edits import Result, apply_edits, locate, malformed_blocks, parse_edits
+from .config import atomic_edits_enabled, is_hosted
+from .edits import (Result, apply_edits, apply_edits_atomic, locate,
+                    malformed_blocks, parse_edits)
 from .llm import (IMAGE_TOKENS_ESTIMATE, CancelledError, LLMError,
                   _append_message_text, _is_local_server,
                   estimate_messages, estimate_tokens)
@@ -6091,21 +6092,24 @@ class Agent:
                         False, f, "refused: this file has unresolved git merge "
                                   "conflicts; resolve them first"))
                 edits = [e for e in edits if e not in blocked]
-        if edits and not dry_run and getattr(self.cfg, "atomic_edits", False):
-            # All or nothing: rehearse first, and write nothing when any
-            # file's edit (or any block already rejected above) would fail,
-            # so a coupled multi-file change is never left half-applied.
-            trial = apply_edits(self.index.root, edits, backup=False,
-                                dry_run=True, cfg=self.cfg,
-                                allowlist=self._write_allowlist())
-            bad = [r for r in trial if not r.ok]
-            if bad or failed:
-                held = [Result(False, r.file,
+        if edits and not dry_run and atomic_edits_enabled(self.cfg):
+            # Staged all-or-nothing transaction (WP-4105C): every candidate is
+            # validated and snapshotted to a durable WAL before the first
+            # write; a write failure rolls back the whole batch; a crash
+            # mid-commit is recovered on the next run.
+            if failed:
+                # Some edits were already refused above (merge conflicts, the
+                # repair test lock, unrequested build files): hold everything.
+                held = [Result(False, e.file,
                                "not written: atomic_edits is on and another "
-                               "file's edit failed; fix that one and resend "
-                               "ALL the blocks")
-                        for r in trial if r.ok]
-                return failed + bad + held
+                               "file's edit was refused; fix that one and "
+                               "resend ALL the blocks")
+                        for e in edits]
+                return failed + held
+            return failed + apply_edits_atomic(
+                self.index.root, edits, backup=self.cfg.backup,
+                backup_dir=backup_dir, cfg=self.cfg,
+                allowlist=self._write_allowlist())
         if edits:
             failed += apply_edits(self.index.root, edits,
                                   backup=self.cfg.backup, dry_run=dry_run,

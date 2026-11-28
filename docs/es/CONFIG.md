@@ -962,7 +962,7 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `edit_plan_brief` | true | El resumen de edición pide 1-3 líneas de plan antes de los bloques (archivo, líneas o símbolo, por qué) y ningún otro texto entre los bloques ni dentro de ellos. Una sobrescritura de prompt (`edit_format.md`, `answer.md`) lo omite. |
 | `sandbox` / `sandbox_network` | true / false | Sandbox del sistema operativo para `run` y los comandos de prueba; permite la red dentro de él. |
 | `sandbox_writable` / `sandbox_strict` | `[]` / false | Directorios escribibles extra; se niega a ejecutar cuando no se puede aplicar ningún sandbox. |
-| `atomic_edits` | false | Escribe una respuesta de varios archivos todo o nada (cualquier fallo no escribe nada). |
+| `atomic_edits` | false (automático en tiers locales pequeños) | Aplicación por etapas de varios archivos todo o nada: cada archivo se valida y su imagen previa se guarda en un WAL duradero antes de la primera escritura; un fallo de escritura revierte todo el lote y un corte a mitad de la confirmación se recupera en la siguiente ejecución. Un `true`/`false` explícito siempre gana; sin configurar se activa solo para un endpoint local cuyo tier es tiny/small/medium. |
 
 Todos los demás ajustes públicos se listan a continuación, agrupados por subsistema, con su valor por defecto real.
 `pedacito config --reference` imprime las mismas claves como una plantilla anotada.

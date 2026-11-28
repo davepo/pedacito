@@ -1098,9 +1098,13 @@ incluidos.
   lista como "not renamed" en lugar de adivinarse; el seguimiento de receptores es
   solo de Python. Cada escritura de varios archivos es transaccional: un error de instantánea o de
   disco a mitad de camino revierte los archivos ya escritos en ese lote, de modo que ningún
-  árbol a medio renombrar sobrevive. Varios bloques de edición entre archivos aún se
-  aplican por archivo a menos que `atomic_edits = true` (la instantánea y
-  `pedacito restore` son la red de seguridad en cualquier caso).
+  árbol a medio renombrar sobrevive. Varios bloques de edición entre archivos se aplican por
+  archivo a menos que el lote atómico por etapas esté activo (`atomic_edits` explícito, o
+  auto-activado para un endpoint local tiny/small/medium): entonces cada candidato se valida
+  y su imagen previa se guarda en un WAL duradero antes de la primera escritura, y un corte
+  a mitad de la confirmación se revierte en la siguiente ejecución — no es visibilidad atómica
+  instantánea a nivel de sistema de archivos. La instantánea y
+  `pedacito restore` son la red de seguridad en cualquier caso.
 - Lenguajes: Python por AST; JS/TS, Ruby, Go, Rust, Java, C, C++, C#, PHP,
   Kotlin, Swift, Scala y Lua mediante tree-sitter (una rareza de la gramática puede omitir una
   arista de llamada ocasional en Swift); todo lo demás es texto de referencia con búsqueda.

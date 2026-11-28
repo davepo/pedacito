@@ -963,7 +963,7 @@ config --reference` prints the annotated template. Key settings:
 | `edit_plan_brief` | true | The edit brief asks for 1-3 plan lines before the blocks (file, lines or symbol, why) and no other text between or inside blocks. A prompt override (`edit_format.md`, `answer.md`) bypasses it. |
 | `sandbox` / `sandbox_network` | true / false | OS sandbox for `run` and test commands; allow network inside it. |
 | `sandbox_writable` / `sandbox_strict` | `[]` / false | Extra writable dirs; refuse to run when no sandbox can be applied. |
-| `atomic_edits` | false | Write a multi-file reply all-or-nothing (any failure writes nothing). |
+| `atomic_edits` | false (auto for local small tiers) | Staged all-or-nothing multi-file apply: every file is validated and its preimage snapshotted to a durable WAL before the first write; a write failure rolls back the whole batch and a crash mid-commit is recovered on the next run. An explicit `true`/`false` always wins; left unset it turns itself on only for a local endpoint whose tier is tiny/small/medium. |
 
 Every remaining public setting is listed below, grouped by subsystem, with its real default.
 `pedacito config --reference` prints the same keys as an annotated template.

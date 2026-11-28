@@ -2137,3 +2137,182 @@ def apply_edits(root: Path, edits: list[Edit], backup: bool = True,
         results.append(Result(False, "*", msg))
 
     return results
+
+
+# --------------------------------------------------------------------------
+# Staged atomic batch (WP-4105C)
+# --------------------------------------------------------------------------
+def _backup_one(src: Path, rel: str, backup_dir: Path | None) -> None:
+    """Back up `src`'s exact bytes before an atomic write/delete, matching the
+    ordinary `apply_edits` snapshot behaviour (first copy per run wins)."""
+    if backup_dir is not None:
+        fileio.backup_copy(src, backup_dir / rel)
+    else:
+        fileio.backup_copy(src, src.with_suffix(src.suffix + ".bak"),
+                           keep_existing=False)
+
+
+def apply_edits_atomic(root: Path, edits: list[Edit], *, backup: bool = True,
+                       backup_dir: Path | None = None, cfg=None,
+                       allowlist: set[str] | None = None) -> list[Result]:
+    """Staged all-or-nothing multi-file edit transaction (WP-4105C).
+
+    The atomic contract, distinct from the per-file legacy apply:
+
+    * every candidate is validated (policy, protected/sensitive paths,
+      allowlist, rename pairing, fragment/wipe guards, syntax) against the
+      current tree BEFORE anything is written;
+    * the preimages of every affected file are snapshotted to a durable WAL
+      (``journal.begin_atomic``) before the first write;
+    * preimage hashes are re-verified just before commit, so a file changed
+      underneath the batch aborts it;
+    * an in-process write failure rolls back every file already written;
+    * a crash mid-commit is recovered on the next run by
+      ``journal.recover_atomic`` (restore preimages / remove creations), not
+      by instantaneous filesystem-wide atomic visibility.
+
+    Returns results shaped like :func:`apply_edits`: on any preflight failure,
+    the failed results plus one "held" result per clean file (nothing was
+    written). ``cfg.atomic_edits`` semantics (explicit value vs tier default)
+    are resolved by :func:`config.atomic_edits_enabled`, not here.
+    """
+    from . import journal as journal_mod
+
+    root = Path(root)
+    root_resolved = root.resolve()
+
+    # A crashed previous run may have left a "prepared" transaction mid-commit:
+    # roll it back before staging anything new.
+    try:
+        journal_mod.recover_atomic(root_resolved)
+    except OSError:
+        pass
+
+    # Preflight: validate every candidate, writing nothing.
+    dry = apply_edits(root, edits, backup=False, dry_run=True, cfg=cfg,
+                      allowlist=allowlist)
+    bad = [r for r in dry if not r.ok]
+    if bad:
+        held = [Result(False, r.file,
+                       "not written: atomic_edits is on and another file's "
+                       "edit failed; fix that one and resend ALL the blocks")
+                for r in dry if r.ok]
+        return bad + held
+
+    # Build the commit plan from the clean dry run. A no-op result (empty sha)
+    # changes nothing; a rename folds its sources into the target's deletion
+    # set.
+    write_rels: dict[str, str] = {}
+    delete_rels: set[str] = set()
+    for r in dry:
+        if not r.sha:
+            continue
+        if r.deleted:
+            delete_rels.add(r.file)
+            continue
+        write_rels[r.file] = r.after
+        delete_rels.update(r.renames_from)
+
+    # Read the preimage bytes of every existing affected file; new files are
+    # recorded as creations so recovery can remove them.
+    preimages: dict[str, bytes] = {}
+    created: list[str] = []
+    for rel in sorted(set(write_rels) | delete_rels):
+        try:
+            path = security.resolve_safe_path(root_resolved, rel)
+        except security.SecurityError as exc:
+            return [Result(False, rel, f"refused: {exc}")]
+        if path.is_file():
+            preimages[rel] = path.read_bytes()
+        elif rel in write_rels:
+            created.append(rel)
+
+    # Snapshot + WAL durable before writes; a snapshot failure stops the batch.
+    try:
+        txn = journal_mod.begin_atomic(root_resolved, preimages, created)
+    except OSError as exc:
+        return [Result(False, "*",
+                       f"atomic batch failed: could not snapshot preimages "
+                       f"before writing ({exc}); nothing was written")]
+
+    def _abort(rel: str, why: str) -> list[Result]:
+        journal_mod.finish_atomic(root_resolved, txn.tx_id, "rolled_back")
+        journal_mod.remove_atomic(root_resolved, txn.tx_id)
+        return [Result(False, rel, why)]
+
+    # Re-verify preimage hashes just before commit.
+    for rel, data in preimages.items():
+        try:
+            path = security.resolve_safe_path(root_resolved, rel)
+        except security.SecurityError as exc:
+            return _abort(rel, f"atomic batch aborted: {exc}")
+        if not path.is_file() or path.read_bytes() != data:
+            return _abort(rel, "atomic batch aborted: this file changed on "
+                               "disk after it was validated; resend the edit "
+                               "blocks")
+
+    # Commit, with an in-process rollback ledger.
+    undo: list[tuple[str, bytes | None]] = []
+    try:
+        for rel in write_rels:
+            after = write_rels[rel]
+            data = preimages.get(rel)
+            style = fileio.detect(data) if data is not None else fileio.TextStyle()
+            path = security.resolve_safe_path(root_resolved, rel)
+            existed = path.is_file()
+            if backup and existed:
+                _backup_one(path, rel, backup_dir)
+            elif backup and not existed and backup_dir is not None:
+                fileio.note_created(backup_dir, rel)
+            pre = path.read_bytes() if existed else None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fileio.write(path, after, style)
+            undo.append((rel, pre))
+        for rel in sorted(delete_rels):
+            if rel in write_rels:
+                continue               # a target is never also a source
+            path = security.resolve_safe_path(root_resolved, rel)
+            if not path.is_file():
+                continue
+            if backup:
+                _backup_one(path, rel, backup_dir)
+            pre = path.read_bytes()
+            path.unlink()
+            undo.append((rel, pre))
+    except (OSError, security.SecurityError) as exc:
+        undone = 0
+        for rel, pre in reversed(undo):
+            try:
+                path = security.resolve_safe_path(root_resolved, rel)
+                if pre is None:
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                else:
+                    fileio.write_bytes(path, pre)
+                undone += 1
+            except (OSError, security.SecurityError):
+                pass
+        journal_mod.finish_atomic(root_resolved, txn.tx_id, "rolled_back")
+        journal_mod.remove_atomic(root_resolved, txn.tx_id)
+        msg = (f"write batch failed: {exc}; rolled back {undone} of "
+               f"{len(undo)} file mutation(s) to their pre-batch state")
+        if undone != len(undo):
+            msg += (f"; {len(undo) - undone} could not be restored -- run "
+                    "`pedacito restore`")
+        return [Result(False, "*", msg)]
+
+    journal_mod.finish_atomic(root_resolved, txn.tx_id, "committed")
+    journal_mod.remove_atomic(root_resolved, txn.tx_id)
+
+    # The dry-run already computed each diff/before/after/sha; strip the
+    # dry-run marker and return it as the applied result set.
+    out: list[Result] = []
+    for r in dry:
+        if not r.sha:
+            out.append(r)
+            continue
+        out.append(Result(r.ok, r.file, r.message.replace(" (dry run)", ""),
+                          r.diff, r.before, r.after, r.sha, fuzzy=r.fuzzy,
+                          renames_from=r.renames_from,
+                          whole_file=r.whole_file, deleted=r.deleted))
+    return out
