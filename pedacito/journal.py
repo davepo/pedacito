@@ -39,16 +39,18 @@ redaction) and, lazily, ``checkpoints`` / ``worktree`` during recovery.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 JOURNAL_DIR = "journal"
 
@@ -1037,3 +1039,310 @@ def rollback_incomplete_task(root: Path | str, task_id: str) -> dict[str, Any]:
         "restored_checkpoint": str(result.get("restored_checkpoint") or ""),
         "detail": str(result.get("detail") or ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Atomic edit transactions (WP-4105C)
+# ---------------------------------------------------------------------------
+# A staged all-or-nothing multi-file edit writes its preimages and a durable
+# "prepared" record BEFORE the first file changes, then marks the record
+# "committed" once every write succeeded. A crash mid-commit leaves the record
+# "prepared", and :func:`recover_atomic` restores the preimages on the next
+# run. This is a write-ahead log for the edit batch, not a claim of
+# instantaneous filesystem-wide atomic visibility: the guarantee is "all
+# candidates validated and durably snapshotted before writes; roll back on
+# in-process write failure; recover a crashed commit from the WAL on the next
+# run".
+
+ATOMIC_DIR = "atomic"
+ATOMIC_VERSION = 1
+ATOMIC_STATUS_PREPARED = "prepared"
+ATOMIC_STATUS_COMMITTED = "committed"
+ATOMIC_STATUS_ROLLED_BACK = "rolled_back"
+ATOMIC_STATUS_RECOVERY_FAILED = "recovery_failed"
+
+# In-process serialization only. An in-process lock is not a cross-process
+# lock: concurrent *processes* are not protected, matching the rest of the
+# single-writer edit path.
+_ATOMIC_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True)
+class AtomicFile:
+    """One file in an atomic edit transaction."""
+
+    rel: str            # project-relative POSIX path
+    sha256: str         # full sha256 hex of the preimage bytes; "" for a new file
+    existed: bool       # True: preimage bytes were snapshotted; False: new file
+
+
+@dataclass(frozen=True)
+class AtomicTxn:
+    """An atomic edit transaction record (WAL)."""
+
+    tx_id: str
+    status: str
+    files: tuple[AtomicFile, ...]
+
+
+def _atomic_root(root: Path | str) -> Path:
+    return Path(root).resolve() / ".pedacito" / ATOMIC_DIR
+
+
+def _atomic_txn_path(root: Path | str, tx_id: str) -> Path:
+    return _atomic_root(root) / f"{tx_id}.json"
+
+
+def _atomic_preimage_dir(root: Path | str, tx_id: str) -> Path:
+    return _atomic_root(root) / tx_id
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory (POSIX). Windows cannot fsync a
+    directory handle; it is skipped there."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _durable_write_bytes(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically and durably (file + dir fsync)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                               dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _durable_write_text(path: Path, text: str) -> None:
+    _durable_write_bytes(path, text.encode("utf-8"))
+
+
+def _write_txn(root: Path, txn: AtomicTxn) -> None:
+    files = [
+        {"rel": str(f.rel), "sha256": str(f.sha256), "existed": bool(f.existed)}
+        for f in txn.files
+    ]
+    payload = {
+        "version": ATOMIC_VERSION,
+        "tx_id": str(txn.tx_id),
+        "status": str(txn.status),
+        "files": files,
+    }
+    _durable_write_text(
+        _atomic_txn_path(root, txn.tx_id),
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+
+
+def _read_txn(path: Path) -> AtomicTxn | None:
+    """Parse and validate one transaction record file. Returns None when the
+    record is missing, malformed, or carries a tx_id that does not match its
+    filename (a tampered/foreign record is never trusted)."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("version") != ATOMIC_VERSION:
+        return None
+    tx_id = obj.get("tx_id")
+    if not isinstance(tx_id, str) or not _valid_uuid(tx_id) \
+            or path.stem != uuid.UUID(tx_id).hex:
+        return None
+    status = obj.get("status")
+    if not isinstance(status, str):
+        return None
+    files_raw = obj.get("files")
+    if not isinstance(files_raw, list):
+        return None
+    files: list[AtomicFile] = []
+    for item in files_raw:
+        if not isinstance(item, dict):
+            return None
+        rel = item.get("rel")
+        if not isinstance(rel, str) or not _safe_atomic_rel(rel):
+            return None
+        sha = item.get("sha256")
+        existed = item.get("existed")
+        if not isinstance(sha, str) or not isinstance(existed, bool):
+            return None
+        if existed and not re.fullmatch(r"[0-9a-f]{64}", sha):
+            return None
+        if not existed and sha != "":
+            return None
+        files.append(AtomicFile(rel=str(rel), sha256=str(sha), existed=bool(existed)))
+    return AtomicTxn(tx_id=tx_id, status=status, files=tuple(files))
+
+
+def _safe_atomic_rel(rel: str) -> bool:
+    """True when `rel` is a plain relative project path: no traversal, no
+    absolute path, no NUL, no backslash separator."""
+    if not rel or "\x00" in rel:
+        return False
+    r = rel.replace("\\", "/")
+    if r.startswith("/"):
+        return False
+    return all(p and p not in (".", "..") for p in r.split("/"))
+
+
+def begin_atomic(root: Path | str, preimages: dict[str, bytes],
+                 created: Iterable[str] = ()) -> AtomicTxn:
+    """Stage an atomic edit transaction: snapshot every preimage durably and
+    write the "prepared" WAL record BEFORE the caller writes anything.
+
+    ``preimages`` maps each *existing* affected file to its raw bytes (the
+    exact bytes to restore on rollback/recovery). ``created`` names files the
+    transaction will create (absent before it), so recovery can remove them.
+
+    Raises ``OSError`` when a preimage or the record cannot be written -- a
+    snapshot failure must stop the batch, never proceed without its safety net.
+    """
+    root = Path(root)
+    tx_id = uuid.uuid4().hex
+    files: list[AtomicFile] = []
+    with _ATOMIC_LOCK:
+        preimage_dir = _atomic_preimage_dir(root, tx_id)
+        for rel in sorted(preimages):
+            data = bytes(preimages[rel])
+            _durable_write_bytes(preimage_dir / rel, data)
+            files.append(AtomicFile(str(rel), _sha256_bytes(data), True))
+        for rel in sorted(created):
+            files.append(AtomicFile(str(rel), "", False))
+        txn = AtomicTxn(tx_id=tx_id, status=ATOMIC_STATUS_PREPARED,
+                        files=tuple(files))
+        _write_txn(root, txn)
+    return txn
+
+
+def finish_atomic(root: Path | str, tx_id: str, status: str) -> None:
+    """Durably mark a transaction terminal (``committed`` / ``rolled_back`` /
+    ``recovery_failed``)."""
+    with _ATOMIC_LOCK:
+        txn = _read_txn(_atomic_txn_path(root, tx_id))
+        if txn is None:
+            return
+        _write_txn(root, AtomicTxn(tx_id=str(tx_id), status=str(status),
+                                   files=txn.files))
+
+
+def remove_atomic(root: Path | str, tx_id: str) -> None:
+    """Delete a finished transaction's record and preimage snapshot."""
+    import shutil
+    with _ATOMIC_LOCK:
+        try:
+            _atomic_txn_path(root, tx_id).unlink()
+        except OSError:
+            pass
+        shutil.rmtree(_atomic_preimage_dir(root, tx_id), ignore_errors=True)
+
+
+def _atomic_store_safe(root: Path) -> Path | None:
+    """``.pedacito/atomic`` only when it is a real directory inside ``root``
+    (never through a symlink or junction)."""
+    from . import security
+    root_res = Path(root).resolve()
+    store = root_res / ".pedacito" / ATOMIC_DIR
+    if not store.is_dir():
+        return None
+    try:
+        if store.is_symlink() or security.is_junction_or_reparse(store):
+            return None
+        store.resolve().relative_to(root_res)
+    except (OSError, ValueError):
+        return None
+    return store
+
+
+def recover_atomic(root: Path | str) -> list[str]:
+    """Roll back any incomplete atomic edit transaction left by a crash.
+
+    A "prepared" transaction whose commit never completed is restored to its
+    preimages (existing files) or removed (files the transaction created). A
+    preimage that is missing or fails its recorded hash leaves the transaction
+    visible (``recovery_failed``) rather than being silently discarded.
+    Returns the project-relative paths that were restored or removed.
+    """
+    from . import fileio, security
+    root = Path(root)
+    store = _atomic_store_safe(root)
+    restored: list[str] = []
+    if store is None:
+        return restored
+    for path in sorted(store.glob("*.json")):
+        if path.is_symlink() or security.is_junction_or_reparse(path):
+            continue
+        txn = _read_txn(path)
+        if txn is None:
+            continue
+        if txn.status in (ATOMIC_STATUS_COMMITTED, ATOMIC_STATUS_ROLLED_BACK,
+                          ATOMIC_STATUS_RECOVERY_FAILED):
+            continue
+        if txn.status != ATOMIC_STATUS_PREPARED:
+            continue                       # unknown status: refuse to guess
+        failed: list[str] = []
+        touched: list[str] = []
+        for f in txn.files:
+            rel = str(f.rel)
+            try:
+                dest = security.resolve_safe_path(root, rel)
+            except security.SecurityError:
+                failed.append(rel)
+                continue
+            if f.existed:
+                pre = _atomic_preimage_dir(root, txn.tx_id) / rel
+                try:
+                    data = pre.read_bytes()
+                except OSError:
+                    failed.append(rel)
+                    continue
+                if _sha256_bytes(data) != f.sha256:
+                    failed.append(rel)
+                    continue
+                try:
+                    fileio.write_bytes(dest, data)
+                    touched.append(rel)
+                except OSError:
+                    failed.append(rel)
+            else:
+                try:
+                    if dest.is_symlink() or dest.is_file():
+                        dest.unlink()
+                    touched.append(rel)
+                except OSError:
+                    failed.append(rel)
+        if failed:
+            finish_atomic(root, txn.tx_id, ATOMIC_STATUS_RECOVERY_FAILED)
+        else:
+            finish_atomic(root, txn.tx_id, ATOMIC_STATUS_ROLLED_BACK)
+            remove_atomic(root, txn.tx_id)
+        restored.extend(touched)
+    return restored

@@ -154,6 +154,27 @@ def _journal_close(cfg, status: str = "completed") -> None:
         pass
 
 
+def _recover_atomic(root, cfg) -> None:
+    """Roll back any atomic edit transaction a previous run left mid-commit.
+
+    Runs before this run snapshots or writes anything, so the pre-run
+    checkpoint captures the rolled-back state. Best effort and surfaced: a
+    leftover transaction that cannot be recovered must not stop the run, but
+    it is reported."""
+    try:
+        from . import journal as journal_mod
+        restored = journal_mod.recover_atomic(root)
+        if restored:
+            print(f"  [recovered {len(restored)} file(s) from an interrupted "
+                  f"atomic edit transaction]", file=sys.stderr)
+    except Exception as exc:
+        try:
+            print(f"  [could not recover a leftover atomic edit transaction: "
+                  f"{exc}]", file=sys.stderr)
+        except Exception:
+            pass
+
+
 # A task line in the plan file: `- [ ] do the thing` / `- [x] done thing`.
 # `*` bullets are accepted too. Group 2 is the box character, group 3 the text.
 _TASK_LINE = re.compile(r"^(\s*[-*]\s*)\[([ xX])\]\s*(.*)$")
@@ -4653,6 +4674,8 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
             # A review task writes only after a human sign-off, but the state
             # before the proposal is exactly what an undo must restore, so the
             # baseline is recorded here and the accepted review adds its child.
+            if writes:
+                _recover_atomic(root, cfg)
             _checkpoint_task(root, cfg, task, "pre")
         if not getattr(cfg, "_auto_step", 0):
             # Standalone task (ask/chat/eval): no outer loop owns the static or

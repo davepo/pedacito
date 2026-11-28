@@ -3224,6 +3224,43 @@ def effective_tier(cfg) -> str:
     return str(getattr(cfg, "active_tier", "") or getattr(cfg, "tier", "") or "")
 
 
+def atomic_edits_enabled(cfg) -> bool:
+    """Whether the staged all-or-nothing edit transaction applies (WP-4105C).
+
+    ``atomic_edits`` defaults to ``False``, so a bare boolean cannot tell an
+    explicit ``false`` from the implicit default. Precedence, from strongest:
+
+    1. ``atomic_edits = true`` -- always atomic (the default is false, so a
+       true value can only be explicit).
+    2. ``atomic_edits = false`` with a config *source* other than the built-in
+       default -- the user (or a profile) wrote it explicitly, so legacy
+       per-file apply wins.
+    3. The implicit default (``cfg.sources`` says "default") -- atomic applies
+       only for a LOCAL endpoint whose effective tier is tiny/small/medium,
+       the models that most need a staged batch and cannot hold a huge
+       multi-file patch in one reply. Larger and hosted models keep legacy.
+
+    ``cfg.sources`` is populated by :func:`load`; a hand-built ``Config()``
+    leaves it empty, which reads as "default" (the field was never explicitly
+    set).
+    """
+    value = bool(getattr(cfg, "atomic_edits", False))
+    if value:
+        return True
+    sources = getattr(cfg, "sources", None) or {}
+    source = str(sources.get("atomic_edits", "default") or "default")
+    if source != "default":
+        return False                      # explicit false wins
+    if effective_tier(cfg) not in ("tiny", "small", "medium"):
+        return False
+    try:
+        return _endpoint_is_local(
+            str(getattr(cfg, "base_url", "") or ""),
+            str(getattr(cfg, "provider", "") or ""))
+    except Exception:
+        return False
+
+
 def effective_creative_temperature(cfg, base_temp: float) -> float:
     """The answer temperature for a Creative/design task on a LOCAL server.
 
@@ -4102,7 +4139,9 @@ REFERENCE_TEMPLATE = TEMPLATE + '''
 # never write (on top of .git/, .pedacito/, the plan file); shell_deny lists
 # command patterns `run` refuses; browser_eval_hosts limits where the browser
 # `eval` action may run JavaScript.
-# atomic_edits = true writes a multi-file reply all-or-nothing.
+# atomic_edits = true stages a multi-file reply all-or-nothing (validate and
+# snapshot a durable WAL before the first write); left unset it auto-enables
+# for a local tiny/small/medium endpoint.
 # sandbox (on) runs `run` and post-edit test commands under bubblewrap (Linux)
 # or sandbox-exec (macOS): writes only to the project and a temp dir, .git/ and
 # .pedacito/ read-only, credentials hidden, network off. sandbox_network = true

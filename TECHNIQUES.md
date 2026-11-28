@@ -249,6 +249,15 @@ The cheapest reliable feedback is the code itself:
     `[INCREMENTAL BATCH PARTIALLY APPLIED]` warning that names what is missing
     and how to start over. A summary that reads "applied" is what let the next
     step build on a feature that was never finished.
+  - *Incremental vs. staged atomic batch.* The microloop above is incremental:
+    each verified hunk lands on its own, and a partial batch is reported, not
+    rolled back. `atomic_edits` is the opposite -- a staged all-or-nothing
+    transaction: every file in the reply is validated and its preimage
+    snapshotted to a durable WAL before the first write, and a write failure
+    (or a crash mid-commit, recovered on the next run) leaves the tree at its
+    pre-batch state. The microloop suits a small model that cannot hold a big
+    patch in one reply; the atomic batch suits a coupled multi-file change
+    that must never half-land.
 - **Failure-identity diffing.** Pytest's stable node ids (plus a normalized
   assertion signature when no id survives truncation) identify each failure
   across runs. The post-edit run is classified against the pre-edit baseline as
