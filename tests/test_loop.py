@@ -3625,3 +3625,95 @@ def test_run_loop_lints_bundled_plan_titles_at_start(tmp_path, monkeypatch,
 
 def test_plan_system_wants_one_change_per_title():
     assert "One title, one change" in loop.PLAN_SYSTEM
+
+
+# ------------------------------------------- R2-BUG-01: gather writes count
+def test_gather_append_satisfies_coverage_literal_without_followup(
+        tmp_path, monkeypatch):
+    """A gather `append` that already landed the quoted literal is edit
+    evidence: coverage must not call it missing (false RED) and must not seed
+    a follow-up that appends a second copy (R2-BUG-01)."""
+    from pedacito import index as index_mod, tools, verify
+    from pedacito.agent import Agent
+
+    (tmp_path / "addition.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8")
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.backup = False
+    cfg.log_events = False
+    cfg.log_sessions = False
+    idx = index_mod.build([str(tmp_path)], cfg, root=tmp_path,
+                          summarise=False, verbose=False)
+    agent = Agent(idx, None, cfg)
+    task = ("Append a comment line '# coverage probe' at the end of "
+            "addition.py. Do not change any other file.")
+    agent.requirements = verify.RequirementTracker(task)
+    # The real gather tool call: it writes the file and feeds the ledger.
+    tools.dispatch(idx, cfg, {"action": "append", "file": "addition.py",
+                              "content": "# coverage probe\n"})
+    assert cfg._task_mutations == ["addition.py"]
+
+    calls: list = []
+    monkeypatch.setattr(agent, "apply_edit_intents",
+                        lambda *a, **k: calls.append(1) or ([], "", []))
+    findings: list = []
+    _res, _reply, findings = agent._coverage_pass(
+        task, "", [], "done", findings, verbose=False)
+
+    assert calls == [], "the landed literal must not seed a follow-up"
+    assert not [f for f in findings if f.kind == "coverage"]
+    text = (tmp_path / "addition.py").read_text(encoding="utf-8")
+    assert text.count("# coverage probe") == 1
+
+
+def test_gather_write_literal_survives_another_clauses_followup(
+        tmp_path, monkeypatch):
+    """The final post-follow-up re-check must keep seeing the gather file too:
+    a literal landed by gather is not owed again just because a DIFFERENT
+    clause seeded the follow-up (no false RED, no duplicate insertion)."""
+    from pedacito import index as index_mod, tools, verify
+    from pedacito.agent import Agent
+    from pedacito.edits import Result
+
+    (tmp_path / "addition.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
+    cfg = Config()
+    cfg.allow_write = True
+    cfg.backup = False
+    cfg.log_events = False
+    cfg.log_sessions = False
+    idx = index_mod.build([str(tmp_path)], cfg, root=tmp_path,
+                          summarise=False, verbose=False)
+    agent = Agent(idx, None, cfg)
+    task = ("1. Append a comment line '# coverage probe' at the end of "
+            "addition.py.\n"
+            "2. Add the line '# other marker' at the end of other.py.")
+    agent.requirements = verify.RequirementTracker(task)
+    tools.dispatch(idx, cfg, {"action": "append", "file": "addition.py",
+                              "content": "# coverage probe\n"})
+    assert cfg._task_mutations == ["addition.py"]
+
+    seeded: list = []
+
+    def fake_apply(_task, _gathered, intents, **_kw):
+        seeded.extend(intents)
+        text = (tmp_path / "other.py").read_text(encoding="utf-8")
+        text += "# other marker\n"
+        (tmp_path / "other.py").write_text(text, encoding="utf-8")
+        return ([Result(True, "other.py", "applied", after=text)],
+                "incremental edits\n[EDITED other.py:(file)]", [])
+
+    monkeypatch.setattr(agent, "apply_edit_intents", fake_apply)
+    findings: list = []
+    _res, _reply, findings = agent._coverage_pass(
+        task, "", [], "done", findings, verbose=False)
+
+    assert seeded, "the second clause still owes its own follow-up"
+    assert all("coverage probe" not in it.get("intended_change", "")
+               for it in seeded)
+    assert not any("coverage probe" in f.message for f in findings)
+    text = (tmp_path / "addition.py").read_text(encoding="utf-8")
+    assert text.count("# coverage probe") == 1
+
