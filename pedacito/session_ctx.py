@@ -26,11 +26,15 @@ T = TypeVar("T")
 __all__ = [
     "BudgetLedger",
     "ContextThreadPoolExecutor",
+    "RunBudget",
+    "RunBudgetError",
     "SessionContext",
     "clone_config",
+    "current_run_budget",
     "current_session",
     "require_session",
     "run_in_context",
+    "set_run_budget",
     "spawn_thread_with_context",
     "use_session",
 ]
@@ -105,6 +109,192 @@ class BudgetLedger:
             }
 
 
+class RunBudgetError(RuntimeError):
+    """A run budget refused a call or was exhausted (deadline or strict cost).
+
+    Raised by :class:`RunBudget` when a deadline has passed, a strict cost cap
+    can no longer be guaranteed (unknown pricing/usage, unbounded output, an
+    unknown reservation), or a reservation would exceed the cap. Callers that
+    already understand ``llm.BudgetExceeded`` catch this type through a small
+    adapter (``llm.py`` re-raises it as ``BudgetExceeded`` at the call site).
+    """
+
+    kind = "budget"
+
+
+def _positive_price(value: Any) -> float | None:
+    """A strictly-positive USD-per-million-token price, else None."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0.0 else None
+
+
+@dataclass
+class RunBudget:
+    """One run's deadline and strict cost reservation state.
+
+    Session-scoped and synchronized: every method takes an internal lock, so a
+    worker thread, the GUI stop thread, and the teardown path can all consult
+    the same budget without corrupting its counters. The dataclass is mutable
+    *by design* -- ``reserved_usd`` and ``spent_usd`` are live counters, and
+    the reservation table and poison flag are runtime state -- but the
+    mutation surface is exactly the three methods below, all under the lock.
+
+    ``deadline_monotonic`` is a ``time.monotonic()`` timestamp that starts
+    *before* model load; ``remaining_seconds()`` and ``check()`` read it so a
+    deadline governs leases, backoff, streaming, gates, tests, teardown and
+    child launches without any wall-clock drift.
+
+    A strict cost cap is ``max_cost_usd > 0``. In strict mode every potentially
+    billable call must be reserved first with known pricing and a bounded
+    output, released only once usage is known, and any unknown pricing, unknown
+    usage, unbounded output or over-budget reservation fails closed. With
+    ``max_cost_usd <= 0`` (uncapped) ``reserve_call``/``settle_call`` are
+    permissive and the run retains legacy (estimate-only) behavior.
+    """
+
+    deadline_monotonic: float | None = None
+    max_cost_usd: float = 0.0
+    reserved_usd: float = 0.0
+    spent_usd: float = 0.0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
+    _reservations: dict[str, float] = field(
+        default_factory=dict, repr=False, compare=False)
+    _poisoned: bool = field(default=False, repr=False, compare=False)
+
+    @property
+    def strict(self) -> bool:
+        """True when this run enforces a hard (reservation-based) cost cap."""
+        return float(self.max_cost_usd or 0.0) > 0.0
+
+    def remaining_seconds(self) -> float | None:
+        """Seconds until the deadline (floor 0), or None when uncapped."""
+        if self.deadline_monotonic is None:
+            return None
+        return max(0.0, float(self.deadline_monotonic) - time.monotonic())
+
+    def _check_locked(self) -> None:
+        if self._poisoned:
+            raise RunBudgetError(
+                "The strict cost cap can no longer be guaranteed (a call ended "
+                "with unknown pricing or usage); refusing to keep running a "
+                "strict cap on estimates.")
+        if self.deadline_monotonic is not None \
+                and time.monotonic() >= float(self.deadline_monotonic):
+            raise RunBudgetError(
+                "The run deadline has passed; no further billable work is "
+                "allowed.")
+        if self.strict and self.spent_usd + self.reserved_usd \
+                >= float(self.max_cost_usd):
+            raise RunBudgetError(
+                f"Cost budget exhausted (${self.spent_usd + self.reserved_usd:.4f}"
+                f" spent+reserved of ${float(self.max_cost_usd):.4f}).")
+
+    def check(self) -> None:
+        """Raise :class:`RunBudgetError` when the deadline passed or (strict)
+        the cost cap is exhausted."""
+        with self._lock:
+            self._check_locked()
+
+    def reserve_call(self, input_tokens: int, max_output_tokens: int,
+                     prices: dict) -> str:
+        """Reserve a conservative maximum cost for one billable call.
+
+        ``prices`` maps ``"input"`` / ``"output"`` (and optional ``"cached"``
+        / ``"cache_write"``) to USD per million tokens. In strict mode the
+        conservative maximum assumes every input token bills at the most
+        expensive input price and every output token bills at the output price;
+        unknown pricing, an unbounded (non-positive) output cap, or a
+        reservation that would exceed the cap raise :class:`RunBudgetError`
+        (and poison a strict budget) instead of estimating. Returns an opaque
+        reservation token for :meth:`settle_call`.
+        """
+        with self._lock:
+            self._check_locked()
+            token = f"res_{uuid.uuid4().hex}"
+            if not self.strict:
+                self._reservations[token] = 0.0
+                return token
+            pin = _positive_price((prices or {}).get("input"))
+            pout = _positive_price((prices or {}).get("output"))
+            if pin is None or pout is None:
+                self._poisoned = True
+                raise RunBudgetError(
+                    "Strict cost cap: input/output pricing is unknown, so a "
+                    "conservative maximum cannot be reserved. Set the price_* "
+                    "fields (USD per million tokens) or drop the strict cap.")
+            mot = int(max_output_tokens or 0)
+            if mot <= 0:
+                self._poisoned = True
+                raise RunBudgetError(
+                    "Strict cost cap: the call has an unbounded (or unknown) "
+                    "output limit, so its maximum cost cannot be reserved.")
+            most = max(
+                pin,
+                _positive_price((prices or {}).get("cache_write")) or pin,
+                _positive_price((prices or {}).get("cached")) or pin,
+            )
+            cost = (max(0, int(input_tokens or 0)) * most
+                    + mot * pout) / 1_000_000
+            if self.spent_usd + self.reserved_usd + cost \
+                    > float(self.max_cost_usd):
+                raise RunBudgetError(
+                    f"Strict cost cap: reserving this call "
+                    f"(~${cost:.6f}) would exceed the ${float(self.max_cost_usd):.4f}"
+                    f" budget (${self.spent_usd + self.reserved_usd:.4f} already "
+                    f"spent or reserved).")
+            self._reservations[token] = cost
+            self.reserved_usd += cost
+            return token
+
+    def settle_call(self, reservation: str, actual_usd: float | None) -> None:
+        """Release a reservation, charging ``actual_usd`` when known.
+
+        Strict mode refuses ``actual_usd=None`` (unknown usage after a call)
+        and an unknown reservation token: either poisons the budget so no
+        further call proceeds on an estimate. Uncapped runs only record known
+        usage for observability and never refuse.
+        """
+        with self._lock:
+            cost = self._reservations.pop(str(reservation), None)
+            if cost is None:
+                if self.strict:
+                    self._poisoned = True
+                    raise RunBudgetError(
+                        "Strict cost cap: cannot settle an unknown reservation "
+                        "token; refusing to keep running a strict cap.")
+                return
+            self.reserved_usd = max(0.0, self.reserved_usd - float(cost))
+            if actual_usd is None:
+                if self.strict:
+                    self._poisoned = True
+                    raise RunBudgetError(
+                        "Strict cost cap: the call reported no usage, so its "
+                        "actual cost is unknown; refusing to keep running a "
+                        "strict cap on estimates.")
+                return
+            self.spent_usd += max(0.0, float(actual_usd))
+
+    def snapshot(self) -> dict[str, Any]:
+        """JSON-safe summary of the budget's limits and live state."""
+        with self._lock:
+            return {
+                "deadline_monotonic": (
+                    float(self.deadline_monotonic)
+                    if self.deadline_monotonic is not None else None),
+                "remaining_seconds": self.remaining_seconds(),
+                "max_cost_usd": float(self.max_cost_usd),
+                "reserved_usd": round(float(self.reserved_usd), 6),
+                "spent_usd": round(float(self.spent_usd), 6),
+                "strict": self.strict,
+                "ok": not self._poisoned,
+                "poisoned": self._poisoned,
+            }
+
+
 def clone_config(cfg: Any) -> Any:
     """Create a shallow per-run copy of `cfg` so run-local attributes never
     mutate sibling sessions. Mutable top-level dict fields (`sources`,
@@ -139,6 +329,7 @@ class SessionContext:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     model_lease: Any = None
     budget_ledger: BudgetLedger = field(default_factory=BudgetLedger)
+    run_budget: RunBudget | None = None
     worktree: Any = None
     policy: Any = None
     review_queue: Any = None
@@ -299,6 +490,39 @@ def require_session() -> SessionContext:
     if ctx is None:
         raise RuntimeError("No active SessionContext is bound in this context.")
     return ctx
+
+
+def current_run_budget(cfg: Any = None) -> RunBudget | None:
+    """The active run's :class:`RunBudget`, or None when none is bound.
+
+    Checks the bound session first (the session-scoped source of truth), then a
+    ``cfg._run_budget`` fallback set by headless CLI runs that never bind a
+    ``SessionContext``. Used by the LLM client, lease manager and process runner
+    to clamp request timeouts, backoff and child launches to the run's
+    remaining deadline, and to reserve/settle strict cost caps. Never raises.
+    """
+    ctx = _CURRENT_SESSION.get()
+    if ctx is not None and ctx.run_budget is not None:
+        return ctx.run_budget
+    if cfg is not None:
+        budget = getattr(cfg, "_run_budget", None)
+        if budget is not None:
+            return budget
+    return None
+
+
+def set_run_budget(budget: RunBudget, cfg: Any = None) -> None:
+    """Bind ``budget`` as the active run budget: on the bound session when one
+    exists (session-scoped), and on ``cfg._run_budget`` as a headless fallback.
+    """
+    ctx = _CURRENT_SESSION.get()
+    if ctx is not None:
+        ctx.run_budget = budget
+    if cfg is not None:
+        try:
+            cfg._run_budget = budget
+        except Exception:
+            pass
 
 
 @contextmanager

@@ -78,6 +78,39 @@ def with_venv_path(env: dict | None, root, *,
     return base
 
 
+def _run_deadline() -> float | None:
+    """The active session's run deadline (monotonic seconds), or None."""
+    try:
+        from . import session_ctx
+        rb = session_ctx.current_run_budget()
+        if rb is not None:
+            return rb.deadline_monotonic
+    except Exception:
+        pass
+    return None
+
+
+def clamp_timeout(timeout: float | None, deadline: float | None, *,
+                  now: float | None = None) -> tuple[float | None, str]:
+    """Clamp a child-launch ``timeout`` to a run ``deadline``.
+
+    Returns ``(timeout, refusal)``. ``timeout`` is the clamped wall-clock limit
+    (None = unbounded); ``refusal`` is a non-empty reason when the deadline has
+    already passed and the child must NOT be launched (so a run never silently
+    extends its budget past a deadline). Both ``timeout`` and ``deadline`` are
+    ``time.monotonic()``-based; ``now`` defaults to ``time.monotonic()``.
+    """
+    if deadline is None:
+        return timeout, ""
+    now = time.monotonic() if now is None else float(now)
+    remaining = float(deadline) - now
+    if remaining <= 0:
+        return None, "run deadline passed before the child launched"
+    if timeout is not None and timeout > 0:
+        return min(float(timeout), remaining), ""
+    return remaining, ""
+
+
 def spawn(command, *, cwd, env: dict | None = None,
           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
           suspended: bool = False, bin_dirs: tuple | list | None = None
@@ -226,7 +259,11 @@ def run(command, *, cwd, timeout: float | None = None,
 
     `timeout` is the hard wall-clock limit; `idle_timeout` stops the process
     after that many seconds with no output (0 disables it). `stopped` is one
-    of "", "idle", "timeout", "cancelled", or "error" (could not start).
+    of "", "idle", "timeout", "cancelled", "unreaped" (the child could not be
+    reaped within the cleanup grace period -- reported as a failure), or
+    "error" (could not start). The timeout is clamped to the active run's
+    remaining deadline (see `session_ctx.RunBudget`) so a child never runs past
+    a deadline; an already-passed deadline refuses to launch ("cancelled").
     Output is combined stdout+stderr, capped at about `max_output` characters
     by keeping the head and the tail (test summaries and tracebacks end the
     output).
@@ -248,6 +285,9 @@ def run(command, *, cwd, timeout: float | None = None,
             max_output=max_output, env=env, stdin_text=stdin_text,
             cancel_event=cancel_event, writable_dirs=writable_dirs,
             bin_dirs=bin_dirs)
+    timeout, refusal = clamp_timeout(timeout, _run_deadline())
+    if refusal:
+        return None, refusal, "cancelled", 0.0
     timeout = float(timeout or 0)
     idle_timeout = float(idle_timeout or 0)
     cap = max(200, int(max_output or 8000))
@@ -351,6 +391,8 @@ def run(command, *, cwd, timeout: float | None = None,
                 rc = p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 rc = None
+                stopped = "unreaped"   # an unreaped child is a failure, not a
+                # silent budget extension
         reader.join(timeout=3)
     finally:
         _unregister_subprocess(resource_id)

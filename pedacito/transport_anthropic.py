@@ -105,9 +105,14 @@ def messages_endpoint(base_url: str) -> str:
     return origin + path + "/messages"
 
 
-def build_headers(api_key: str, *, ttl: str = "5m") -> dict[str, str]:
+def build_headers(api_key: str, *, ttl: str = "5m",
+                  idempotency_key: str | None = None) -> dict[str, str]:
     """Anthropic request headers: key, version, JSON content type, and the
-    extended-TTL beta flag (only for the ``1h`` cache TTL)."""
+    extended-TTL beta flag (only for the ``1h`` cache TTL).
+
+    ``idempotency_key`` is attached ONLY when the caller already confirmed the
+    provider documents idempotency support (``ProviderCapabilities.idempotency``
+    is True); an empty/None key omits the header, never guessed."""
     headers = {
         "x-api-key": api_key or "",
         "anthropic-version": _ANTHROPIC_VERSION,
@@ -115,6 +120,8 @@ def build_headers(api_key: str, *, ttl: str = "5m") -> dict[str, str]:
     }
     if ttl == "1h":
         headers["anthropic-beta"] = _EXTENDED_TTL_BETA
+    if idempotency_key:
+        headers["idempotency-key"] = str(idempotency_key)
     return headers
 
 

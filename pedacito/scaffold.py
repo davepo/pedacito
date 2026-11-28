@@ -2123,6 +2123,10 @@ def run_new(root: Path, cfg, client, spec: Spec, *, apply: bool = False,
     `log_command`, when given, is recorded in the run log -- but only on the
     write path, after the refusal guard: a dry run or a refusal writes nothing
     into the target (BUG-006)."""
+    # Establish the run's deadline + strict cost budget before any model load.
+    from .loop import ensure_run_budget
+    ensure_run_budget(cfg, int(max_minutes or 0))
+
     if not force:
         entries = [p.name for p in root.iterdir()
                    if not is_harness_owned(p.name)] if root.is_dir() else []
