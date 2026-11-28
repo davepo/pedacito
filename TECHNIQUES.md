@@ -808,18 +808,17 @@ monotonic:
   directories and vendored/state directories skipped, size and count caps via
   `auto_checkpoint_max_file_bytes` / `auto_checkpoint_max_files`) into
   `.pedacito/checkpoints/step_<k>/` with a `manifest.json` recording size
-  and skip-state. The checkpoint is a **hard link** where the
-  filesystem allows it (`os.link`, with a `shutil.copy2` fallback for
-  EXDEV/EPERM/FAT) -- free, byte-identical by construction, no copy of a
-  multi-megabyte tree per step. That buys the price of one invariant: every
-  write that can touch a snapshotted path must REPLACE the file, never
-  rewrite it in place, because `open(path, "wb")` truncates through the
-  shared inode and would silently corrupt history. `fileio.write` is exactly
-  that atomic replacement (mkstemp beside the target, mode preserved,
-  `os.replace`), every loop write path goes through it, and `rollback`
+  and skip-state. The checkpoint is an **independent copy** -- a copy-on-write
+  reflink where the platform offers one, else `shutil.copy2` -- never a hard
+  link, and the destination is verified to be a distinct inode before it is
+  accepted. External in-place writers (formatters, hooks, tests) can therefore
+  never corrupt history through a shared inode. The cost is a real copy of the
+  tracked files per step, so `auto_keep_checkpoints` and `checkpoint_quota_mb`
+  bound that history. `fileio.write` remains the atomic replacement
+  (mkstemp beside the target, mode preserved, `os.replace`), and `rollback`
   restores the same way (snapshot bytes into a temp file, `os.replace`), so
-  the fast path -- skip the restore when size+mtime already match, which is
-  the common case for a true hard link -- stays safe.
+  the fast path -- skip the restore when size+mtime already match -- stays
+  safe.
   The plan file itself is on the never-snapshot list: the
   loop ticks boxes mid-step and no rollback may un-tick them.
 - **The frontier.** When a step verifies green, `ratchet.green` advances a

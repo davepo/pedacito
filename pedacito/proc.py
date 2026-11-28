@@ -21,6 +21,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -76,6 +77,55 @@ def with_venv_path(env: dict | None, root, *,
         if prepend:
             base[path_key] = os.pathsep.join(prepend + parts)
     return base
+
+
+def shadow_environment(root, *, cfg=None, bin_dirs=None):
+    """A scrubbed child environment for isolated shadow tests (§3.7).
+
+    Creates a private HOME and TMP under a fresh temporary directory (so a
+    test that writes ``~/.cache``, ``$TMP`` or ``$TEMP`` cannot touch the
+    user's real files), scrubs ambient API keys/tokens through
+    ``safety.child_env``, and prepends the project's venv directories to PATH.
+    Returns ``(home, tmp, env)``; the caller owns cleanup of ``home.parent``.
+    """
+    base = Path(tempfile.mkdtemp(prefix="pedacito-shadow-home-")).resolve()
+    home = base / "home"
+    tmp = base / "tmp"
+    home.mkdir()
+    tmp.mkdir()
+    from . import safety
+    env = safety.child_env(cfg)
+    env.update({
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMP": str(tmp),
+        "TMPDIR": str(tmp),
+        "TEMP": str(tmp),
+    })
+    return home, tmp, with_venv_path(env, root, bin_dirs=bin_dirs)
+
+
+def allocate_loopback_ports(n: int = 1) -> list[int]:
+    """Reserve ``n`` free loopback ports and return them (bind-then-close).
+
+    Port selection is NOT a network namespace: these are merely ports that
+    were free at allocation time, so a shadow test can bind its own servers
+    without colliding with the harness. It does not isolate the network, and
+    Windows cannot promise network isolation.
+    """
+    import socket
+    ports: list[int] = []
+    socks: list[socket.socket] = []
+    try:
+        for _ in range(max(1, int(n))):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+            ports.append(s.getsockname()[1])
+    finally:
+        for s in socks:
+            s.close()
+    return ports
 
 
 def spawn(command, *, cwd, env: dict | None = None,

@@ -1019,6 +1019,7 @@ config --reference` imprime la plantilla anotada. Ajustes principales:
 | `verify_answer` | `"deterministic"` | `off` / `deterministic` / `full`: verifica las ediciones antes de escribirlas. |
 | `best_of` | 1 | Muestrea N respuestas candidatas de edición y conserva la de mejor puntuación. |
 | `verify_tests` / `test_command` | false / `""` | Ejecuta las pruebas afectadas tras las ediciones aplicadas (necesita `allow_shell`); `test_command` es la anulación de la detección del ejecutor. |
+| `shadow_tests` | false | Pruebas sombra aisladas optativas (§3.7): ejecuta el comando de pruebas dentro de una copia independiente de `VirtualWorkspace` con un HOME/TMP privado, material de dependencias copiado (nunca enlazado), puertos de loopback asignados por separado, un entorno depurado y el sandbox del sistema operativo. La selección de puertos no es un espacio de nombres de red y Windows no puede prometer aislamiento de red; donde el aislamiento solicitado no puede aplicarse, la ejecución informa `unavailable` y rechaza la ejecución desatendida. Ejecuta comandos, así que es un ajuste de `EXEC_FIELDS` (protegido por confianza). |
 | `auto_verify` | `""` | Cadena de comando que se ejecuta tras cada tarea de Auto; un fallo devuelve su salida para reparación. Vacío = desactivado; nunca un bool. El `/verify on` de la TUI y **Post-edit verify** de la GUI lo detectan y lo completan. `pdc ask --verify-cmd "..."` lo anula para una ejecución, en memoria (consulta [USAGE.md](USAGE.md#modo-headless-y-automatización)). |
 | `auto_verify_final` | false | Ejecuta `auto_verify` una vez tras la última tarea sin marcar del plan en lugar de tras cada tarea (útil cuando toda la suite no puede pasar a mitad del plan). |
 | `auto_repair_rounds` / `auto_verify_rounds` | 2 / 2 | Rondas de reparación por verificación fallida por tarea; rondas de verificación en tiempo de ejecución tras una ejecución `auto --apply`. |
@@ -1225,6 +1226,7 @@ Todos los demás ajustes públicos se listan a continuación, agrupados por subs
 | `security_outbound_mode` | `"warn"` | Protección saliente hacia proveedores en la nube: antes de que una petición salga hacia un endpoint alojado, escanea sus mensajes en busca de secretos no reconocidos. |
 | `keep_sessions` | `0` | Valores por defecto de `pedacito prune` (0 = conservar todo). |
 | `keep_backups` | `0` | Respaldos que conserva `pedacito prune`; 0 conserva todo. |
+| `checkpoint_quota_mb` | `0` | Tope de bytes de checkpoints/instantáneas/ratchet/respaldos conservados bajo `.pedacito/` (§3.7). 0 = ilimitado (legado). Cuando se define, una pasada de mantenimiento borra primero lo elegible más antiguo y nunca toca la cabeza activa, sus ancestros, un WAL/recuperación en curso, la frontera verde, las instantáneas de seguridad ni los archivos creados por el usuario; si la cuota no puede cumplirse de forma segura, las nuevas escrituras dependientes de instantáneas se detienen y la ejecución explica por qué. |
 | `log_max_bytes` | `2000000` | Rota el registro de eventos tras esta cantidad de bytes. |
 
 </details>

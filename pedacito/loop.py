@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from . import checkpoints as checkpoints_mod
+from . import checkpoint_gc
 from . import diagnostics, events as events_mod, hooks as hooks_mod
 from . import fileio
 from . import safety, workspace
@@ -6160,6 +6161,17 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
         attempted += 1
         print(f"\n=== task {attempted}: {task} ===", file=sys.stderr)
         if ratchet_on:
+            # Checkpoint quota (§3.7): free eligible history first, and stop
+            # new snapshot-dependent writes (the green ratchet) when the quota
+            # cannot be met without deleting protected history.
+            quota_ok, quota_reason = checkpoint_gc.enforce_quota(root, cfg)
+            if not quota_ok:
+                msg = ("checkpoint quota "
+                       f"({getattr(cfg, 'checkpoint_quota_mb', 0)} MB) cannot "
+                       f"be met safely; stopping: {quota_reason}")
+                workspace.log_event(root, msg, "ERROR")
+                print(f"\n[stopped: {msg}]", file=sys.stderr)
+                break
             step_no += 1
             try:
                 snap = ratchet_mod.begin(

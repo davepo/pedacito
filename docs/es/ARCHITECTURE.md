@@ -1209,11 +1209,16 @@ incluidos.
   Pedacito). La dependencia está fijada a `<0.26` (0.25.2 tiene wheels para cp314);
   el CI cubre 3.11–3.14. El fragmentador también pausa el GC cíclico alrededor de los nodos
   vivos como segunda línea de defensa.
-- `run` y los comandos de prueba están en sandbox donde funcionan bubblewrap/sandbox-exec (no
-  en Windows, ni donde los espacios de nombres de usuario están desactivados: recibes un aviso, no una
-  degradación silenciosa); `browser`, `fetch`, MCP, los procesos `serve` en segundo plano y
-  los servidores LSP están protegidos (entorno depurado, rutas protegidas, listas permitidas,
-  avisos de confianza), no en sandbox.
+- `run` y los comandos de prueba están en sandbox donde funciona un backend: bubblewrap en Linux
+  y sandbox-exec (Seatbelt) en macOS, y Windows tiene un sandbox optativo `win_restricted`
+  de Job Object + token restringido. El backend de Windows aísla el tiempo de vida del proceso
+  y restringe las escrituras al proyecto y a los directorios temporales, pero **no** oculta los
+  archivos legibles por el usuario y **no** filtra el tráfico de red saliente (eso requiere un
+  AppContainer); por eso las pruebas sombra nunca prometen aislamiento de red en Windows. Cuando
+  un backend está ausente o desactivado (espacios de nombres de usuario desactivados, anidamiento
+  prohibido), los comandos se ejecutan sin sandbox con un aviso, no con una degradación silenciosa;
+  `browser`, `fetch`, MCP, los procesos `serve` en segundo plano y los servidores LSP están
+  protegidos (entorno depurado, rutas protegidas, listas permitidas, avisos de confianza), no en sandbox.
 - `rename` es mecánico y conservador. Un nombre simple se renombra solo cuando tiene
   exactamente una definición en cualquier parte, y luego sigue las importaciones, no los tipos. La herramienta
   del agente además admite una consulta calificada por receptor (`Store.save`): los sitios de llamada de Python

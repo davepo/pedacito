@@ -1211,11 +1211,17 @@ shipped.
   Pedacito). The dependency is pinned to `<0.26` (0.25.2 has cp314 wheels);
   CI covers 3.11–3.14. The chunker also pauses the cyclic GC around live
   nodes as a second line of defence.
-- `run` and test commands are sandboxed where bubblewrap/sandbox-exec work (not
-  on Windows, not where user namespaces are disabled -- you get a notice, not a
-  silent downgrade); `browser`, `fetch`, MCP, background `serve` processes and
-  LSP servers are guarded (scrubbed environment, protected paths, allowlists,
-  trust prompts), not sandboxed.
+- `run` and test commands are sandboxed where a backend works: Linux bubblewrap
+  and macOS sandbox-exec (Seatbelt), and Windows has an opt-in `win_restricted`
+  Job Object + restricted-token sandbox. The Windows backend isolates process
+  lifetime and restricts writes to the project and temporary directories, but
+  it does **not** hide user-readable files and does **not** filter outbound
+  network traffic (that needs an AppContainer); shadow tests therefore never
+  promise network isolation on Windows. Where a backend is absent or disabled
+  (user namespaces off, nesting forbidden) commands run unsandboxed with one
+  notice, not a silent downgrade; `browser`, `fetch`, MCP, background `serve`
+  processes and LSP servers are guarded (scrubbed environment, protected paths,
+  allowlists, trust prompts), not sandboxed.
 - `rename` is mechanical and conservative. A bare name renames only when it has
   exactly one definition anywhere, then follows imports, not types. The agent
   tool additionally takes a receiver-qualified query (`Store.save`): Python call

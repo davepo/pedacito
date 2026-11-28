@@ -1051,6 +1051,15 @@ class Config:
     verify_tests: bool = False
     test_command: str = ""
     test_timeout: int = 300
+    # Opt-in isolated shadow tests (§3.7): run the project's test command
+    # inside an independent `VirtualWorkspace` copy with a private HOME/TMP,
+    # copied (never linked) dependency material, separately allocated loopback
+    # ports, a scrubbed environment and the OS sandbox. Port selection is NOT a
+    # network namespace, and Windows cannot promise network isolation: where the
+    # requested isolation cannot be enforced the run reports `unavailable` and
+    # refuses unattended execution instead of running the original tree. Runs
+    # commands, so it is an `EXEC_FIELDS` setting (trust-gated like the others).
+    shadow_tests: bool = False
     # Headless DOM smoke check after applied web edits (`pedacito domcheck`):
     # load the entry page in headless Chromium, prove the module graph mounts,
     # report page errors and unbound controls, and diff the mounted surface
@@ -1162,6 +1171,13 @@ class Config:
     keep_backups: int = 0
     keep_events: int = 20
     log_max_bytes: int = 2_000_000
+    # Ceiling on the checkpoint/snapshot/ratchet/backup bytes kept under
+    # `.pedacito/` (§3.7). 0 = unlimited (legacy). When a quota is set, a
+    # maintenance pass plans deletion oldest-eligible-first and never touches
+    # the active head, its ancestors, an in-flight WAL/recovery, the green
+    # frontier, safety snapshots or authored files. If the quota cannot be met
+    # safely, new snapshot-dependent writes stop and the run explains why.
+    checkpoint_quota_mb: int = 0
 
     # --- Updates (opt-out) ------------------------------------------------------
     # Quiet check for newer Pedacito releases on PyPI: one anonymous GET at
@@ -1691,7 +1707,7 @@ EXEC_FIELDS = ("hooks", "mcp_servers", "auto_verify", "test_command",
                "load_cmd", "unload_cmd",
                "scrub_env", "env_passthrough",
                "verify_tests", "verify_dom", "dom_entry",
-               "autofix_enabled",
+               "autofix_enabled", "shadow_tests",
                "shell_allowlist", "shell_allowlist_by_project",
                "browser_eval_hosts",
                "allow_fetch", "fetch_allowed_hosts",
@@ -3870,6 +3886,11 @@ lsp_diagnostics_gate = false
 # --no-deps, or the resolved interpreter's inspect after static declarations
 # produced nothing. Also needs allow_shell and an allowing policy.
 api_oracle_exec = false
+# Opt-in isolated shadow tests: run the test command in an independent copy
+# with a private HOME/TMP, copied (never linked) dependencies, loopback ports
+# and a scrubbed env under the OS sandbox. Runs commands, so a project config
+# needs `pedacito trust`. Windows cannot promise network isolation here.
+shadow_tests = false
 
 # Autonomous loop (`pedacito auto`).
 auto_plan_file = "PLAN.md"
@@ -3892,6 +3913,11 @@ auto_green_ratchet = true
 auto_checkpoint_max_file_bytes = 1000000
 auto_checkpoint_max_files = 1500
 auto_keep_checkpoints = 25
+# Ceiling (MB) on checkpoint/snapshot/ratchet/backup bytes under .pedacito/.
+# 0 = unlimited (legacy). When set, oldest-eligible history is GC'd and the
+# head/ancestors/in-flight WAL/green frontier/safety snapshots are never
+# deleted; if the quota cannot be met safely, new snapshot writes stop.
+# checkpoint_quota_mb = 0
 interface_lock = true
 
 # Project scaffolding (`pedacito new`).
@@ -4445,11 +4471,11 @@ _PROJECT_HEADER = """\
 #
 # Settings that run something are ignored until you read this file and run
 # `pedacito trust`: hooks, mcp_servers, auto_verify, test_command, allow_serve,
-# allow_lsp, lsp_servers, lsp_diagnostics_gate, api_oracle_exec, the sandbox
-# settings, and the capability toggles allow_shell, allow_write, allow_browser,
-# allow_screenshots, enable_mcp and allow_mcp. They are shown commented out
-# here: active defaults would warn on every load, and once trusted they would
-# overrule the capabilities you granted at user scope.
+# allow_lsp, lsp_servers, lsp_diagnostics_gate, api_oracle_exec, shadow_tests,
+# the sandbox settings, and the capability toggles allow_shell, allow_write,
+# allow_browser, allow_screenshots, enable_mcp and allow_mcp. They are shown
+# commented out here: active defaults would warn on every load, and once trusted
+# they would overrule the capabilities you granted at user scope.
 # Uncomment only the ones this repository genuinely needs. Everything else in
 # this file applies immediately.
 #

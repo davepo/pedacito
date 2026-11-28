@@ -1144,3 +1144,42 @@ def snapshot_size(root, checkpoint_id: str) -> int:
         except OSError:
             pass
     return total
+
+
+def count_regular_bytes(path: Path) -> int:
+    """Sum ``st_size`` of the regular files under ``path``, never following a
+    symlink, junction or reparse point.
+
+    The quota GC (§3.7, `checkpoint_gc`) counts snapshot/ratchet/backup bytes
+    with this so a hand-placed symlink inside a checkpoint cannot inflate (or
+    escape) the store's measured size.
+    """
+    try:
+        if path.is_symlink() or security.is_junction_or_reparse(path):
+            return 0
+        if path.is_file():
+            return path.stat().st_size
+    except OSError:
+        return 0
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        d = Path(dirpath)
+        keep: list[str] = []
+        for name in dirnames:
+            child = d / name
+            try:
+                if child.is_symlink() or security.is_junction_or_reparse(child):
+                    continue
+            except OSError:
+                continue
+            keep.append(name)
+        dirnames[:] = keep
+        for name in filenames:
+            p = d / name
+            try:
+                if p.is_symlink() or security.is_junction_or_reparse(p):
+                    continue
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total

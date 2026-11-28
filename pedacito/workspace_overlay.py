@@ -33,9 +33,7 @@ import contextlib
 import dataclasses
 import difflib
 import hashlib
-import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import weakref
@@ -124,30 +122,25 @@ def copy_tree_no_link(root, dest, *, files=None,
     return tuple(copied)
 
 
-def _link_node_modules(link: Path, target: Path) -> None:
-    """Link a project's `node_modules` into a mirror, or skip cleanly.
+def build_shadow_copy(root, *, cfg=None,
+                      max_bytes: int = MAX_MIRROR_BYTES) -> Path:
+    """An independent, no-link shadow copy of the tracked project files.
 
-    An unprivileged symlink fails on Windows without the developer-mode
-    ``SeCreateSymbolicLinkPrivilege`` (``OSError`` / ``WinError 1314``). Fall
-    back to a directory junction (``mklink /J``, which needs no privilege), and
-    finally skip without failing mirror creation -- the project copy is still
-    fully usable, just without its already-installed dependencies.
+    This is the copy the isolated shadow-test path (§3.7) runs against: a
+    fresh temporary directory holding ``copy_tree_no_link`` output, so no
+    symlink, junction or ``cmd /c mklink`` ever points the copy back at the
+    original tree or its ``node_modules``/dependency directories. The caller
+    owns cleanup (``shutil.rmtree``) and must reap any children first.
+
+    Returns the copy root.
     """
+    dest = Path(tempfile.mkdtemp(prefix="pedacito-shadow-")).resolve()
     try:
-        link.symlink_to(target, target_is_directory=True)
-        return
-    except OSError:
-        pass
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                capture_output=True, check=False, timeout=30)
-            if link.exists():
-                return
-        except (OSError, subprocess.SubprocessError):
-            pass
-    # Last resort: leave `node_modules` absent rather than crash the mirror.
+        copy_tree_no_link(root, dest, max_bytes=max_bytes)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dest
 
 
 def _register_mirror(ws: "VirtualWorkspace") -> None:
@@ -700,9 +693,12 @@ class VirtualWorkspace:
                     dest = mirror / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dest)
-                deps = self.root / "node_modules"
-                if deps.is_dir() and not (mirror / "node_modules").exists():
-                    _link_node_modules(mirror / "node_modules", deps)
+                # Dependency trees are never linked into the mirror (no
+                # symlink, no Windows junction, no `cmd /c mklink`): a writable
+                # link back to the original node_modules/dependencies would let
+                # a command running in the mirror mutate the real tree. They
+                # are left out; a command that needs them reports them missing
+                # instead of silently running against the originals.
             except BaseException:
                 self.close()
                 raise

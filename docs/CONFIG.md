@@ -1011,6 +1011,7 @@ config --reference` prints the annotated template. Key settings:
 | `verify_answer` | `"deterministic"` | `off` / `deterministic` / `full`: check edits before writing them. |
 | `best_of` | 1 | Sample N candidate edit replies and keep the best-scoring one. |
 | `verify_tests` / `test_command` | false / `""` | Run impacted tests after applied edits (needs `allow_shell`); `test_command` is the runner detection override. |
+| `shadow_tests` | false | Opt-in isolated shadow tests (§3.7): run the test command inside an independent `VirtualWorkspace` copy with a private HOME/TMP, copied (never linked) dependency material, separately allocated loopback ports, a scrubbed environment and the OS sandbox. Port selection is not a network namespace and Windows cannot promise network isolation; where the requested isolation cannot be enforced the run reports `unavailable` and refuses unattended execution. Runs commands, so it is an `EXEC_FIELDS` setting (trust-gated). |
 | `auto_verify` | `""` | Command string run after each Auto task; a failure feeds its output back for repair. Empty = off; never a bool. The TUI `/verify on` and GUI **Post-edit verify** detect and fill it. `pdc ask --verify-cmd "..."` overrides it for one run, in memory (see [USAGE.md](USAGE.md#headless-and-automation)). |
 | `auto_verify_final` | false | Run `auto_verify` once after the plan's last unchecked task instead of after every task (useful when the whole suite cannot pass mid-plan). |
 | `auto_repair_rounds` / `auto_verify_rounds` | 2 / 2 | Repair rounds per failing per-task check; runtime-verification rounds after an `auto --apply` run. |
@@ -1217,6 +1218,7 @@ Every remaining public setting is listed below, grouped by subsystem, with its r
 | `security_outbound_mode` | `"warn"` | Outbound cloud-provider guard: before a request leaves for a hosted endpoint, scan its messages for unacknowledged secrets. |
 | `keep_sessions` | `0` | `pedacito prune` defaults (0 = keep everything). |
 | `keep_backups` | `0` | Backups kept by `pedacito prune`; 0 keeps everything. |
+| `checkpoint_quota_mb` | `0` | Ceiling on the checkpoint/snapshot/ratchet/backup bytes kept under `.pedacito/` (§3.7). 0 = unlimited (legacy). When set, a maintenance pass deletes oldest-eligible-first and never touches the active head, its ancestors, an in-flight WAL/recovery, the green frontier, safety snapshots or authored files; if the quota cannot be met safely, new snapshot-dependent writes stop and the run explains why. |
 | `log_max_bytes` | `2000000` | Rotate the event log after this many bytes. |
 
 </details>
