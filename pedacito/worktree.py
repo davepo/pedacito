@@ -21,6 +21,7 @@ branch names, a per-session state dir, dirty-tree handling (`refuse` /
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -551,3 +552,75 @@ def prune_stale(
     except WorktreeError:
         pass
     return pruned
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """Case-insensitive path identity on Windows, exact on POSIX."""
+    try:
+        return os.path.normcase(str(a)) == os.path.normcase(str(b))
+    except Exception:                       # pragma: no cover - best effort
+        return str(a) == str(b)
+
+
+def remove_recorded_worktree(
+    root: Path | str,
+    worktree_path: Path | str,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """Evaluate a recorded worktree for removal (safety checks only).
+
+    Performs the containment and ownership checks any removal MUST satisfy:
+
+    * the ``.pedacito/worktrees`` base must be a real directory (no symlink /
+      junction escape), and the path must resolve inside it;
+    * the worktree must carry Pedacito's ownership marker
+      (``.pedacito/sessions_state/<session_id>/``).
+
+    Removal itself is **refused**: authorising a deletion requires an
+    authoritative cross-process ownership/liveness proof for this precise
+    worktree/session (that every session and OS process was enumerated and
+    none owns it). No such mechanism exists in this release, and a
+    caller-supplied session set is not proof -- so this function never removes
+    anything and never calls a global ``git worktree prune`` (which could touch
+    unrelated registrations). Returns ``(False, reason)``.
+    """
+    from . import security
+    try:
+        repo = _root(root)
+    except WorktreeError:
+        repo = Path(root).expanduser().resolve()
+
+    # The base directory itself must be a real directory, not a link escape.
+    base = repo / ".pedacito" / "worktrees"
+    if base.is_symlink() or security.is_junction_or_reparse(base):
+        return False, "the .pedacito/worktrees base is a link; refusing to touch it"
+    try:
+        resolved_repo = repo.resolve()
+        resolved_base = base.resolve()
+    except OSError as exc:
+        return False, f"could not resolve the worktrees base: {exc}"
+    if not resolved_base.is_relative_to(resolved_repo):
+        return False, "the .pedacito/worktrees base escapes the repository; refusing"
+
+    wt = Path(worktree_path)
+    if wt.is_symlink() or security.is_junction_or_reparse(wt):
+        return False, "worktree path is a link/reparse point; refusing to touch it"
+    try:
+        resolved = wt.resolve()
+    except OSError as exc:
+        return False, f"could not resolve worktree path: {exc}"
+    if not resolved.is_relative_to(resolved_base):
+        return False, ("worktree path is outside .pedacito/worktrees/; "
+                       "refusing to touch it")
+
+    # Ownership proof: a Pedacito-owned worktree carries a sessions_state dir.
+    sids = _session_ids_of(resolved)
+    if not sids:
+        return False, "worktree has no Pedacito ownership marker; refusing"
+
+    # No authoritative cross-process ownership/liveness proof is available in
+    # this release to prove this precise worktree is orphaned. Refuse rather
+    # than falsely claim orphan status.
+    return False, ("no authoritative cross-process ownership/liveness proof is "
+                   "available for this worktree/session; refusing cleanup")

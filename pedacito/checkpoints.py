@@ -332,12 +332,17 @@ def _new_id(seq: int, label: str) -> str:
 # --- create / list ------------------------------------------------------------
 
 def create_checkpoint(root, label: str, mode: str = "task",
-                      parent_id: str | None = None) -> dict:
+                      parent_id: str | None = None,
+                      wal_id: str = "") -> dict:
     """Snapshot the tracked workspace and append one checkpoint.
 
     `parent_id` defaults to the active head, which makes the normal case a
     linear history and a create-after-restore a branch.  The new checkpoint
     becomes the active head.
+
+    `wal_id` binds the checkpoint to the WAL (task journal) that recorded it;
+    recovery verifies this exact association before restoring, so a checkpoint
+    created by another task can never be substituted.
     """
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -393,6 +398,7 @@ def create_checkpoint(root, label: str, mode: str = "task",
             "timestamp": _now_iso(),
             "mode": mode,
             "label": label,
+            "wal_id": str(wal_id or ""),
             "files_changed": changed,
             # BUG-14: `file_count` used to mean "files in the snapshot", so a
             # 14-file project with 3 changed files looked like "14 files
@@ -428,7 +434,7 @@ def ensure_baseline(root, label: str = "baseline",
 
 
 def ensure_pre_run_checkpoint(root, label: str = "pre-run",
-                              mode: str = "task") -> dict | None:
+                              mode: str = "task", wal_id: str = "") -> dict | None:
     """Record a pre-run checkpoint that ALWAYS matches the live workspace.
 
     Unlike :func:`ensure_baseline` (which only snapshots when no checkpoint
@@ -439,21 +445,28 @@ def ensure_pre_run_checkpoint(root, label: str = "pre-run",
     for the task's post-run checkpoint, so Undo restores the true pre-task
     state instead of an older one.
 
+    With ``wal_id`` (the owning WAL's UUID), a *fresh* checkpoint bound to that
+    UUID is always recorded -- the historical "reuse the unchanged head" fast
+    path cannot bind a shared head to a new task, and rollback must be able to
+    verify the exact UUID association. Without ``wal_id`` (legacy callers) the
+    fast path is preserved.
+
     Returns None when the workspace cannot be snapshotted.
     """
     try:
         with _LOCK:
-            data = _load_index(root)
-            if data["checkpoints"]:
-                head = _find_entry(data, data.get("head_id") or "")
-                if head is None:
-                    head = data["checkpoints"][-1]
-                head_dir = snapshot_dir(root, str(head.get("id") or ""))
-                if head_dir.is_dir():
-                    live = dict(iter_workspace_files(root))
-                    if not _changed_paths(_snapshot_map(head_dir), live):
-                        return dict(head)
-            return create_checkpoint(root, label, mode=mode)
+            if not wal_id:
+                data = _load_index(root)
+                if data["checkpoints"]:
+                    head = _find_entry(data, data.get("head_id") or "")
+                    if head is None:
+                        head = data["checkpoints"][-1]
+                    head_dir = snapshot_dir(root, str(head.get("id") or ""))
+                    if head_dir.is_dir():
+                        live = dict(iter_workspace_files(root))
+                        if not _changed_paths(_snapshot_map(head_dir), live):
+                            return dict(head)
+            return create_checkpoint(root, label, mode=mode, wal_id=wal_id)
     except (OSError, CheckpointError):
         return None
 

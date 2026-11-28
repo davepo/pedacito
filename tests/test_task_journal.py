@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pedacito import journal
+from pedacito import checkpoints, journal
 from pedacito import workspace   # noqa: F401  (imports requests at collection time)
 
 
@@ -39,8 +39,9 @@ def test_append_seq_redaction_and_close(tmp_path):
     assert recs[-1].data["status"] == "completed"
     assert recs[-1].data["ok"] is True
 
-    # The journal file lives under .pedacito/journal/<safe_id>.jsonl.
-    assert j.path == tmp_path / ".pedacito" / "journal" / "task1.jsonl"
+    # The journal file lives under .pedacito/journal/<wal_id>.jsonl (a fresh
+    # UUID, never the title).
+    assert j.path == tmp_path / ".pedacito" / "journal" / f"{j.wal_id}.jsonl"
     # close() is idempotent: a second close does not append another task_end.
     j.close(status="completed")
     assert len(journal.read_journal(j.path)) == 4
@@ -87,26 +88,45 @@ def test_find_incomplete_tasks_summaries(tmp_path):
     assert pend["session_id"] == "s2"
     assert pend["last_kind"] == "checkpoint"
     assert pend["checkpoint_id"] == "cp_456"
-    assert pend["path"].endswith("pending.jsonl")
+    # The path is a UUID-named journal file (not title-derived).
+    assert pend["path"].endswith(".jsonl")
+    assert Path(pend["path"]).parent.name == "journal"
 
 
 def test_rollback_incomplete_task_appends_rolled_back(tmp_path):
     k = journal.TaskJournal(tmp_path, "pending", session_id="s2")
+    cp = checkpoints.create_checkpoint(tmp_path, "baseline", wal_id=k.wal_id)
+    cp_id = cp["id"]
     k.append("task_start", task="work")
-    k.append("checkpoint", checkpoint_id="does-not-exist")   # restore fails cleanly
+    k.append("checkpoint", checkpoint_id=cp_id, phase="pre")
 
-    result = journal.rollback_incomplete_task(tmp_path, "pending")
+    result = journal.rollback_incomplete_task(tmp_path, k.wal_id)
     assert result["ok"] is True
-    assert result["task_id"] == "pending"
-    # The checkpoint id was recorded but restore failed gracefully (best effort).
-    assert result["restored_checkpoint"] == ""
-    assert "checkpoint restore failed" in result["detail"]
+    assert result["task_id"] == k.wal_id
+    assert result["restored_checkpoint"] == cp_id
 
     # The task is no longer flagged incomplete.
     assert journal.find_incomplete_tasks(tmp_path) == []
     recs = journal.read_journal(k.path)
     assert recs[-1].kind == "task_end"
     assert recs[-1].data["status"] == "rolled_back"
+
+
+def test_rollback_incomplete_task_refuses_on_restore_failure(tmp_path):
+    k = journal.TaskJournal(tmp_path, "pending", session_id="s2")
+    k.append("task_start", task="work")
+    k.append("checkpoint", checkpoint_id="does-not-exist", phase="pre")
+
+    result = journal.rollback_incomplete_task(tmp_path, k.wal_id)
+    assert result["ok"] is False
+    assert result["task_id"] == k.wal_id
+    assert result["restored_checkpoint"] == ""
+    assert "cannot be verified" in result["detail"]
+
+    # A failed restore must NOT mark the task terminal.
+    assert journal.find_incomplete_tasks(tmp_path)
+    recs = journal.read_journal(k.path)
+    assert recs[-1].kind == "checkpoint"      # no task_end appended
 
 
 def test_crash_recovery_and_stale_lock_takeover(tmp_path):
@@ -150,7 +170,9 @@ def test_crash_recovery_and_stale_lock_takeover(tmp_path):
             p.kill()
             p.wait(timeout=15)
 
-    path = proj / ".pedacito" / "journal" / "crashy.jsonl"
+    journal_files = list((proj / ".pedacito" / "journal").glob("*.jsonl"))
+    assert len(journal_files) == 1
+    path = journal_files[0]
     recs = journal.read_journal(path)
     assert recs and recs[0].kind == "task_start"
     assert recs[-1].kind == "checkpoint"          # no task_end: it was killed
@@ -163,6 +185,10 @@ def test_crash_recovery_and_stale_lock_takeover(tmp_path):
     assert lock is not None
     workspace.release_lock(proj)
 
-    result = journal.rollback_incomplete_task(proj, "crashy")
-    assert result["ok"] is True
-    assert journal.find_incomplete_tasks(proj) == []
+    # The recorded checkpoint has no pre-run boundary (and the id does not
+    # exist), so rollback refuses and does NOT mark the task terminal.
+    crashy = next(i for i in incomplete if i["task_id"] == "crashy")
+    result = journal.rollback_incomplete_task(proj, crashy["wal_id"])
+    assert result["ok"] is False
+    assert "pre-run" in result["detail"]
+    assert any(i["task_id"] == "crashy" for i in journal.find_incomplete_tasks(proj))

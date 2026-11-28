@@ -47,10 +47,40 @@ from .llm import CancelledError, CircuitOpenError, LLMError
 
 
 # ---------------------------------------------------------------- task journal
+def _journal_root(journal) -> Path | None:
+    """The project root a journal lives under (``<root>/.pedacito/journal/``),
+    or None when it cannot be derived."""
+    try:
+        p = Path(journal.path)
+        if not p.is_absolute():
+            return None
+        # <root>/.pedacito/journal/<stem>.jsonl  ->  up three levels
+        parent = p
+        for _ in range(3):
+            parent = parent.parent
+        return parent
+    except Exception:
+        return None
+
+
+def _journal_surface_error(root, message: str) -> None:
+    """Surface a journal disk error to the run log and stderr; never raise."""
+    try:
+        if root is not None:
+            workspace.log_event(Path(root), message, "ERROR")
+    except Exception:
+        pass
+    try:
+        print(f"  [task journal] {message}", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _journal_open(root, cfg, task: str):
     """Best-effort `TaskJournal` for this task, stored on ``cfg._task_journal``
     (and on the bound session, so subprocess helpers can append too). Returns
-    the journal or None when the root is absent / read-only."""
+    the journal or None when the root is absent / read-only. A lost durability
+    guarantee is surfaced, never swallowed."""
     try:
         from . import journal as journal_mod
         sid = ""
@@ -63,6 +93,8 @@ def _journal_open(root, cfg, task: str):
             pass
         journal = journal_mod.TaskJournal(root, task, session_id=sid)
         journal.append("task_start", task=(task or "")[:400])
+        if getattr(journal, "durable", True) is False:
+            _journal_surface_error(root, journal.error)
         try:
             from . import session_ctx
             sess = session_ctx.current_session()
@@ -71,29 +103,44 @@ def _journal_open(root, cfg, task: str):
         except Exception:
             pass
         return journal
-    except Exception:
+    except Exception as exc:
+        _journal_surface_error(root, f"could not open task journal: {exc}")
         return None
 
 
 def _journal_append(cfg, kind: str, **data) -> None:
-    """Append one journal record, silently swallowing any failure."""
+    """Append one journal record, surfacing (not swallowing) durability loss."""
     journal = getattr(cfg, "_task_journal", None)
     if journal is None:
         return
     try:
         journal.append(kind, **data)
-    except Exception:
-        pass
+    except Exception as exc:
+        _journal_surface_error(_journal_root(journal),
+                               f"journal append failed: {exc}")
+        return
+    if getattr(journal, "durable", True) is False:
+        _journal_surface_error(
+            _journal_root(journal),
+            f"task journal lost its durability guarantee: {journal.error}")
 
 
-def _journal_close(cfg) -> None:
-    """Close (append task_end) and detach the task journal, best effort."""
+def _journal_close(cfg, status: str = "completed") -> None:
+    """Close (append task_end with `status`) and detach the task journal, best
+    effort. A non-durable journal is surfaced, never silently claimed as a
+    durable terminal outcome."""
     journal = getattr(cfg, "_task_journal", None)
     if journal is not None:
         try:
-            journal.close(status="completed")
-        except Exception:
-            pass
+            journal.close(status=status)
+            if getattr(journal, "durable", True) is False:
+                _journal_surface_error(
+                    _journal_root(journal),
+                    f"task journal is not durable; terminal outcome "
+                    f"'{status}' is unrecoverable: {journal.error}")
+        except Exception as exc:
+            _journal_surface_error(_journal_root(journal),
+                                   f"could not close task journal: {exc}")
     try:
         cfg._task_journal = None
     except Exception:
@@ -436,17 +483,22 @@ def _checkpoint_task(root: Path, cfg, task: str, phase: str) -> dict | None:
     Checkpointing is best-effort: a full disk or a racing process must never
     turn a working task into a failed one.  Dry runs leave the tree untouched;
     a review task records its pre-sign-off baseline here and its accepted
-    write in `_review`.
+    write in `_review`. The checkpoint is bound to the task's WAL UUID so
+    recovery can verify the exact association before restoring.
     """
     try:
         mode = checkpoint_mode(cfg)
         title = _task_title(task).strip()[:200] or "task"
+        wal_id = ""
+        journal = getattr(cfg, "_task_journal", None)
+        if journal is not None:
+            wal_id = str(getattr(journal, "wal_id", "") or "")
         if phase == "pre":
             entry = checkpoints_mod.ensure_pre_run_checkpoint(
-                root, f"baseline before {title}", mode=mode)
+                root, f"baseline before {title}", mode=mode, wal_id=wal_id)
         else:
             entry = checkpoints_mod.create_checkpoint(
-                root, title, mode=mode)
+                root, title, mode=mode, wal_id=wal_id)
         if isinstance(entry, dict) and entry.get("id"):
             _journal_append(cfg, "checkpoint", checkpoint_id=str(entry["id"]),
                             phase=phase, mode=mode)
@@ -4732,8 +4784,17 @@ def run_task(root: Path, cfg, client, agent, idx, task: str, *,
     finally:
         # Record the terminal journal entry before the deadline is cleared, so
         # a task that ends (or crashes into this finally) is never left as an
-        # incomplete task for crash recovery.
-        _journal_close(cfg)
+        # incomplete task for crash recovery. The outcome reflects HOW the task
+        # ended: a propagating cancellation is "cancelled", any other exception
+        # "failed", and a clean return "completed".
+        exc_type = sys.exc_info()[0]
+        if exc_type is None:
+            status = "completed"
+        elif issubclass(exc_type, CancelledError):
+            status = "cancelled"
+        else:
+            status = "failed"
+        _journal_close(cfg, status=status)
         # The task's wall-clock budget is over: clear the deadline so the next
         # task's (or a post-task summary refresh's) requests are not clamped
         # by a stale deadline.

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1053,6 +1054,23 @@ def release_lock(root) -> None:
     if not owners:
         del held[key]
     _DEFAULT_LOCK_MANAGER.release(root, owner)
+
+
+@contextmanager
+def recovery_lock(root: Path | str):
+    """A cross-process project write claim for a destructive maintenance or
+    recovery action (SS3.7).
+
+    The project run lock is a *cross-process* claim (``run.lock``), not a
+    thread-only lock, so a recovery or GC running in another process is blocked
+    for the whole operation. Raises :class:`ProjectBusy` when another live run
+    holds the project; the caller maps that to a refusal, never a takeover.
+    """
+    acquire_lock(root, mode="exclusive")
+    try:
+        yield
+    finally:
+        release_lock(root)
 
 
 # --------------------------------------------------------- atomic state files

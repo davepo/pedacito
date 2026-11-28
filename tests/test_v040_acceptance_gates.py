@@ -625,9 +625,12 @@ class TestGate07CrashRecovery:
 
         incomplete = find_incomplete_tasks(root)
         assert [t["task_id"] for t in incomplete] == ["task-crash"]
-        outcome = rollback_incomplete_task(root, "task-crash")
+        outcome = rollback_incomplete_task(root, incomplete[0]["wal_id"])
         assert outcome
-        assert find_incomplete_tasks(root) == []
+        # No checkpoint was recorded before the crash, so rollback refuses
+        # (nothing to restore) and does NOT mark the task terminal.
+        assert outcome["ok"] is False
+        assert [t["task_id"] for t in find_incomplete_tasks(root)] == ["task-crash"]
 
         lock = workspace.acquire_lock(root, session_id="ses_recovered")
         assert lock.exists()
