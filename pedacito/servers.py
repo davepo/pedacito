@@ -831,6 +831,23 @@ def _known_model(server: dict, model: str) -> str:
     return ""
 
 
+def _clamp_timeout_to_deadline(timeout: float) -> float:
+    """Clamp a control-plane timeout to the active run's remaining deadline, so
+    a model load/unload never runs past a run deadline (session_ctx.RunBudget).
+    Returns the original timeout when no deadline is bound or it has passed."""
+    try:
+        from . import session_ctx
+        rb = session_ctx.current_run_budget()
+        if rb is not None and rb.deadline_monotonic is not None:
+            remaining = float(rb.deadline_monotonic) - time.monotonic()
+            if remaining <= 0:
+                return 0.05
+            return min(float(timeout), remaining)
+    except Exception:
+        pass
+    return timeout
+
+
 def _lemonade_action(server: dict, action: str,
                      model: str) -> tuple[bool, str, str]:
     root = _root(str(server.get("base_url") or ""))
@@ -845,6 +862,7 @@ def _lemonade_action(server: dict, action: str,
         payload = {"model_name": model} if model else {}
         urls = (root + f"/v1/{action}", root + f"/api/v1/{action}")
         timeout = LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT
+    timeout = _clamp_timeout_to_deadline(timeout)
     for url in urls:
         ok, detail, resp = _post_json(url, headers, payload, timeout=timeout)
         if ok:
@@ -864,7 +882,8 @@ def _llama_action(server: dict, action: str,
     for url in (root + f"/models/{action}", root + f"/v1/models/{action}"):
         ok, detail, resp = _post_json(
             url, headers, payload,
-            timeout=LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT)
+            timeout=_clamp_timeout_to_deadline(
+                LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT))
         if ok:
             return True, f"POST {url}", detail
         if not _retry_next_spelling(resp, detail):
@@ -915,7 +934,8 @@ def _generic_action(server: dict, action: str,
         url = root + path
         ok, answer, resp = _post_json(
             url, headers, payload,
-            timeout=LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT)
+            timeout=_clamp_timeout_to_deadline(
+                LOAD_TIMEOUT if action == "load" else ACTION_TIMEOUT))
         if ok:
             return True, f"POST {url}", answer
         code = int(getattr(resp, "status_code", 0) or 0)

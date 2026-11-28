@@ -37,7 +37,10 @@ import re
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -1728,14 +1731,142 @@ def _close(response) -> None:
 
 
 def _retry_after(response) -> float | None:
-    """Seconds from a `Retry-After` header (delta-seconds form), clamped."""
+    """Seconds from a `Retry-After` header, clamped.
+
+    Parses both the delta-seconds form (``"3"``) and the HTTP-date form
+    (``"Wed, 21 Oct 2015 07:28:00 GMT"``); an unparseable or absent value
+    returns None."""
     try:
         raw = (getattr(response, "headers", None) or {}).get("Retry-After")
-        if raw is None:
-            return None
-        return max(0.0, min(float(raw), 120.0))
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, AttributeError):
+        raw = None
+    if raw is None:
         return None
+    parsed = parse_retry_after(raw)
+    if parsed is None:
+        return None
+    return min(parsed, 120.0)
+
+
+def parse_retry_after(value, *, now_utc: datetime | None = None) -> float | None:
+    """Parse a ``Retry-After`` value into a non-negative delay in seconds.
+
+    Accepts the delta-seconds form (an integer/float string) and the HTTP-date
+    form (RFC 1123, as produced by ``email.utils``). Returns None for a blank
+    or unparseable value; an HTTP-date in the past yields 0.0.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # Delta-seconds form first: a bare numeric string.
+    try:
+        return max(0.0, min(float(text), 86400.0))
+    except ValueError:
+        pass
+    # HTTP-date form.
+    try:
+        date = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if date is None:
+        return None
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return max(0.0, min((date - now).total_seconds(), 86400.0))
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded exponential backoff with ``Retry-After`` (delta or HTTP-date).
+
+    Frozen, so a policy is a small, shareable, hashable value object. A
+    ``Retry-After`` value from the server is honoured as a floor; otherwise the
+    delay is ``base_s * 2**(attempt-1)`` (plus rng jitter) capped at ``cap_s``.
+    ``sleep`` applies the delay cancellably, clamped to a remaining deadline.
+    """
+
+    max_attempts: int = 5
+    base_s: float = 2.0
+    cap_s: float = 120.0
+
+    def retry_delay(self, attempt: int, retry_after: str | None, *,
+                    now_utc: datetime | None = None, rng=None) -> float:
+        """Delay in seconds before the next attempt (1-based `attempt`).
+
+        ``retry_after`` is the raw ``Retry-After`` header (delta-seconds or
+        HTTP-date); when present and parseable it is the whole delay (clamped
+        to ``cap_s``). Otherwise an exponential backoff with bounded jitter is
+        returned. ``rng`` must expose ``uniform(a, b)`` (``random.Random`` or a
+        deterministic fake); a missing rng skips jitter for full determinism.
+        """
+        cap = max(0.0, float(self.cap_s or 0.0))
+        if retry_after:
+            server = parse_retry_after(retry_after, now_utc=now_utc)
+            if server is not None:
+                return min(max(0.0, float(server)), cap) if cap else \
+                    max(0.0, float(server))
+        backoff = float(self.base_s or 0.0) * (2 ** max(0, int(attempt) - 1))
+        delay = min(backoff, cap) if cap else backoff
+        if rng is not None:
+            try:
+                jitter = float(rng.uniform(0.0, 0.25 * max(delay, 1.0)))
+            except Exception:
+                jitter = 0.0
+            delay = min(delay + jitter, cap) if cap else delay + jitter
+        return max(0.0, delay)
+
+    def sleep(self, delay: float, *, cancel_event=None,
+              deadline_monotonic: float | None = None) -> float:
+        """Sleep ``delay`` seconds cancellably, clamped to a remaining deadline.
+
+        Sleeps in small slices; aborts early when ``cancel_event`` is set or the
+        ``deadline_monotonic`` (a ``time.monotonic()`` timestamp) arrives.
+        Returns the seconds actually slept (>= 0), so the caller can re-check
+        cancellation/deadline and decide whether to retry. Never raises.
+        """
+        remaining = max(0.0, float(delay or 0.0))
+        if deadline_monotonic is not None:
+            remaining = min(remaining,
+                            max(0.0, float(deadline_monotonic) - time.monotonic()))
+        slept = 0.0
+        while remaining > 0:
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                break
+            chunk = min(0.25, remaining)
+            time.sleep(chunk)
+            slept += chunk
+            remaining -= chunk
+            if deadline_monotonic is not None \
+                    and time.monotonic() >= float(deadline_monotonic):
+                break
+        return slept
+
+
+def dedupe_stream_chunks(chunks, seen_ids=None):
+    """Drop already-seen stream chunks by opaque resume cursor/event id.
+
+    ``chunks`` is an iterable of ``(id, text)`` tuples; ``id`` is the opaque
+    resume cursor/event ID the adapter exposes (``""`` for a chunk that carries
+    none -- such chunks are always kept, since they cannot be deduplicated).
+    Returns ``(new_chunks, seen_ids)`` where ``seen_ids`` is the updated set, so
+    a resumed stream replays no already-delivered chunk and each distinct chunk
+    is accounted once. Purely functional and transport-agnostic.
+    """
+    seen = set(seen_ids or ())
+    new: list[tuple[str, str]] = []
+    for cid, text in chunks or ():
+        key = str(cid or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        new.append((key, text))
+    return new, seen
 
 
 class LLMClient:
@@ -1814,6 +1945,10 @@ class LLMClient:
         # Label for the current call site (gather / answer / repair / ...);
         # set with `client.site = "answer"` and read by usage accounting.
         self.site = ""
+        # Reservation token held against a strict RunBudget for the in-flight
+        # call; set by `_reserve_call` before the request and settled in
+        # `_account` (or released-as-unknown on the next attempt).
+        self._active_reservation: str | None = None
         # Text streamed before a cancel or a mid-stream disconnect.
         self.partial_text = ""
         # Temporary sampling temperature (best-of-N candidates); None = config.
@@ -2066,6 +2201,36 @@ class LLMClient:
             self._prov = prov
         return prov
 
+    def _capabilities(self):
+        """Known ``ProviderCapabilities`` for this endpoint (cached)."""
+        caps = getattr(self, "_caps", None)
+        if caps is None:
+            from .providers import get_capabilities
+            caps = get_capabilities(
+                self.cfg.base_url, self.cfg.model, cfg=self.cfg)
+            self._caps = caps
+        return caps
+
+    def idempotency_key(self) -> str | None:
+        """An idempotency key, or None when the provider lacks documented
+        idempotency support (``ProviderCapabilities.idempotency is not True``).
+
+        A fresh key is generated per logical request; callers that retry the
+        SAME logical request must reuse the same returned key, and must never
+        reuse it for a different request."""
+        caps = self._capabilities()
+        if caps is not None and caps.idempotency is True:
+            return f"pdc-{uuid.uuid4().hex}"
+        return None
+
+    def stream_resume_supported(self) -> bool:
+        """True only when the adapter documents opaque resume-cursor support
+        (``ProviderCapabilities.stream_resume is True``). False otherwise, in
+        which case a partial stream is exposed as interrupted and never
+        auto-replayed."""
+        caps = self._capabilities()
+        return bool(caps is not None and caps.stream_resume is True)
+
     def _reset_session(self) -> None:
         with self._session_lock:
             old = self._session
@@ -2172,11 +2337,18 @@ class LLMClient:
         return bool(getattr(self.cfg, "circuit_breaker", True))
 
     def _sleep_cancelable(self, seconds: float, cancel_event=None) -> None:
-        """Sleep up to `seconds` in 0.25s slices, aborting promptly if cancelled."""
+        """Sleep up to `seconds` in 0.25s slices, aborting promptly if cancelled
+        and clamped to the active run deadline (never oversleep past it)."""
         if self._cancel_requested(cancel_event):
             raise RunCancelledError("Stopped by user during retry wait.")
         if seconds <= 0:
             return
+        deadline = self._run_deadline()
+        if deadline is not None:
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                return            # the next call/check will refuse
+            seconds = min(float(seconds), remaining)
         if time.sleep is not _REAL_SLEEP:
             time.sleep(seconds)
             if self._cancel_requested(cancel_event):
@@ -2325,14 +2497,35 @@ class LLMClient:
             self._notify_redaction(count, findings, "warn")
         return payload
 
+    def _run_budget(self):
+        """The active run's ``RunBudget``, or None when none is bound."""
+        try:
+            from . import session_ctx
+            return session_ctx.current_run_budget(self.cfg)
+        except Exception:
+            return None
+
+    def _run_deadline(self) -> float | None:
+        """The active run's monotonic deadline, or None when uncapped."""
+        budget = self._run_budget()
+        if budget is None:
+            return None
+        return budget.deadline_monotonic
+
     def _effective_timeout(self) -> float:
-        """The per-request timeout, clamped to the task's remaining wall-clock
-        budget (floor 5s) when ``max_task_seconds`` is set and a task is
-        active. A single slow request must not run far past ``--max-minutes``."""
+        """The per-request timeout, clamped to the task's and the run's
+        remaining wall-clock budget (floor 5s). A single slow request must not
+        run far past ``--max-minutes`` or a run deadline."""
         timeout = float(self.cfg.timeout)
-        deadline = float(getattr(self.cfg, "_task_deadline", 0.0) or 0.0)
-        if deadline:
-            remaining = deadline - time.monotonic()
+        deadlines: list[float] = []
+        task = float(getattr(self.cfg, "_task_deadline", 0.0) or 0.0)
+        if task:
+            deadlines.append(task)
+        run = self._run_deadline()
+        if run is not None:
+            deadlines.append(run)
+        if deadlines:
+            remaining = min(deadlines) - time.monotonic()
             if remaining <= 0:
                 return 5.0
             return min(timeout, max(5.0, remaining))
@@ -2784,6 +2977,55 @@ class LLMClient:
                 f"Cost budget spent: ${cost:.4f} of max_cost="
                 f"${cap_cost:.2f}. Raise it (or pass --max-cost) to continue.")
 
+    def _reserve_call(self, messages: list[dict], max_tokens: int) -> str | None:
+        """Reserve this call against a strict :class:`RunBudget` (if active).
+
+        Returns an opaque reservation token, or None when no strict run budget
+        is bound (legacy, uncapped behavior). A reservation left over from a
+        prior attempt that never reached ``_account`` (an error before usage
+        was known) is settled as unknown first, which poisons a strict budget
+        and surfaces as ``BudgetExceeded`` -- never an estimate.
+        """
+        budget = self._run_budget()
+        if budget is None or not budget.strict:
+            self._active_reservation = None
+            return None
+        from .session_ctx import RunBudgetError
+        if self._active_reservation is not None:
+            leftover = self._active_reservation
+            self._active_reservation = None
+            try:
+                budget.settle_call(leftover, None)
+            except RunBudgetError as e:
+                raise BudgetExceeded(str(e)) from e
+        prices = {
+            "input": float(getattr(self.cfg, "price_input_per_mtok", 0) or 0),
+            "output": float(getattr(self.cfg, "price_output_per_mtok", 0) or 0),
+            "cached": float(getattr(self.cfg, "price_cached_per_mtok", 0) or 0),
+            "cache_write": float(
+                getattr(self.cfg, "price_cache_write_per_mtok", 0) or 0),
+        }
+        prompt_est = estimate_messages(messages, self.estimate_tokens)
+        try:
+            token = budget.reserve_call(prompt_est, int(max_tokens or 0), prices)
+        except RunBudgetError as e:
+            raise BudgetExceeded(str(e)) from e
+        self._active_reservation = token
+        return token
+
+    def _settle_call(self, actual_usd: float | None) -> None:
+        """Settle the active reservation with ``actual_usd`` (or unknown)."""
+        budget = self._run_budget()
+        token = self._active_reservation
+        self._active_reservation = None
+        if budget is None or token is None:
+            return
+        from .session_ctx import RunBudgetError
+        try:
+            budget.settle_call(token, actual_usd)
+        except RunBudgetError as e:
+            raise BudgetExceeded(str(e)) from e
+
     def _account(self, usage: dict, timings: dict | None, seconds: float,
                  prompt_est: int, out_text: str = "") -> dict:
         """Fold one response's usage into the stats; returns the call record
@@ -2878,6 +3120,24 @@ class LLMClient:
                 cb(record)
             except Exception:
                 pass          # telemetry must never break a call
+        # Strict cost reservation: settle the reserved maximum with the actual
+        # cost when the server reported real usage; a response without usage
+        # settles as unknown and (strict) refuses rather than estimating.
+        if self._active_reservation is not None:
+            budget = self._run_budget()
+            if budget is not None and budget.strict:
+                reported = bool(usage) and bool(
+                    int(usage.get("prompt_tokens") or 0)
+                    or int(usage.get("completion_tokens") or 0))
+                self._settle_call(cost if reported else None)
+                try:
+                    from . import events as events_mod
+                    events_mod.note_budget(
+                        self._outbound_root(), self.cfg, budget.snapshot())
+                except Exception:
+                    pass
+            else:
+                self._active_reservation = None
         return record
 
     def _chat_once(self, messages: list[dict], max_tokens: int,
@@ -2896,6 +3156,7 @@ class LLMClient:
         and the request is re-sent one tier down immediately, so no call ever
         fails over server schema support differences."""
         self._check_budget()
+        self._reserve_call(messages, max_tokens)
         external_cancel = (cancel_event if cancel_event is not None
                            else getattr(self, "cancel_event", None))
         # `_cancel` belongs to the PREVIOUS stream (client.cancel() may be
@@ -3699,7 +3960,8 @@ class LLMClient:
             tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
             cache_enabled=cache_enabled, cache_ttl=cache_ttl)
         headers = transport_anthropic.build_headers(_api_key(self.cfg),
-                                                    ttl=cache_ttl)
+                                                    ttl=cache_ttl,
+                                                    idempotency_key=self.idempotency_key())
 
         start_cb = self.on_start
         if start_cb is not None:
@@ -4442,7 +4704,8 @@ class LLMClient:
             self.cfg, msgs, max_tokens, stream=stream, disable_thinking=want_off,
             tools=openai_tools, tool_choice=openai_tool_choice, temperature=temp,
             prompt_cache_key=pkey, json_schema=resp_schema)
-        headers = transport_openai.build_headers(_api_key(self.cfg))
+        headers = transport_openai.build_headers(
+            _api_key(self.cfg), idempotency_key=self.idempotency_key())
         url = transport_openai.responses_endpoint(self.cfg.base_url)
 
         if _count_call:

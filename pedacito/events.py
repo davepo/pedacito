@@ -493,6 +493,20 @@ def note_call(rec: dict) -> None:
             pass
 
 
+def note_budget(root, cfg, rec: dict) -> None:
+    """Emit one redacted ``run_budget`` event through the project event log.
+
+    ``rec`` carries bounded metadata only -- deadline/remaining, max/reserved/
+    spent USD, strict and ok -- never raw prompts, source, tool output or
+    credentials. New fields are additive to the existing (session_id, seq)
+    event envelope. Never raises.
+    """
+    try:
+        get(root, cfg).emit("run_budget", **rec)
+    except Exception:
+        pass
+
+
 def run_line(summary: dict) -> str:
     """The one-line aggregate of a finished run (`new`, `auto`, a task).
     Shared verbatim by the CLI stderr and the TUI transcript so both tell

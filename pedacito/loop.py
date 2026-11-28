@@ -5559,6 +5559,36 @@ _NOOP_EVIDENCE_RETRY_NOTE = (
     "line, citing what you read.")
 
 
+def ensure_run_budget(cfg, max_minutes: int = 0, *, now: float | None = None):
+    """Establish the run's :class:`RunBudget` before any model work, if none is
+    already bound.
+
+    The monotonic deadline derives from ``max_minutes`` (the run's own
+    wall-clock budget) and starts before any model load/lease, so leases,
+    backoff, streaming, gates, tests, teardown and child launches are all
+    clamped to the same deadline. ``now`` is the monotonic anchor for the
+    deadline (defaults to ``time.monotonic()``); callers that already captured
+    the run start pass it so the anchor is not re-read. A strict cost cap
+    (``strict_cost_budget``) turns ``max_cost`` into a reservation-based cap;
+    without it the run is uncapped and retains legacy estimate-only behavior.
+    """
+    from . import session_ctx
+    existing = session_ctx.current_run_budget(cfg)
+    if existing is not None:
+        return existing
+    minutes = int(max_minutes or 0)
+    anchor = time.monotonic() if now is None else float(now)
+    deadline = (anchor + minutes * 60.0) if minutes > 0 else None
+    strict = bool(getattr(cfg, "strict_cost_budget", False))
+    max_cost = float(getattr(cfg, "max_cost", 0) or 0)
+    if not strict:
+        max_cost = 0.0
+    budget = session_ctx.RunBudget(
+        deadline_monotonic=deadline, max_cost_usd=max_cost)
+    session_ctx.set_run_budget(budget, cfg)
+    return budget
+
+
 def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
              apply: bool = True, verify: str = "", repair_rounds: int = 2,
              max_tasks: int = 0, max_minutes: int = 0,
@@ -5662,6 +5692,10 @@ def run_loop(root: Path, cfg, client, idx, plan_path: Path, *,
     partial_tasks: list[tuple[str, int, int]] = []
     red_tasks: list[str] = []   # BUG-808: ticked done while the gate was red
     started_at = time.monotonic()
+    # Establish the run's deadline + strict cost budget from the same anchor
+    # the loop already uses, before any model load or lease, so gates, tests,
+    # backoff and child launches are all clamped to it.
+    ensure_run_budget(cfg, max_minutes, now=started_at)
     # Reports/edit summaries carried into later task prompts so a fresh
     # context still benefits from earlier findings.
     context_notes: list[str] = []

@@ -897,6 +897,11 @@ class Config:
     # Cache-write tokens (explicit prompt caching) are billed separately from
     # cache reads on Anthropic/DashScope-style providers.
     price_cache_write_per_mtok: float = 0.0
+    # Strict (reservation-based) cost cap: when True, `max_cost` is enforced by
+    # reserving a conservative maximum from KNOWN pricing/output bound before
+    # every billable call and refusing unknown pricing, unknown usage, or
+    # unbounded output. Default False keeps the legacy estimate-only `max_cost`.
+    strict_cost_budget: bool = False
     # Quietly refresh the local models.dev provider catalog cache
     # (`model_catalog.json`, 24 h TTL) when probing or refreshing hosted
     # providers so context windows and pricing stay current. Never blocks
@@ -3418,6 +3423,10 @@ _EXTRA_FIELD_HELP = {
                              "reporting and max_cost.",
     "price_cached_per_mtok": "USD per million cache-read tokens, used for "
                              "cost reporting.",
+    "strict_cost_budget": "Enforce max_cost strictly: reserve a conservative "
+                          "maximum from known pricing/output bound before each "
+                          "billable call and refuse unknown pricing, unknown "
+                          "usage, or unbounded output (default off, estimate-only).",
     "max_whole_file_lines": "Refuse a whole-file rewrite larger than this many "
                             "lines in a small context.",
     "max_brief_tokens": "Token cap for the deterministic repository brief.",

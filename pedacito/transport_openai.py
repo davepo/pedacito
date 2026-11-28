@@ -73,11 +73,18 @@ def models_endpoint(base_url: str) -> str:
     return (base_url or "").rstrip("/") + "/models"
 
 
-def build_headers(api_key: str) -> dict[str, str]:
-    """OpenAI Responses request headers."""
+def build_headers(api_key: str, idempotency_key: str | None = None) -> dict[str, str]:
+    """OpenAI Responses request headers.
+
+    ``idempotency_key`` is attached ONLY when the caller already confirmed the
+    provider documents idempotency support (``ProviderCapabilities.idempotency``
+    is True); an empty/None key means the header is omitted, never guessed.
+    """
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if idempotency_key:
+        headers["Idempotency-Key"] = str(idempotency_key)
     return headers
 
 

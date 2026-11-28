@@ -140,6 +140,11 @@ def _add_common(p, paths_nargs="+", dest="paths"):
     p.add_argument("--max-cost", type=float, default=None, metavar="USD",
                    help="stop before the next call once the estimated spend "
                         "reaches this (needs price_*_per_mtok in config)")
+    p.add_argument("--strict-cost", dest="strict_cost", action="store_true",
+                   help="enforce --max-cost strictly: reserve a conservative "
+                        "maximum from known pricing/output bound before each "
+                        "billable call and refuse unknown pricing, unknown "
+                        "usage, or unbounded output")
     p.add_argument("--image", action="append", default=[], metavar="FILE",
                    help=i18n.t("cli.opt.image"))
     p.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
@@ -351,6 +356,9 @@ def _config(args) -> Config:
         blind = cost_blind_warning(cfg)
         if blind:
             print(f"[config warning] {blind}", file=sys.stderr)
+    if getattr(args, "strict_cost", False):
+        cfg.strict_cost_budget = True
+        cfg.sources["strict_cost_budget"] = "--strict-cost"
     # Fit token budgets to the server's real context window before any request;
     # `config` skips this so it reports the true sources. `tui` starts before
     # any model connection and fits lazily when its first task runs.

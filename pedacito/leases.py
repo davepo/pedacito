@@ -212,6 +212,25 @@ class ModelLeaseManager:
         """
         from . import servers as servers_mod
 
+        # Clamp the acquire timeout to the active run's remaining deadline so a
+        # model lease wait never runs past a deadline (session_ctx.RunBudget).
+        try:
+            from . import session_ctx
+            rb = session_ctx.current_run_budget(cfg)
+            if rb is not None and rb.deadline_monotonic is not None:
+                remaining = float(rb.deadline_monotonic) - self._clock()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "run deadline passed before the model lease was acquired")
+                if timeout_s and timeout_s > 0:
+                    timeout_s = min(float(timeout_s), remaining)
+                else:
+                    timeout_s = remaining
+        except TimeoutError:
+            raise
+        except Exception:
+            pass        # best-effort clamp; acquire still honours timeout_s
+
         url = servers_mod.normalize_url(base_url)
         key = ModelKey(url, model_id)
         if not servers_mod.is_local_url(base_url):

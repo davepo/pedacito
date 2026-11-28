@@ -132,7 +132,14 @@ def endpoint(base_url: str, model: str, *, stream: bool = False) -> str:
 
 
 def build_headers(api_key: str) -> dict[str, str]:
-    """Native Gemini request headers."""
+    """Native Gemini request headers.
+
+    Gemini's documented ``generateContent`` API has no idempotency-key header
+    and no opaque stream-resume cursor, so this transport never attaches either
+    (the capability gate in ``LLMClient`` stays ``None``); a resumed stream is
+    therefore never claimed, and an interrupted stream is exposed as partial
+    text, not auto-replayed.
+    """
     return {
         "x-goog-api-key": api_key or "",
         "Content-Type": "application/json",
