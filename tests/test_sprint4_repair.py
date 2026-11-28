@@ -181,6 +181,22 @@ def test_traceback_packet_quotes_project_frames_and_drops_venv(tmp_path):
     assert "site-packages" not in packet and ".venv" not in packet
 
 
+def _rerun_reproduces(monkeypatch, tmp_path) -> list[str]:
+    """WP-4105D: a new failure enters repair only when its one node rerun shows
+    the same assertion. Writes the node's file and stubs only the rerun."""
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test_c.py").write_text(
+        "def test_new():\n    assert 5 == 6\n", encoding="utf-8")
+    reruns: list[str] = []
+
+    def fake_rerun(root, cfg, command):
+        reruns.append(command)
+        return False, "FAILED tests/test_c.py::test_new - assert 5 == 6\n1 failed in 0.10s"
+
+    monkeypatch.setattr(loop.testsel, "run_command", fake_rerun)
+    return reruns
+
+
 # ------------------------------------------ loop integration: flat count repairs
 def test_post_edit_tests_repairs_new_failure_even_when_total_is_flat(
         tmp_path, monkeypatch):
@@ -189,6 +205,8 @@ def test_post_edit_tests_repairs_new_failure_even_when_total_is_flat(
     cfg.allow_shell = True
     cfg.repair_rounds = 1
     cfg.log_events = False
+    cfg.test_command = "pytest -q"
+    reruns = _rerun_reproduces(monkeypatch, tmp_path)
 
     runs = [(False, CURRENT, "pytest"), (True, "2 passed", "pytest")]
     monkeypatch.setattr(loop, "_run_tests",
@@ -211,6 +229,7 @@ def test_post_edit_tests_repairs_new_failure_even_when_total_is_flat(
         None, (False, BASELINE, "pytest"), ["a.py"])
 
     assert tests_ok is True
+    assert reruns == ["pytest -q tests/test_c.py::test_new"]
     assert agent.errors, "a new failure must trigger repair at an equal count"
     packet = agent.errors[0].message
     assert "these tests fail (they did not before)" in packet
@@ -285,6 +304,8 @@ def test_post_edit_still_repairs_when_an_in_run_baseline_shows_a_new_failure(
     cfg.static_gate = False
     cfg.frontend_contracts = False
     cfg.interface_lock = False
+    cfg.test_command = "pytest -q"
+    _rerun_reproduces(monkeypatch, tmp_path)
 
     desc = f"`pytest -q` -- {testsel.PRE_EXISTING_LABEL}"
     runs = [(False, CURRENT, desc), (True, "2 passed", desc)]

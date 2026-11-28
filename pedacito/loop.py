@@ -39,6 +39,7 @@ from . import prompts as prompts_mod
 from . import ratchet as ratchet_mod
 from . import review as review_mod
 from . import security as security_mod
+from . import test_classify
 from . import testsel
 from . import todo as todo_mod
 from . import trajectories
@@ -2389,6 +2390,120 @@ def _run_tests(idx, cfg, files: list[str]):
     return ok, out, desc
 
 
+@dataclass(frozen=True)
+class _RedRun:
+    """Routing verdict for one red test run (WP-4105D). `real` is what repair
+    may see; `unverified` means the run stays red and is not repaired."""
+    real: tuple[FailureIdentity, ...]
+    unverified: bool
+    category: str
+    summary: str
+
+
+def _emit_test_category(root, cfg, round_: int, c, quarantined=False) -> None:
+    events_mod.emit_test_category(
+        events_mod.get(root, cfg), round_=round_, category=c.kind,
+        node_id=c.node_id, baseline=c.baseline, rerun=c.rerun,
+        reason=c.reason, quarantined=quarantined)
+
+
+def _classify_new_failures(root, cfg, idx, changed, out, base_out, diff,
+                           reruns: dict, skip: set) -> dict:
+    """{node id: TestClassification} for each new failure of a red run.
+
+    A failing node is rerun at most once per verify run (`reruns` remembers
+    every verdict across repair rounds) and at most `MAX_RERUN_NODES` nodes are
+    rerun. Nodes without a stable pytest id, a file inside the project, or
+    budget are classified `unknown` and are not rerun. `skip` holds quarantined
+    ids, which are reported but never rerun or repaired."""
+    base = testsel.impacted_base(root, cfg, changed)
+    verdicts: dict = {}
+    for fail in diff.new:
+        nid = fail.test_id
+        if nid in skip:
+            continue
+        if nid in reruns:
+            verdicts[nid] = reruns[nid]
+            continue
+        bstatus = test_classify.baseline_status(
+            base_out, failure_identities(base_out or ""), nid)
+        cmd = test_classify.rerun_command(base, nid)
+        if not cmd or not test_classify.node_file_inside(root, nid):
+            verdicts[nid] = test_classify.TestClassification(
+                "unknown", nid, bstatus, "not_run",
+                "no stable node id to rerun; the failure is unverified")
+            continue
+        if len(reruns) >= test_classify.MAX_RERUN_NODES:
+            verdicts[nid] = test_classify.TestClassification(
+                "unknown", nid, bstatus, "not_run",
+                "rerun budget for this verify run is spent")
+            continue
+        passed, rerun_out = testsel.run_command(root, cfg, cmd)
+        verdict = test_classify.classify_test_failure(
+            out, test_classify.NodeRerun(nid, bool(passed), rerun_out or ""),
+            base_out)
+        reruns[nid] = verdict
+        verdicts[nid] = verdict
+    return verdicts
+
+
+def _triage_red_run(root, cfg, idx, changed, out, base_out, desc, diff,
+                    current, reruns: dict, quarantine: dict,
+                    round_: int) -> _RedRun:
+    """Decide which failures of a red run may enter model repair (WP-4105D).
+
+    Infrastructure stops (timeout, collection error, missing dependency,
+    infrastructure) consume no rerun. A recorded-history pre-existing failure and
+    an all-pre-existing red suite keep their legacy handling. Otherwise each new
+    failure is classified and only `real_failure` is repairable."""
+    infra = test_classify.classify_output_kind(
+        out, has_node_failures=test_classify.has_test_node(current))
+    if infra:
+        note = test_classify.TestClassification(
+            infra, "", "absent" if not base_out else "not_failing", "not_run",
+            f"{infra}: the run stopped before a test verdict; not repaired")
+        _emit_test_category(root, cfg, round_, note)
+        return _RedRun((), True, infra, note.reason)
+    if not diff.new:
+        if not current:
+            return _RedRun((), True, "unknown",
+                           "no failing test could be identified")
+        return _RedRun((), False, "", "")
+    if not base_out and testsel.PRE_EXISTING_LABEL in desc:
+        return _RedRun((), False, "", "")
+
+    quarantined = {f.test_id for f in diff.new if f.test_id in quarantine}
+    verdicts = _classify_new_failures(root, cfg, idx, changed, out, base_out,
+                                      diff, reruns, quarantined)
+    real: list[FailureIdentity] = []
+    unverified: list[str] = []
+    category = ""
+    for fail in diff.new:
+        nid = fail.test_id
+        if nid in quarantined:
+            q = quarantine[nid]
+            events_mod.emit_test_category(
+                events_mod.get(root, cfg), round_=round_,
+                category="quarantined", node_id=nid, baseline="failed",
+                rerun="not_run", reason=f"{q.reason} (until {q.expires})",
+                quarantined=True)
+            unverified.append(f"quarantined: {nid}")
+            category = category or "quarantined"
+            continue
+        verdict = verdicts[nid]
+        _emit_test_category(root, cfg, round_, verdict)
+        if verdict.kind in test_classify.REPAIRABLE_KINDS:
+            real.append(fail)
+        else:
+            unverified.append(f"{verdict.kind}: {nid}")
+            category = category or verdict.kind
+    if real:
+        return _RedRun(tuple(real), False, "real_failure",
+                       f"{len(real)} attributable failure(s)")
+    return _RedRun((), True, category or "unknown",
+                   "; ".join(unverified)[:300])
+
+
 # A test command the TASK ITSELF names ("make node --test tests/x.test.js
 # pass", "npm test", "pytest ..."): its guarantee is part of the task, so a
 # run that never executed it must say so instead of ending silent (BUG-203).
@@ -3117,13 +3232,17 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             text = getattr(e, "message", None) or str(e)
             collect.append(verify_mod.Finding(kind, "error", "", str(text)))
 
-    def unresolved_tests(severity, diff, score, out) -> None:
+    def unresolved_tests(severity, diff, score, out, triage=None) -> None:
         """Record a red suite as a finding so task.findings / RPC blockers name
         it even without --strict (BUG-323). A purely pre-existing failure is a
-        warning (R2: it predates this task); a new failure is an error."""
+        warning (R2: it predates this task); a new failure is an error. A red
+        run that could not be attributed (WP-4105D) stays an error and says so."""
         if collect is None:
             return
-        if diff.new:
+        if triage is not None and triage.unverified:
+            msg = (f"the test run is red and NOT verified "
+                   f"({triage.category}): {triage.summary or 'no attributable failure'}")
+        elif diff.new:
             msg = (f"{len(diff.new)} new test failure(s) introduced by this "
                    f"task; {len(diff.still_failing)} still failing")
         elif score > 0:
@@ -3165,6 +3284,10 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
                 else "")
     base_failures = failure_identities(base_out)
     base_score = _failure_score(base_out) if base_out else 0
+    reruns: dict = {}              # node id -> verdict, one rerun per node (WP-4105D)
+    quarantine, q_warnings = test_classify.load_quarantine(root)
+    for warning in q_warnings:
+        workspace.log_event(root, f"flakes: {warning}", "WARN")
     max_rounds = max(0, int(getattr(cfg, "repair_rounds", 2) or 0))
     tests_ok = None
     preexisting_only = False       # the red suite is entirely pre-existing (R2)
@@ -3461,10 +3584,16 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             pre_existing=len(diff.pre_existing))
         if ok:
             break
-        # A new identity repairs even when the total count is flat or lower;
-        # a genuinely worse count (including output with no parseable ids)
-        # keeps the old score-based guard.
-        should_repair = bool(diff.new) or score > base_score
+        # Only a failing test that a rerun showed to be a real, attributable
+        # failure of this change reaches repair (WP-4105D). Flakes, infra and
+        # anything unattributable stop here as unverified: the run stays red.
+        triage = _triage_red_run(root, cfg, idx, changed, out, base_out, desc,
+                                 diff, current, reruns, quarantine, round_)
+        repair_diff = FailureDiff(
+            new=list(triage.real), fixed=list(diff.fixed),
+            still_failing=list(diff.still_failing),
+            pre_existing=list(diff.pre_existing))
+        should_repair = bool(triage.real)
         last_worse = should_repair
         # Baseline-aware verdict (R2): with no in-run baseline to diff
         # against, the cross-run command history is the only baseline there
@@ -3478,24 +3607,26 @@ def _post_edit_tests(root, cfg, agent, idx, task, results, reply, backup_dir,
             print("  [tests: failure pre-dates this run (recorded command "
                   "history); not auto-repaired]", file=sys.stderr)
         if not should_repair:
-            preexisting_only = not ok
-            if not ok and score > 0:
+            preexisting_only = not ok and not triage.unverified
+            if triage.unverified:
+                print(f"  [tests: not repaired -- {triage.category}: "
+                      f"{triage.summary or 'no attributable failure'}; the run "
+                      "stays red and unverified]", file=sys.stderr)
+            elif not ok and score > 0:
                 # Honest exit: the suite is still red, but every remaining
-                # failure predates this task (or no identity could be parsed
-                # and it was no worse than the baseline). Say so instead of
-                # ending on a silent FAILED line.
+                # failure predates this task. Say so instead of ending on a
+                # silent FAILED line.
                 print(f"  [tests: {score} failure(s) remain; the suite "
                       f"already had {base_score} before this task, so they "
                       "predate it and were not auto-repaired]", file=sys.stderr)
-            unresolved_tests("warn", diff, score, last_out)   # BUG-323
+            unresolved_tests("error" if triage.unverified else "warn",
+                             diff, score, last_out, triage)   # BUG-323
             break
         if round_ >= max_rounds:
             unresolved_tests("error", diff, score, last_out)  # BUG-323
             break
-        packet = traceback_repair_packet(root, diff, current=current)
-        intro = ("after your edits these tests fail (they did not before):\n"
-                 if diff.new else
-                 "after your edits the test suite is failing more severely:\n")
+        packet = traceback_repair_packet(root, repair_diff, current=current)
+        intro = "after your edits these tests fail (they did not before):\n"
         finding = verify_mod.Finding("tests", "error", "", intro + packet)
         fixed = agent._repair_from_findings(task, reply, [finding], results)
         if not fixed:

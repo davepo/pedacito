@@ -719,6 +719,12 @@ denied at once, with a `permission_decision` event) or `auto-safe` (`pytest`, `r
 `git status` and `git diff` are approved, everything else asks). Background and headless sessions are denied
 deterministically instead of waiting for a person.
 
+## Flaky-test reruns and quarantine (v0.4.1)
+
+A flaky-test rerun runs the same runner, argv, environment, permission check and sandbox as the original test run, once per failing node. It adds no network, write or shell permission. Project input that reaches it is only a pytest node id, which must be a relative `.py` path with `::` parts and no traversal, whitespace or shell syntax; the file must resolve inside the project.
+
+`.pedacito/flakes.json` is project-authored. It can only move a named failure out of repair routing, and only until its dated expiry. It is read through `resolve_safe_path`, and a symlink or junction out of the project is refused. A quarantined failure is still shown as a finding and keeps its run red. Nothing in the file grants permission or enables a tool. Reruns, quarantine and category reasons are redacted and bounded before they reach events.
+
 ## Known limits and gaps
 
 These are real boundaries. Read them before you rely on Pedacito for untrusted code.

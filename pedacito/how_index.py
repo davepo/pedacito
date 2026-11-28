@@ -1682,7 +1682,8 @@ CLI_COMMANDS = [
         "usage": "pedacito tests PROJECT [--files FILE...]",
         "summary": "Show the detected test command and which tests a change to "
                    "the given files can break.",
-        "keywords": ["test command", "impacted tests", "pytest"],
+        "keywords": ["test command", "impacted tests", "pytest", "flaky test",
+                     "flake", "quarantine", "flakes.json"],
         "examples": [
             "pedacito tests .",
             "pedacito tests . --files src/app.py",

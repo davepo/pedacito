@@ -574,6 +574,18 @@ It is plain JSON. Read it, edit it, or delete it to forget everything it has
 learned. `micro_facts = false` turns recording and injection off, and
 `max_micro_fact_tokens` caps how much of it reaches the prompt.
 
+### Red test runs: flakes, infrastructure and repair routing
+
+`pedacito/test_classify.py` decides which failures of a red post-edit test run may reach model repair. Only `real_failure` may. Failure identities and baseline diffs come from the same `loop.failure_identities` used by the repair packet.
+
+- A timeout, a collection error, a missing dependency or another infrastructure stop is classified before any rerun. It is never rerun and never repaired.
+- A new failing pytest node is rerun at most once per verify run, with the original runner and the same argv and sandbox, and at most three nodes are rerun. A passing rerun that shows pass evidence is a `flake`. The same assertion failing again is a `real_failure`. Anything else is `unknown`.
+- Runners without a stable node id (npm, `node --test`, cargo, go) are never given invented pytest syntax, so their new failures are `unknown` and stop as unverified.
+- Quarantined ids from `.pedacito/flakes.json` are reported and not rerun. A quarantined failure never makes a run green.
+- Every decision is a `test_category` event with a redacted, bounded reason. Unverified outcomes are recorded as an error finding that says the run is not verified. They are never recorded as passing.
+
+This does not claim that a rerun proves determinism. One passing rerun is evidence of a flake, not proof that the test is fine. Windows sandboxing does not change this path.
+
 ## What gets indexed
 
 Code files are parsed into functions, classes, and methods with exact line
