@@ -1249,6 +1249,7 @@ def test_new_switches_workspace_before_scaffolding_starts(
                                      "model": "fake-model", "vram_gb": "8"})
     target = gui.tmp / "midbuild"
     gate = threading.Event()
+    entered = threading.Event()
     seen = {}
 
     def fake_build(root, cfg, client, spec, **kw):
@@ -1258,6 +1259,7 @@ def test_new_switches_workspace_before_scaffolding_starts(
         seen["root"] = state["root"]
         seen["has_index"] = state["has_index"]
         seen["index_files"] = state["index_files"]
+        entered.set()
         assert gate.wait(15), "the test never released the build"
         (root / "main.py").write_text("def main():\n    return 0\n",
                                       encoding="utf-8")
@@ -1269,6 +1271,11 @@ def test_new_switches_workspace_before_scaffolding_starts(
     assert status == 202
     resolved = str(target.resolve())
     try:
+        # Polling root+job alone can succeed before open_project has installed
+        # the empty index. The contract starts at the fake scaffold's entry:
+        # wait for that exact point, then the build remains blocked while the
+        # page-facing state is checked.
+        assert entered.wait(15), "the scaffold never started"
         # mid-build: the page already lives in the new project
         def switched(s):
             return s if s["root"] == resolved and s["job"] else None
