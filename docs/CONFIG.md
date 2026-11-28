@@ -1079,6 +1079,7 @@ Every remaining public setting is listed below, grouped by subsystem, with its r
 | `auto_diagnostics` | `false` | After each `auto` task (when no --verify command is set), run the project's detected linter/type checker and feed failures into the repair rounds. |
 | `diagnostics_timeout` | `90` | Seconds allowed for one auto-diagnostics linter/typechecker run. |
 | `max_diagnostics_chars` | `8000` | Cap on diagnostics text fed back into repair. |
+| `autofix_enabled` | `false` | Opt-in §3.4 autofix ladder: before the model repair rounds, run the project's own deterministic formatters/linters (`ruff check --fix`, installed Biome or ESLint `--fix`, `gofmt`, `cargo fmt`, then `cargo clippy --fix`) on an independent no-link shadow copy, and commit a candidate only when the baseline finding identity set strictly shrinks, no new findings appear, and the impacted tests actually run and stay green relative to a green baseline. Missing tools, no tests, a red baseline, timeouts, out-of-scope modifications or a preimage hash mismatch discard the candidate (`verified=false`), never "green". Runs commands, so it is trust-gated like the other execution settings. |
 | `max_write_chars` | `200000` | Ceiling on one `write` call's contents, in characters. |
 | `max_write_lines` | `120` | Maximum lines one reply may emit for one file (gather `write` or answer-phase edit block). |
 | `allow_rename` | `true` | Treat a creation of a new path paired with a block that empties an existing same-extension file as a real move (old file deleted). |

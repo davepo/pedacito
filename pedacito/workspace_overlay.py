@@ -54,6 +54,76 @@ EditResult = Result
 MAX_MIRROR_BYTES = 400_000_000
 
 
+def copy_tree_no_link(root, dest, *, files=None,
+                      max_bytes: int = MAX_MIRROR_BYTES,
+                      skip_sensitive: bool = True) -> tuple[str, ...]:
+    """Copy the tracked project files (or the given `files` subset) into
+    `dest` as independent copies, with no link back to the originals.
+
+    This is the safe candidate copy the autofix ladder (§3.4) needs: every
+    file is a fresh ``shutil.copy2`` of the original, so a formatter/linter
+    running inside `dest` can never follow a symlink or junction back to the
+    project, and an in-place mutation cannot corrupt a hard-linked snapshot.
+    Unlike :meth:`VirtualWorkspace.exec_root`, which links the original
+    ``node_modules`` via symlink/junction, this copy never links any
+    dependency directory: dependency trees are simply left out (the tracked
+    source files, tests and manifests are what get copied).
+
+    Each path is resolved with :func:`security.resolve_safe_path`; traversal,
+    symlink/junction escapes and protected paths are refused, and secret/
+    credential files are skipped. Returns the project-relative POSIX paths
+    that were copied. `max_bytes` bounds the total copy so a vendored
+    monorepo cannot fill a temp disk (raising :class:`WorkspaceError`).
+    """
+    from . import checkpoints
+
+    root = Path(str(root)).expanduser().resolve()
+    dest = Path(str(dest))
+    dest.mkdir(parents=True, exist_ok=True)
+
+    wanted: set[str] | None = None
+    if files is not None:
+        wanted = set()
+        for f in files:
+            rel = fileio.normalise_rel(str(f))
+            if rel:
+                wanted.add(rel)
+
+    sources: list[tuple[str, Path]] = []
+    if wanted is not None:
+        for rel in sorted(wanted):
+            try:
+                path = security.resolve_safe_path(root, rel)
+            except security.SecurityError:
+                continue
+            if path.is_file():
+                sources.append((rel, path))
+    else:
+        for rel, path in checkpoints.iter_workspace_files(root):
+            sources.append((rel, path))
+
+    copied: list[str] = []
+    total = 0
+    for rel, src in sources:
+        if skip_sensitive and security.is_sensitive_path(rel):
+            continue
+        if safety.is_protected(rel, None, write=True):
+            continue
+        try:
+            total += src.stat().st_size
+        except OSError:
+            continue
+        if total > max_bytes:
+            raise WorkspaceError(
+                "the project is too large to copy for a shadow autofix run; "
+                "apply the edits first (or narrow the file set)")
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        copied.append(rel)
+    return tuple(copied)
+
+
 def _link_node_modules(link: Path, target: Path) -> None:
     """Link a project's `node_modules` into a mirror, or skip cleanly.
 

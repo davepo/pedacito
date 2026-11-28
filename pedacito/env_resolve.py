@@ -866,3 +866,16 @@ def find_executable(resolved: ResolvedEnvironment, name: str, *,
         found = (shutil.which(name, path=path_value) if path_value
                  else shutil.which(name))
     return Path(found) if found else None
+
+
+def find_executables(resolved: ResolvedEnvironment, names,
+                     *, env: dict[str, str] | None = None) -> dict[str, Path | None]:
+    """``{name: executable_path | None}`` for several tool names at once.
+
+    One pass over the resolved bin dirs and ``PATH`` instead of a separate
+    scan per name, so the autofix ladder can ask "which of ruff / biome /
+    eslint / gofmt / cargo is actually installed here?" without re-walking the
+    directories. Detection only: nothing here executes a tool. The mapping is
+    returned in the caller's name order (a dict preserves insertion order).
+    """
+    return {name: find_executable(resolved, name, env=env) for name in names}
