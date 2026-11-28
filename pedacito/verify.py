@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import fileio
-from .edits import (StructuredEdit, StructuredIntent, locate,
+from .edits import (Result, StructuredEdit, StructuredIntent, locate,
                     materialize_structured_edits, parse_edits)
 
 
@@ -2803,6 +2803,34 @@ def _edit_evidence_text(e) -> str:
             f"{getattr(e, 'search', '') or getattr(e, 'before', '')}")
 
 
+def gather_edit_evidence(root, files) -> list:
+    """Result-shaped edit evidence for gather-phase `write`/`append` mutations.
+
+    A gather action lands before the answer phase and produces no `Result`, so
+    its file used to be invisible to coverage: a quoted literal the model had
+    already appended was judged missing, and the follow-up inserted a second
+    copy (R2-BUG-01). Read each mutated file's CURRENT text (the same state the
+    answer phase sees) and present it as one successful edit. Deleted or
+    missing files carry no insertion evidence and are skipped."""
+    root = Path(root)
+    out: list = []
+    seen: set[str] = set()
+    for raw in files or ():
+        rel = fileio.normalise_rel(str(raw or ""))
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        path = root / rel
+        try:
+            if not path.is_file():
+                continue
+            text, _style = fileio.read(path, errors="replace")
+        except (OSError, ValueError):
+            continue
+        out.append(Result(True, rel, "gather-phase mutation", after=text))
+    return out
+
+
 # A test DECLARATION, not merely the word "test" in a file name or an import
 # line: the test-clause exemption below must not fire for an import-only edit
 # to a test file (BUG-205).
@@ -2980,12 +3008,16 @@ def _unaddressed(task: str, reply: str, edits,
 
 
 def check_coverage(task: str, reply: str, edits,
-                   tracker: RequirementTracker | None = None) -> list[Finding]:
+                   tracker: RequirementTracker | None = None, *,
+                   gather_edits=()) -> list[Finding]:
     """Requirements whose key terms appear nowhere in the edits, their file
     names, or the reply's prose. When a live RequirementTracker is supplied,
-    its states are authoritative for what counts as addressed."""
+    its states are authoritative for what counts as addressed. `gather_edits`
+    adds Result-shaped evidence for files a gather action already mutated
+    (`gather_edit_evidence`), so those writes count like answer-phase edits."""
     out: list[Finding] = []
-    for req in _unaddressed(task, reply, edits, tracker):
+    evidence = list(edits or ()) + list(gather_edits or ())
+    for req in _unaddressed(task, reply, evidence, tracker):
         if getattr(req, "missing_literals", None):
             # One verb per literal: the from-side of a replace (or a removal)
             # is "still present", an insertion that never landed is "missing"
@@ -3015,11 +3047,15 @@ def check_coverage(task: str, reply: str, edits,
 
 
 def coverage_seeds(task: str, reply: str, edits,
-                   tracker: RequirementTracker | None = None) -> list[Requirement]:
+                   tracker: RequirementTracker | None = None, *,
+                   gather_edits=()) -> list[Requirement]:
     """The unaddressed EDIT clauses of `task` after a batch: the deterministic
     trigger for one coverage-seeded follow-up pass. Report clauses are left to
-    the answer prose; only edit clauses can seed another edit intent."""
-    return [req for req in _unaddressed(task, reply, edits, tracker)
+    the answer prose; only edit clauses can seed another edit intent.
+    `gather_edits` carries gather-phase write evidence, exactly as in
+    `check_coverage`."""
+    evidence = list(edits or ()) + list(gather_edits or ())
+    return [req for req in _unaddressed(task, reply, evidence, tracker)
             if req.is_edit]
 
 

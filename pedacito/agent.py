@@ -5019,30 +5019,38 @@ class Agent:
         shared by the incremental microloop and the ordinary answer path
         (BUG-213): a zero-intent answer run used to skip the coverage verdict
         entirely because it never entered apply_edit_intents. check_coverage
-        and coverage_seeds see the SAME edit evidence (results, not the prose
-        reply). The follow-up hunks pay the same dry-apply/verify gate via
-        apply_edit_intents(_followup=True), which never recurses again.
-        Returns (results, reply, findings)."""
+        and coverage_seeds see the SAME edit evidence (results plus the
+        gather-mutation ledger, not the prose reply): a gather `write`/`append`
+        is edit evidence, so a literal it already landed is never judged
+        missing or inserted a second time (R2-BUG-01). The follow-up hunks pay
+        the same dry-apply/verify gate via apply_edit_intents(_followup=True),
+        which never recurses again. Returns (results, reply, findings)."""
         from . import verify as verify_mod
         tracker = getattr(self, "requirements", None)
         # Coverage mines the user's brief, not the harness-injected evidence
         # hint / contract map / retry notes the loop appended to `task`.
         clean_task = verify_mod.clean_task_for_coverage(task)
+        gather_files = list(getattr(self.cfg, "_task_mutations", None) or ())
+        gather_evidence = verify_mod.gather_edit_evidence(
+            self.index.root, gather_files)
+        evidence = list(results) + gather_evidence
         self._coverage_edit_targets = [
-            r.file for r in results
+            r.file for r in evidence
             if getattr(r, "ok", False) and getattr(r, "file", "")]
         findings.extend(verify_mod.check_coverage(
-            clean_task, reply, results, tracker=tracker))
+            clean_task, reply, results, tracker=tracker,
+            gather_edits=gather_evidence))
         # A half-answered multi-clause task used to end with an advisory
         # coverage warning. The requirement state machine seeds one bounded
         # follow-up pass from the clauses no edit addressed.
-        seeds = verify_mod.coverage_seeds(clean_task, reply, results,
-                                          tracker=tracker)
+        seeds = verify_mod.coverage_seeds(
+            clean_task, reply, results, tracker=tracker,
+            gather_edits=gather_evidence)
         # A removal whose file was never touched leaves its copy on disk even
         # though no after-text carries it: re-check the real files and merge
         # those clauses in, annotated with the exact line still to delete.
         seeds = verify_mod.merge_unmet(seeds, verify_mod.unmet_requirements(
-            self.index.root, clean_task, results, tracker=tracker))
+            self.index.root, clean_task, evidence, tracker=tracker))
         if seeds:
             if self._task_budget_exceeded("coverage follow-up"):
                 # The task is out of wall-clock/token budget: do not spend
@@ -5075,14 +5083,21 @@ class Agent:
                 reply += ("\n\nCoverage follow-up (unaddressed task clauses):"
                           "\n" + "\n".join(more_reply.splitlines()[1:]))
                 # The follow-up was the LAST chance to land the user's quoted
-                # copy. Re-read the final edited text: if a required literal
-                # is still missing (or a removed one is still present), the
-                # turn ends with a concrete finding instead of silent success.
+                # copy. Re-read the final edited text (and the gather files
+                # again, in case a follow-up hunk rewrote one): if a required
+                # literal is still missing (or a removed one is still present),
+                # the turn ends with a concrete finding instead of silent
+                # success.
+                still_gather = verify_mod.gather_edit_evidence(
+                    self.index.root, gather_files)
+                still_evidence = list(results) + still_gather
                 still = verify_mod.coverage_seeds(
-                    clean_task, reply, results, tracker=tracker)
+                    clean_task, reply, results, tracker=tracker,
+                    gather_edits=still_gather)
                 still = verify_mod.merge_unmet(
                     still, verify_mod.unmet_requirements(
-                        self.index.root, clean_task, results, tracker=tracker))
+                        self.index.root, clean_task, still_evidence,
+                        tracker=tracker))
                 for req in still:
                     hits = getattr(req, "literal_hits", [])
                     where = (" -- still on disk at "
