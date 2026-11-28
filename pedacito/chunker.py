@@ -886,3 +886,29 @@ def locate_symbol_span(file_path, symbol_path: str,
     if start < 1 or end > len(lines) or end < start:
         return None
     return start, end, _leading_indent(lines[start - 1])
+
+
+def file_symbol_spans(rel_path, text: str | None = None
+                      ) -> list[tuple[str, int, int]] | None:
+    """``[(qualname, start_line, end_line)]`` for every addressable definition
+    in a file, 1-based and inclusive, decorators counted -- the exact backing
+    table :func:`locate_symbol_span` resolves a single name from.
+
+    ``None`` when the file is missing, its language is unknown, or it cannot
+    be parsed. Exposed so a guard can reason about a whole file at once: the
+    structured-edit guard uses it to tell a missing symbol from an ambiguous
+    one, and to detect a definition that spans the entire file (a whole-file
+    replacement). ``text`` is parsed directly when given (an evolving in-memory
+    buffer); otherwise ``rel_path`` is read from disk."""
+    path = Path(rel_path)
+    suffix = path.suffix.lower()
+    if text is None:
+        if not path.is_file():
+            return None
+        try:
+            text = fileio.read_text(path)
+        except (OSError, UnicodeDecodeError):
+            return None
+    if suffix == ".py":
+        return _py_symbol_spans(text)
+    return _ts_symbol_spans(path.name, text, suffix)

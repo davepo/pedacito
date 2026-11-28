@@ -57,7 +57,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import fileio
-from .edits import locate, parse_edits
+from .edits import (StructuredEdit, StructuredIntent, locate,
+                    materialize_structured_edits, parse_edits)
 
 
 @dataclass
@@ -3380,3 +3381,54 @@ def parse_verdict(text: str, resolve=None, root=None) -> list[Finding]:
         out.append(Finding("model", severity, file,
                            m.group("what").strip()[:240], line_no))
     return out[:5]
+
+
+# --------------------------------------------------- structured-edit guard
+# `validate_structured_reply` is the deterministic preflight a structured-mode
+# reply must clear before anything is written: strict schema parse, exact
+# intent matching, containment/sensitive/protected/policy, symbol/search
+# resolution, no-op/overlap/scope, the syntax gate, and the existing
+# undefined-name static gate over the dry-applied buffers. WP-4101B feeds it
+# before the atomic transaction.
+def _structured_static_errors(mat, cfg) -> list[str]:
+    """New undefined-name (F821/`__all__`) errors in the dry-applied buffers,
+    the structured twin of `check_static` for materialized Results."""
+    out: list[str] = []
+    for r in mat.results:
+        rel = str(getattr(r, "file", "") or "")
+        if not rel.lower().endswith(".py"):
+            continue
+        if not getattr(cfg, "static_gate", True):
+            continue
+        before = getattr(r, "before", "") or ""
+        after = getattr(r, "after", "") or ""
+        new = _new_static_errors(rel, after, before)
+        if new:
+            out.append(
+                f"{rel}: this edit introduces names that do not exist at the "
+                "point they are used (a missing import or a typo): "
+                + "; ".join(new[:5]))
+    return out
+
+
+def validate_structured_reply(root, intents: list[StructuredIntent],
+                              edits: list[StructuredEdit], *,
+                              allowed_files: set[str] | None = None,
+                              read_spans: dict | None = None,
+                              cfg=None) -> list[str]:
+    """Preflight a structured reply; ``[]`` means every edit is valid to apply.
+
+    Runs the strict mechanical guard (:func:`edits.materialize_structured_edits`:
+    intent matching, containment, sensitive/protected/policy, symbol/search
+    resolution, no-op/overlap/scope, and the syntax gate) and then the existing
+    verifier gate (undefined-name static check) over the dry-applied buffers.
+    Nothing is written; each returned string is one refusal.
+    """
+    mat = materialize_structured_edits(root, intents, edits,
+                                       allowed_files=allowed_files,
+                                       read_spans=read_spans, cfg=cfg)
+    errors = list(mat.errors)
+    if errors:
+        return errors
+    errors.extend(_structured_static_errors(mat, cfg))
+    return errors

@@ -74,7 +74,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import fileio, safety, security
-from .chunker import locate_symbol_span
+from .chunker import file_symbol_spans, locate_symbol_span
 from .chunker_ts import LANG_BY_EXT, TS_AVAILABLE, has_syntax_error
 
 # The `=======` separator must be a whole line, so a `/* ====` banner at the
@@ -2316,3 +2316,594 @@ def apply_edits_atomic(root: Path, edits: list[Edit], *, backup: bool = True,
                           renames_from=r.renames_from,
                           whole_file=r.whole_file, deleted=r.deleted))
     return out
+
+
+# --------------------------------------------------------------------------
+# Structured edit parser and guard (WP-4101A)
+# --------------------------------------------------------------------------
+# Structured mode requests one strict JSON object and never salvages embedded
+# JSON or applies a partial reply. The five actions and their field contract
+# (unused strings are ""):
+#
+#     replace_symbol       symbol != "", search == "", replacement != ""
+#     insert_after_symbol  symbol != "", search == "", replacement != ""
+#     search_replace       symbol != "", search != "", replacement any
+#     append               symbol == "", search == "", replacement != ""
+#     delete_symbol        symbol != "", search == "", replacement == ""
+#
+# A reply of no change is the explicit {"version":1,"intents":[],"edits":[]}.
+
+STRUCTURED_ACTIONS = (
+    "replace_symbol", "insert_after_symbol", "search_replace",
+    "append", "delete_symbol",
+)
+_MAX_STRUCTURED = 8
+_WHY_MAX = 300
+_INTENT_KEYS = frozenset({"file", "symbol", "why"})
+_EDIT_KEYS = frozenset({"edit_action", "file", "symbol", "search",
+                        "replacement"})
+
+
+@dataclass(frozen=True)
+class StructuredIntent:
+    """One structured edit intent: what the model plans to change and why."""
+
+    file: str
+    symbol: str
+    why: str
+
+
+@dataclass(frozen=True)
+class StructuredEdit:
+    """One structured edit action. Unused string fields are ``""`` (see the
+    action table in the module docstring)."""
+
+    edit_action: str
+    file: str
+    symbol: str
+    search: str
+    replacement: str
+
+
+class StructuredReplyError(ValueError):
+    """A reply failed strict structured-mode schema parsing."""
+
+
+@dataclass(frozen=True)
+class StructuredMaterialization:
+    """The dry-run product of validated structured edits; nothing is written.
+
+    ``buffers`` maps each touched file (normalised relative path) to its final
+    LF-normalised text; ``styles`` records each file's original encoding so an
+    apply can write the bytes back unchanged (CRLF/BOM preserved). ``results``
+    carries the per-file before/after/diff/sha for the reviewer and the
+    existing verifier gates. ``edits`` holds one legacy whole-file ``Edit``
+    per file for compatibility and atomic apply. ``errors`` lists every
+    refusal; empty means clean.
+    """
+
+    files: tuple[str, ...]
+    buffers: dict[str, str]
+    styles: dict[str, fileio.TextStyle]
+    results: tuple[Result, ...]
+    edits: tuple[Edit, ...]
+    errors: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _strip_structured_fences(text: str) -> str:
+    """Strip one wrapping markdown fence around the whole reply (normalisation,
+    not salvage); the body must still be one strict JSON object."""
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^\s*```[^\n]*\n?", "", raw, count=1)
+        raw = re.sub(r"\n?\s*```\s*$", "", raw, count=1)
+    return raw.strip()
+
+
+def _reject_keys(item: dict, allowed: frozenset, kind: str) -> None:
+    """Enforce ``additionalProperties: false`` plus required keys."""
+    extra = sorted(set(item) - allowed)
+    if extra:
+        raise StructuredReplyError(
+            f"{kind} has unknown field(s): {', '.join(extra)} "
+            "(additionalProperties is false)")
+    missing = sorted(allowed - set(item))
+    if missing:
+        raise StructuredReplyError(
+            f"{kind} is missing required field(s): {', '.join(missing)}")
+
+
+def _require_string(item: dict, key: str, kind: str) -> str:
+    value = item.get(key)
+    if not isinstance(value, str):
+        raise StructuredReplyError(f"{kind} field {key!r} must be a string")
+    return value
+
+
+def _parse_intent(item) -> StructuredIntent:
+    if not isinstance(item, dict):
+        raise StructuredReplyError("each intent must be a JSON object")
+    _reject_keys(item, _INTENT_KEYS, "intent")
+    file = _require_string(item, "file", "intent")
+    symbol = _require_string(item, "symbol", "intent")
+    why = _require_string(item, "why", "intent")
+    if not why.strip():
+        raise StructuredReplyError("intent 'why' must be nonblank")
+    if len(why) > _WHY_MAX:
+        raise StructuredReplyError(
+            f"intent 'why' is {len(why)} characters; it is capped at "
+            f"{_WHY_MAX}")
+    return StructuredIntent(file=file, symbol=symbol, why=why)
+
+
+def _parse_edit(item) -> StructuredEdit:
+    if not isinstance(item, dict):
+        raise StructuredReplyError("each edit must be a JSON object")
+    _reject_keys(item, _EDIT_KEYS, "edit")
+    action = _require_string(item, "edit_action", "edit")
+    if action not in STRUCTURED_ACTIONS:
+        raise StructuredReplyError(
+            f"unknown edit_action {action!r} (expected one of "
+            f"{', '.join(STRUCTURED_ACTIONS)})")
+    file = _require_string(item, "file", "edit")
+    symbol = _require_string(item, "symbol", "edit")
+    search = _require_string(item, "search", "edit")
+    replacement = _require_string(item, "replacement", "edit")
+    return StructuredEdit(action, file, symbol, search, replacement)
+
+
+def parse_structured_reply(text: str) -> tuple[list[StructuredIntent],
+                                                list[StructuredEdit]]:
+    """Parse one strict structured-edit reply into ``(intents, edits)``.
+
+    The reply must be exactly one JSON object (an optional wrapping code fence
+    is tolerated) with ``additionalProperties: false`` and required
+    ``version``, ``intents``, ``edits``. ``version`` must be the integer 1;
+    ``intents`` and ``edits`` are arrays of at most 8 objects with the exact
+    keys documented above. There is no JSON salvage and no partial
+    application: any deviation raises :class:`StructuredReplyError`.
+    """
+    raw = _strip_structured_fences(text)
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise StructuredReplyError(
+            f"the reply is not one valid JSON object: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise StructuredReplyError("the reply is not a JSON object")
+    _reject_keys(obj, frozenset({"version", "intents", "edits"}), "reply")
+    version = obj["version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise StructuredReplyError("version must be the integer 1")
+    intents_raw = obj["intents"]
+    edits_raw = obj["edits"]
+    if not isinstance(intents_raw, list) or not isinstance(edits_raw, list):
+        raise StructuredReplyError("'intents' and 'edits' must be arrays")
+    if len(intents_raw) > _MAX_STRUCTURED or len(edits_raw) > _MAX_STRUCTURED:
+        raise StructuredReplyError(
+            f"at most {_MAX_STRUCTURED} intents and edits are allowed")
+    intents = [_parse_intent(i) for i in intents_raw]
+    edits = [_parse_edit(e) for e in edits_raw]
+    return intents, edits
+
+
+def _action_field_errors(e: StructuredEdit) -> list[str]:
+    """Operation-specific field constraints, enforced locally even when the
+    server's JSON-schema support is incomplete."""
+    errs: list[str] = []
+    action = e.edit_action
+    if not e.file.strip():
+        errs.append(f"{action}: 'file' must name a project file")
+        return errs
+    if action == "append":
+        if e.symbol:
+            errs.append("append: 'symbol' must be empty (append is whole-file)")
+        if e.search:
+            errs.append("append: 'search' must be empty")
+        if not e.replacement.strip():
+            errs.append("append: 'replacement' must be nonblank")
+    elif action in ("replace_symbol", "insert_after_symbol"):
+        if not e.symbol:
+            errs.append(f"{action}: 'symbol' must name a symbol")
+        if e.search:
+            errs.append(f"{action}: 'search' must be empty")
+        if not e.replacement.strip():
+            errs.append(f"{action}: 'replacement' must be nonblank"
+                        + ("" if action == "insert_after_symbol"
+                           else " (use delete_symbol to remove a symbol)"))
+    elif action == "search_replace":
+        if not e.symbol:
+            errs.append("search_replace: 'symbol' must name a symbol")
+        if not e.search:
+            errs.append("search_replace: 'search' must be nonblank")
+    elif action == "delete_symbol":
+        if not e.symbol:
+            errs.append("delete_symbol: 'symbol' must name a symbol")
+        if e.search:
+            errs.append("delete_symbol: 'search' must be empty")
+        if e.replacement:
+            errs.append("delete_symbol: 'replacement' must be empty")
+    return errs
+
+
+def _empty_materialization(errors: list[str]) -> StructuredMaterialization:
+    return StructuredMaterialization((), {}, {}, (), (), tuple(errors))
+
+
+def _span_lines(text: str, start: int, end: int) -> tuple[int, int]:
+    """1-based inclusive line range of a half-open char span."""
+    a = text.count("\n", 0, start) + 1
+    b = a if end <= start else text.count("\n", 0, end - 1) + 1
+    return a, b
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _covered(a: int, b: int, read: list[tuple[int, int]]) -> bool:
+    return any(s <= a and b <= t for s, t in _merge_spans(read))
+
+
+def _lookup_read(read_spans, key: str):
+    """The read ledger for `key`, or None when no ledger was supplied, or []
+    when the file was never read."""
+    if read_spans is None:
+        return None
+    if key in read_spans:
+        return list(read_spans[key])
+    for k, v in read_spans.items():
+        if k.endswith("/" + key) or key.endswith("/" + k):
+            return list(v)
+    return []
+
+
+def _symbol_missing(rel: str, e: StructuredEdit, vpath, original: str,
+                    errors: list[str]) -> None:
+    """Append a missing-vs-ambiguous diagnostic for an unresolvable symbol."""
+    spans = file_symbol_spans(vpath, text=original)
+    if spans is None:
+        errors.append(f"{rel}: cannot parse the file to resolve symbol "
+                      f"{e.symbol!r}")
+        return
+    matches = [q for (q, _s, _e) in spans
+               if q == e.symbol or q.endswith("." + e.symbol)]
+    if not matches:
+        errors.append(f"{rel}: no definition named {e.symbol!r} (unknown "
+                      "symbol); check the spelling against an `outline`")
+    else:
+        uniq = sorted({q for q in matches})
+        errors.append(f"{rel}: symbol {e.symbol!r} is ambiguous "
+                      f"({len(uniq)} definitions match: "
+                      f"{', '.join(uniq[:5])})")
+
+
+def _resolve_structured_edit(vpath, e: StructuredEdit, original: str,
+                             exists: bool, task_text: str,
+                             errors: list[str]):
+    """Resolve one StructuredEdit against ``original`` (``""`` for a new file).
+
+    Returns ``(start, end, new_text, kind)`` in original char coordinates
+    (half-open), or None after appending an error. ``kind`` is one of
+    ``create``, ``append``, ``replace``, ``delete``.
+    """
+    action = e.edit_action
+    if not exists:
+        # Only a whole-file append (symbol == "") may create a file. Every
+        # other action needs an existing definition to resolve against.
+        if action != "append":
+            errors.append(f"{e.file}: cannot {action} a file that does not "
+                          "exist yet; use append with an empty symbol to "
+                          "create it")
+            return None
+        text = e.replacement
+        if not text.endswith("\n"):
+            text += "\n"
+        return (0, 0, text, "create")
+
+    if action == "append":
+        sep = "" if not original or original.endswith("\n") else "\n"
+        body = sep + e.replacement
+        if not body.endswith("\n"):
+            body += "\n"
+        return (len(original), len(original), body, "append")
+
+    hit = locate_symbol_span(vpath, e.symbol, text=original)
+    if hit is None:
+        _symbol_missing(e.file, e, vpath, original, errors)
+        return None
+    s0, e0, base_ind = hit
+    sym_span = _line_span(original, s0, e0)
+    if sym_span is None:
+        errors.append(f"{e.file}: symbol {e.symbol!r} resolved to lines "
+                      f"{s0}-{e0}, which are out of bounds")
+        return None
+    cs, ce = sym_span
+    needle = original[cs:ce]
+
+    if action == "replace_symbol":
+        body = normalise_symbol_indent(e.replacement, base_ind)
+        decs = _leading_decorators(original, s0, e0)
+        if decs and body.strip() and not body.lstrip().startswith("@"):
+            body = "\n".join(decs) + "\n" + body
+        if body and needle.endswith("\n") and not body.endswith("\n"):
+            body += "\n"
+        if body == needle:
+            errors.append(f"{e.file}: replace_symbol {e.symbol!r} is a no-op "
+                          "(the replacement equals the current definition)")
+            return None
+        total_lines = len(original.splitlines())
+        if s0 <= 1 and e0 >= total_lines:
+            whole = body if not body or body.endswith("\n") else body + "\n"
+            refusal = fragment_refusal(e.file, original, whole, task=task_text)
+            if refusal:
+                errors.append(f"{e.file}: {refusal}")
+                return None
+        return (cs, ce, body, "replace")
+
+    if action == "insert_after_symbol":
+        body = normalise_symbol_indent(e.replacement, base_ind)
+        repl = needle
+        if body.strip():
+            if not repl.endswith("\n"):
+                repl += "\n"
+            repl += body + "\n"
+        return (cs, ce, repl, "replace")
+
+    if action == "search_replace":
+        n = needle.count(e.search)
+        if n != 1:
+            errors.append(f"{e.file}: search text must occur exactly once "
+                          f"within symbol {e.symbol!r} (found {n}); widen the "
+                          "search text or narrow the symbol")
+            return None
+        if e.replacement == e.search:
+            errors.append(f"{e.file}: search_replace is a no-op (replacement "
+                          "equals the search)")
+            return None
+        idx = needle.index(e.search)
+        return (cs + idx, cs + idx + len(e.search), e.replacement, "replace")
+
+    if action == "delete_symbol":
+        if not needle.strip():
+            errors.append(f"{e.file}: delete_symbol {e.symbol!r} spans only "
+                          "blank lines; nothing to delete")
+            return None
+        return (cs, ce, "", "delete")
+
+    errors.append(f"{e.file}: unsupported edit_action {action!r}")
+    return None
+
+
+def materialize_structured_edits(root, intents: list[StructuredIntent],
+                                 edits: list[StructuredEdit], *,
+                                 allowed_files: set[str] | None = None,
+                                 read_spans: dict | None = None,
+                                 cfg=None) -> StructuredMaterialization:
+    """Dry-run validated structured edits against evolving in-memory buffers.
+
+    Performs the strict preflight and returns the final buffers, per-file
+    legacy ``Result``/``Edit`` objects, and any refusals (in ``errors``), never
+    touching the filesystem for writes. Checks, in order:
+
+    * every edit's exact canonical ``(file, symbol)`` matches a declared
+      intent, and operation-specific fields are valid;
+    * paths are contained (``security.resolve_safe_path``), non-sensitive,
+      non-protected, policy-allowed, and inside ``allowed_files``;
+    * a ``symbol=""`` file intent only creates an authorized new file or an
+      explicit whole-file append; existing symbols resolve uniquely and stay
+      inside the read ledger (``read_spans``);
+    * ``search`` occurs exactly once within its symbol, no edit is a no-op,
+      and no two edits overlap;
+    * the resulting buffers parse (no new syntax errors) and change bytes.
+
+    ``allowed_files`` is a set of normalised paths the task may modify; pass
+    None to skip the file allowlist. ``read_spans`` maps
+    ``fileio.path_key(file)`` to ``[(start, end)]`` 1-based inclusive line
+    spans; pass None to skip the read-scope gate.
+    """
+    intents = list(intents or ())
+    edits = list(edits or ())
+    errors: list[str] = []
+    task_text = str(getattr(cfg, "_task_text", "") or "")
+    policy = getattr(cfg, "policy", None)
+
+    if (not intents) != (not edits):
+        errors.append("intents and edits must both be empty (a no-change reply "
+                      'is {"version":1,"intents":[],"edits":[]}) or both '
+                      "non-empty")
+        return _empty_materialization(errors)
+    if not intents:
+        return _empty_materialization([])
+
+    for e in edits:
+        errors.extend(_action_field_errors(e))
+    if errors:
+        # No partial application: a malformed edit rejects the whole reply.
+        return _empty_materialization(errors)
+
+    intent_keys = {(fileio.path_key(i.file), i.symbol) for i in intents}
+
+    try:
+        root_resolved = Path(root).resolve()
+    except OSError as exc:
+        errors.append(f"project root could not be resolved: {exc}")
+        return _empty_materialization(errors)
+
+    allowed = None
+    if allowed_files is not None:
+        allowed = {fileio.path_key(p) for p in allowed_files}
+
+    ordered: list[str] = []
+    by_file: dict[str, list[StructuredEdit]] = {}
+    rel_of: dict[str, str] = {}
+    for e in edits:
+        rel = fileio.normalise_rel(e.file)
+        key = fileio.path_key(rel)
+        if key not in by_file:
+            by_file[key] = []
+            ordered.append(key)
+            rel_of[key] = rel
+        by_file[key].append(e)
+
+    files: list[str] = []
+    buffers: dict[str, str] = {}
+    styles: dict[str, fileio.TextStyle] = {}
+    results: list[Result] = []
+    legacy_edits: list[Edit] = []
+
+    for key in ordered:
+        rel = rel_of[key]
+        group = by_file[key]
+
+        # ---- edit -> intent exact canonical match -------------------------
+        for e in group:
+            if (key, e.symbol) not in intent_keys:
+                errors.append(f"{rel}: edit (file={e.file}, symbol="
+                              f"{e.symbol or ''!r}) does not match any "
+                              "declared intent")
+
+        # ---- containment / sensitive / protected / policy / allowlist -----
+        try:
+            path = security.resolve_safe_path(root_resolved, rel)
+        except security.SecurityError as exc:
+            errors.append(f"{rel}: {exc}")
+            continue
+        s_ok, s_err = security.check_sensitive_write(
+            root_resolved, rel, action="edit", policy=policy)
+        if not s_ok:
+            errors.append(f"{rel}: {s_err}")
+            continue
+        why = safety.is_protected(rel, cfg)
+        if why:
+            errors.append(f"{rel}: refused: {why}")
+            continue
+        try:
+            from . import policy as policy_mod
+            d = policy_mod.enforce(cfg, "write", rel, root=root_resolved)
+            if d is not None and getattr(d, "decision", None) == "deny":
+                errors.append(f"{rel}: denied by policy "
+                              f"({getattr(d, 'matched_rule', '?')}): "
+                              f"{getattr(d, 'reason', '')}")
+                continue
+        except Exception as exc:                       # fail closed
+            errors.append(f"{rel}: denied by policy: policy evaluation error: "
+                          f"{exc}")
+            continue
+        if allowed is not None and key not in allowed:
+            errors.append(f"{rel}: not in the authorized file set "
+                          "(allowed_files)")
+            continue
+
+        read = _lookup_read(read_spans, key)
+
+        exists = path.is_file()
+        if exists:
+            try:
+                original, style = fileio.read(path, errors="strict")
+            except UnicodeDecodeError:
+                errors.append(f"{rel}: file is not valid UTF-8; refusing to "
+                              "edit it as text")
+                continue
+            except OSError as exc:
+                errors.append(f"{rel}: could not read file: {exc}")
+                continue
+        else:
+            if len(group) > 1:
+                errors.append(f"{rel}: a new file may only be created by a "
+                              "single append edit")
+                continue
+            original = ""
+            style = fileio.TextStyle()
+
+        vpath = Path(root) / rel
+
+        ops: list[tuple[int, int, int, str, str]] = []
+        bad = False
+        for idx, e in enumerate(group):
+            op = _resolve_structured_edit(vpath, e, original, exists, task_text,
+                                          errors)
+            if op is None:
+                bad = True
+                continue
+            start, end, new, kind = op
+            if read is not None and exists and kind in ("replace", "delete"):
+                a, b = _span_lines(original, start, end)
+                if not read:
+                    errors.append(f"{rel}: {e.edit_action} {e.symbol or e.search!r} "
+                                  "targets a file this run never read")
+                    bad = True
+                elif not _covered(a, b, read):
+                    errors.append(f"{rel}: lines {a}-{b} are outside the lines "
+                                  "read; the edit may be a guess")
+                    bad = True
+            elif read is not None and exists and kind == "append":
+                if not read:
+                    errors.append(f"{rel}: append targets a file this run "
+                                  "never read")
+                    bad = True
+            ops.append((idx, start, end, new, kind))
+
+        if bad:
+            continue
+
+        # ---- overlap: two content edits may not touch the same bytes ------
+        spans = sorted(((s, e, i) for i, s, e, _n, _k in ops if e > s),
+                       key=lambda t: t[0])
+        max_end = -1
+        overlap = False
+        for s, e, i in spans:
+            if s < max_end:
+                errors.append(f"{rel}: edits overlap (edit #{i + 1} touches a "
+                              "region an earlier edit already changed); merge "
+                              "them or drop one")
+                overlap = True
+                break
+            max_end = max(max_end, e)
+        if overlap:
+            continue
+
+        # ---- apply in reverse order so original offsets stay valid --------
+        final = original
+        for _i, start, end, new, _k in sorted(ops, key=lambda t: (-t[1], -t[0])):
+            final = final[:start] + new + final[end:]
+
+        # ---- syntax gate (reject only NEW syntax errors) -------------------
+        err = _validate(path, final)
+        if err and (original == "" or not _validate(path, original)):
+            errors.append(f"{rel}: edit produced {err}; not applied")
+            continue
+
+        if final == original:
+            errors.append(f"{rel}: edits change no bytes (net no-op)")
+            continue
+
+        before = original if exists else ""
+        whole_file = exists and any(
+            s == 0 and e == len(original) for (_i, s, e, _n, _k) in ops)
+        diff = "".join(difflib.unified_diff(
+            before.splitlines(keepends=True), final.splitlines(keepends=True),
+            fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+        sha = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        note = (f"applied {len(group)} structured edit(s)"
+                if exists else f"created with {len(final.splitlines())} line(s)")
+        results.append(Result(True, rel, note, diff, before, final, sha,
+                              whole_file=whole_file))
+        files.append(rel)
+        buffers[rel] = final
+        styles[rel] = style
+        legacy_edits.append(Edit(rel, "", final))
+
+    return StructuredMaterialization(tuple(files), buffers, styles,
+                                     tuple(results), tuple(legacy_edits),
+                                     tuple(errors))
