@@ -386,6 +386,7 @@ does not chase a blocked write as if it were a code bug.
 | `verify_tests` after an edit | Yes | Scrubbed | Test timeout |
 | `pedacito serve` (background dev servers) | **No** | Scrubbed | Kept running until stopped |
 | `browser`, `lsp`, MCP servers | **No** | Scrubbed | `lsp_timeout` (10 s), MCP discovery 5 s per server; the diagnostics gate uses one 2.9 s budget per symbol batch and reaps a timed-out server |
+| API oracle enrichment (`api_oracle_exec`) | Yes where a backend exists | Scrubbed | The remaining task deadline, capped at 12 s |
 | Hooks and `auto_verify` (your own commands) | **No** (by design) | Scrubbed for hooks (+ `PEDACITO_EVENT`); `auto_verify` also scrubbed | Hook timeout |
 | Server lifecycle `load_cmd` / `unload_cmd` (trusted config) | **No** (by design) | Scrubbed allow-list + `PEDACITO_SERVER_NAME` / `PEDACITO_MODEL_PATH` | 120 s |
 | GUI **Run** tab (you click it) | **No** | Credential variables removed (see below) | 15 s default, or the value you set |
@@ -439,6 +440,20 @@ Other limits:
   project's bin directories cannot re-add a variable the scrub removed.
   Resolver-discovered scripts are data: nothing runs because a manifest names
   it, and `allow_shell`/policy/sandbox still gate every actual execution.
+- **The API oracle is static by default.** The `api` gather action reads
+  `.pyi`/`.py` and distribution metadata from the resolved interpreter's
+  `site-packages`, plus contained `node_modules` `*.d.ts` files. It never
+  imports package code, evaluates package defaults, runs a package script or
+  uses the network, and every candidate passes `security.resolve_safe_path`;
+  links that escape an approved dependency root are skipped. Optional
+  enrichment (`api_oracle_exec = true`) also needs `allow_shell` and an
+  allowing policy before it runs `go doc`, `cargo metadata --offline
+  --no-deps` or the project interpreter's `inspect`. Those children are
+  argv-only, run with the scrubbed environment and the OS sandbox where
+  available, are bounded by the task deadline (12 s cap) and capped/redacted
+  in output. The cache under `.pedacito/cache/api/` holds only redacted,
+  capped symbol metadata and is written atomically; execution-derived results
+  are not reused after consent is withdrawn.
 
 The environment policy has three per-surface tiers:
 

@@ -89,13 +89,13 @@ _MAX_REPEATED_STEPS = 3
 # Read-only steps whose result cannot change when the previous step is the
 # identical call. `read` has its own duplicate-range guard.
 _DEDUP_STEP_ACTIONS = {"grep", "find", "outline", "usages", "callers",
-                       "sessions", "diff", "git_diff", "diagnose"}
+                       "sessions", "diff", "git_diff", "diagnose", "api"}
 
 # Read-only steps whose repeat (even many steps later) adds nothing while the
 # index, the conversation and the working tree are unchanged.
 _CACHEABLE_ACTIONS = {"grep", "find", "outline", "usages", "callers",
                       "context", "git", "git_diff", "diagnose", "sessions",
-                      "fetch", "fetch_url", "web_search"}
+                      "fetch", "fetch_url", "web_search", "api"}
 # Steps that can change what the cacheable ones return.
 _MUTATING = {"write", "append", "move", "delete", "undo", "rename",
              "rename_symbol", "run",
@@ -2525,6 +2525,12 @@ class Agent:
         mcp_notes = "\n\n".join(x for x in (mcp_notes, named_notes) if x)
         if mcp_notes:
             system += "\n\n" + mcp_notes
+        # Exact task-named libraries only: a bounded static API block. It is
+        # empty for tasks that name no declared dependency, so their prompt
+        # stays byte-identical; it is never rebuilt mid-gather.
+        api_notes = tools_mod.api_injection(self.cfg)
+        if api_notes:
+            system += "\n\n" + api_notes
         if verbose:
             print(f"  [map: {tier}, ~{estimate_tokens(repo_map)} tokens, "
                   f"{len(self.index.files)} files]", file=sys.stderr)
@@ -3466,6 +3472,10 @@ class Agent:
                     and not obs.startswith("ERROR")
                     and sym not in resolved_symbols):
                 resolved_symbols.add(sym)
+                step_progress = True
+            if action == "api" and not obs.startswith("ERROR"):
+                # Exact public signatures are new evidence even though no
+                # project file/line range was read.
                 step_progress = True
             # An ERROR is navigation feedback, not source: record it compactly
             # so the SOURCE section does not look populated without code.

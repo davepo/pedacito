@@ -119,6 +119,9 @@ serve    - manage background servers (opt-in). args: symbol (start, list,
 lsp      - exact language-server symbols/diagnostics (opt-in). args: symbol
            (definition, references, hover, diagnostics), file, start=line,
            end=column
+api      - exact public signatures from a library the task names, read from
+           static .pyi/.py/.d.ts declarations (never imports it). args:
+           symbol (library name), pattern (optional symbol fragment)
 rename   - mechanically rename ONE definition and its references in the
            files that import it (refuses ambiguous names). args: symbol (old
            name), to (new name)
@@ -185,7 +188,7 @@ STEP_SCHEMA = {
                      "screenshot", "browser",
                      "todo",
                      "remember", "skill", "task", "fetch", "fetch_url",
-                     "web_search", "question", "mcp", "mcp_call",
+                     "web_search", "question", "mcp", "mcp_call", "lsp", "api",
                      "done"],
         },
         "file": {"type": "string",
@@ -326,6 +329,7 @@ MCP_CALL_ACTION = "mcp_call"
 FETCH_URL_ACTION = "fetch_url"
 WEB_SEARCH_ACTION = "web_search"
 GENERATE_IMAGE_ACTION = "generate_image"
+API_ACTION = "api"
 WRITE_ACTIONS = (WRITE_ACTION, APPEND_ACTION)
 MUTATING_ACTIONS = WRITE_ACTIONS + (MOVE_ACTION, DELETE_ACTION, UNDO_ACTION)
 
@@ -529,6 +533,40 @@ def _image_gen_offered(cfg) -> bool:
     return security.permission_broker_active()
 
 
+def _api_offered(cfg) -> bool:
+    """`api` enters the schema only when the task text names a library that
+    the project's own manifests declare exactly. That keeps the default
+    schema and prompt byte-identical on every path that does not ask for an
+    external API. Reading manifests is static; it never executes a manager."""
+    root = getattr(cfg, "_root", None) or getattr(cfg, "root", None)
+    task = str(getattr(cfg, "_task_text", "") or "")
+    if not root or not task.strip():
+        return False
+    try:
+        from . import api_oracle
+        return bool(api_oracle.named_libraries(Path(root), task))
+    except Exception:
+        return False
+
+
+def api_injection(cfg) -> str:
+    """A bounded named-library API block for the gather prompt, or ''.
+
+    The block is built only from exact task-named libraries, and only from the
+    static index (`.pyi`/`.py`/`.d.ts`), so prompt assembly never executes a
+    package or a toolchain. Tasks that name no declared dependency are
+    untouched."""
+    root = getattr(cfg, "_root", None) or getattr(cfg, "root", None)
+    task = str(getattr(cfg, "_task_text", "") or "")
+    if not root or not task.strip():
+        return ""
+    try:
+        from . import api_oracle
+        return api_oracle.injection(Path(root), task, cfg)
+    except Exception:
+        return ""
+
+
 def mcp_injection(cfg) -> str:
     """The compact MCP TOOLS block for the gather prompt: the relevant named
     tools' one-line signatures (server.name(args) -- summary), or '' when
@@ -583,6 +621,8 @@ _FIELD_ACTION_FRAGMENTS = {
         (("find",), "For find: a name/signature/summary fragment."),
         (("git",), "For git: the git arguments."),
         (("fetch",), "For fetch: the URL."),
+        (("api",),
+         "For api: an optional public symbol or fragment to look up."),
         (("browser",),
          "For browser: optional actions like 'press Enter; hold Space 1.5; "
          "click #start; wait 2; eval <js>' -- hold keeps a key DOWN for N "
@@ -597,6 +637,9 @@ _FIELD_ACTION_FRAGMENTS = {
         (("read",), "or for read when file is empty (reads that definition)."),
         (("skill",), "For skill: the skill name."),
         (("mcp",), "For mcp: server/tool, or server to list its tools."),
+        (("api",),
+         "For api: the exact library name from the task (or the library "
+         "whose API you need)."),
     ],
     "command": [
         (("run", "screenshot"),
@@ -833,6 +876,11 @@ def schema_for(cfg) -> dict:
         actions.append(MCP_CALL_ACTION)
     if getattr(cfg, "allow_lsp", False):
         actions.append("lsp")
+    if _api_offered(cfg):
+        # Read-only static API lookup for a library the task names exactly.
+        # Offered only when the project's manifests declare that library, so
+        # unaffected tasks keep the existing schema byte-for-byte.
+        actions.append(API_ACTION)
     if _image_gen_offered(cfg):
         # Opt-in local/hosted image generation: offered only when an image
         # profile is configured and either allow_image_gen is on or the
@@ -933,7 +981,7 @@ _PLAIN_SHORTHAND_VERBS = frozenset({
     "move", "delete", "undo", "rename", "rename_symbol", "run", "run_test",
     "screenshot", "browser", "todo", "remember", "skill", "task", "fetch",
     "fetch_url", "web_search", "question", "mcp", "mcp_call", "serve",
-    "generate_image", "lsp", "done",
+    "generate_image", "lsp", "api", "done",
 })
 
 # The field a shorthand's first bare value fills (`read a.py` -> file).
@@ -943,7 +991,7 @@ _PLAIN_SHORTHAND_FIELD = {
     "symbol": "symbol", "callers": "symbol", "context": "symbol",
     "usages": "symbol",
     "rename": "symbol", "rename_symbol": "symbol", "skill": "symbol",
-    "lsp": "symbol", "mcp": "symbol", "mcp_call": "server",
+    "lsp": "symbol", "mcp": "symbol", "mcp_call": "server", "api": "symbol",
     "run": "command", "diagnose": "command", "serve": "command",
     "screenshot": "command", "browser": "command",
     "run_test": "target", "todo": "content", "remember": "content",
@@ -3072,6 +3120,47 @@ def tool_diagnose(index, cfg, file: str = "") -> str:
     if ok:
         return report + f"\n[No blocking diagnostics in {rel}.]"
     return report + "\n[Fix these before claiming the task is complete.]"
+
+
+def tool_api(index, cfg, symbol: str = "", pattern: str = "") -> str:
+    """Read-only public-API lookup for one exact task-named library.
+
+    Static declarations first (`.pyi`/`.py`/distribution metadata and
+    contained `node_modules/*.d.ts`); optional Go/Rust/Python-inspect
+    enrichment only through `api_oracle_exec` + `allow_shell` + policy. The
+    observation is bounded and says "unknown" (never "missing") on a miss.
+    """
+    library = _as_text(symbol).strip()
+    query = _as_text(pattern).strip()
+    if not library:
+        return ("ERROR: api needs the library name in `symbol` (the exact "
+                "name from the task) and optionally a symbol fragment in "
+                "`pattern`.")
+    if not _api_offered(cfg):
+        return ("ERROR: `api` is available only when the task names a "
+                "library declared in this project's manifests. Read or grep "
+                "the project's own source instead.")
+    from . import api_oracle
+    named = api_oracle.named_libraries(index.root,
+                                       str(getattr(cfg, "_task_text", "") or ""))
+    canonical = api_oracle.match_named_library(named, library)
+    if not canonical:
+        shown = ", ".join(named) or "(none)"
+        return (f"ERROR: '{library}' is not one of the exact task-named "
+                f"libraries: {shown}. Use `read`/`grep` for project code.")
+    resolved = env_resolve.resolve_environment(index.root)
+    task_deadline = float(getattr(cfg, "_task_deadline", 0) or 0)
+    deadline = time.monotonic() + 8.0
+    if task_deadline > 0:
+        deadline = min(deadline, task_deadline)
+    result = api_oracle.index_api(
+        index.root, canonical, environment=resolved, cfg=cfg, deadline=deadline)
+    hits = (api_oracle.lookup_api(result, query, limit=12) if query
+            else result.symbols[:12])
+    return safety.frame(
+        API_ACTION,
+        api_oracle.render_result(result, hits, package=canonical, query=query),
+        cfg)
 
 
 def tool_lsp(index, cfg, symbol: str = "", file: str = "",
@@ -5834,6 +5923,9 @@ def dispatch(index, cfg, step: dict, client=None, agent=None,
         return tool_lsp(index, cfg, step.get("symbol", ""),
                         step.get("file", ""), step.get("start", 0),
                         step.get("end", 0))
+    if action == API_ACTION:
+        return tool_api(index, cfg, _as_text(step.get("symbol")),
+                        _as_text(step.get("pattern")))
     if action == RUN_ACTION:
         return tool_run(index, cfg, step.get("command", ""))
     if action == RUN_TEST_ACTION:
