@@ -1144,6 +1144,7 @@ only the map is stale.
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`); `--no-complex` (alias `--single`) turns off the automatic Complex escalation |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
 | `pedacito restore PROJ` | Undo the last write |
+| `pedacito recover list [PROJ]` | Show unfinished task journals by UUID. `recover rollback ID PROJ` previews a safely bound rollback; add `--apply` to perform it |
 | `pedacito commit [--all] [-m MSG] [-y]` | Secret-scan the staged diff, then create a local commit. Never pushes; `--no-model` drafts offline and `--allow-secrets` is the explicit override |
 | `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Draft a PR title/body from the branch diff and commits, then open it with `gh`. Never pushes the branch |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Rename a symbol across the project. No model call; preview by default; `--strings` also renames whole-word string literals, `--include-labels` only test-label strings |

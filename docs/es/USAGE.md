@@ -197,6 +197,7 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 | `pedacito undo PROJ` | Restaura el espacio de trabajo al estado inmediatamente anterior a la última ejecución; `--list` muestra el árbol de checkpoints |
 | `pedacito checkpoints` | Lista los checkpoints de viaje en el tiempo y la cabeza activa; `--limit` y `--json` dan forma a la salida |
 | `pedacito checkout ID` | Restaura todo el espacio de trabajo o un `--file` desde un id de checkpoint (un prefijo único sirve) |
+| `pedacito recover ACTION ...` | `list [PROJECT]` muestra los diarios inacabados por UUID; `rollback TASK_ID [PROJECT] [--apply]` previsualiza el checkpoint previo vinculado y solo escribe con `--apply`. `resume` y `cleanup` se rechazan cuando no se puede probar la seguridad |
 | `pedacito update [--run]` | Verifica en PyPI si hay un Pedacito más reciente y, opcionalmente, actualiza esta instalación |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito rename OLD NEW` | Renombrado de símbolos en varios archivos mediante el AST y el tokenizador, sin llamada al modelo. `--file` lo acota, `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba, `--apply` escribe (por defecto: vista previa del diff) |
@@ -213,6 +214,30 @@ comandos. Ejecuta `pedacito <command> --help` para ver cada opción.
 
 Los benchmarks también se ejecutan desde la GUI mediante el botón **Benchmarks**; el comando
 de la CLI construye los mismos proyectos y escribe los mismos informes.
+
+### Recuperar una tarea interrumpida
+
+Cada ejecución añade un diario en `.pedacito/journal/`.
+`pedacito recover list [PROJECT]` muestra cada diario inacabado o incierto por
+su UUID, con su título, sesión, estado y checkpoint registrado. Los diarios
+anteriores a v0.4.1 nombrados por título siguen visibles para inspección, pero
+son de solo lectura: la recuperación nunca adivina la propiedad a partir de un
+título.
+
+Toda acción se previsualiza primero y no escribe nada salvo con `--apply`.
+`pedacito recover rollback TASK_ID PROJECT` previsualiza la restauración del
+checkpoint previo duradero del diario; `--apply` toma el bloqueo de escritura
+del proyecto, vuelve a comprobar la seguridad de mantenimiento, revalida el
+diario y el vínculo del checkpoint con el WAL bajo ese bloqueo, y captura los
+archivos modificados en un checkpoint de seguridad antes de restaurar. El
+checkpoint de seguridad debe estar completo, y la recuperación verifica un
+manifiesto versionado que registra las rutas exactas de la instantánea y sus
+hashes SHA-256: un manifiesto ausente, incompleto o alterado, un archivo de la
+instantánea ausente o dañado, o un escape por symlink/junction se rechaza antes
+de tocar cualquier archivo fuente. `resume` y `cleanup` se rechazan con una
+explicación en esta versión, porque no existe un límite de reanudación duradero
+validado ni una prueba autoritativa de propiedad o vivacidad entre procesos. Un
+rechazo sale con código 1 y deja intactos el diario y tus archivos.
 
 ## Ayuda integrada: `pedacito how`
 

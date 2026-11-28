@@ -551,16 +551,67 @@ def _candidate(path: Path, records: list[JournalRecord],
     )
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """True when `path` is a symlink or a Windows reparse point (junction)."""
+    try:
+        if path.is_symlink():
+            return True
+        if os.name == "nt":
+            st = os.lstat(path)
+            if getattr(st, "st_file_attributes", 0) & 0x400:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _contained_journal_dir(root: Path) -> Path | None:
+    """Return `.pedacito/journal` only when it is a real directory inside `root`."""
+    try:
+        root_res = Path(root).resolve()
+    except OSError:
+        return None
+    ped_dir = root_res / ".pedacito"
+    jdir = ped_dir / JOURNAL_DIR
+    if not jdir.is_dir():
+        return None
+    if _is_link_or_reparse(ped_dir) or _is_link_or_reparse(jdir):
+        return None
+    try:
+        jdir.resolve().relative_to(root_res)
+    except (OSError, ValueError):
+        return None
+    return jdir
+
+
+def _contained_journal_file(root: Path, jdir: Path, path: Path) -> Path | None:
+    """Return `path` only when it is a regular non-link file inside `jdir`."""
+    if not path.is_file() or _is_link_or_reparse(path):
+        return None
+    try:
+        root_res = Path(root).resolve()
+        jdir_res = jdir.resolve()
+        path_res = path.resolve()
+        path_res.relative_to(jdir_res)
+        path_res.relative_to(root_res)
+    except (OSError, ValueError):
+        return None
+    return path
+
+
 def list_recovery(root: Path | str) -> list[RecoveryCandidate]:
     """Recovery candidates for every incomplete task under a project root."""
     root = Path(root)
-    jdir = root / ".pedacito" / JOURNAL_DIR
+    jdir = _contained_journal_dir(root)
     out: list[RecoveryCandidate] = []
-    if not jdir.is_dir():
+    if jdir is None:
         return out
     for path in sorted(jdir.glob("*.jsonl")):
-        records, torn, corrupt, non_durable = _read_journal_with_status(path)
-        cand = _candidate(path, records, torn, corrupt, non_durable)
+        safe_path = _contained_journal_file(root, jdir, path)
+        if safe_path is None:
+            continue
+        records, torn, corrupt, non_durable = _read_journal_with_status(safe_path)
+        cand = _candidate(safe_path, records, torn, corrupt, non_durable)
         if cand is not None:
             out.append(cand)
     return out
@@ -573,17 +624,28 @@ def _find_journal_path(root: Path, task_id: str) -> Path | None:
     falls back to the legacy title-named lookup (read-only compatibility).
     There is deliberately no scan-by-title: a title can be shared by several
     UUID-named runs, and recovery must address exactly one run by its UUID.
+
+    UUIDs are matched in both their literal and canonical-hex forms (a user may
+    paste the hyphenated form while WAL filenames use ``uuid4().hex``). A valid
+    UUID never falls through to the title lookup, so a title that merely looks
+    like a UUID can never hijack an identity.
     """
     root = Path(root)
+    jdir = _contained_journal_dir(root)
+    if jdir is None:
+        return None
     if _valid_uuid(task_id):
-        p = root / ".pedacito" / JOURNAL_DIR / f"{task_id}.jsonl"
-        if p.is_file():
-            return p
+        stems = [str(task_id)]
+        canonical = uuid.UUID(str(task_id)).hex
+        if canonical not in stems:
+            stems.append(canonical)
+        for stem in stems:
+            p = _contained_journal_file(root, jdir, jdir / f"{stem}.jsonl")
+            if p is not None:
+                return p
+        return None
     stem = _safe_task_id(str(task_id))
-    p = root / ".pedacito" / JOURNAL_DIR / f"{stem}.jsonl"
-    if p.is_file():
-        return p
-    return None
+    return _contained_journal_file(root, jdir, jdir / f"{stem}.jsonl")
 
 
 RECOVERY_ACTIONS = ("resume", "rollback", "cleanup")
@@ -653,6 +715,53 @@ def _checkpoint_wal_id(root: Path, checkpoint_id: str) -> str:
     return ""
 
 
+def _verify_recovery_checkpoint(
+    root: Path, checkpoint_id: str, journal_wal_id: str
+) -> tuple[str, str, str, str]:
+    """Read-only validation of a rollback target.
+
+    Returns ``(resolved_id, detail, code, error)`` where an empty ``detail``
+    means the checkpoint exists, is bound to this WAL and still has its
+    snapshot directory. Every check runs in both the preview and the apply
+    path, so a preview can never claim a rollback that apply would refuse.
+    """
+    from . import checkpoints
+
+    try:
+        resolved_id = checkpoints.resolve_id(root, checkpoint_id)
+    except Exception as exc:  # noqa: BLE001 - a missing index entry is a refusal
+        return ("", f"checkpoint {checkpoint_id!r} cannot be verified: {exc}",
+                "checkpoint_unverified", str(exc))
+    # Ownership: the checkpoint must be bound to THIS WAL's UUID at creation.
+    # A legacy/unbound checkpoint or a foreign task's checkpoint (different
+    # wal_id) is refused.
+    if not journal_wal_id:
+        return (resolved_id,
+                f"checkpoint {resolved_id} is not bound to this WAL; "
+                "refusing to restore it",
+                "checkpoint_unbound", "")
+    entry_wal_id = _checkpoint_wal_id(root, resolved_id)
+    if not entry_wal_id or entry_wal_id != journal_wal_id:
+        return (resolved_id,
+                f"checkpoint {resolved_id} is not bound to this WAL; "
+                "refusing to restore it",
+                "checkpoint_unbound", "")
+    # A missing, partial, altered or unmanifested snapshot would let restore
+    # treat current files as deleted or copy damaged bytes; refuse instead.
+    try:
+        verified, reason = checkpoints.verify_recovery_snapshot(
+            root, resolved_id, journal_wal_id)
+    except Exception as exc:  # noqa: BLE001
+        return (resolved_id,
+                f"checkpoint {resolved_id} snapshot cannot be verified: {exc}",
+                "checkpoint_unverified", str(exc))
+    if not verified:
+        return (resolved_id,
+                f"checkpoint {resolved_id} cannot be verified: {reason}",
+                "checkpoint_unverified", str(reason))
+    return resolved_id, "", "", ""
+
+
 def recover(root: Path | str, task_id: str, *, action: str,
             dry_run: bool = True) -> dict[str, Any]:
     """Preview or apply a recovery action for one task's journal.
@@ -666,38 +775,59 @@ def recover(root: Path | str, task_id: str, *, action: str,
     terminal unless every requested operation succeeded: a failed or partial
     restore leaves the journal incomplete so it stays visible to recovery.
     Torn / corrupt / fsync-error journals fail closed for mutations.
+
+    ``result["code"]`` is a stable ASCII refusal/success code for surfaces that
+    localize the message; ``result["detail"]`` stays the canonical English
+    explanation.
     """
     root = Path(root)
     action = str(action or "").strip().lower()
     result: dict[str, Any] = {
         "ok": False, "action": action, "task_id": str(task_id),
-        "dry_run": bool(dry_run), "detail": "",
+        "dry_run": bool(dry_run), "detail": "", "code": "",
     }
     if action not in RECOVERY_ACTIONS:
         result["detail"] = f"unknown recovery action {action!r}"
+        result["code"] = "unknown_action"
         return result
 
     path = _find_journal_path(root, str(task_id))
     if path is None:
         result["detail"] = "no journal found for this task"
+        result["code"] = "no_journal"
         return result
+    result["journal_path"] = str(path)
     records, torn, corrupt, non_durable = _read_journal_with_status(path)
     if not records:
         result["detail"] = "the journal file is empty or corrupt"
+        result["code"] = "journal_empty"
         return result
 
+    has_fsync_error = any(r.kind == FSYNC_ERROR_KIND for r in records)
     if records[-1].kind == "task_end":
-        result["detail"] = "this task is already terminal; nothing to recover"
+        if torn or corrupt or non_durable or has_fsync_error:
+            # A trailing torn line (or lost durability) means a newer run may
+            # have started after this task_end; never present it as cleanly
+            # terminal, because that would hide recoverable work.
+            result["detail"] = ("refusing to treat this task as terminal: the "
+                                "journal is not intact (corrupt/torn/"
+                                "durability-lost)")
+            result["code"] = "journal_not_intact"
+        else:
+            result["detail"] = "this task is already terminal; nothing to recover"
+            result["code"] = "terminal"
         return result
 
     if action == "resume":
         cand = _candidate(path, records, torn, corrupt, non_durable)
         if cand is None:
             result["detail"] = "this task is already terminal"
+            result["code"] = "terminal"
             return result
         result.update(resumable=cand.resumable, status=cand.status,
                       reason=cand.reason, checkpoint_id=cand.checkpoint_id)
         result["ok"] = cand.resumable
+        result["code"] = "resume_unavailable"
         result["detail"] = f"cannot resume: {cand.reason}"
         return result
 
@@ -706,81 +836,106 @@ def recover(root: Path | str, task_id: str, *, action: str,
                 or any(r.kind == FSYNC_ERROR_KIND for r in records):
             result["detail"] = ("refusing to roll back: the journal is not "
                                 "intact (corrupt/torn/durability-lost)")
+            result["code"] = "journal_not_intact"
             return result
         pre_ids = _pre_run_checkpoints(records)
         if not pre_ids:
             result["detail"] = ("no durable pre-run boundary recorded "
                                 "(phase='pre'); refusing to roll back")
+            result["code"] = "no_pre_run_boundary"
             return result
         if len(pre_ids) > 1:
             result["detail"] = ("ambiguous: multiple pre-run boundaries "
                                 "recorded; refusing to roll back")
+            result["code"] = "ambiguous_pre_run_boundary"
             return result
         if dry_run:
+            journal_wal_id = records[-1].wal_id or records[0].wal_id
+            resolved_id, detail, code, error = _verify_recovery_checkpoint(
+                root, pre_ids[0], journal_wal_id)
+            if detail:
+                result.update(detail=detail, code=code, error=error)
+                if resolved_id:
+                    result["checkpoint_id"] = resolved_id
+                return result
             result["ok"] = True
-            result["restored_checkpoint"] = pre_ids[0]
-            result["detail"] = f"would restore checkpoint {pre_ids[0]}"
+            result["restored_checkpoint"] = resolved_id
+            result["code"] = "rollback_preview"
+            result["detail"] = f"would restore checkpoint {resolved_id}"
             return result
         locked, reason = _acquire_project_lock(root)
         if not locked:
             result["detail"] = reason
+            result["code"] = "project_busy"
+            result["error"] = str(reason)
             return result
         try:
             # TOCTOU guard: re-read and revalidate under the lock.
             recs2, torn2, corrupt2, non_durable2 = _read_journal_with_status(path)
             if not recs2:
                 result["detail"] = "the journal changed and is now empty or corrupt"
+                result["code"] = "journal_changed_empty"
                 return result
+            has_fsync_error2 = any(
+                r.kind == FSYNC_ERROR_KIND for r in recs2)
             if recs2[-1].kind == "task_end":
-                result["detail"] = "the task became terminal since the preview"
+                if torn2 or corrupt2 or non_durable2 or has_fsync_error2:
+                    result["detail"] = ("refusing to treat this task as "
+                                        "terminal: the journal changed and is "
+                                        "no longer intact")
+                    result["code"] = "journal_not_intact"
+                else:
+                    result["detail"] = ("the task became terminal since the "
+                                        "preview")
+                    result["code"] = "terminal"
                 return result
-            if corrupt2 or torn2 or non_durable2 \
-                    or any(r.kind == FSYNC_ERROR_KIND for r in recs2):
+            if corrupt2 or torn2 or non_durable2 or has_fsync_error2:
                 result["detail"] = ("refusing to roll back: the journal changed "
                                     "and is no longer intact")
+                result["code"] = "journal_not_intact"
                 return result
             pre_ids2 = _pre_run_checkpoints(recs2)
             if not pre_ids2:
                 result["detail"] = "no durable pre-run boundary recorded; refusing"
+                result["code"] = "no_pre_run_boundary"
                 return result
             if len(pre_ids2) > 1:
                 result["detail"] = "ambiguous: multiple pre-run boundaries; refusing"
+                result["code"] = "ambiguous_pre_run_boundary"
                 return result
-            checkpoint_id = pre_ids2[0]
+            journal_wal_id = recs2[-1].wal_id or recs2[0].wal_id
+            resolved_id, detail, code, error = _verify_recovery_checkpoint(
+                root, pre_ids2[0], journal_wal_id)
+            if detail:
+                result.update(detail=detail, code=code, error=error)
+                if resolved_id:
+                    result["checkpoint_id"] = resolved_id
+                return result
 
             from . import checkpoints
-            # Independently verify checkpoint existence before any mutation.
-            try:
-                resolved_id = checkpoints.resolve_id(root, checkpoint_id)
-            except Exception as exc:  # noqa: BLE001
-                result["detail"] = (f"checkpoint {checkpoint_id!r} cannot be "
-                                    f"verified: {exc}")
-                return result
-            # Ownership: the checkpoint must be bound to THIS WAL's UUID at
-            # creation. A legacy/unbound checkpoint or a foreign task's
-            # checkpoint (different wal_id) is refused.
-            journal_wal_id = recs2[-1].wal_id or recs2[0].wal_id
-            entry_wal_id = _checkpoint_wal_id(root, resolved_id)
-            if not journal_wal_id or not entry_wal_id \
-                    or entry_wal_id != journal_wal_id:
-                result["detail"] = (f"checkpoint {resolved_id} is not bound to "
-                                    "this WAL; refusing to restore it")
-                return result
             restore = (getattr(checkpoints, "restore_checkpoint", None)
                        or getattr(checkpoints, "restore", None))
             if not callable(restore):
                 result["detail"] = "no checkpoint restore function available"
+                result["code"] = "restore_unavailable"
                 return result
             restored = restore(root, resolved_id)
             if isinstance(restored, dict) and restored.get("ok") is False:
                 result["detail"] = ("checkpoint restore reported failure: "
                                     f"{restored.get('detail') or restored}")
+                result["code"] = "restore_failed"
+                result["error"] = str(restored.get('detail') or restored)
                 return result
             if isinstance(restored, dict) and restored.get("skipped"):
+                skipped = len(restored["skipped"])
                 result["detail"] = (f"checkpoint restore was partial "
-                                    f"({len(restored['skipped'])} file(s) skipped); "
+                                    f"({skipped} file(s) skipped); "
                                     "refusing to mark the task terminal")
+                result["code"] = "restore_partial"
+                result["skipped"] = skipped
                 return result
+            if isinstance(restored, dict) and restored.get("safety_id"):
+                result["safety_id"] = str(restored["safety_id"])
 
             # Mark terminal durably; only report success if the marker is durable.
             durable, err = _append_terminal(
@@ -792,13 +947,19 @@ def recover(root: Path | str, task_id: str, *, action: str,
             if not durable:
                 result["detail"] = (f"checkpoint restored but the terminal "
                                     f"record was not durable: {err}")
+                result["code"] = "terminal_not_durable"
+                result["error"] = str(err)
+                result["restored_checkpoint"] = resolved_id
                 return result
             result["ok"] = True
             result["restored_checkpoint"] = resolved_id
+            result["code"] = "rollback_applied"
             result["detail"] = f"restored checkpoint {resolved_id}"
             return result
         except Exception as exc:  # noqa: BLE001 - recovery reports, never raises
             result["detail"] = f"checkpoint restore failed: {exc}"
+            result["code"] = "restore_failed"
+            result["error"] = str(exc)
             return result
         finally:
             _release_project_lock(root)
@@ -812,6 +973,7 @@ def recover(root: Path | str, task_id: str, *, action: str,
                         "ownership/liveness check for the precise worktree/"
                         "session, which is not available in this release; "
                         "refusing")
+    result["code"] = "cleanup_unavailable"
     return result
 
 

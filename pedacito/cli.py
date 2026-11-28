@@ -2890,6 +2890,233 @@ def _cmd_undo(args) -> int:
     return 0
 
 
+# Recovery CLI presentation. The ASCII codes come from `journal.recover`; the
+# cards only localize them, so the library remains the single source of truth
+# for what is (and is not) safe.
+_RECOVER_STATUS_KEYS = {
+    "incomplete": "cli.recover.status.incomplete",
+    "torn": "cli.recover.status.torn",
+    "corrupt": "cli.recover.status.corrupt",
+    "fsync_error": "cli.recover.status.fsync_error",
+    "non_durable": "cli.recover.status.non_durable",
+    "no_checkpoint": "cli.recover.status.no_checkpoint",
+}
+_RECOVER_REASON_KEYS = {
+    "incomplete": "cli.recover.reason.resume_unavailable",
+    "torn": "cli.recover.reason.torn",
+    "corrupt": "cli.recover.reason.corrupt",
+    "fsync_error": "cli.recover.reason.fsync_error",
+    "non_durable": "cli.recover.reason.non_durable",
+    "no_checkpoint": "cli.recover.reason.no_checkpoint",
+}
+_RECOVER_CODE_KEYS = {
+    "unknown_action": "cli.recover.codes.unknown_action",
+    "no_journal": "cli.recover.codes.no_journal",
+    "journal_empty": "cli.recover.codes.journal_empty",
+    "terminal": "cli.recover.codes.terminal",
+    "journal_not_intact": "cli.recover.codes.journal_not_intact",
+    "no_pre_run_boundary": "cli.recover.codes.no_pre_run_boundary",
+    "ambiguous_pre_run_boundary": "cli.recover.codes.ambiguous_pre_run_boundary",
+    "project_busy": "cli.recover.codes.project_busy",
+    "journal_changed_empty": "cli.recover.codes.journal_changed_empty",
+    "checkpoint_unverified": "cli.recover.codes.checkpoint_unverified",
+    "checkpoint_unbound": "cli.recover.codes.checkpoint_unbound",
+    "checkpoint_snapshot_missing": "cli.recover.codes.checkpoint_snapshot_missing",
+    "restore_unavailable": "cli.recover.codes.restore_unavailable",
+    "restore_failed": "cli.recover.codes.restore_failed",
+    "restore_partial": "cli.recover.codes.restore_partial",
+    "terminal_not_durable": "cli.recover.codes.terminal_not_durable",
+    "cleanup_unavailable": "cli.recover.reason.cleanup",
+    "maintenance_blocked": "cli.recover.codes.maintenance_blocked",
+}
+# A failure after the checkpoint restore began may have written files, so the
+# CLI must not print the reassuring "no files were changed" line.
+_RECOVER_MAY_HAVE_MUTATED = frozenset({
+    "restore_failed", "restore_partial", "terminal_not_durable",
+})
+
+
+def _recover_root(args) -> Path:
+    """The project root for a recover command, without creating any state."""
+    raw = (getattr(args, "root", None)
+           or getattr(args, "project", None) or ".")
+    return Path(str(raw)).expanduser().resolve()
+
+
+def _recover_status_text(status: str) -> str:
+    key = _RECOVER_STATUS_KEYS.get(str(status or ""))
+    if key:
+        return i18n.t(key)
+    return i18n.t("cli.recover.status.unknown", status=str(status or ""))
+
+
+def _recover_candidate_reason(candidate) -> str:
+    key = _RECOVER_REASON_KEYS.get(str(candidate.status or ""))
+    return i18n.t(key) if key else str(candidate.reason or "")
+
+
+def _recover_code_reason(result: dict, root: Path) -> str:
+    """Localize a `journal.recover` refusal, falling back to its English detail."""
+    code = str(result.get("code") or "")
+    if code == "resume_unavailable":
+        key = _RECOVER_REASON_KEYS.get(str(result.get("status") or ""))
+        if key:
+            return i18n.t(key)
+    key = _RECOVER_CODE_KEYS.get(code)
+    if key:
+        kwargs: dict = {"project": str(root)}
+        if result.get("error") is not None:
+            kwargs["error"] = str(result.get("error"))
+        if result.get("skipped") is not None:
+            kwargs["count"] = result.get("skipped")
+        return i18n.t(key, **kwargs)
+    detail = str(result.get("detail") or "")
+    return detail or i18n.t("cli.recover.codes.unknown")
+
+
+def _recover_journal_display(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _cmd_recover_list(root: Path) -> int:
+    """Read-only list of recovery candidates (never creates or writes state)."""
+    from . import journal
+
+    candidates = journal.list_recovery(root)
+    if not candidates:
+        print(i18n.t("cli.recover.list.empty", project=str(root)))
+        return 0
+    print(i18n.t("cli.recover.list.header", project=str(root)))
+    rollback_ready = False
+    for candidate in candidates:
+        print()
+        if candidate.wal_id:
+            print(i18n.t("cli.recover.list.identity", wal_id=candidate.wal_id))
+            print(i18n.t("cli.recover.list.title", title=candidate.task_id))
+        else:
+            print(i18n.t("cli.recover.list.identity_legacy",
+                         title=candidate.task_id))
+            print(i18n.t("cli.recover.list.legacy_note"))
+        print(i18n.t("cli.recover.list.status",
+                     status=_recover_status_text(candidate.status)))
+        print(i18n.t("cli.recover.list.session",
+                     session=candidate.session_id
+                     or i18n.t("cli.recover.list.none")))
+        print(i18n.t("cli.recover.list.checkpoint",
+                     checkpoint=candidate.checkpoint_id
+                     or i18n.t("cli.recover.list.none")))
+        print(i18n.t("cli.recover.list.journal",
+                     journal=_recover_journal_display(root,
+                                                      candidate.journal_path)))
+        print(i18n.t("cli.recover.list.resume",
+                     reason=_recover_candidate_reason(candidate)))
+        identity = candidate.wal_id or candidate.task_id
+        preview = journal.recover(root, identity, action="rollback",
+                                  dry_run=True)
+        if preview.get("ok"):
+            rollback_ready = True
+            print(i18n.t("cli.recover.list.rollback_ready",
+                         checkpoint=preview.get("restored_checkpoint")
+                         or candidate.checkpoint_id))
+        else:
+            print(i18n.t("cli.recover.list.rollback_refused",
+                         reason=_recover_code_reason(preview, root)))
+    if rollback_ready:
+        print()
+        print(i18n.t("cli.recover.list.hint", project=str(root)))
+    return 0
+
+
+def _cmd_recover(args) -> int:
+    """`pedacito recover list|resume|rollback|cleanup` (preview by default).
+
+    Recover never needs a model, config or index. `list` and every preview are
+    read-only; only `rollback --apply` mutates files, and then only through the
+    journal's project lock, checkpoint ownership checks and a safety snapshot.
+    Resume and cleanup always report their refusal instead of pretending.
+    """
+    from . import journal
+
+    action = str(getattr(args, "recover_action", "") or "").strip().lower()
+    root = _recover_root(args)
+    if not root.is_dir():
+        print(i18n.t("cli.recover.error.project", path=str(root)),
+              file=sys.stderr)
+        return 2
+    if action == "list":
+        return _cmd_recover_list(root)
+
+    task_id = str(getattr(args, "task_id", "") or "").strip()
+    if not task_id:
+        print(i18n.t("cli.recover.error.task_required", action=action),
+              file=sys.stderr)
+        return 2
+    apply = bool(getattr(args, "apply", False))
+
+    # A destructive recovery obeys the same maintenance gate as undo/reset.
+    # Preview never takes a lock, so a read-only inspection stays available
+    # while another run is active.
+    if action == "rollback" and apply:
+        try:
+            ok, reason = workspace.check_maintenance_safe(
+                root, action="recover rollback")
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            ok, reason = False, f"{type(exc).__name__}: {exc}"
+        if not ok:
+            blocked = {"code": "maintenance_blocked", "error": reason}
+            print(i18n.t("cli.recover.header", action=action, task=task_id,
+                         project=str(root)), file=sys.stderr)
+            print(i18n.t("cli.recover.refused",
+                         reason=_recover_code_reason(blocked, root)),
+                  file=sys.stderr)
+            print(i18n.t("cli.recover.no_changes"), file=sys.stderr)
+            return 1
+
+    result = journal.recover(root, task_id, action=action,
+                             dry_run=not apply)
+    header = i18n.t("cli.recover.header", action=action, task=task_id,
+                    project=str(root))
+
+    if action == "rollback" and result.get("ok"):
+        if result.get("dry_run"):
+            print(header)
+            print(i18n.t("cli.recover.rollback_preview",
+                         checkpoint=result.get("restored_checkpoint") or ""))
+            print(i18n.t("cli.recover.rollback_safety"))
+            print(i18n.t("cli.recover.rollback_apply_hint"))
+            return 0
+        print(header)
+        print(i18n.t("cli.recover.rollback_applied", task=task_id,
+                     checkpoint=result.get("restored_checkpoint") or ""))
+        if result.get("safety_id"):
+            print(i18n.t("cli.recover.safety_snapshot",
+                         checkpoint=result["safety_id"]))
+        return 0
+
+    # Everything else is a refusal; keep the exit status distinct from usage.
+    print(header, file=sys.stderr)
+    reason = _recover_code_reason(result, root)
+    if action == "resume":
+        print(i18n.t("cli.recover.resume_refused", reason=reason),
+              file=sys.stderr)
+    elif action == "cleanup":
+        print(i18n.t("cli.recover.cleanup_refused", reason=reason),
+              file=sys.stderr)
+    else:
+        print(i18n.t("cli.recover.refused", reason=reason), file=sys.stderr)
+    if str(result.get("code") or "") in _RECOVER_MAY_HAVE_MUTATED:
+        print(i18n.t("cli.recover.incomplete"), file=sys.stderr)
+    else:
+        print(i18n.t("cli.recover.no_changes"), file=sys.stderr)
+    if action == "rollback":
+        print(i18n.t("cli.recover.refusal_hint", project=str(root)),
+              file=sys.stderr)
+    return 1
+
+
 def _cmd_daemon(args) -> int:
     """`pedacito daemon [start|stop|status|sessions]` (loopback-only)."""
     from . import daemon as daemon_mod
@@ -4256,6 +4483,35 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                             metavar="PATH",
                             help="restore only this file; repeatable")
 
+    p_recover = sub.add_parser("recover", help=t("cli.cmd.recover"))
+    p_recover.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                           default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    rec_sub = p_recover.add_subparsers(
+        dest="recover_action", required=True,
+        metavar="{list,resume,rollback,cleanup}")
+    p_rec_list = rec_sub.add_parser("list", help=t("cli.recover.help.list"))
+    p_rec_list.add_argument("project", nargs="?", default=".",
+                            help=t("cli.recover.opt.project"))
+    p_rec_list.add_argument("--root", default=None,
+                            help=t("cli.recover.opt.root"))
+    p_rec_list.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                            default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    for rec_action in ("resume", "rollback", "cleanup"):
+        p_rec_action = rec_sub.add_parser(
+            rec_action, help=t(f"cli.recover.help.{rec_action}"))
+        p_rec_action.add_argument("task_id",
+                                  help=t("cli.recover.opt.task_id"))
+        p_rec_action.add_argument("project", nargs="?", default=".",
+                                  help=t("cli.recover.opt.project"))
+        p_rec_action.add_argument(
+            "--apply", action="store_true",
+            help=t("cli.recover.opt.apply"))
+        p_rec_action.add_argument("--root", default=None,
+                                  help=t("cli.recover.opt.root"))
+        p_rec_action.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                                  default=argparse.SUPPRESS,
+                                  help=t("cli.opt.lang"))
+
     p_wt = sub.add_parser(
         "worktree",
         help="create/list/remove an isolated git worktree for risky runs")
@@ -5121,6 +5377,11 @@ def _main(argv=None) -> int:
         from . import rpc as rpc_mod
         print(json.dumps(rpc_mod.describe(), indent=2))
         return 0
+
+    # Recovery is a local journal operation: no config, model or index is
+    # needed, and even the preview must work while another run holds the lock.
+    if args.cmd == "recover":
+        return _cmd_recover(args)
 
     # The daemon is loopback-only and needs no model/config/index to answer
     # `status`, `sessions` or `stop`: it must exit 0 cleanly offline.

@@ -1022,10 +1022,20 @@ ejecución esté tomado, y `force=True` es la única anulación.
 
 ### TaskJournal (WAL)
 
-`TaskJournal` (`journal.py`) añade una línea JSON por paso y, por defecto, hace fsync. Una última línea
-truncada se ignora. `find_incomplete_tasks` lista las tareas que empezaron y nunca terminaron, y
-`rollback_incomplete_task` registra la reversión. Un `run.lock` obsoleto que dejó un proceso muerto lo
-toma `acquire_lock`.
+`TaskJournal` (`journal.py`) escribe archivos WAL versionados con nombre UUID
+(`.pedacito/journal/<wal_id>.jsonl`, separados del título redactado de la tarea),
+mantiene números de secuencia monotónicos al reabrir un `wal_id` explícito y hace
+fsync por defecto en cada línea. Los fallos de escritura o fsync marcan la
+durabilidad como perdida en lugar de silenciarlos; los diarios truncados,
+corruptos o no duraderos se informan como no recuperables en vez de ignorarse.
+`list_recovery` inspecciona de forma conservadora tanto diarios UUID v2 como
+diarios heredados por título, y `recover` (`pedacito recover
+list|resume|rollback|cleanup`, vista previa por defecto y `--apply` para mutar)
+verifica bloqueos entre procesos, seguridad de mantenimiento, propiedad y
+manifiestos SHA-256 de checkpoints antes de restaurar o limpiar, negándose a
+marcar la tarea como terminal si falla la restauración o la durabilidad del
+registro terminal. Un `run.lock` obsoleto que dejó un proceso muerto lo toma
+`acquire_lock`.
 
 ### SessionResourceRegistry y cancelación
 

@@ -41,6 +41,10 @@ CHECKPOINTS_DIR = CHECKPOINT_DIR        # compatibility alias
 INDEX_FILE = "index.json"
 SNAPSHOT_DIR = "snapshots"
 SNAPSHOTS_DIR = SNAPSHOT_DIR            # compatibility alias
+MANIFEST_DIR = "manifests"
+# A recovery manifest records the exact tracked paths and full SHA-256 hashes
+# captured with one snapshot. Version 1 is the first (and current) format.
+SNAPSHOT_MANIFEST_VERSION = 1
 VERSION = 1
 
 # Directories that never belong in a source snapshot.  The list starts with
@@ -98,6 +102,17 @@ def snapshot_dir(root, checkpoint_id: str) -> Path:
             or not re.fullmatch(r"[A-Za-z0-9_-]+", cid)):
         raise CheckpointError(f"invalid checkpoint id {checkpoint_id!r}")
     return checkpoint_root(root) / SNAPSHOT_DIR / cid
+
+
+def snapshot_manifest_path(root, checkpoint_id: str) -> Path:
+    """Where one checkpoint's integrity manifest is stored.
+
+    The manifest lives beside (not inside) the snapshot tree so it can never be
+    mistaken for a tracked project file or copied back by a legacy restore.
+    """
+    cid = str(checkpoint_id or "")
+    snapshot_dir(root, cid)              # validates the id before using it
+    return checkpoint_root(root) / MANIFEST_DIR / f"{cid}.json"
 
 
 def _empty_index() -> dict:
@@ -268,6 +283,172 @@ def _file_hash(path: Path) -> str:
         return ""
 
 
+def _file_sha256(path: Path) -> str:
+    """The full SHA-256 of a file (used by recovery integrity manifests)."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_MANIFEST_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _write_snapshot_manifest(root, checkpoint_id: str, wal_id: str,
+                             hashes: dict[str, str]) -> Path:
+    """Write the versioned, WAL-bound integrity manifest for a snapshot."""
+    path = snapshot_manifest_path(root, checkpoint_id)
+    files = {str(rel): str(hashes[rel]) for rel in sorted(hashes)}
+    payload = {
+        "version": SNAPSHOT_MANIFEST_VERSION,
+        "complete": True,
+        "checkpoint_id": str(checkpoint_id),
+        "wal_id": str(wal_id or ""),
+        "created_at": _now_iso(),
+        "count": len(files),
+        "files": files,
+    }
+    data = (json.dumps(payload, indent=1, ensure_ascii=False,
+                       sort_keys=True) + "\n").encode("utf-8")
+    fileio.write_bytes(path, data)
+    return path
+
+
+def verify_recovery_snapshot(root, checkpoint_id: str,
+                             wal_id: str) -> tuple[bool, str]:
+    """Verify a WAL-bound snapshot manifest and every file it names.
+
+    Read-only and fail-closed: an absent/incomplete/altered manifest, an extra
+    or missing snapshot file, a hash mismatch, an unsafe path, or a symlink/
+    junction anywhere in the snapshot tree returns ``(False, reason)``. A
+    genuine empty snapshot passes only when its verified manifest says zero
+    files. This is the recovery-only gate; ordinary ``checkout``/``undo`` keep
+    their legacy snapshot behavior.
+    """
+    root = Path(root)
+    cid = str(checkpoint_id or "")
+    expected_wal = str(wal_id or "")
+    if not expected_wal:
+        return False, "the journal has no WAL identity"
+    try:
+        manifest_path = snapshot_manifest_path(root, cid)
+        snapshot_root = snapshot_dir(root, cid)
+        store_root = checkpoint_root(root).resolve()
+    except (CheckpointError, OSError) as exc:
+        return False, f"the checkpoint path is unsafe: {exc}"
+
+    # The manifest and snapshot must live inside the checkpoint store; a
+    # junction or symlinked parent would otherwise redirect the read.
+    if manifest_path.is_symlink() \
+            or security.is_junction_or_reparse(manifest_path):
+        return False, "the snapshot manifest is a symlink or junction"
+    try:
+        if not manifest_path.resolve().is_relative_to(store_root):
+            return False, "the snapshot manifest escapes the checkpoint store"
+    except OSError as exc:
+        return False, f"the snapshot manifest path cannot be resolved: {exc}"
+    if snapshot_root.is_symlink() \
+            or security.is_junction_or_reparse(snapshot_root):
+        return False, "the snapshot directory is a symlink or junction"
+    try:
+        if not snapshot_root.resolve().is_relative_to(store_root):
+            return False, "the snapshot directory escapes the checkpoint store"
+    except OSError as exc:
+        return False, f"the snapshot path cannot be resolved: {exc}"
+    if not snapshot_root.is_dir():
+        return False, "the snapshot directory is missing"
+
+    # Ownership is recorded twice: on the index entry and in the manifest.
+    data = _load_index(root)
+    entry = _find_entry(data, cid)
+    if entry is None:
+        return False, "the checkpoint is not in the index"
+    if str(entry.get("wal_id") or "") != expected_wal:
+        return False, "the checkpoint is not bound to this WAL"
+
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as exc:
+        return False, f"the snapshot manifest is missing or unreadable: {exc}"
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return False, f"the snapshot manifest is not valid JSON: {exc}"
+    if not isinstance(manifest, dict):
+        return False, "the snapshot manifest is not an object"
+    version = manifest.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != SNAPSHOT_MANIFEST_VERSION:
+        return False, "the snapshot manifest has an unsupported version"
+    if manifest.get("complete") is not True:
+        return False, "the snapshot manifest is not marked complete"
+    if str(manifest.get("checkpoint_id") or "") != cid:
+        return False, "the snapshot manifest belongs to another checkpoint"
+    if str(manifest.get("wal_id") or "") != expected_wal:
+        return False, "the snapshot manifest is not bound to this WAL"
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return False, "the snapshot manifest has no file table"
+    count = manifest.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) \
+            or count != len(files):
+        return False, "the snapshot manifest file count is inconsistent"
+
+    hashes: dict[str, str] = {}
+    for rel, digest in files.items():
+        if not isinstance(rel, str) or not isinstance(digest, str) \
+                or not _MANIFEST_HASH_RE.fullmatch(digest):
+            return False, "the snapshot manifest has a malformed file entry"
+        try:
+            safe = _safe_relative(root, rel)
+        except CheckpointError as exc:
+            return False, f"the snapshot manifest path is unsafe: {exc}"
+        if safe != rel:
+            return False, "the snapshot manifest path is not normalized"
+        hashes[rel] = digest
+
+    actual: dict[str, Path] = {}
+    try:
+        for dirpath, dirnames, filenames in os.walk(snapshot_root,
+                                                    followlinks=False):
+            directory = Path(dirpath)
+            for name in list(dirnames):
+                child = directory / name
+                rel = child.relative_to(snapshot_root).as_posix()
+                if child.is_symlink() \
+                        or security.is_junction_or_reparse(child):
+                    return False, f"the snapshot contains an unsafe link: {rel}"
+            for name in filenames:
+                child = directory / name
+                rel = child.relative_to(snapshot_root).as_posix()
+                if child.is_symlink() \
+                        or security.is_junction_or_reparse(child) \
+                        or not child.is_file():
+                    return False, f"the snapshot contains an unsafe file: {rel}"
+                actual[rel] = child
+    except OSError as exc:
+        return False, f"the snapshot cannot be walked: {exc}"
+
+    missing = sorted(set(hashes) - set(actual))
+    if missing:
+        return False, ("the snapshot is missing manifest file(s): "
+                       + ", ".join(missing[:5]))
+    extra = sorted(set(actual) - set(hashes))
+    if extra:
+        return False, ("the snapshot contains file(s) absent from the "
+                       "manifest: " + ", ".join(extra[:5]))
+
+    for rel in sorted(hashes):
+        try:
+            digest = _file_sha256(actual[rel])
+        except OSError as exc:
+            return False, f"the snapshot file cannot be read: {rel} ({exc})"
+        if digest != hashes[rel]:
+            return False, f"the snapshot file hash does not match: {rel}"
+    return True, ""
+
+
 def _snapshot_map(path: Path) -> dict[str, Path]:
     """Files in one snapshot directory, keyed by project-relative path."""
     out: dict[str, Path] = {}
@@ -333,7 +514,8 @@ def _new_id(seq: int, label: str) -> str:
 
 def create_checkpoint(root, label: str, mode: str = "task",
                       parent_id: str | None = None,
-                      wal_id: str = "") -> dict:
+                      wal_id: str = "",
+                      require_complete: bool = False) -> dict:
     """Snapshot the tracked workspace and append one checkpoint.
 
     `parent_id` defaults to the active head, which makes the normal case a
@@ -343,6 +525,14 @@ def create_checkpoint(root, label: str, mode: str = "task",
     `wal_id` binds the checkpoint to the WAL (task journal) that recorded it;
     recovery verifies this exact association before restoring, so a checkpoint
     created by another task can never be substituted.
+
+    ``require_complete`` makes this strict: if any tracked file cannot be
+    copied and hash-verified, or its integrity manifest cannot be written, no
+    checkpoint entry is added and ``CheckpointError`` is raised. Pre-run and
+    pre-restore safety checkpoints use it so recovery can never offer an
+    incomplete safety net. The default preserves legacy non-recovery behavior
+    (an incomplete checkpoint remains usable by ``checkout``/``undo`` but is
+    explicitly refused by recovery because it has no verified manifest).
     """
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -372,14 +562,37 @@ def create_checkpoint(root, label: str, mode: str = "task",
         tmp.mkdir(parents=True, exist_ok=True)
         current = dict(iter_workspace_files(root))
         copied: dict[str, Path] = {}
+        hashes: dict[str, str] = {}
+        failed: list[str] = []
         for rel, src in current.items():
             dest = tmp / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             try:
+                digest = _file_sha256(src)
                 fileio.copy_file_atomic(src, dest)
+                copied_digest = _file_sha256(dest)
             except OSError:
+                failed.append(rel)
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                continue
+            if copied_digest != digest:
+                failed.append(rel)
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
                 continue
             copied[rel] = dest
+            hashes[rel] = digest
+        if failed and require_complete:
+            shutil.rmtree(tmp, ignore_errors=True)
+            sample = ", ".join(sorted(failed)[:5])
+            raise CheckpointError(
+                f"snapshot incomplete: {len(failed)} file(s) could not be "
+                f"copied and verified ({sample})")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(target, ignore_errors=True)
         os.replace(tmp, target)
@@ -387,6 +600,23 @@ def create_checkpoint(root, label: str, mode: str = "task",
         # every record at the final snapshot so the hash comparison reads the
         # copied bytes instead of empty paths.
         copied = {rel: target / rel for rel in copied}
+
+        # Only a complete copy gets a manifest. A failed copy remains a legacy
+        # checkpoint (normal undo/checkout still work) but recovery refuses it.
+        if not failed:
+            try:
+                _write_snapshot_manifest(root, cp_id, str(wal_id or ""), hashes)
+            except (OSError, CheckpointError) as exc:
+                if require_complete:
+                    shutil.rmtree(target, ignore_errors=True)
+                    try:
+                        snapshot_manifest_path(root, cp_id).unlink()
+                    except OSError:
+                        pass
+                    raise CheckpointError(
+                        f"snapshot manifest could not be written: {exc}") from exc
+                # Keep the legacy checkpoint; it simply has no verified
+                # manifest, so recovery will refuse it.
 
         base_dir = snapshot_dir(root, parent) if parent else None
         base = _snapshot_map(base_dir) if base_dir is not None else {}
@@ -411,7 +641,16 @@ def create_checkpoint(root, label: str, mode: str = "task",
         data["checkpoints"].append(entry)
         data["head_id"] = cp_id
         data["next_seq"] = seq + 1
-        _save_index(root, data)
+        try:
+            _save_index(root, data)
+        except BaseException:
+            if require_complete:
+                shutil.rmtree(target, ignore_errors=True)
+                try:
+                    snapshot_manifest_path(root, cp_id).unlink()
+                except OSError:
+                    pass
+            raise
         return dict(entry)
 
 
@@ -466,7 +705,8 @@ def ensure_pre_run_checkpoint(root, label: str = "pre-run",
                         live = dict(iter_workspace_files(root))
                         if not _changed_paths(_snapshot_map(head_dir), live):
                             return dict(head)
-            return create_checkpoint(root, label, mode=mode, wal_id=wal_id)
+            return create_checkpoint(root, label, mode=mode, wal_id=wal_id,
+                                     require_complete=True)
     except (OSError, CheckpointError):
         return None
 
@@ -734,7 +974,8 @@ def restore_checkpoint(root, checkpoint_id: str, files=None) -> dict:
                 mode="restore",
                 parent_id=str(data.get("head_id")
                               or entry.get("parent_id") or "")
-                or None)
+                or None,
+                require_complete=True)
 
         restored: list[str] = []
         deleted: list[str] = []

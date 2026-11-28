@@ -196,6 +196,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito undo PROJ` | Restore the workspace to the state immediately before the last run; `--list` shows the checkpoint tree |
 | `pedacito checkpoints` | List time-travel checkpoints and the active head; `--limit` and `--json` shape the output |
 | `pedacito checkout ID` | Restore the whole workspace or one `--file` from a checkpoint id (a unique prefix works) |
+| `pedacito recover ACTION ...` | `list [PROJECT]` shows unfinished journals by UUID; `rollback TASK_ID [PROJECT] [--apply]` previews the bound pre-run checkpoint and writes only with `--apply`. `resume` and `cleanup` refuse when safety cannot be proved |
 | `pedacito update [--run]` | Check PyPI for a newer Pedacito and optionally upgrade this install |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito commit [--all] [-m MSG] [-y]` | Scan the staged diff for secrets, then create a local commit. Never pushes; `--no-model` drafts the message offline and `--allow-secrets` is the explicit override |
@@ -212,6 +213,28 @@ commands. Run `pedacito <command> --help` for every flag.
 
 Benchmarks also run from the GUI through the **Benchmarks** button; the CLI
 command builds the same projects and writes the same reports.
+
+### Recovering an interrupted task
+
+Each run appends a journal under `.pedacito/journal/`.
+`pedacito recover list [PROJECT]` shows every unfinished or uncertain journal
+by UUID, with its title, session, status and recorded checkpoint. Pre-v0.4.1
+title-named journals stay visible for inspection, but they are read-only:
+recovery never guesses ownership from a title.
+
+Every action previews first and writes nothing unless `--apply` is present.
+`pedacito recover rollback TASK_ID PROJECT` previews restoring the journal's
+durable pre-run checkpoint; `--apply` takes the project write lock, rechecks
+maintenance safety, revalidates the journal and the checkpoint's WAL binding
+under that lock, and captures dirty files in a safety checkpoint before the
+restore. The safety checkpoint must be complete, and recovery verifies a
+versioned manifest that records the exact snapshot paths and SHA-256 hashes:
+an absent, incomplete or altered manifest, a missing or damaged snapshot file,
+or a symlink/junction escape is refused before any source file is touched.
+`resume` and `cleanup` refuse with an explanation in this release, because no
+validated durable resume boundary or authoritative cross-process
+ownership/liveness proof exists. A refusal exits 1 and leaves the journal and
+your files untouched.
 
 ## Built-in help: `pedacito how`
 

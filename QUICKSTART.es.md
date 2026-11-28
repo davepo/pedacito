@@ -1141,6 +1141,7 @@ solo el mapa está desactualizado.
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero (o `--spec FILE`); `--no-complex` (alias `--single`) desactiva la escalada automática a Complex |
 | `pedacito auto PROJ -t "..."` | Planifica una meta y luego la implementa tarea por tarea |
 | `pedacito restore PROJ` | Deshace la última escritura |
+| `pedacito recover list [PROJ]` | Muestra los diarios de tareas inacabadas por UUID. `recover rollback ID PROJ` previsualiza una reversión vinculada de forma segura; añade `--apply` para realizarla |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Renombra un símbolo en todo el proyecto. Sin llamada al modelo; vista previa por defecto; `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba |
 | `pedacito eval` | Puntúa el arnés sobre repositorios de prueba. Usa `--baseline` como compuerta |
 | `pedacito bench [BENCHMARK\|all]` | Ejecuta los seis benchmarks de diagnóstico y la rúbrica de evaluación. `--list`/`--recent` son gratis; `--json`/`--strict` para CI |

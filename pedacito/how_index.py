@@ -98,6 +98,8 @@ _SYNONYMS = {
     "cli": ("command", "terminal", "shell", "pedacito"),
     "run": ("command", "execute", "start", "usage"),
     "undo": ("restore", "backup", "revert", "rollback", "snapshot"),
+    "recover": ("recovery", "interrupted", "crash", "journal", "rollback",
+                "resume", "cleanup"),
     "revert": ("restore", "backup", "undo", "rollback"),
     "restore": ("undo", "backup", "revert", "snapshot"),
     "edit": ("apply", "review", "changes", "write"),
@@ -1110,6 +1112,36 @@ CLI_COMMANDS = [
             {"flag": "--root DIR", "help": "project root"},
             {"flag": "--file PATH",
              "help": "restore only this file; repeatable"},
+        ],
+    },
+    {
+        "name": "recover",
+        "usage": "pedacito recover list [PROJECT] | pedacito recover "
+                 "resume|rollback|cleanup TASK_ID [PROJECT] [--apply]",
+        "summary": "List interrupted task journals by their UUID and preview "
+                   "or apply a recovery action. Everything is read-only "
+                   "without --apply; resume and cleanup refuse when Pedacito "
+                   "cannot prove a durable boundary or authoritative "
+                   "ownership.",
+        "keywords": ["recover", "recovery", "interrupted task", "crashed run",
+                     "journal", "wal", "resume", "rollback", "cleanup",
+                     "task id", "uuid", "legacy journal"],
+        "examples": [
+            "pedacito recover list .",
+            "pedacito recover rollback 6f1c... .",
+            "pedacito recover rollback 6f1c... . --apply",
+            "pedacito recover resume 6f1c... .",
+            "pedacito recover cleanup 6f1c... .",
+        ],
+        "flags": [
+            {"flag": "list | resume | rollback | cleanup",
+             "help": "list is read-only; the others preview by default"},
+            {"flag": "TASK_ID", "help": "the journal UUID from recover list; "
+                                        "legacy titles are read-only"},
+            {"flag": "PATH...", "help": "the project (default: .)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--apply", "help": "perform a safely bound rollback; "
+                                        "without it nothing is written"},
         ],
     },
     {
@@ -3987,6 +4019,7 @@ _ES_SUMMARIES = {
     "cli:auto": "Convierte un objetivo en una lista de tareas y luego implementa cada una en un contexto nuevo. Sin --apply solo escribe o imprime el plan.",
     "cli:reset": "Borra el estado de Pedacito de este proyecto (índice, planes, cachés, sesiones y respaldos); el código y los archivos de configuración no se tocan. No es un restablecimiento de la configuración.",
     "cli:undo": "Deshace la última ejecución: restaura el espacio de trabajo al estado anterior al checkpoint activo (o a la instantánea de respaldo más reciente en proyectos antiguos).",
+    "cli:recover": "Lista los diarios de tareas interrumpidas por su UUID y previsualiza o aplica una recuperación. Sin --apply no se escribe nada; resume y cleanup se rechazan cuando no se puede probar un límite duradero o una propiedad autoritativa.",
     "cli:gui": "Abre el panel de control local en el navegador (solo 127.0.0.1).",
     "cli:calibrate": "Mide el modelo configurado (elección de herramientas, formato de edición, honestidad, contexto largo y sondas de especialidad) y guarda una tarjeta de modelo que ajusta los valores por defecto.",
     "cli:rpc": "JSONL-RPC interactivo por stdin/stdout para editores y otros agentes: una petición JSON por línea; cada línea de stdout es un marco JSON y los diagnósticos humanos van a stderr.",

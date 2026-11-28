@@ -1032,10 +1032,18 @@ or the run lock is held, and `force=True` is the only override.
 
 ### TaskJournal (WAL)
 
-`TaskJournal` (`journal.py`) appends one JSON line per step and fsyncs it by
-default. A torn trailing line is ignored. `find_incomplete_tasks` lists tasks that
-started but never ended, and `rollback_incomplete_task` records the rollback.
-A stale `run.lock` left by a dead process is taken over by `acquire_lock`.
+`TaskJournal` (`journal.py`) writes versioned UUID-named WAL files
+(`.pedacito/journal/<wal_id>.jsonl`, separate from the redacted task title),
+preserves monotonic sequence numbers across explicit `wal_id` reopens, and
+fsyncs each line by default. Write or fsync failures mark durability lost rather
+than succeeding silently; torn, corrupt, or non-durable journals are surfaced as
+non-recoverable rather than silently ignored. `list_recovery` inspects both
+v2 UUID journals and legacy title-named journals conservatively, and `recover`
+(`pedacito recover list|resume|rollback|cleanup`, preview-by-default, `--apply`
+to mutate) verifies cross-process locks, maintenance safety, ownership, and
+SHA-256 checkpoint manifests before restoring or cleaning up, refusing to mark a
+task terminal if restore or terminal durability fails. A stale `run.lock` left
+by a dead process is taken over by `acquire_lock`.
 
 ### SessionResourceRegistry and cancellation
 
