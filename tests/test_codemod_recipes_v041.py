@@ -145,6 +145,37 @@ def test_add_param_keyword_conflict_refuses(tmp_path):
     assert "already passes" in res.error
 
 
+def test_add_param_default_after_annotated_defaulted_param(tmp_path):
+    path = _write(
+        tmp_path, "def load(path: str = 'x') -> str:\n    return path\n")
+    res = apply(tmp_path, _request("add_param", symbol="load", name="strict",
+                                   annotation="bool", default="False"))
+    assert res.ok, res.error
+    text = path.read_text(encoding="utf-8")
+    assert "def load(path: str = 'x', strict: bool = False) -> str:" in text
+
+
+def test_add_param_default_after_unannotated_defaulted_param(tmp_path):
+    path = _write(tmp_path, "def f(a=1):\n    return a\n")
+    res = apply(tmp_path, _request("add_param", symbol="f", name="b",
+                                   default="2"))
+    assert res.ok, res.error
+    assert "def f(a=1, b=2):" in path.read_text(encoding="utf-8")
+
+
+def test_add_param_default_after_multiline_trailing_comma(tmp_path):
+    path = _write(tmp_path, "def f(\n"
+                            "    a: int = 1,\n"
+                            "    b: int = 2,\n"
+                            "):\n"
+                            "    return a\n")
+    res = apply(tmp_path, _request("add_param", symbol="f", name="c",
+                                   annotation="bool", default="False"))
+    assert res.ok, res.error
+    text = path.read_text(encoding="utf-8")
+    assert "    b: int = 2, c: bool = False,\n):" in text
+
+
 def test_add_param_method_default_keeps_self_call(tmp_path):
     path = _write(tmp_path, "class C:\n"
                             "    def m(self, a):\n"
@@ -264,6 +295,62 @@ def test_remove_param_preserves_comments_and_strings(tmp_path):
     assert "# comment" in text
     assert '"f(1, 2)"' in text
     assert "f(1)  # call" in text
+
+
+def test_remove_param_removes_last_annotated_default(tmp_path):
+    path = _write(
+        tmp_path,
+        "def new_expense_id(expenses: list[str], limit: int = 0) -> str:\n"
+        "    return expenses\n")
+    res = apply(tmp_path, _request("remove_param", symbol="new_expense_id",
+                                   name="limit"))
+    assert res.ok, res.error
+    text = path.read_text(encoding="utf-8")
+    assert "def new_expense_id(expenses: list[str]) -> str:" in text
+    assert "= 0" not in text
+
+
+def test_remove_param_removes_first_defaulted_param(tmp_path):
+    path = _write(tmp_path, "def f(a: int = 1, b: int = 2) -> int:\n"
+                            "    return b\n")
+    res = apply(tmp_path, _request("remove_param", symbol="f", name="a"))
+    assert res.ok, res.error
+    assert "def f(b: int = 2) -> int:" in path.read_text(encoding="utf-8")
+
+
+def test_remove_param_removes_middle_defaulted_param(tmp_path):
+    path = _write(tmp_path, "def f(a, b: int = 1, c: int = 2):\n"
+                            "    return c\n")
+    res = apply(tmp_path, _request("remove_param", symbol="f", name="b"))
+    assert res.ok, res.error
+    assert "def f(a, c: int = 2):" in path.read_text(encoding="utf-8")
+
+
+def test_remove_param_removes_defaulted_positional_only_param(tmp_path):
+    path = _write(tmp_path, "def f(a: int = 1, /, b: int = 2):\n"
+                            "    return b\n")
+    res = apply(tmp_path, _request("remove_param", symbol="f", name="a"))
+    assert res.ok, res.error
+    assert "def f(b: int = 2):" in path.read_text(encoding="utf-8")
+
+
+def test_remove_param_removes_defaulted_keyword_only_param(tmp_path):
+    path = _write(tmp_path, "def f(a, *, limit: int = 0, "
+                            "strict: bool = False):\n"
+                            "    return a\n\nf(1, limit=2)\n")
+    res = apply(tmp_path, _request("remove_param", symbol="f", name="limit"))
+    assert res.ok, res.error
+    text = path.read_text(encoding="utf-8")
+    assert "def f(a, *, strict: bool = False):" in text
+    assert "f(1)\n" in text
+
+
+def test_remove_param_removes_sole_keyword_only_param_and_star(tmp_path):
+    path = _write(tmp_path, "def f(a, *, limit: int = 0):\n"
+                            "    return a\n")
+    res = apply(tmp_path, _request("remove_param", symbol="f", name="limit"))
+    assert res.ok, res.error
+    assert "def f(a):" in path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +474,25 @@ def test_move_symbol_positive(tmp_path):
         encoding="utf-8")
     assert "from pkg.util import helper" in (tmp_path / "pkg/user.py").read_text(
         encoding="utf-8")
+
+
+def test_move_symbol_inserts_new_import_in_leading_import_block(tmp_path):
+    idx = _project(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/a.py": "def x():\n    return 1\n\n\ndef combine():\n"
+                    "    return 2\n",
+        "pkg/b.py": "",
+        "pkg/user.py": "from pkg.a import x, combine\n\nTWO = 2\n\n"
+                       "print(TWO)\n",
+    })
+    res = apply(tmp_path, _request("move_symbol", file="pkg/a.py",
+                                   symbol="combine", to_file="pkg/b.py"),
+                index=idx)
+    assert res.ok, res.error
+    text = (tmp_path / "pkg/user.py").read_text(encoding="utf-8")
+    assert text.startswith(
+        "from pkg.a import x\nfrom pkg.b import combine\n\nTWO = 2\n")
+    assert text.index("from pkg.b import combine") < text.index("TWO = 2")
 
 
 def test_move_symbol_preview_does_not_write(tmp_path):

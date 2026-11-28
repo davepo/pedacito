@@ -2365,6 +2365,30 @@ def _arg_has_default(fn: ast.AST, index: int, positional: list[ast.arg]) -> bool
     return index >= len(positional) - ndefaults
 
 
+def _arg_default(fn: ast.AST, arg: ast.arg) -> ast.AST | None:
+    """The default expression attached to `arg`, if it has one."""
+    args = fn.args
+    positional = _positional_params(fn)
+    for index, candidate in enumerate(positional):
+        if candidate is arg:
+            first = len(positional) - len(args.defaults)
+            return args.defaults[index - first] if index >= first else None
+    for index, candidate in enumerate(args.kwonlyargs):
+        if candidate is arg:
+            return args.kw_defaults[index]
+    return None
+
+
+def _arg_decl_span(source: _Source, fn: ast.AST,
+                   arg: ast.arg) -> tuple[int, int]:
+    """The source span of a parameter, including its `= <default>`."""
+    start, end = source.span(arg)
+    default = _arg_default(fn, arg)
+    if default is not None:
+        end = source.span(default)[1]
+    return start, end
+
+
 def _insert_param(source: _Source, fn: ast.AST, name: str, annotation: str,
                   default: str) -> str:
     """Return the source with `name` inserted at a valid parameter position."""
@@ -2379,7 +2403,7 @@ def _insert_param(source: _Source, fn: ast.AST, name: str, annotation: str,
     if positional:
         if has_default:
             last = positional[-1]
-            offset = source.span(last)[1]
+            offset = _arg_decl_span(source, fn, last)[1]
             return text[:offset] + ", " + _param_text(name, annotation, default) \
                 + text[offset:]
         first_default = None
@@ -2402,27 +2426,40 @@ def _insert_param(source: _Source, fn: ast.AST, name: str, annotation: str,
         + text[offset:]
 
 
+def _param_remove_span(source: _Source, fn: ast.AST, arg: ast.arg,
+                       scope_start: int, scope_end: int) -> tuple[int, int]:
+    """Delete span for one parameter, its default and any now-empty marker."""
+    start, end = _arg_decl_span(source, fn, arg)
+    header_tokens = [t for t in source.tokens()
+                     if scope_start <= t.start < scope_end]
+    if any(arg is a for a in fn.args.posonlyargs) \
+            and len(fn.args.posonlyargs) == 1:
+        slash = next((t for t in header_tokens
+                      if t.type == tokenize.OP and t.string == "/"
+                      and t.start >= end), None)
+        if slash is not None:
+            end = slash.end
+    elif any(arg is a for a in fn.args.kwonlyargs) \
+            and len(fn.args.kwonlyargs) == 1 and fn.args.vararg is None:
+        # `*` is not an AST node; pick the bare-star token directly before
+        # the first keyword-only parameter (not a `*` inside a default).
+        for tok in header_tokens:
+            if tok.type != tokenize.OP or tok.string != "*" \
+                    or tok.start >= start:
+                continue
+            between = [t for t in header_tokens
+                       if tok.end <= t.start < start]
+            if all(t.type == tokenize.OP and t.string == "," for t in between):
+                start = tok.start
+    return _remove_item_span(source, start, end, scope_start, scope_end)
+
+
 def _remove_param_def(source: _Source, fn: ast.AST, arg: ast.arg) -> str:
     """Return the source with one parameter (and its comma) removed."""
-    text = source.text
-    start, end = source.span(arg)
-    tokens = source.tokens()
-    commas = [t for t in tokens
-              if t.type == tokenize.OP and t.string == ","
-              and t.start >= end and t.start <= source.line_end(arg.lineno)]
-    if commas:
-        # delete the arg plus the following comma and any spaces
-        stop = commas[0].end
-        while stop < len(text) and text[stop] in " \t":
-            stop += 1
-        return text[:start] + text[stop:]
-    commas_before = [t for t in tokens
-                     if t.type == tokenize.OP and t.string == ","
-                     and t.end <= start
-                     and t.start >= _open_paren_offset(source, fn)]
-    if commas_before:
-        return text[:commas_before[-1].start] + text[end:]
-    return text[:start] + text[end:]
+    start, end = _param_remove_span(source, fn, arg,
+                                    _open_paren_offset(source, fn),
+                                    _function_colon(source, fn))
+    return source.text[:start] + source.text[end:]
 
 
 def _expr_path(node: ast.AST) -> str:
@@ -2897,6 +2934,15 @@ def _remove_call_arg_span(source: _Source, call: ast.Call,
     return _remove_item_span(source, start, end, cs, ce)
 
 
+def _remove_call_target_span(source: _Source, call: ast.Call,
+                             target: ast.AST) -> tuple[int, int]:
+    if isinstance(target, ast.keyword):
+        start, end = source.span(target)
+        cs, ce = source.span(call)
+        return _remove_item_span(source, start, end, cs, ce)
+    return _remove_call_arg_span(source, call, target)
+
+
 def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
                          for_write, index):
     symbol = str(request.symbol or "").strip()
@@ -2910,21 +2956,26 @@ def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
     positional = _positional_params(fn)
     leaf = qualname.rsplit(".", 1)[-1]
     index_in_pos = None
+    kwonly_index = None
     arg_node = None
     for i, a in enumerate(positional):
         if a.arg == name:
             index_in_pos, arg_node = i, a
             break
     if arg_node is None:
-        if any(a.arg == name for a in fn.args.kwonlyargs):
-            raise _Refuse(
-                f"refused: '{name}' is a keyword-only parameter; call sites "
-                "pass it by keyword and cannot be updated mechanically")
+        for i, a in enumerate(fn.args.kwonlyargs):
+            if a.arg == name:
+                kwonly_index, arg_node = i, a
+                break
+    if arg_node is None:
         known = ", ".join(a.arg for a in _function_args(fn)) or "(none)"
         raise _Refuse(
             f"refused: '{name}' is not a parameter of {fn.name}; parameters: "
             f"{known}")
-    has_default = _arg_has_default(fn, index_in_pos, positional)
+    if kwonly_index is not None:
+        has_default = fn.args.kw_defaults[kwonly_index] is not None
+    else:
+        has_default = _arg_has_default(fn, index_in_pos, positional)
 
     calls, dynamic, issues = _find_call_sites(source, fn, qualname)
     xcalls, xissues = _cross_file_callers(root, loaded.rel, qualname, index,
@@ -2943,6 +2994,16 @@ def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
     n_params = len(positional)
 
     def check_call(call: ast.Call, recv_off: int = 0) -> ast.AST | None:
+        if kwonly_index is not None:
+            for keyword in call.keywords:
+                if keyword.arg is None:
+                    raise _Refuse(
+                        f"refused: a call at line {call.lineno} uses "
+                        "**kwargs; the keyword-only argument cannot be "
+                        "mapped provably")
+                if keyword.arg == name:
+                    return keyword
+            return None
         err = _call_positional_count_ok(call)
         if err:
             raise _Refuse(
@@ -2964,12 +3025,11 @@ def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
     for call, recv_off in calls:
         target = check_call(call, recv_off)
         if target is not None:
-            edits.append((*_remove_call_arg_span(source, call, target), ""))
+            edits.append((*_remove_call_target_span(source, call, target), ""))
     open_off = _open_paren_offset(source, fn)
     colon = _function_colon(source, fn)
-    aspan = source.span(arg_node)
-    edits.append((*_remove_item_span(source, aspan[0], aspan[1], open_off,
-                                     colon), ""))
+    edits.append((*_param_remove_span(source, fn, arg_node, open_off, colon),
+                  ""))
     new_text = _apply_text_edits(source.text, edits)
 
     changes: list[_FileChange] = []
@@ -2983,7 +3043,8 @@ def _recipe_remove_param(root, request, loaded, source, options, *, cfg,
         for call in calls_in_file:
             target = check_call(call)
             if target is not None:
-                iedits.append((*_remove_call_arg_span(isrc, call, target), ""))
+                iedits.append((*_remove_call_target_span(isrc, call, target),
+                               ""))
                 removed += 1
         if iedits:
             changes.append(_FileChange(rel, imp.text,
@@ -3154,7 +3215,7 @@ def _rewrite_symbol_import(loaded: _Loaded, src_rel: str, dest_rel: str,
     source = _Source(loaded.text, _parse_python(loaded.text, loaded.rel),
                      loaded.rel)
     edits: list[tuple[int, int, str]] = []
-    insertions: list[tuple[int, str]] = []      # (offset, line)
+    insertions: list[str] = []
     n = 0
     for node in ast.walk(source.tree):
         if not isinstance(node, ast.ImportFrom):
@@ -3189,18 +3250,18 @@ def _rewrite_symbol_import(loaded: _Loaded, src_rel: str, dest_rel: str,
         if got.asname:
             new_line += f" as {got.asname}"
         new_text = _remove_alias(source, got, node)
-        insert_off = source.line_end(node.end_lineno or node.lineno)
-        insertions.append((insert_off, new_line))
+        insertions.append(new_line)
         edits.append((0, len(source.text), new_text))
         n += 1
     if not edits and not insertions:
         return loaded.text, 0
     text = _apply_text_edits(source.text, edits)
-    # insert new lines right-to-left to keep offsets stable
-    for offset, line in sorted(insertions, key=lambda t: -t[0]):
-        if not line.endswith("\n"):
-            line += "\n"
-        text = text[:offset] + line + text[offset:]
+    if insertions:
+        # New imports belong at the end of the leading import block, never
+        # after a constant/statement (E402), and offsets from the pre-removal
+        # text are not reusable after an alias was deleted.
+        inserted = _Source(text, _parse_python(text, loaded.rel), loaded.rel)
+        text = _insert_top(inserted, insertions, purpose="import")
     return text, n
 
 

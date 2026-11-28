@@ -194,6 +194,28 @@ def test_cli_apply_writes_one_snapshotted_change(project, capsys):
     assert list((project / ".pedacito" / "backups").glob("*/app.py"))
 
 
+def test_cli_move_file_reindex_drops_deleted_source(project, capsys):
+    _write(project, "pkg/__init__.py", "")
+    _write(project, "pkg/core.py", "def helper():\n    return 1\n")
+    _write(project, "pkg/user.py", "from pkg.core import helper\n\nhelper()\n")
+    index_mod.build([str(project)], Config(), client=None, summarise=False,
+                    root=project, verbose=False)
+    cfg_path = _write(project, "allowed.toml", "allow_write = true\n")
+    code, out, err = _run(capsys, [
+        "codemod", "apply", "move_file", "--file", "pkg/core.py",
+        "--option", "to_path=pkg/moved.py", "--config", str(cfg_path),
+        str(project),
+    ])
+    assert code == 0, err
+    assert "Codemod applied" in out
+    assert "could not be re-indexed" not in err
+    assert "[warn]" not in err
+    live = index_mod.Index.load(project)
+    assert live is not None
+    assert "pkg/core.py" not in live.files
+    assert "pkg/moved.py" in live.files
+
+
 @pytest.mark.parametrize("bad,needle", [
     (["--option", "moduleos"], "not KEY=VALUE"),
     (["--option", "=os"], "empty key"),

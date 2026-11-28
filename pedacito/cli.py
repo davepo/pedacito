@@ -4505,7 +4505,12 @@ def _cmd_codemod(args) -> int:
             refresh.log_events = False
             refresh.log_sessions = False
             for rel in result.changed:
-                index_mod.reindex_file(live, rel, refresh, save=False)
+                if (root / rel).is_file():
+                    index_mod.reindex_file(live, rel, refresh, save=False)
+                else:
+                    # move_file deletes its source; drop that entry instead
+                    # of trying to re-index a path that no longer exists.
+                    live.forget(rel)
             live.save()
             print(i18n.t("cli.codemod.index_refreshed",
                          count=len(result.changed)))
