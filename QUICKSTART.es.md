@@ -1152,6 +1152,7 @@ solo el mapa está desactualizado.
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito recover list [PROJ]` | Muestra los diarios de tareas inacabadas por UUID. `recover rollback ID PROJ` previsualiza una reversión vinculada de forma segura; añade `--apply` para realizarla |
 | `pedacito rename OLD NEW [--file F] [--strings] [--include-labels] [--apply]` | Renombra un símbolo en todo el proyecto. Sin llamada al modelo; vista previa por defecto; `--strings` también renombra literales de cadena de palabra completa, `--include-labels` solo cadenas de etiquetas de prueba |
+| `pedacito codemod list` / `[preview] RECIPE` / `apply RECIPE` | Lista, previsualiza o aplica una receta determinista (imports, print→logger, constante, anotación, parámetro, try/context, mover símbolo/archivo, obsoleto, re-exportación). `--file`, `--symbol` y `--option KEY=VALUE` repetible; preview por defecto (sin escrituras); `apply` requiere `allow_write` y una única transacción atómica con instantáneas |
 | `pedacito eval` | Puntúa el arnés sobre repositorios de prueba. Usa `--baseline` como compuerta |
 | `pedacito bench [BENCHMARK\|all]` | Ejecuta los seis benchmarks de diagnóstico y la rúbrica de evaluación. `--list`/`--recent` son gratis; `--json`/`--strict` para CI |
 | `pedacito memory PROJ` | Lista, agrega u olvida hechos recordados; `--consolidate` compacta el historial de sesiones en una entrega |

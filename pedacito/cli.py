@@ -4353,6 +4353,174 @@ def _cmd_rename(args) -> int:
     return 0
 
 
+def _codemod_fail(message: str, code: int = 1) -> int:
+    """Print a codemod refusal on stderr and return its exit code."""
+    print(i18n.t("cli.codemod.refused", error=message), file=sys.stderr)
+    return code
+
+
+def _print_codemod_result(result, recipe: str, *, applied: bool,
+                          root: Path) -> int:
+    """Print one codemod result as a bounded human report."""
+    if not result.ok:
+        return _codemod_fail(result.error or i18n.t("cli.codemod.unknown"))
+    if not result.changed:
+        detail = "; ".join(result.warnings) or i18n.t("cli.codemod.no_change")
+        print(i18n.t("cli.codemod.noop", recipe=recipe, detail=detail))
+        return 0
+    header = ("cli.codemod.apply.header" if applied
+              else "cli.codemod.preview.header")
+    print(i18n.t(header, recipe=recipe, project=str(root)))
+    print(i18n.t("cli.codemod.changed", count=len(result.changed),
+                 files=", ".join(result.changed)))
+    if result.warnings:
+        print(i18n.t("cli.codemod.warnings",
+                     warnings="; ".join(result.warnings)))
+    for rel in result.changed:
+        diff = result.diffs.get(rel, "")
+        if diff:
+            print()
+            print(diff.rstrip())
+    if not applied:
+        print(i18n.t("cli.codemod.preview_note"))
+    else:
+        print(i18n.t("cli.codemod.apply_note"))
+    return 0
+
+
+def _cmd_codemod(args) -> int:
+    """`pedacito codemod`: list, preview or apply a deterministic recipe.
+
+    `preview` is the default action. It never writes: no index build, backup,
+    checkpoint or source mutation happens. `apply` loads config, checks
+    allow_write, policy and sensitive/protected paths for every file the
+    preview would touch, snapshots through `codemod.apply`'s one atomic
+    transaction, and refreshes an existing index in place (no model call).
+    Recipe ids and files are validated by `pedacito.codemod` through
+    `security.resolve_safe_path`; `--option KEY=VALUE` is parsed as data and
+    never reaches a shell or subprocess.
+    """
+    from . import codemod as codemod_mod
+
+    action = str(getattr(args, "codemod_action", "") or "preview").lower()
+    root = _root(args)
+    if action == "list":
+        recipes = codemod_mod.list_recipes()
+        print(i18n.t("cli.codemod.list.header", count=len(recipes)))
+        for recipe in recipes:
+            options = ", ".join(
+                (o["name"] + "*") if o.get("required") else o["name"]
+                for o in recipe.get("options") or ()) or i18n.t(
+                    "cli.codemod.list.none")
+            print(i18n.t(
+                "cli.codemod.list.item", recipe=recipe["id"],
+                status=recipe["status"], title=recipe["title"],
+                symbol=recipe.get("symbol", "ignored"), options=options,
+                languages=", ".join(recipe.get("languages") or ())))
+        print(i18n.t("cli.codemod.list.hint"))
+        return 0
+
+    try:
+        options = codemod_mod.parse_option_pairs(
+            getattr(args, "option", None) or ())
+    except ValueError as exc:
+        print(i18n.t("cli.codemod.bad_option", error=str(exc)),
+              file=sys.stderr)
+        return 2
+    recipe = str(getattr(args, "recipe", "") or "").strip()
+    file = str(getattr(args, "file", "") or "").strip()
+    if not recipe:
+        print(i18n.t("cli.codemod.need_recipe"), file=sys.stderr)
+        return 2
+    if not file:
+        print(i18n.t("cli.codemod.need_file"), file=sys.stderr)
+        return 2
+    try:
+        cfg = _light_config(args)
+    except ConfigError as exc:
+        print(i18n.t("cli.config_error", message=str(exc)), file=sys.stderr)
+        return 2
+    index = None
+    try:
+        index = index_mod.Index.load(root)
+    except Exception:
+        index = None
+    request = codemod_mod.CodemodRequest(
+        recipe=recipe, file=file, symbol=str(getattr(args, "symbol", "") or ""),
+        options=options)
+
+    if action == "preview":
+        result = codemod_mod.preview(root, request, index=index, cfg=cfg)
+        return _print_codemod_result(result, recipe, applied=False, root=root)
+
+    if not getattr(cfg, "allow_write", False):
+        return _codemod_fail(i18n.t("cli.codemod.denied_write"))
+    ok, reason = workspace.check_maintenance_safe(
+        root, action="codemod apply")
+    if not ok:
+        return _codemod_fail(reason)
+    prepared = codemod_mod.preview(root, request, index=index, cfg=cfg)
+    if not prepared.ok:
+        return _print_codemod_result(prepared, recipe, applied=True, root=root)
+    from . import policy as policy_mod
+    from . import safety, security
+
+    def _gate(rel: str, _path: Path) -> str | None:
+        try:
+            decision = policy_mod.enforce(cfg, "write", rel, root=root)
+        except Exception as exc:
+            return i18n.t("cli.codemod.policy_error", error=str(exc))
+        if decision is not None and decision.decision == "deny":
+            return i18n.t(
+                "cli.codemod.policy_denied", rule=decision.matched_rule,
+                reason=decision.reason)
+        allowed, sensitive_error = security.check_sensitive_write(
+            root, rel, action="codemod apply",
+            policy=getattr(cfg, "policy", None))
+        if not allowed:
+            return sensitive_error
+        return safety.is_protected(rel, cfg, write=True) or None
+
+    for rel in prepared.changed:
+        refusal = _gate(rel, root / rel)
+        if refusal:
+            return _codemod_fail(refusal)
+    try:
+        checkpoints_mod.ensure_pre_run_checkpoint(
+            root, f"baseline before codemod {recipe}", mode="manual")
+    except Exception as exc:
+        print(i18n.t("cli.codemod.checkpoint_skipped", error=str(exc)),
+              file=sys.stderr)
+    result = codemod_mod.apply(
+        root, request, index=index, cfg=cfg, before_write=_gate)
+    code = _print_codemod_result(result, recipe, applied=True, root=root)
+    if code != 0 or not result.changed:
+        return code
+    # A stale index would answer later searches from the pre-codemod source.
+    # This is a local re-chunk of the changed files only: no model, no rebuild.
+    try:
+        live = index_mod.Index.load(root)
+        if live is not None:
+            refresh = Config()
+            refresh.log_events = False
+            refresh.log_sessions = False
+            for rel in result.changed:
+                index_mod.reindex_file(live, rel, refresh, save=False)
+            live.save()
+            print(i18n.t("cli.codemod.index_refreshed",
+                         count=len(result.changed)))
+    except Exception as exc:                 # a stale index is not fatal
+        print(i18n.t("cli.codemod.index_skipped", error=str(exc)),
+              file=sys.stderr)
+    try:
+        checkpoints_mod.create_checkpoint(
+            root, f"codemod {recipe}", mode="manual")
+    except Exception as exc:
+        print(i18n.t("cli.codemod.checkpoint_skipped", error=str(exc)),
+              file=sys.stderr)
+    return 0
+
+
 def _rename_docs_advisory(root: Path, old: str) -> None:
     """One-line advisory when unindexed Markdown docs still name `old`.
 
@@ -5562,6 +5730,42 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                                "with unified diffs)")
     p_rename.add_argument("--root", default=None)
 
+    p_codemod = sub.add_parser("codemod", help=t("cli.cmd.codemod"))
+    p_codemod.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                           default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    codemod_sub = p_codemod.add_subparsers(
+        dest="codemod_action", required=True, metavar="{list,preview,apply}")
+    p_cm_list = codemod_sub.add_parser(
+        "list", help=t("cli.codemod.help.list"))
+    p_cm_list.add_argument("project", nargs="?", default=".",
+                           help=t("cli.codemod.opt.project"))
+    p_cm_list.add_argument("--root", default=None,
+                           help=t("cli.codemod.opt.root"))
+    p_cm_list.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                           default=argparse.SUPPRESS, help=t("cli.opt.lang"))
+    for codemod_action in ("preview", "apply"):
+        p_cm_action = codemod_sub.add_parser(
+            codemod_action, help=t(f"cli.codemod.help.{codemod_action}"))
+        p_cm_action.add_argument("recipe", help=t("cli.codemod.opt.recipe"))
+        p_cm_action.add_argument("project", nargs="?", default=".",
+                                 help=t("cli.codemod.opt.project"))
+        p_cm_action.add_argument("--file", required=True, metavar="FILE",
+                                 help=t("cli.codemod.opt.file"))
+        p_cm_action.add_argument("--symbol", default="", metavar="SYMBOL",
+                                 help=t("cli.codemod.opt.symbol"))
+        p_cm_action.add_argument(
+            "--option", action="append", default=[], metavar="KEY=VALUE",
+            help=t("cli.codemod.opt.option"))
+        p_cm_action.add_argument("--root", default=None,
+                                 help=t("cli.codemod.opt.root"))
+        p_cm_action.add_argument("--config", metavar="FILE",
+                                 help=t("cli.codemod.opt.config"))
+        p_cm_action.add_argument("--profile", metavar="NAME",
+                                 help=t("cli.codemod.opt.profile"))
+        p_cm_action.add_argument("--lang", choices=i18n.SUPPORTED_LANGUAGES,
+                                 default=argparse.SUPPRESS,
+                                 help=t("cli.opt.lang"))
+
     p_eval = sub.add_parser(
         "eval", help="score the harness on built-in fixture repos (locate "
                      "precision, edit success, tokens, cache hits)")
@@ -5690,10 +5894,47 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
     return ap
 
 
+_CODEMOD_ACTIONS = ("list", "preview", "apply")
+
+
+def _default_codemod_action(argv: list[str]) -> list[str]:
+    """Insert `preview` when the codemod action is omitted.
+
+    `pedacito codemod add_import --file app.py` is the documented short form
+    of `pedacito codemod preview add_import ...`; an explicit `list`,
+    `preview` or `apply`, or a leading option such as `--help`, is left
+    untouched so argparse reports its own error. Only the command-position
+    token is considered, so a project directory or option value literally
+    named `codemod` can never change another command's arguments.
+    """
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in ("--lang", "--config", "--profile"):
+            i += 2
+            continue
+        if token.startswith(("--lang=", "--config=", "--profile=")):
+            i += 1
+            continue
+        if token in ("--attach-daemon", "-h", "--help"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "codemod":
+        return argv
+    if i + 1 < len(argv):
+        nxt = argv[i + 1]
+        if not nxt.startswith("-") and nxt not in _CODEMOD_ACTIONS:
+            return argv[:i + 1] + ["preview"] + argv[i + 1:]
+    return argv
+
+
 def _main(argv=None) -> int:
     _configure_stdio()
     active_lang = _preparse_lang(argv)
-    args = build_parser(lang=active_lang).parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser(lang=active_lang).parse_args(
+        _default_codemod_action(raw_argv))
     if getattr(args, "lang", None):
         i18n.set_current_lang(args.lang)
     # `pdc doctor` is the documented alias of `pdc config --doctor`: map it
@@ -5842,6 +6083,7 @@ def _main(argv=None) -> int:
              "skills": _cmd_skills, "plan": _cmd_plan,
              "autopsy": _cmd_autopsy, "tools": _cmd_tools,
              "prompt": _cmd_prompt,
+             "codemod": _cmd_codemod,
              "rename": _cmd_rename,
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,

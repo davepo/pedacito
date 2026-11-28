@@ -455,6 +455,7 @@ do:
 |---|---|---|
 | `write` / `append` / `move` / `delete` | `allow_write = true` | Whole-file operations; `append` builds a file larger than one reply. |
 | `rename` | `allow_write = true` | Mechanically rename one definition and its references in the files that import it (strings and comments untouched, every file re-parsed, snapshotted). Refuses a name defined in several places and lists the references it left alone. |
+| `codemod` | `list`/`preview` always; `apply` with `allow_write = true` | Run one deterministic recipe from the shared catalogue (`add_import`, `remove_import`, `print_to_logger`, `extract_constant`, `add_annotation`, `add_param`, `remove_param`, `wrap_try`, `wrap_context`, `move_symbol`, `move_file`, `replace_deprecated`, `add_reexport`). `list`/`preview` never write; `apply` uses one atomic transaction, snapshots, the write policy, protected/sensitive-path gates and the mutation ledger. |
 | `undo` | `allow_write = true` (+ `backup`, on by default) | Self-recovery mid-task: reverts what this task's `write`/`append`/`move`/`delete` actions did so far (or just one of their files), pre-task snapshots come back, files the task created go away. |
 | `run` | `allow_shell = true` | Run one command (e.g. `pytest -q`), without a shell, so `&` and `nohup` are rejected and long-lived processes go to `serve`. A quiet GUI/server is stopped after `shell_idle_seconds`. |
 | `serve` | `allow_serve = true` | Start, list, log, or stop a background dev server. The registry and logs live under `.pedacito/procs/`; also `pedacito serve` / `pedacito procs`. The list collapses superseded stopped entries (restart history) behind a count; `procs --all` shows them. |
@@ -790,6 +791,47 @@ change and snapshots the originals first, so `pedacito restore` undoes it.
 In the GUI, **Project ▾ → Rename symbol…** takes the old name, the new name and an
 optional scope file. **Preview** shows the diffs, and **Rename** writes them.
 The dialog renames identifiers only; `--strings` is a CLI flag.
+
+### Deterministic codemods
+
+`pedacito/codemod.py` is a catalogue of provable, AST/tokenizer-based source
+recipes. The CLI and the agent share one `CodemodRequest(recipe, file, symbol,
+options)` and one `preview`/`apply` pair, so their behaviour cannot drift:
+
+```bash
+pedacito codemod list .
+pedacito codemod preview add_import --file app.py --option module=typing --option name=Any
+pedacito codemod apply print_to_logger --file app.py
+```
+
+The initial catalogue is `add_param`, `remove_param`, `add_import`,
+`remove_import`, `wrap_try`, `wrap_context`, `print_to_logger`,
+`extract_constant`, `add_annotation`, `move_symbol`, `move_file`,
+`replace_deprecated` and `add_reexport`. `list_recipes()` publishes each
+recipe's exact option names, symbol role, languages and status; a catalogued
+recipe that is not implemented reports `unverified` instead of pretending to
+be green.
+
+- **Preview is the default.** It computes the deterministic unified diff and
+  never writes, builds an index, creates a backup or checkpoint. `list` is
+  equally read-only.
+- **Apply is one transaction.** `apply` recomputes the batch from current
+  bytes, re-parses every output, and hands the whole set to
+  `edits.apply_edits_atomic` with preimage hashes. A policy, protection,
+  sensitive-path or syntax refusal leaves every file untouched. The agent
+  path adds `before_write`, evaluated against the exact apply-time batch, so a
+  cross-file recipe cannot introduce a file the policy gate never saw.
+- **Containment and data, not commands.** Recipe ids are catalog names and
+  reject path separators; files resolve through `security.resolve_safe_path`
+  (traversal, symlink and junction escapes refuse); `--option KEY=VALUE` is
+  parsed as data, and the agent's `options` field is JSON only. No subprocess
+  is involved.
+- **Encoding is preserved.** `fileio` carries each file's encoding, BOM and
+  line endings through the transaction.
+- **Agent exposure is pruned.** The `codemod` action enters the step schema
+  only when the task names a mechanical transformation; `ACTION_PERMISSION`
+  records that `apply` needs `allow_write`. A successful apply records the
+  changed paths in the task mutation ledger, so post-edit verification runs.
 
 ### Checking an answer before it is written
 

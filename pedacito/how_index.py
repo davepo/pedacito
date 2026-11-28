@@ -1209,6 +1209,85 @@ CLI_COMMANDS = [
         ],
     },
     {
+        "name": "codemod",
+        "usage": "pedacito codemod list [PROJECT] | pedacito codemod "
+                 "[preview] RECIPE --file FILE [--symbol SYMBOL] "
+                 "[--option KEY=VALUE ...] [PROJECT] | pedacito codemod "
+                 "apply RECIPE --file FILE [--symbol SYMBOL] "
+                 "[--option KEY=VALUE ...] [PROJECT]",
+        "summary": "Run one deterministic codemod recipe from the catalog: "
+                   "add/remove import, print-to-logger, extract a constant, "
+                   "add an annotation, add/remove a parameter, wrap a body in "
+                   "try/except or a context manager, move a symbol or file, "
+                   "replace a deprecated name, or add a re-export. Every "
+                   "recipe uses the Python AST/tokenizer, refuses ambiguous "
+                   "bindings and unsupported languages instead of guessing, "
+                   "re-parses each output and preserves comments, encoding "
+                   "and line endings. list and preview never write; preview "
+                   "is the default action. apply needs allow_write, the write "
+                   "policy and the normal snapshots, and lands as one atomic "
+                   "transaction -- partially written trees never survive. The "
+                   "same catalog is the agent's gated codemod action.",
+        "keywords": ["codemod", "recipe", "refactor", "add import",
+                     "remove import", "print logging", "logger",
+                     "extract constant", "annotation", "type hint",
+                     "add parameter", "remove parameter", "try except",
+                     "context manager", "move symbol", "move file",
+                     "deprecated", "re-export", "reexport", "mechanical edit",
+                     "deterministic refactor", "diff preview"],
+        "examples": [
+            "pedacito codemod list .",
+            "pedacito codemod preview add_import --file app.py "
+            "--option module=typing --option name=Any",
+            "pedacito codemod add_import --file app.py --option module=os",
+            "pedacito codemod print_to_logger --file app.py",
+            "pedacito codemod apply print_to_logger --file app.py --root .",
+            "pedacito codemod apply add_param --file pkg/core.py "
+            "--symbol f --option name=retries --option default=3",
+        ],
+        "flags": [
+            {"flag": "list", "help": "print the recipe catalog with option "
+                                     "names, symbol role and languages"},
+            {"flag": "preview", "help": "show unified diffs and write nothing "
+                                        "(default when the action is omitted)"},
+            {"flag": "apply", "help": "write through one atomic, snapshotted "
+                                      "transaction (needs allow_write)"},
+            {"flag": "RECIPE", "help": "recipe id from `pedacito codemod "
+                                       "list`; path separators are refused"},
+            {"flag": "--file FILE", "help": "project-relative source file the "
+                                            "recipe targets; traversal and "
+                                            "escaping links are refused"},
+            {"flag": "--symbol SYMBOL", "help": "recipe-specific target symbol "
+                                               "(empty when the recipe ignores "
+                                               "it)"},
+            {"flag": "--option KEY=VALUE",
+             "help": "recipe option, repeatable; parsed as data, never as a "
+                     "command"},
+            {"flag": "PROJECT", "help": "the project (default: current "
+                                        "directory)"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "preview/list are read-only: no index build, backup, checkpoint "
+            "or source write",
+            "apply writes only with allow_write = true and an allowing write "
+            "policy; protected, sensitive and task-allowlisted paths refuse "
+            "before anything is staged",
+            "every changed file keeps its encoding, BOM and line endings; "
+            "each result is re-parsed and a syntax break refuses the whole "
+            "batch",
+            "an unmatched or ambiguous symbol/binding refuses instead of "
+            "guessing; recipes that are catalogued but unverified report "
+            "`unverified`, not green",
+            "the agent `codemod` action exposes the same catalog with "
+            "operation=list|preview|apply and the same request fields",
+            "no subprocess or shell is involved: KEY=VALUE and JSON options "
+            "are data",
+        ],
+    },
+    {
         "name": "restore",
         "usage": "pedacito restore PROJECT [--list | --snapshot NAME] [--dry-run]",
         "summary": "Undo an --apply run by copying a backup snapshot back over "

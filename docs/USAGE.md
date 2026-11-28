@@ -208,6 +208,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito commit [--all] [-m MSG] [-y]` | Scan the staged diff for secrets, then create a local commit. Never pushes; `--no-model` drafts the message offline and `--allow-secrets` is the explicit override |
 | `pedacito pr [--base main] [--draft] [--dry-run] [-y]` | Draft a grounded title/body from the branch diff, commit log and recent checkpoints, then open the pull request with `gh`. Never pushes the branch |
 | `pedacito rename OLD NEW` | Multi-file symbol rename through the AST and the tokenizer, no model call. `--file` scopes it, `--strings` also renames whole-word string literals, `--include-labels` only test-label strings, `--apply` writes (default: diff preview) |
+| `pedacito codemod list` / `[preview] RECIPE` / `apply RECIPE` | List, preview or apply one deterministic codemod recipe (13 ids: imports, print→logger, extract constant, annotation, parameter, wrap try/context, move symbol/file, deprecated, re-export). `--file`, `--symbol` and repeatable `--option KEY=VALUE`; preview is the default; apply needs `allow_write` and lands one atomic, snapshotted transaction. The agent's `codemod` action exposes the same catalog through `operation=list\|preview\|apply` |
 | `pedacito image PROMPT` | Generate one image with a configured image-model profile (`--out`, `--size WxH`, `--steps`, `--seed`, `--negative`, `--json`). Saved under `.pedacito/images/` |
 | `pedacito index`, `map`, `files`, `cost` | Build and inspect the index. These need no model call, except `index` summaries |
 | `pedacito diag [PATH]` | Alias of `pedacito diagnose`: run the project's detected linter or typechecker |
@@ -219,6 +220,41 @@ commands. Run `pedacito <command> --help` for every flag.
 
 Benchmarks also run from the GUI through the **Benchmarks** button; the CLI
 command builds the same projects and writes the same reports.
+
+### Deterministic codemods
+
+`pedacito codemod` runs one catalogued source recipe without a model call. It
+uses the real Python AST and tokenizer, so comments, string literals and
+unrelated formatting are never touched by accident; an ambiguous symbol,
+unsupported language or syntax-breaking result refuses instead of guessing.
+
+```bash
+pedacito codemod list .
+pedacito codemod preview add_import --file app.py \
+  --option module=typing --option name=Any
+pedacito codemod add_import --file app.py --option module=os   # preview is the default
+pedacito codemod apply print_to_logger --file app.py           # needs allow_write
+```
+
+The 13 recipe ids are `add_param`, `remove_param`, `add_import`,
+`remove_import`, `wrap_try`, `wrap_context`, `print_to_logger`,
+`extract_constant`, `add_annotation`, `move_symbol`, `move_file`,
+`replace_deprecated` and `add_reexport`. `pedacito codemod list` prints each
+recipe's status (`implemented` or `unverified`), required symbol role and exact
+option names. `--option` is repeatable and parsed as data: it is never a shell
+command. A recipe id with a path separator, a `--file` that escapes the project
+through `..` or a symlink/junction, a protected path, or a secrets file is
+refused before anything is read or written.
+
+`preview` and `list` are side-effect free: no index build, backup, checkpoint or
+source write happens. `apply` requires `allow_write = true`, an allowing write
+policy, and the same snapshots as any other mutation; every touched file must
+still parse before the single atomic transaction commits, so a partially
+written tree never survives. An existing index is refreshed in place after a
+successful apply (no model call). The gather loop offers the same catalog as
+the `codemod` action (`operation=list|preview|apply`, with `recipe`, `file`,
+`symbol` and a JSON `options` object); `apply` there goes through the mutation
+ledger and the same policy, protected-path and sensitive-file gates.
 
 ### Recovering an interrupted task
 
