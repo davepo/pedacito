@@ -865,8 +865,7 @@ def find_executable(resolved: ResolvedEnvironment, name: str, *,
     if env is None:
         found = shutil.which(name)
     else:
-        found = (shutil.which(name, path=path_value) if path_value
-                 else shutil.which(name))
+        found = shutil.which(name, path=path_value) if path_value else None
     return Path(found) if found else None
 
 

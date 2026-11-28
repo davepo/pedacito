@@ -772,8 +772,12 @@ def collect_gate_diagnostics(root: Path, files: list[str], *, cfg,
     out: list[Diagnostic] = []
     seen: set[str] = set()
     for raw in files:
+        raw_str = str(raw or "").strip()
+        if not raw_str:
+            status = _worse(status, "denied")
+            continue
         try:
-            path = security.resolve_safe_path(root, _norm_rel(raw))
+            path = security.resolve_safe_path(root, raw_str)
         except security.SecurityError:
             status = _worse(status, "denied")
             continue

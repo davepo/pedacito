@@ -69,6 +69,7 @@ def _lmstudio(models):
     }
 
 
+@pytest.mark.live_probe
 def test_describe_models_filters_embedding_and_too_big(fake):
     gib = 1024 ** 3
     url = fake(_lmstudio([

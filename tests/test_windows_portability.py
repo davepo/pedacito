@@ -804,9 +804,11 @@ def _pretend_windows(monkeypatch, k32):
     # path class so registry records still land in tmp_path. `state_dir`
     # re-wraps its root with index's own Path, and fileio re-wraps the final
     # path again for its atomic write, so patch those namespaces too.
+    from pedacito import security
     monkeypatch.setattr(processes, "Path", _REAL_PATH)
     monkeypatch.setattr(index, "Path", _REAL_PATH)
     monkeypatch.setattr(fileio, "Path", _REAL_PATH)
+    monkeypatch.setattr(security, "Path", _REAL_PATH)
     runs: list[list[str]] = []
 
     def fake_run(argv, **_kw):

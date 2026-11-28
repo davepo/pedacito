@@ -3607,21 +3607,23 @@ class LLMClient:
                                        on_stream=on_stream,
                                        _count_call=False,
                                        trip_circuit=trip_circuit)
-            if self._deny_accel_caps(payload, e):
+            low = str(e).lower()
+            if "stream_options" in payload and (
+                    "stream_options" in low or "include_usage" in low):
+                # An older server that rejects the usage option: remember and
+                # retry once without it. Check BEFORE _deny_accel_caps so a
+                # server explicitly complaining about stream_options does not
+                # mistakenly strip cache_prompt first.
+                self._stream_usage_ok = False
+                payload.pop("stream_options", None)
+                r = self._post(payload, stream=True, trip_circuit=trip_circuit)
+            elif self._deny_accel_caps(payload, e):
                 return self._chat_once(messages, max_tokens, schema, stream,
                                        disable_thinking, json_schema,
                                        cancel_event=cancel_event,
                                        on_stream=on_stream,
                                        _count_call=False,
                                        trip_circuit=trip_circuit)
-            low = str(e).lower()
-            if "stream_options" in payload and (
-                    "stream_options" in low or "include_usage" in low):
-                # An older server that rejects the usage option: remember and
-                # retry once without it.
-                self._stream_usage_ok = False
-                payload.pop("stream_options", None)
-                r = self._post(payload, stream=True, trip_circuit=trip_circuit)
             else:
                 raise
         if self._response_is_json(r):

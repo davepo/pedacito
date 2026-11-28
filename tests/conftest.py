@@ -59,6 +59,14 @@ def _isolate_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     if os.name == "nt":
+        import site
+        user_site = site.getusersitepackages()
+        if user_site and Path(user_site).is_dir():
+            cur_pp = os.environ.get("PYTHONPATH", "")
+            parts = [p for p in cur_pp.split(os.pathsep) if p]
+            if user_site not in parts:
+                parts.append(user_site)
+                monkeypatch.setenv("PYTHONPATH", os.pathsep.join(parts))
         appdata = iso / "appdata"
         (appdata / "pedacito").mkdir(parents=True)
         monkeypatch.setenv("APPDATA", str(appdata))

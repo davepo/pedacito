@@ -304,7 +304,9 @@ def test_atomic_replace_retries_transient_sharing_violation(tmp_path, monkeypatc
         return real_replace(src, dst)
 
     monkeypatch.setattr(os_mod, "replace", flaky)
-    monkeypatch.setattr(os_mod, "name", "nt")
+    monkeypatch.setattr(
+        fileio, "_is_transient_replace_error",
+        lambda exc: getattr(exc, "winerror", 0) in (5, 32))
     monkeypatch.setattr(fileio, "_OS_REPLACE_DELAYS", (0.0, 0.0))
     fileio.write_bytes(tmp_path / "x.py", b"X = 1\n")
     assert calls["n"] == 2  # first attempt failed, retry succeeded

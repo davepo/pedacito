@@ -285,6 +285,7 @@ def test_run_test_uses_the_resolved_interpreter_and_bin_dirs(tmp_path, monkeypat
     idx = Index(tmp_path, [])
     cfg = Config()
     cfg.allow_shell = True
+    cfg.sandbox = False
     cfg.log_events = False
     calls: list[tuple[list[str], dict]] = []
 

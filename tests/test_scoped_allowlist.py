@@ -366,7 +366,7 @@ def test_tui_prompt_bar_project_answer_persists_rule(tmp_path):
             project_root=str(tmp_path))
         assert allowed is True
         assert "Allowed in this project" in message
-        text = out.getvalue()
+        text = " ".join(out.getvalue().split())
         assert "y = once / a = session / n = deny" in text
         assert "p = allow 'pytest *' in this project" in text
         norm = security.normalize_project_root(tmp_path)

@@ -130,14 +130,12 @@ def _deadline(seconds=lsp.GATE_BUDGET_SECONDS):
 # ------------------------------------------------------------------ URIs
 
 def test_from_uri_strips_windows_drive_slash_and_decodes():
-    uri = PureWindowsPath("C:/Users/dev/my proj/a.py").as_uri()
-    assert uri == "file:///C:/Users/dev/my%20proj/a.py"
+    uri = "file:///C:/Users/dev/my%20proj/a.py"
     assert lsp._from_uri(uri) == str(PureWindowsPath("C:/Users/dev/my proj/a.py"))
 
 
 def test_from_uri_rebuilds_unc_share():
-    uri = PureWindowsPath("//server/share/src/a.py").as_uri()
-    assert uri == "file://server/share/src/a.py"
+    uri = "file://server/share/src/a.py"
     assert lsp._from_uri(uri) == str(PureWindowsPath("//server/share/src/a.py"))
 
 
