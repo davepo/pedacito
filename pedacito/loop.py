@@ -232,6 +232,19 @@ def _is_noop(reply: str) -> bool:
     return any(p in low for p in _NOOP_PHRASES)
 
 
+def _structured_files(reply: str) -> list[str]:
+    """The normalised file paths a structured-mode reply touches (from its
+    intents and edits); [] when it is not a strict structured object. Used for
+    the pre_edit hook and test baselines without a legacy `parse_edits` pass."""
+    try:
+        from .edits import parse_structured_reply
+        intents, edits = parse_structured_reply(reply or "")
+    except Exception:
+        return []
+    return sorted({e.file for e in edits if e.file}
+                  | {i.file for i in intents if i.file})
+
+
 def _normalized_reply(reply: str) -> str:
     """Lowercase with apostrophe styles folded to ASCII, so refusal/incomplete
     phrasing matches whatever quoting came back. Local servers sometimes
@@ -5386,13 +5399,16 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
     fabricated = False       # reply's only blocks were no-ops
     fabricated_only = False  # ...and the reply did not declare "no changes"
     intents: list = []
+    structured = (answer_system is None
+                  and getattr(cfg, "edit_mode", "legacy") == "structured")
     if (answer_system is None and apply and not review
+            and not structured
             and hasattr(agent, "incremental_eligible")
             and agent.incremental_eligible(task)):
         intents = agent.plan_edit_intents(task, gathered)
         if len(intents) < 2:
             intents = []          # single target: the ordinary reply is cheaper
-    incremental = bool(intents)
+    incremental = bool(intents) and not structured
 
     def _mark_fabricated(text: str) -> str:
         """Record null-only blocks; add the "No changes" marker only when the
@@ -5406,7 +5422,46 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                 "reply was a no-op (SEARCH == REPLACE) and was discarded; "
                 "nothing was written.]")
 
-    if incremental:
+    if structured:
+        # Structured mode (WP-4101B): one strict JSON reply, generated and
+        # re-asked (bounded) inside agent.answer, then parsed, locally guarded
+        # and applied atomically inside agent.apply. No legacy block parsing
+        # and no salvage; a rejected reply lands as failed results, never a
+        # half-written batch.
+        raw_reply = agent.answer(task, gathered, system=answer_system)
+        edit_files = _structured_files(raw_reply)
+        pre = _fire(cfg, root, "pre_edit", files=edit_files, task=task[:300])
+        baseline_tests = None
+        if apply and not review and edit_files and getattr(
+                cfg, "verify_tests", False) \
+                and (getattr(cfg, "allow_shell", False)
+                     or _test_run_consent(cfg)):
+            baseline_tests = _run_tests(idx, cfg, edit_files)
+            _note_baseline_lesson_run(root, cfg, baseline_tests)
+        if apply and not review:
+            _capture_dom_baseline(root, cfg, edit_files)
+        if pre.denied:
+            print(f"  [edits blocked by a pre_edit hook: {pre.message}]",
+                  file=sys.stderr)
+            results = [Result(False, f, f"blocked by a pre_edit hook: "
+                                        f"{pre.message}") for f in edit_files]
+            reply = raw_reply
+        else:
+            results, reply = agent.apply(
+                raw_reply, dry_run=review or not apply, task=task,
+                gathered=gathered, backup_dir=None if review else backup_dir)
+            if apply and not review and (
+                    any(r.ok for r in results) or gather_mut):
+                _fire(cfg, root, "post_edit",
+                      files=sorted({r.file for r in results if r.ok}
+                                   | set(gather_mut)))
+                results, reply, tests_ok, tests_preexisting_only = \
+                    _post_edit_tests(
+                        root, cfg, agent, idx, task, results, reply,
+                        backup_dir, baseline_tests,
+                        sorted(set(edit_files) | set(gather_mut)),
+                        collect=findings)
+    elif incremental:
         # One symbol hunk at a time, each dry-applied and verified
         # before it is written. The full impacted-test/lint pass runs once,
         # after the last hunk, exactly like the ordinary apply path.
@@ -5586,7 +5641,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                           f"block(s) ({files}); treated as a "
                                           f"refusal to edit", "WARN")
                 reply = _mark_fabricated(reply)
-    if not incremental and not results and not _is_noop(reply) \
+    if not incremental and not structured and not results \
+            and not _is_noop(reply) \
             and not contradicted and not gather_mut:
         # Zero edit blocks: one bounded recovery (honour read tool-calls or
         # re-ask with the edit protocol). Skipped for no-op replies ("already
@@ -5627,7 +5683,8 @@ def _run_task_once(root: Path, cfg, client, agent, idx, task: str, *,
                                       f"block(s) ({files}); treated as a "
                                       f"refusal to edit", "WARN")
             reply = _mark_fabricated(reply)
-    if (not incremental and not results and not contradicted and not fabricated
+    if (not incremental and not structured and not results
+            and not contradicted and not fabricated
             and not _is_noop(reply) and not gather_mut):
         # A "no changes" declaration is a decision, not a parse failure, and
         # a gather-only run wrote its changes with tool actions instead of

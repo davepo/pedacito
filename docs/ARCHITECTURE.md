@@ -751,6 +751,17 @@ A block the model *started* but never finished (a missing `=======` or
 `>>>>>>> REPLACE`, a block with no `--- FILE:` header) is reported back as a
 failure instead of being silently dropped.
 
+With `edit_mode = "structured"` the answer is instead one strict JSON object
+(`{"version":1,"intents":[...],"edits":[...]}`, `additionalProperties: false`),
+requested through the engine's `json_schema -> json_object -> prompt` ladder.
+The reply is parsed strictly (no salvage) and re-validated locally before it
+materializes into the same edit path and applies through the atomic transaction;
+the rung the engine actually honoured is recorded as `schema_enforcement`
+(`strict` / `json_object` / `prompt_only`), so a prompt-only fallback is never
+called sampler-enforced. `edit_mode` defaults to `legacy` and is chosen by
+`pedacito calibrate` from a three-arm comparison only when the model measures
+better; the legacy prompt and cards are unchanged on the default path.
+
 ### Renaming a symbol across the project
 
 A rename does not need a model, so Pedacito does it mechanically: every exact

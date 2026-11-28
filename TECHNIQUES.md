@@ -341,9 +341,12 @@ retries.
 edit format, planted-injection and honesty, long-context retrieval,
 continuation, a thinking A/B, and capabilities, and stores a per-model card.
 The card then picks `prompt_pack`, `answer_mode`, `best_of`, `verify_answer`,
-`tool_mode`, `fuzzy_match`, and `edit_style` *only for settings the user left
-at their default*, with an explicit config value always winning. The direction
-is deliberate: the *weakest* models get the *most* safety net.
+`tool_mode`, `fuzzy_match`, `edit_style`, and `edit_mode` *only for settings the
+user left at their default*, with an explicit config value always winning. The
+edit format is measured as three paired arms -- quote (legacy), anchor, and
+structured -- and a non-legacy arm is adopted only when it beats the legacy arm
+by the minimum improvement (0.05), ties preferring the current legacy arm. The
+direction is deliberate: the *weakest* models get the *most* safety net.
 
 ### 8. Prompt-cache layout
 
@@ -2195,7 +2198,32 @@ words) escalates the task straight to the `escalate` role. A boundary-fewshot
 Scout classifier keeps well-defined single-file tasks local. Both paths run once per
 task, and the setting is off by default so existing reactive behaviour is unchanged.
 
-## Quick reference: techniques 5, 11, 17 to 51
+### 57. Structured edit mode: one strict JSON reply, validated before it writes
+
+**Problem.** A free-form search/replace reply leaves the harness to salvage what
+it can from prose, half-written blocks and near-miss quotes. Structured output
+(the reply *is* the schema) is only trustworthy when every rung of the request
+ladder is known and the reply is still re-checked locally.
+
+**Technique.** With `edit_mode = "structured"`, the answer is a single strict
+JSON object -- `{"version":1,"intents":[...],"edits":[...]}` with
+`additionalProperties: false` and the five actions (`replace_symbol`,
+`insert_after_symbol`, `search_replace`, `append`, `delete_symbol`). The request
+uses the same `json_schema -> json_object -> prompt` ladder as every structured
+call (§27), and the rung actually honoured is recorded as `schema_enforcement`
+(`strict` / `json_object` / `prompt_only`), so a prompt-only fallback is never
+labelled sampler-enforced. The reply is then parsed strictly (no salvage) and
+run through the same local guard as every edit (`validate_structured_reply`:
+intent matching, containment, sensitive/protected/policy, symbol/search
+resolution, no-op/overlap/scope, syntax and the undefined-name gate) before it
+materializes into legacy whole-file edits and applies through the atomic
+transaction (§20). A rejected reply is re-asked a bounded number of times and
+recorded as a `schema_rejection` event without persisting the raw reply. `edit_mode`
+is chosen by `pedacito calibrate` from the three paired arms only when the model
+measures better than the legacy arm; the legacy prompt and legacy cards are
+unchanged on the default path.
+
+## Quick reference: techniques 5, 11, 17 to 51, 57
 
 | Technique | Section | How to turn it off | Where you see it |
 |---|---|---|---|
@@ -2238,6 +2266,7 @@ task, and the setting is off by default so existing reactive behaviour is unchan
 | Strategy shift when no `escalate` role exists | §49 | `auto_escalate = false` | `strategy_shift` event; one same-model retry with the edit style flipped after an escalation reason |
 | Specialist auto-routing + clean VRAM handoff | §50 | `auto_route_specialties = false` (default), or `--no-auto-route` per run | `specialist_routed` / `model_swap` events; **✦ Auto-route** in the GUI top bar; Specialties column in `pedacito profiles` |
 | Windows process-tree reaping (suspended job wrap + retained handle + orphan walk) | §51 | None (always on; it is the Windows `stop` path) | `job_note` / `born_ft` / `descendants` / `stop_note` / `stop_incomplete` in `.pedacito/procs/*.json`; the orphan crucible + fake-kernel32 portability tests |
+| Structured edit mode (one strict JSON reply, locally validated then applied atomically) | §57 | `edit_mode = "legacy"` (default) | `edit_mode = "structured"`; `schema_enforcement` (`strict`/`json_object`/`prompt_only`) and `schema_rejection` events; the three-arm `edit_mode_scores` on the model card |
 
 ## Techniques that exist but are not a good fit
 

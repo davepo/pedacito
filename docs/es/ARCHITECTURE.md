@@ -755,6 +755,17 @@ Un bloque que el modelo *empezó* pero nunca terminó (un `=======` o
 `>>>>>>> REPLACE` faltante, un bloque sin encabezado `--- FILE:`) se informa como
 fallo en lugar de descartarse en silencio.
 
+Con `edit_mode = "structured"` la respuesta es en cambio un único objeto JSON estricto
+(`{"version":1,"intents":[...],"edits":[...]}`, `additionalProperties: false`),
+solicitado a través de la escalera `json_schema -> json_object -> prompt` del motor.
+La respuesta se analiza estrictamente (sin salvamento) y se vuelve a validar localmente antes de
+materializarse en la misma ruta de edición y aplicarse a través de la transacción atómica;
+el escalón que el motor realmente honró se registra como `schema_enforcement`
+(`strict` / `json_object` / `prompt_only`), de modo que una degradación solo de prompt nunca
+se llama impuesta por el muestreador. `edit_mode` es `legacy` por defecto y lo elige
+`pedacito calibrate` a partir de una comparación de tres brazos solo cuando el modelo mide
+mejor; el prompt legacy y las tarjetas legacy no cambian en la ruta por defecto.
+
 ### Renombrar un símbolo en todo el proyecto
 
 Un renombrado no necesita un modelo, así que Pedacito lo hace mecánicamente: cada identificador

@@ -79,6 +79,10 @@ from . import tools as tools_mod
 # JSON, before giving up and answering from what was gathered.
 _MAX_GATHER_RECOVERIES = 2
 
+# Structured-mode (WP-4101B) re-asks after a reply fails strict JSON parsing or
+# local validation before the run accepts the explicit no-change object.
+_MAX_STRUCTURED_REASKS = 2
+
 # Consecutive re-reads that add no new source before gather stops (one duplicate
 # only gets a compact "already read" observation).
 _MAX_DUPLICATE_READS = 2
@@ -4139,6 +4143,9 @@ class Agent:
         token = self._prompt_resume()
         try:
             with self._phase_temp("temperature_answer"):
+                if (self._structured_mode() and system is None
+                        and include_edit_format):
+                    return self._answer_structured(task, gathered, max_tokens)
                 return self._answer(task, gathered, stream, system, max_tokens,
                                     include_edit_format, images=images)
         finally:
@@ -4147,6 +4154,95 @@ class Agent:
                 prompt_inspect_mod.deactivate(token)
             else:
                 self._prompt_rest()
+
+    def _structured_mode(self) -> bool:
+        """True when the run answers with the strict structured JSON format
+        (WP-4101B). Only the default edit flow routes here: a caller-supplied
+        brief (scaffold/explain) always keeps the legacy block path."""
+        return getattr(self.cfg, "edit_mode", "legacy") == "structured"
+
+    def _answer_structured(self, task: str, gathered: str,
+                           max_tokens: int | None) -> str:
+        """Structured-mode answer: request ONE strict JSON object, re-asking a
+        bounded number of times when the reply fails strict parsing or local
+        validation. Returns the raw (already-validated) JSON text for `apply`.
+
+        Each rejection is recorded as a `schema_rejection` event without
+        persisting the raw reply; the rung the engine actually used is recorded
+        as `schema_enforcement` (strict | json_object | prompt_only), never
+        labelled sampler-enforced when it was only prompt-based."""
+        from .edits import (STRUCTURED_SCHEMA, parse_structured_reply,
+                            StructuredReplyError)
+        from .verify import validate_structured_reply
+        self._set_site("answer")
+        if self._task_budget_exceeded("answer"):
+            return '{"version":1,"intents":[],"edits":[]}'
+        system = self._answer_sys(task)
+        repo_map, _tier = self._map(task)
+        src = gathered or "(nothing was looked up)"
+        user = (f"PROJECT MAP\n\n{repo_map}\n\nSOURCE YOU REQUESTED\n\n{src}\n\n"
+                f"TASK\n{task}")
+        est = getattr(self.client, "estimate_tokens", None) or estimate_tokens
+        reply_room = self._answer_max_tokens(max_tokens)
+        limit = self.cfg.context_tokens - reply_room - self.cfg.reserve_tokens // 2
+        if est(user) > limit > 0 and not is_hosted(self.cfg):
+            head = f"PROJECT MAP\n\n{repo_map}\n\nSOURCE YOU REQUESTED\n\n"
+            src, _dropped = _trim_gathered(
+                src, lambda text: est(head) + est(text) > limit,
+                requirements=getattr(self, "requirements", None),
+                diagnostics=getattr(self, "active_diagnostics", None),
+                index=self.index)
+            user = (f"PROJECT MAP\n\n{repo_map}\n\nSOURCE YOU REQUESTED\n\n{src}"
+                    f"\n\nTASK\n{task}")
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        reasks = _MAX_STRUCTURED_REASKS
+        feedback = ""
+        for attempt in range(reasks + 1):
+            if self._task_budget_exceeded("structured answer"):
+                break
+            msgs = list(messages)
+            if feedback:
+                msgs.append({"role": "user", "content":
+                             "Your previous reply was rejected:\n" + feedback
+                             + "\n\nReply again with ONE strict JSON object "
+                             "only, exactly the {version, intents, edits} shape."})
+            try:
+                raw = self.client.chat(
+                    msgs, max_tokens=reply_room,
+                    json_schema=STRUCTURED_SCHEMA, stream=False)
+            except CancelledError:
+                raise
+            except LLMError as e:
+                self._emit("schema_rejection",
+                           reason=f"call failed: {str(e)[:120]}")
+                feedback = f"the request failed ({str(e).splitlines()[0][:120]})"
+                continue
+            enforcement = getattr(self.client, "last_schema_enforcement", "") \
+                or "prompt_only"
+            self._emit("answer", mode="structured",
+                       schema_enforcement=enforcement,
+                       reply_chars=len(raw or ""))
+            try:
+                intents, edits = parse_structured_reply(raw or "")
+            except StructuredReplyError as e:
+                self._emit("schema_rejection", reason=str(e)[:300])
+                feedback = f"it is not one strict JSON object: {e}"
+                continue
+            errors = validate_structured_reply(
+                self.index.root, intents, edits,
+                allowed_files=self._write_allowlist(),
+                read_spans=self._read_spans or None, cfg=self.cfg)
+            if errors:
+                self._emit("schema_rejection",
+                           reason="; ".join(errors[:5])[:300])
+                feedback = "; ".join(errors[:5])
+                continue
+            return raw.strip() if raw is not None else \
+                '{"version":1,"intents":[],"edits":[]}'
+        # Exhausted the re-ask budget: an explicit no-change reply, never a
+        # half-validated partial (no salvage / no partial application).
+        return '{"version":1,"intents":[],"edits":[]}'
 
     def _emit_creative_mode(self) -> None:
         """Record the effective answer temperature for a Creative/design task
@@ -5723,6 +5819,55 @@ class Agent:
              {"role": "user", "content": user_content}])
 
     # ------------------------------------------------------------------- edits
+    def _apply_structured(self, reply: str, dry_run: bool, task: str = "",
+                          gathered: str = "", backup_dir=None) -> tuple[list, str]:
+        """Apply a structured-mode reply: strict parse, local guard, materialize
+        to legacy whole-file edits, then the atomic transaction (or per-file
+        apply when atomic_edits is off). No salvage and no partial application;
+        a rejected reply yields failed results, never a half-written batch."""
+        from .edits import (StructuredReplyError, materialize_structured_edits,
+                            parse_structured_reply)
+        from .verify import validate_structured_reply
+        self._set_site("repair")
+        try:
+            intents, edits = parse_structured_reply(reply or "")
+        except StructuredReplyError as e:
+            self._emit("schema_rejection", reason=str(e)[:300])
+            return [Result(False, "*",
+                           f"structured reply rejected: {e}")], reply
+        if not intents and not edits:
+            return [], reply          # the explicit no-change object
+        allowlist = self._write_allowlist()
+        read_spans = self._read_spans or None
+        errors = validate_structured_reply(
+            self.index.root, intents, edits, allowed_files=allowlist,
+            read_spans=read_spans, cfg=self.cfg)
+        if errors:
+            self._emit("schema_rejection", reason="; ".join(errors[:5])[:300])
+            return [Result(False, "*", "structured reply rejected: "
+                           + "; ".join(errors[:5]))], reply
+        mat = materialize_structured_edits(
+            self.index.root, intents, edits, allowed_files=allowlist,
+            read_spans=read_spans, cfg=self.cfg)
+        if not mat.ok:
+            self._emit("schema_rejection",
+                       reason="; ".join(mat.errors[:5])[:300])
+            return [Result(False, "*", "structured reply rejected: "
+                           + "; ".join(mat.errors[:5]))], reply
+        if dry_run:
+            return list(mat.results), reply
+        edits_legacy = list(mat.edits)
+        if atomic_edits_enabled(self.cfg):
+            results = apply_edits_atomic(
+                self.index.root, edits_legacy, backup=self.cfg.backup,
+                backup_dir=backup_dir, cfg=self.cfg, allowlist=allowlist)
+        else:
+            results = apply_edits(
+                self.index.root, edits_legacy, backup=self.cfg.backup,
+                dry_run=False, backup_dir=backup_dir, cfg=self.cfg,
+                allowlist=allowlist)
+        return results, reply
+
     def apply(self, reply: str, dry_run: bool, repair_rounds: int | None = None,
               task: str = "", gathered: str = "",
               backup_dir=None) -> tuple[list, str]:
@@ -5732,6 +5877,10 @@ class Agent:
 
         A brand-new file is created from its block as soon as the block parses;
         only a block that must match existing text needs the repair loop."""
+        if self._structured_mode():
+            return self._apply_structured(reply, dry_run, task=task,
+                                          gathered=gathered,
+                                          backup_dir=backup_dir)
         if repair_rounds is None:
             repair_rounds = self.cfg.repair_rounds
         self._set_site("repair")

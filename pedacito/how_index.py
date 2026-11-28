@@ -3811,6 +3811,8 @@ _SETTING_GUI = {
                    "Execution Overrides → answer_mode",
     "edit_style": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                   "Execution Overrides → edit_style",
+    "edit_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
+                 "Execution Overrides → edit_mode",
     "tool_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
                  "Execution Overrides → tool_mode",
     "execution_mode": "⚙ Settings → Profiles → [Select Profile] → Reasoning & "
@@ -3835,7 +3837,8 @@ _SETTING_GUI = {
 _REASONING_KEYS = {
     "disable_thinking", "thinking_suffix", "step_reasoning_first",
     "incremental_edit_loop", "edit_plan_brief", "dynamic_tool_pruning",
-    "prompt_pack", "answer_mode", "edit_style", "tool_mode", "execution_mode",
+    "prompt_pack", "answer_mode", "edit_style", "edit_mode", "tool_mode",
+    "execution_mode",
     "best_of", "fuzzy_match", "temperature", "temperature_answer",
     "max_output_tokens", "context_tokens",
 }
@@ -3976,6 +3979,8 @@ _SETTING_KEYWORDS = {
                     "remember commands", "micro facts"],
     "max_micro_fact_tokens": ["lesson budget", "micro fact budget"],
     "edit_style": ["symbol edit", "anchor edit", "splice", "search replace"],
+    "edit_mode": ["structured edit", "structured output", "json edit reply",
+                  "edit mode", "legacy edit"],
     "creative_mode": ["creative", "creative mode", "design mode", "builder",
                       "ui polish", "designer persona", "website builder"],
     "creative_auto": ["creative auto", "detect design tasks", "auto creative",
