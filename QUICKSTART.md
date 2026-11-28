@@ -1143,6 +1143,7 @@ only the map is stale.
 | `pedacito mcp list` | Show the tools of the named MCP servers and their trust flags |
 | `pedacito new DIR -t "..."` | Start a project from scratch (or `--spec FILE`); `--no-complex` (alias `--single`) turns off the automatic Complex escalation |
 | `pedacito auto PROJ -t "..."` | Plan a goal, then implement it task by task |
+| `pedacito plan --check PLAN.md PROJ` | Validate a checklist against the index before Auto or Complex runs (`--impact` previews callers and tests; exit 0 clean/warnings, 1 errors, 2 invalid) |
 | `pedacito restore PROJ` | Undo the last write |
 | `pedacito recover list [PROJ]` | Show unfinished task journals by UUID. `recover rollback ID PROJ` previews a safely bound rollback; add `--apply` to perform it |
 | `pedacito commit [--all] [-m MSG] [-y]` | Secret-scan the staged diff, then create a local commit. Never pushes; `--no-model` drafts offline and `--allow-secrets` is the explicit override |

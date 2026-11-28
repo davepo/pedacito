@@ -167,9 +167,13 @@ Every tool path goes through `security.resolve_safe_path(root, target)`:
    call raises `SecurityError`.
 
 Callers include the read, edit, write and rename tools (`pedacito/tools.py`,
-`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), the skill loader
-(`pedacito/skills.py`), the checkpoint restore path (`pedacito/checkpoints.py`), and
-every GUI file route (`pedacito/gui/server.py`).
+`pedacito/edits.py`, `pedacito/loop.py`, `pedacito/workspace.py`), the plan
+checker (`pedacito/plan.py`, which resolves the plan path and every file mention
+before Auto or Complex runs), the skill loader (`pedacito/skills.py`), the
+checkpoint restore path (`pedacito/checkpoints.py`), and every GUI file route
+(`pedacito/gui/server.py`). The plan checker only reads: a traversal, symlink or
+junction escape is reported as a definite error and stops the run before the
+first task writes.
 
 **A note on `os.path.commonpath`.** Pedacito uses `os.path.commonpath` in
 `pedacito/index.py`, but only to work out the project root when you pass several

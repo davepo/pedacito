@@ -106,6 +106,64 @@ class Graph:
         out |= set(self.callers_files(rel))
         return out
 
+    def import_cycles(self, only=None) -> list[list[str]]:
+        """Strongly connected import components of size > 1, deterministic.
+
+        `only`, when given, restricts the graph to those files (edges to a
+        file outside the set are ignored). An import cycle is legal in Python
+        and in several other languages, so callers treat this as evidence and
+        a warning, never as a hard failure. The implementation is iterative
+        Tarjan so a deep import chain cannot hit the recursion limit.
+        """
+        allowed = set(self.files)
+        if only is not None:
+            allowed &= {str(f).replace("\\", "/") for f in only}
+        nodes = sorted(allowed)
+        adj = {
+            f: sorted(t for t in self.imports.get(f, ()) if t in allowed)
+            for f in nodes
+        }
+        indices: dict[str, int] = {}
+        low: dict[str, int] = {}
+        on_stack: set[str] = set()
+        stack: list[str] = []
+        components: list[list[str]] = []
+        counter = 0
+        for root in nodes:
+            if root in indices:
+                continue
+            work: list[tuple[str, int]] = [(root, 0)]
+            while work:
+                node, pos = work[-1]
+                if pos == 0:
+                    indices[node] = low[node] = counter
+                    counter += 1
+                    stack.append(node)
+                    on_stack.add(node)
+                if pos < len(adj[node]):
+                    target = adj[node][pos]
+                    work[-1] = (node, pos + 1)
+                    if target not in indices:
+                        work.append((target, 0))
+                    elif target in on_stack:
+                        low[node] = min(low[node], indices[target])
+                    continue
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] == indices[node]:
+                    component: list[str] = []
+                    while True:
+                        item = stack.pop()
+                        on_stack.discard(item)
+                        component.append(item)
+                        if item == node:
+                            break
+                    if len(component) > 1:
+                        components.append(sorted(component))
+        return sorted(components, key=lambda c: (c[0], len(c), c))
+
     def import_reliable(self, rel: str) -> bool:
         """Whether 'no importers' means something for this file: the language
         resolves imports to files (not Go packages / C# namespaces), and at

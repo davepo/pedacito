@@ -186,6 +186,7 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito ask PROJ -t "..."` | Run one task. Dry run by default. Add `--review`, `--apply`, `--plan`, `--refine`, `--jsonl`, or `--json` |
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
+| `pedacito plan --check [PLAN] [PROJECT]` | Validate a checklist against the index before an Auto or Complex run; `--impact` previews callers and tests. Exit 0 clean/warnings, 1 definite errors, 2 invalid |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
@@ -719,6 +720,43 @@ and symlink escapes are refused. Tasks stream `session/update` notifications
 `session/cancel` maps to the rpc cancel and keeps the process alive. stdout is
 pure JSON-RPC; every human line goes to stderr, and stdin EOF drains the active
 task and exits 0.
+
+### `plan`: check a checklist before it runs
+
+Auto and `new --complex` validate the checklist at their execution boundary.
+The same inspection is available on its own, without a model call and without
+changing project source files (it may refresh the static index cache under
+`.pedacito/`):
+
+```bash
+pedacito plan --check PLAN.md .             # validate the checklist
+pedacito plan --check PLAN.md . --impact    # preview callers and tests too
+pedacito plan --check PLAN.md . --json      # machine-readable report for CI
+```
+
+The check is index-backed and deliberately conservative. It contains the plan
+path and every file mention with `security.resolve_safe_path`; a traversal, an
+absolute path outside the project, a symlink/junction escape, a sensitive file
+(`.env`, keys, credentials) or a protected path (`.pedacito/`, `.git/`, the
+Pedacito config names) is a definite error. Explicit `path: symbol` references
+are resolved against the static index; a missing symbol in an existing Python
+file is an error unless the task marks it as a creation. Dependency
+annotations such as `(depends on 1, 2)` or `depends_on: 1, 2` are checked for
+cycles, missing task numbers and later-task order.
+
+A file that does not exist yet is valid when the task deliberately marks it as
+a creation ("Create `src/new.py`", "Implement `main.py`", "Add tests in
+`tests/test_new.py`"): its parent must stay inside the project. On Windows a
+case-only collision with an existing file is an error because the filesystem
+compares names without case; on a case-sensitive filesystem the two names can
+coexist and the near-collision is only a warning. Callers and tests come from
+static import/call edges and file-naming links, so dynamic imports, reflection
+and tests with unrelated names are reported under `unknowns` rather than
+treated as failures.
+
+Exit codes: `0` clean or warnings only, `1` definite errors, `2` an invalid
+plan (unreadable, too large, without checklist tasks, or escaping its project).
+Auto and Complex stop only on `1` or `2`; warnings do not block a run.
 
 ### `new`: start a project from scratch
 

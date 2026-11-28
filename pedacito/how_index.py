@@ -405,6 +405,47 @@ CLI_COMMANDS = [
         "common": True,
     },
     {
+        "name": "plan",
+        "usage": "pedacito plan --check [PLAN] [PROJECT] [--impact] [--json]",
+        "summary": "Validate a checklist against the index before Auto or "
+                   "Complex execution: contain every named path, resolve "
+                   "explicit symbols, check dependency order and preview the "
+                   "callers and tests. Warnings never block; definite errors "
+                   "exit 1 and an invalid plan exits 2.",
+        "keywords": ["plan check", "validate plan", "impact", "callers",
+                     "tests", "dependency order", "cycle", "preview",
+                     "before auto", "before complex"],
+        "examples": [
+            "pedacito plan --check .",
+            "pedacito plan --check PLAN.md .",
+            "pedacito plan --check PLAN.md . --impact",
+            "pedacito plan --check PLAN.md . --json",
+        ],
+        "flags": [
+            {"flag": "PLAN", "help": "the checklist (default: PLAN.md in the "
+                                     "project root)"},
+            {"flag": "PROJECT", "help": "the project (default: .)"},
+            {"flag": "--check", "help": "validate paths, symbols, dependency "
+                                        "order and impact; read-only"},
+            {"flag": "--impact", "help": "print the conservative caller/test "
+                                         "preview"},
+            {"flag": "--plan FILE", "help": "use this checklist instead of the "
+                                            "positional PLAN"},
+            {"flag": "--json", "help": "print issues and impact as JSON"},
+            {"flag": "--root DIR", "help": "project root"},
+            {"flag": "--config FILE", "help": "use this config file as well"},
+            {"flag": "--profile NAME", "help": "apply a profile block"},
+        ],
+        "notes": [
+            "Exit codes: 0 clean or warnings only, 1 definite errors, 2 an "
+            "invalid or escaping plan path. A file may be marked as a planned "
+            "creation ('Create `src/new.py`'); its parent must stay inside "
+            "the project. Dynamic callers and tests without a naming link "
+            "are reported as unknown, never as failures.",
+        ],
+        "common": True,
+    },
+    {
         "name": "new",
         "usage": 'pedacito new DIR -t "PROJECT IDEA" [--apply]',
         "summary": "Start a project from scratch: plan, scaffold, then build. "
@@ -4017,6 +4058,7 @@ _ES_SUMMARIES = {
     "cli:files": "Muestra qué archivos se indexarían y por qué, incluidos los archivos ignorados y sus motivos.",
     "cli:ask": "Ejecuta una tarea de código de principio a fin. Sin --apply es una ejecución de prueba que imprime las ediciones propuestas.",
     "cli:auto": "Convierte un objetivo en una lista de tareas y luego implementa cada una en un contexto nuevo. Sin --apply solo escribe o imprime el plan.",
+    "cli:plan": "Valida una lista de tareas contra el índice antes de la ejecución Auto o Complex: contiene cada ruta nombrada, resuelve los símbolos explícitos, comprueba el orden de dependencias y previsualiza llamadores y pruebas. Las advertencias no bloquean; los errores definitivos salen con 1 y un plan inválido con 2.",
     "cli:reset": "Borra el estado de Pedacito de este proyecto (índice, planes, cachés, sesiones y respaldos); el código y los archivos de configuración no se tocan. No es un restablecimiento de la configuración.",
     "cli:undo": "Deshace la última ejecución: restaura el espacio de trabajo al estado anterior al checkpoint activo (o a la instantánea de respaldo más reciente en proyectos antiguos).",
     "cli:recover": "Lista los diarios de tareas interrumpidas por su UUID y previsualiza o aplica una recuperación. Sin --apply no se escribe nada; resume y cleanup se rechazan cuando no se puede probar un límite duradero o una propiedad autoritativa.",

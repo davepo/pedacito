@@ -1070,6 +1070,28 @@ and the minimum Pedacito version it needs. `pkg_manifest.py` validates the file,
 and a person reviews it before anything in the package runs. See
 [SKILLS_AND_TOOLS.md](SKILLS_AND_TOOLS.md#package-manifests-pedacito-packagetoml).
 
+### Plan validation and impact
+
+`plan.check_plan(root, plan_path, index)` runs before Auto and Complex execute
+their first task (and is exposed as `pedacito plan --check [PLAN] [PROJECT]`).
+It contains the plan path and every file mention with
+`security.resolve_safe_path`, rejects traversal, symlink/junction escapes,
+sensitive and protected targets, resolves explicit `path: symbol` references
+against the static index, and checks dependency annotations for cycles, missing
+numbers and later-task order. A task that says it creates a file is a valid
+creation when its parent stays inside the project; a missing file with an edit
+verb and no creation marker is a definite error. On Windows a case-only
+collision with an existing file is an error because the filesystem cannot hold
+both; a case-sensitive filesystem treats the near-collision as a warning.
+
+`PlanImpact` is a conservative preview built from the same index: touched files
+and symbols, indexed callers (importers plus call edges and symbol callers),
+tests linked by language naming conventions, and deterministic `unknowns` for
+dynamic imports, approximate bare-name callers, unindexed files, planned
+creations and missing tests. An absent index or an unresolved dependency makes
+the preview smaller and explicitly unknown, never green. Warnings do not block;
+only definite errors stop a run, and an invalid plan maps to exit code 2.
+
 ## Known limits
 
 These are the real boundaries. Missing harness features are not on this list:

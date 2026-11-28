@@ -15,6 +15,7 @@ Usage
     pedacito reset  ~/code/app               # wipe .pedacito/ state (code stays)
     pedacito new  my-app -t "todo CLI"       # start a project from scratch
     pedacito auto . -t "add retries" --apply # autonomous outer loop over tasks
+    pedacito plan --check PLAN.md .          # validate a checklist, no model call
     pedacito rename old_name new_name        # rename a symbol across files, no model call
     pedacito update --run                    # check PyPI and upgrade this install
 
@@ -1435,13 +1436,22 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
     if getattr(args, "diagnostics", False):
         cfg.auto_diagnostics = True
 
+    # WP-4104C: validate the checklist at the CLI boundary too, so a caller
+    # that replaces run_loop still gets the same gate. The loop's own default
+    # stays on for direct run_loop users.
+    if args.apply:
+        from . import plan as plan_mod
+        gate_code = plan_mod.gate_plan(root, plan_path, idx, cfg=cfg)
+        if gate_code is not None:
+            return gate_code
+
     code = loop.run_loop(root, cfg, client, idx, plan_path,
                          apply=args.apply, verify=verify, repair_rounds=repair,
                          max_tasks=max_tasks, max_minutes=max_minutes,
                          stop_on_fail=not args.keep_going,
                          auto_install=auto_install, goal=spec_text,
                          strict=bool(getattr(args, "strict", False)),
-                         verify_final=verify_final)
+                         verify_final=verify_final, validate_plan=False)
 
     # Post-run verification: exercise the project once (--verify and/or a smoke
     # run of main.py) and feed a failure back for repair. With --verify-final
@@ -1499,6 +1509,134 @@ def _cmd_auto(args, cfg, client, idx, root: Path) -> int:
         fresh = index_mod.Index.load(root)
         if fresh is not None:
             _refresh(fresh, args, cfg, root)
+    return code
+
+
+def _looks_like_plan_arg(path: Path) -> bool:
+    """Whether the first positional names a checklist rather than a project."""
+    try:
+        if path.is_dir():
+            return False
+        if path.exists():
+            return path.is_file()
+    except OSError:
+        pass
+    return (path.suffix.lower() in (".md", ".markdown", ".txt")
+            or "plan" in path.name.lower())
+
+
+def _plan_cli_targets(args) -> tuple[Path, Path | None]:
+    """Resolve `[PLAN] [PROJECT]` (and `--plan FILE`) without guessing roots."""
+    paths = [str(p) for p in (getattr(args, "paths", None) or []) if str(p)]
+    explicit = getattr(args, "plan_file", None)
+    plan_arg = explicit
+    project: str | None = None
+    if paths:
+        if plan_arg is None and _looks_like_plan_arg(Path(paths[0])):
+            plan_arg = paths[0]
+            project = paths[1] if len(paths) > 1 else None
+        else:
+            project = paths[0]
+            if (plan_arg is None and len(paths) > 1
+                    and _looks_like_plan_arg(Path(paths[1]))):
+                plan_arg = paths[1]
+    root_hint = getattr(args, "root", None)
+    if project is not None:
+        root = Path(project).expanduser().resolve()
+    elif root_hint:
+        root = Path(root_hint).expanduser().resolve()
+    elif plan_arg and Path(plan_arg).expanduser().is_absolute():
+        # A plan passed by absolute path without a PROJECT lives in that
+        # project's root (the common "check this checklist" invocation).
+        root = Path(plan_arg).expanduser().resolve().parent
+    else:
+        root = Path(".").resolve()
+    if plan_arg is None:
+        return root, None
+    plan_path = Path(plan_arg).expanduser()
+    if not plan_path.is_absolute():
+        plan_path = root / plan_path
+    return root, plan_path
+
+
+def _load_plan_index(root: Path, cfg):
+    """Load or build a static index for a plan check (no model, no summaries)."""
+    try:
+        idx = index_mod.Index.load(root)
+    except Exception:
+        idx = None
+    if idx is None:
+        # No ignore-file or config mutation: a check only needs the static
+        # index cache, and `Index.save` creates just `.pedacito/index.json`.
+        return index_mod.build([str(root)], cfg, client=None, root=root,
+                               summarise=False, verbose=False)
+    try:
+        changed, missing = idx.stale()
+        for rel in missing:
+            idx.forget(rel)
+        for rel in changed:
+            idx = index_mod.reindex_file(idx, rel, cfg, save=False)
+    except Exception:
+        pass
+    return idx
+
+
+def _cmd_plan(args) -> int:
+    """`pedacito plan --check`: validate a checklist and preview its impact."""
+    from dataclasses import asdict
+
+    from . import plan as plan_mod
+
+    if not getattr(args, "check", False) and not getattr(args, "impact", False):
+        print(i18n.t("cli.plan.usage"), file=sys.stderr)
+        return 2
+    root, plan_arg = _plan_cli_targets(args)
+    if not root.is_dir():
+        print(i18n.t("cli.plan.invalid", message=f"not a directory: {root}"),
+              file=sys.stderr)
+        return 2
+    args.root = str(root)
+    cfg = _light_config(args)
+    plan_path = plan_arg or (root / cfg.auto_plan_file)
+    try:
+        idx = _load_plan_index(root, cfg)
+        issues, impact = plan_mod.check_plan(root, plan_path, idx)
+    except Exception as exc:
+        print(i18n.t("cli.plan.invalid", message=str(exc)), file=sys.stderr)
+        return 2
+    code = plan_mod.check_plan_exit_code(issues)
+    try:
+        shown_plan = plan_path.relative_to(root).as_posix()
+    except ValueError:
+        shown_plan = str(plan_path)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "plan": shown_plan,
+            "issues": [asdict(i) for i in issues],
+            "impact": asdict(impact),
+            "exit_code": code,
+        }, ensure_ascii=False, indent=2))
+        return code
+
+    print(i18n.t("cli.plan.header", plan=shown_plan))
+    for issue in issues:
+        print(plan_mod.render_issue(issue))
+    if getattr(args, "impact", False):
+        print(i18n.t("cli.plan.impact.header"))
+        for line in plan_mod.render_impact(impact):
+            print(line)
+    if code == 2:
+        print(i18n.t("cli.plan.invalid_result"))
+    elif code == 1:
+        print(i18n.t("cli.plan.errors", count=len(plan_mod.blocking_issues(
+            issues))))
+    else:
+        warnings = sum(1 for i in issues if i.severity == plan_mod.WARNING)
+        if warnings:
+            print(i18n.t("cli.plan.warnings", count=warnings))
+        else:
+            print(i18n.t("cli.plan.clean"))
     return code
 
 
@@ -4802,6 +4940,17 @@ def build_parser(lang: str | None = None) -> argparse.ArgumentParser:
                              "including the Task-vs-Auto nudge")
     _add_execution_mode(p_auto)
 
+    p_plan = sub.add_parser("plan", help=t("cli.cmd.plan"))
+    _add_common(p_plan, paths_nargs="*")
+    p_plan.add_argument("--check", action="store_true",
+                        help=t("cli.plan.opt.check"))
+    p_plan.add_argument("--impact", action="store_true",
+                        help=t("cli.plan.opt.impact"))
+    p_plan.add_argument("--plan", dest="plan_file", metavar="FILE",
+                        default=None, help=t("cli.plan.opt.plan"))
+    p_plan.add_argument("--json", action="store_true",
+                        help=t("cli.plan.opt.json"))
+
     p_chat = sub.add_parser("chat", help=t("cli.cmd.chat"))
     _add_common(p_chat)
     p_chat.add_argument("--apply", action="store_true")
@@ -5444,7 +5593,7 @@ def _main(argv=None) -> int:
     light = {"prune": _cmd_prune, "reset": _cmd_reset, "memory": _cmd_memory,
              "trust": _cmd_trust, "tests": _cmd_tests,
              "webcheck": _cmd_webcheck, "domcheck": _cmd_domcheck,
-             "skills": _cmd_skills,
+             "skills": _cmd_skills, "plan": _cmd_plan,
              "rename": _cmd_rename,
              "undo": _cmd_undo, "checkpoints": _cmd_checkpoints,
              "checkout": _cmd_checkout,
