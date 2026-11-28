@@ -55,6 +55,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import autopsy as autopsy_mod
 from . import events as events_mod
 from . import fileio, safety, security
 from . import tools as tools_mod
@@ -1945,7 +1946,8 @@ class _Loop:
             results.append(outcome.text)
             self.emit("tool_result", name=call.name, id=call.id, ok=outcome.ok,
                       chars=len(outcome.text), preview=outcome.text[:300],
-                      novel=novel, gate_errors=len(outcome.gate_errors))
+                      novel=novel, gate_errors=len(outcome.gate_errors),
+                      obs_code=autopsy_mod.classify_observation(outcome.text))
             if finished:
                 res.summary = outcome.summary
             max_sec = float(getattr(self.cfg, "max_task_seconds", 0) or 0)

@@ -4099,6 +4099,23 @@ function procsDialog() {
   PDC.api('/api/procs').then(paint, () => { status.textContent = 'The GUI server did not answer.'; });
 }
 
+// "Why did this fail?": the read-only autopsy of the last run. The server
+// classifies it from typed events only; an unknown category means no evidence.
+function autopsyDialog() {
+  if (!_needRoot()) return;
+  const out = h('div', { class: 'note-box', style: 'margin-top:10px' });
+  const lines = h('pre', { class: 'diffwrap', style: 'max-height:40vh;overflow:auto;margin:8px 0 0' });
+  PDC.api('/api/autopsy').then((j) => {
+    if (!j.ok) { out.textContent = j.detail || 'The autopsy could not run.'; return; }
+    out.textContent = j.label + (j.incomplete ? ' \u2014 ' + PDC.t('gui.autopsy.incomplete', null, 'the run log is incomplete') : '');
+    lines.textContent = (j.evidence_lines || []).join('\n') || PDC.t('gui.autopsy.no_evidence', null, 'No typed evidence was recorded for the last run.');
+    if ((j.next_labels || []).length) lines.textContent += '\n\n' + j.next_labels.map((s) => '- ' + s).join('\n');
+  }, () => { out.textContent = 'The GUI server did not answer.'; });
+  PDC.modal('Why did this fail?', h('div', {},
+    h('p', { class: 'small-text', text: PDC.t('gui.autopsy.intro', null, 'Classified from the last run\u2019s recorded events. Nothing is re-run and no model is asked.') }),
+    out, lines), [{ label: 'Close' }], { wide: true });
+}
+
 // On-demand project checks: diagnose (linter/typecheck), webcheck (static web
 // contracts) and domcheck (headless DOM smoke). The server runs the check
 // synchronously and returns its report.
@@ -4603,7 +4620,9 @@ function TopBar() {
                        title=${PDC.t('gui.menu.skills_title', null, 'browse the built-in, user and project skills; write or auto-draft custom ones')} />
             <${MenuItem} label=${PDC.t('gui.menu.procs', null, 'Background servers\u2026')} action=${procsDialog}
                        title=${PDC.t('gui.menu.procs_title', null, 'servers live in the scratchpad while no project is open')} />
-            <${MenuItem} label=${PDC.t('gui.menu.checks', null, 'Run project checks\u2026')} disabled=${!s.root} action=${checksDialog} />
+            <${MenuItem} label=${PDC.t('gui.menu.autopsy', null, 'Why did this fail?\u2026')} disabled=${!s.root} action=${autopsyDialog}
+                        title=${PDC.t('gui.menu.autopsy_title', null, 'classify the last run from its recorded events; read-only, no model call')} />
+             <${MenuItem} label=${PDC.t('gui.menu.checks', null, 'Run project checks\u2026')} disabled=${!s.root} action=${checksDialog} />
             <${MenuItem} label=${PDC.t('gui.menu.prune', null, 'Prune old sessions/backups\u2026')} action=${pruneDialog}
                        title=${PDC.t('gui.menu.prune_title', null, 'prunes the scratchpad while no project is open')} />
             <${MenuItem} label=${PDC.t('gui.menu.reset', null, 'Reset project state\u2026')} disabled=${!!j} action=${resetDialog}

@@ -189,6 +189,8 @@ commands. Run `pedacito <command> --help` for every flag.
 | `pedacito explain PROJ -q "..."` | Answer a question about the code. Never edits |
 | `pedacito auto PROJ -t "..."` | Turn a goal into a checklist, then implement it task by task |
 | `pedacito plan --check [PLAN] [PROJECT]` | Validate a checklist against the index before an Auto or Complex run; `--impact` previews callers and tests. Exit 0 clean/warnings, 1 definite errors, 2 invalid |
+| `pedacito autopsy --last [PROJECT]` | Classify why the last run failed, from its recorded typed events; read-only, no model call. Exit 0 always |
+| `pedacito tools [PROJECT] [--task TEXT]` | Show which tools the model is offered for a task, the reason each is on or off, and its permission; read-only. `--allow-tool NAME` on `ask`/`auto` restores one pruned tool for that task only |
 | `pedacito new DIR -t "..."` | Start a project from scratch |
 | `pedacito chat PROJ` | Interactive session that keeps the index warm (`--rpc` turns the session into a machine protocol) |
 | `pedacito tui PROJ` | Split-screen terminal UI: transcript, live activity/plan sidebar, and a Context Meter / token burn / tok/s telemetry footer. Full slash-command suite; `--headless` is scriptable |
@@ -759,6 +761,42 @@ treated as failures.
 Exit codes: `0` clean or warnings only, `1` definite errors, `2` an invalid
 plan (unreadable, too large, without checklist tasks, or escaping its project).
 Auto and Complex stop only on `1` or `2`; warnings do not block a run.
+
+### `autopsy` and `tools`: why a run failed, and which tools were offered
+
+```bash
+pedacito autopsy --last .                      # classify the most recent run
+pedacito autopsy --run SESSION_ID . --json     # one run or session, as JSON
+pedacito tools . --task "fix the failing test" # tools offered for a task
+pedacito tools . --allow-tool write --json     # preview one pruned tool
+```
+
+`autopsy` reads the typed events a run already wrote under
+`.pedacito/events/` and reports the most severe typed cause: `unread_edit`,
+`format_error`, `truncation`, `schema_rejection`, `test_regression`, `flake`,
+`api_hallucination`, `context_overflow`, `permission_denial`, `timeout`,
+`budget_stop` or `partial_batch`. Ties go to the earliest event. Each cause
+lists its redacted evidence (event id, sequence number, relative clock and a
+few short scalar fields) and next steps. It never calls a model, never re-runs
+anything and never guesses what the model intended. With no typed evidence, or
+with a missing or old log, the answer is `unknown`; `incomplete` marks a run
+with no closing event or with gaps in its sequence. `flake` and
+`api_hallucination` have no emitter in this build, so they are unverified and
+report `unknown`. The GUI Project menu item "Why did this fail?" shows the same
+result through the read-only `GET /api/autopsy` route. `autopsy` exits `0` in
+every case: it reports, it does not judge.
+
+`tools` lists every action the model would be offered for a task. Each row is
+`active`, or names its reason (`config_disabled`, `policy_denied`,
+`missing_dependency`, `not_relevant`, `pruned`, `forced`) and the permission
+it needs. The list comes from the same table as the real schema, and nothing
+runs. `--allow-tool NAME` is repeatable on `ask` and `auto`, and it overrides
+only dynamic pruning. A tool that config, capability, consent or policy
+disables stays off. The override resets when the task ends. In the TUI,
+`/tools [TASK]` shows the same view.
+
+`pedacito tools` reads the configured tier without probing the model server,
+so a tier that only the live server reveals can differ from a running task.
 
 ### `new`: start a project from scratch
 

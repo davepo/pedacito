@@ -1145,6 +1145,8 @@ solo el mapa está desactualizado.
 | `pedacito mcp list` | Muestra las herramientas de los servidores MCP con nombre y sus indicadores de confianza |
 | `pedacito new DIR -t "..."` | Inicia un proyecto desde cero (o `--spec FILE`); `--no-complex` (alias `--single`) desactiva la escalada automática a Complex |
 | `pedacito auto PROJ -t "..."` | Planifica una meta y luego la implementa tarea por tarea |
+| `pedacito autopsy --last PROJ` | Clasifica por qué falló la última ejecución, a partir de sus eventos tipados registrados (solo lectura, sin llamar al modelo; `--json` para scripts) |
+| `pedacito tools PROJ [--task "..."] [--allow-tool NAME]` | Muestra qué herramientas se ofrecen al modelo para una tarea, el motivo de cada una (activa o no) y su permiso; `--allow-tool` restaura una herramienta podada solo para esa tarea |
 | `pedacito plan --check PLAN.md PROJ` | Valida una lista de tareas contra el índice antes de que se ejecute Auto o Complex (`--impact` previsualiza llamadores y pruebas; sale con 0 limpio/advertencias, 1 errores y 2 inválido) |
 | `pedacito restore PROJ` | Deshace la última escritura |
 | `pedacito recover list [PROJ]` | Muestra los diarios de tareas inacabadas por UUID. `recover rollback ID PROJ` previsualiza una reversión vinculada de forma segura; añade `--apply` para realizarla |

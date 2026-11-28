@@ -1199,6 +1199,34 @@ creations and missing tests. An absent index or an unresolved dependency makes
 the preview smaller and explicitly unknown, never green. Warnings do not block;
 only definite errors stop a run, and an invalid plan maps to exit code 2.
 
+### Autopsy and tool availability
+
+`autopsy.autopsy(root, run_id="last")` is a pure function over the local typed
+event logs. It never calls a model. Each category comes from an event that
+the harness already writes with a machine-readable field: a `step` carrying
+`obs_code` (on `step` or the interleaved `tool_result`, set by
+`autopsy.classify_observation` on a fixed harness marker, never on model
+prose), `payload_cut`, `step_rejected`, `gate_error`,
+`verify` (finding kinds `unread` and `syntax`), `task_budget`,
+`incremental_partial`, `llm_error` (`context_overflow` or `schema_rejection`)
+and `test_result`. The most severe category wins, ties go to the earliest
+`seq`, and evidence carries only ids, sequence numbers, the relative clock,
+the kind and a whitelist of short scalar fields, all redacted. A missing or
+old log, or no matching event, yields `unknown`, and `incomplete` marks a run
+with no closing event or a sequence gap. `flake` and `api_hallucination` have
+no emitter in this build and are reported as unverified.
+
+`tools.inspect_tools(cfg, index, task, force=...)` reads the same
+`_offer_rows` table and the same `_prune_optional_actions` pass as
+`schema_for`, so the inspector cannot drift from the schema the model receives.
+Each row carries one reason from `active`, `config_disabled`, `policy_denied`,
+`missing_dependency`, `not_relevant`, `pruned` or `forced`, plus the permission
+it needs. `--allow-tool` (`cfg._force_tools`, set per `ask`/`auto` invocation
+and cleared when the task ends) only keeps tools that dynamic pruning would
+have removed. Config, capability, consent and policy gates never read it, and
+the inspector cannot execute anything. Listing MCP tools for `mcp_call`
+availability starts the named servers, as the real schema build already does.
+
 ## Known limits
 
 These are the real boundaries. Missing harness features are not on this list:

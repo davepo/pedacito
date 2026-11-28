@@ -46,6 +46,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import autopsy as autopsy_mod
 from . import config as config_mod
 from . import diagnostics as diagnostics_mod
 from . import events as events_mod
@@ -103,6 +104,13 @@ _MUTATING = {"write", "append", "move", "delete", "undo", "rename",
 
 # Steps discarded for a cut-off payload before gather gives up.
 _MAX_PAYLOAD_CUTS = 2
+
+
+def _obs_code_fields(obs: str) -> dict:
+    """The typed cause of one observation, for the `step` event (empty when
+    the observation carries no known harness marker)."""
+    code = autopsy_mod.classify_observation(obs)
+    return {"obs_code": code} if code else {}
 
 # Consecutive malformed steps (rejected before dispatch, so they never reach
 # the dispatched-error streak) before gather gives up and answers with what
@@ -2967,6 +2975,7 @@ class Agent:
                 # A plain-word reply with no recognisable action: re-ask once
                 # with the exact format, then give up and move to the answer.
                 malformed_streak += 1
+                self._emit("step_rejected", n=step, reason="malformed")
                 self.steps_log.append(f"{step}. (no action parsed from plain reply)")
                 obs = ("[I could not read an action from your reply. Reply in "
                        "plain words, ONE action only, e.g. `action read / file "
@@ -3019,6 +3028,7 @@ class Agent:
                         break
             if cut:
                 payload_cuts += 1
+                self._emit("payload_cut", n=step, field=cut)
                 self.steps_log.append(
                     f"{step}. (discarded: `{cut}` payload cut off; NOT "
                     f"executed)")
@@ -3084,6 +3094,7 @@ class Agent:
                 budget = max(0, budget - len(obs))
                 self._fit(messages, gclient)
                 malformed_streak += 1
+                self._emit("step_rejected", n=step, reason="malformed")
                 if verbose:
                     print("  [step rejected: `read` (no file) -- no file or "
                           f"symbol given ({malformed_streak}/"
@@ -3490,7 +3501,8 @@ class Agent:
                 item = f"--- {action} {arg} failed: {obs[:160]}"
                 gathered.append(item)
                 self._emit("step", n=step, action=action, detail=arg[:120],
-                           obs_chars=len(obs), error=True)
+                           obs_chars=len(obs), error=True,
+                           **_obs_code_fields(obs))
                 messages.append({"role": "assistant", "content": _compact(stepjson)})
                 messages.append({"role": "user",
                                  "content": f"{obs}\n\n{nudge(step + 1)}"})
@@ -3610,7 +3622,8 @@ class Agent:
                 # lines, not the requested ones.
                 self._record_evidence(obs, step)
             self._emit("step", n=step, action=action, detail=str(detail)[:120],
-                       obs_chars=len(obs), duplicate=duplicate_read)
+                       obs_chars=len(obs), duplicate=duplicate_read,
+                       **_obs_code_fields(obs))
             messages.append({"role": "assistant", "content": _compact(stepjson)})
             messages.append({"role": "user",
                              "content": f"RESULT:\n{obs}\n\n{nudge(step + 1)}"})

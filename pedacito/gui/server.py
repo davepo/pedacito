@@ -1225,6 +1225,26 @@ def _settings(q, body=None):
     return 200, settings_api.payload()
 
 
+@get("/api/autopsy")
+def _autopsy(q, body=None):
+    """"Why did this fail?": the same pure autopsy `pdc autopsy --last` runs,
+    over the open project's typed event logs. Read-only; no model call."""
+    from .. import autopsy as autopsy_mod
+    root = _project_root()
+    if root is None:
+        return 400, {"ok": False, "detail": i18n.t("gui.autopsy.no_project")}
+    run_id = str((q.get("run") or ["last"])[0] or "last").strip()[:200]
+    result = autopsy_mod.autopsy(Path(root), run_id or "last")
+    out = autopsy_mod.payload(result)
+    out["ok"] = True
+    out["label"] = i18n.t(f"autopsy.category.{result.category}")
+    out["next_labels"] = [i18n.t(f"autopsy.next.{code}")
+                          for code in result.next_steps]
+    out["evidence_lines"] = [autopsy_mod.render_evidence(item)
+                             for item in result.evidence]
+    return 200, out
+
+
 # --- non-blocking secret & credential guard ------------------------------------
 
 def _security_cfg():

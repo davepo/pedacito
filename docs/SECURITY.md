@@ -782,6 +782,20 @@ These are real boundaries. Read them before you rely on Pedacito for untrusted c
 - **The sandbox is defence in depth, not a promise against a determined adversary or a
   kernel bug.**
 
+## Autopsy, tool inspector and `--allow-tool`
+
+- `pedacito autopsy`, the GUI "Why did this fail?" item and `GET /api/autopsy` only read
+  the local typed event logs. They store and show redacted ids, sequence numbers, kinds and
+  short scalar fields, never raw observations, prompts, tool output, server bodies or
+  credentials. A missing or old log yields `unknown`, which is not proof that nothing failed.
+- `pedacito tools` and the TUI `/tools` command evaluate the same gates as the real schema
+  and run nothing. Listing MCP tools for an `mcp_call` offer still starts the configured
+  servers, as the real schema build does.
+- `--allow-tool NAME` (on `ask` and `auto`, task-local) restores only a tool that dynamic
+  pruning removed. It never overrides `allow_*` settings, the capability and consent gates,
+  project trust, the policy engine or the permission broker. An allowed tool still asks for
+  each permission it needs.
+
 ## Reporting a vulnerability
 
 Please open a private security advisory on the GitHub repository, or email

@@ -55,6 +55,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from html import unescape as _html_unescape
 from html.parser import HTMLParser
@@ -397,13 +398,20 @@ _PRUNE_TRIGGERS = {
 }
 
 
-def _prune_optional_actions(cfg, actions: list[str]) -> list[str]:
+def _prune_optional_actions(cfg, actions: list[str], *,
+                            force: tuple[str, ...] = (),
+                            pruned: list[str] | None = None,
+                            forced: list[str] | None = None) -> list[str]:
     """Drop enabled-but-stale optional actions from the prompt schema.
 
     A tool is pruned only when dynamic_tool_pruning is on, the repository has
     reached the task threshold, the tool has gone unused that long, and the
     current task text contains none of its trigger words. Core actions are
     never candidates; config-disabled actions are already absent.
+
+    `force` (the task's `--allow-tool` names) keeps a pruned action; it never
+    touches anything else. `pruned` and `forced` collect what was removed and
+    what was kept only because of `force`, for the inspector.
     """
     if not getattr(cfg, "dynamic_tool_pruning", True):
         return actions
@@ -434,7 +442,15 @@ def _prune_optional_actions(cfg, actions: list[str]) -> list[str]:
         if _PRUNE_TRIGGERS[action].search(prompt):
             kept.append(action)
             continue
-        # stale and untriggered: omit its schema and its help entry
+        # stale and untriggered: omit its schema and its help entry, unless
+        # the task explicitly allows it (--allow-tool)
+        if action in force:
+            kept.append(action)
+            if forced is not None:
+                forced.append(action)
+            continue
+        if pruned is not None:
+            pruned.append(action)
     return kept
 
 
@@ -794,100 +810,173 @@ def build_gather_json_schema(allowed_actions: list[str],
     return schema
 
 
+def _offer_rows(cfg) -> list[tuple[str, str | None]]:
+    """Every action this run could offer, in schema order, each paired with
+    None when its gate passes or with the reason it is absent. `schema_for`
+    and `inspect_tools` both read this table, so the schema the model sees and
+    the inspector's view cannot disagree.
+
+    On compact tiers `git` already covers `git diff`/`git status`, so the
+    overlapping `git_diff` alias is omitted; a tiny profile keeps the small
+    core, and `rename`/`remember`/`task`/`fetch` wait for the larger tiers.
+    """
+    from .prompts import pack_for
+    pack = pack_for(cfg)
+    tiny = pack == "tiny"
+    compact_tier = pack in ("tiny", "small")
+    rows: list[tuple[str, str | None]] = []
+
+    def gate(action: str, ok: bool, reason: str = "config_disabled") -> None:
+        rows.append((action, None if ok else reason))
+
+    for action in ("read", "grep", "find", "callers", "context", "outline",
+                   "usages", "sessions", "todo"):
+        gate(action, True)
+    gate("diff", bool(getattr(cfg, "allow_diff", True)))
+    allow_git = bool(getattr(cfg, "allow_git", True))
+    git_ok = allow_git and not tiny and bool(getattr(cfg, "_is_git", True))
+    git_reason = ("config_disabled" if not allow_git
+                  else "policy_denied" if tiny else "missing_dependency")
+    gate("git", git_ok, git_reason)
+    gate(GIT_DIFF_ACTION, git_ok and not compact_tier,
+         git_reason if not git_ok else "policy_denied")
+    allow_shell = bool(getattr(cfg, "allow_shell", False))
+    gate("run", allow_shell)
+    gate("diagnose", allow_shell)
+    # Scoped, sandboxed pytest runner for the gather phase: offered when the
+    # repo has tests or the task text names a failure. Runtime gates (path
+    # validation, no shell, broker when the setting is off) live in
+    # tool_run_test itself.
+    gate(RUN_TEST_ACTION, _run_test_offered(cfg), "not_relevant")
+    gate("serve", bool(getattr(cfg, "allow_serve", False)))
+    allow_write = bool(getattr(cfg, "allow_write", False))
+    for action in ("write", "append", "move", "delete"):
+        gate(action, allow_write)
+    # On tiny/small tiers keep the deterministic AST-gated `rename_symbol`
+    # and drop the overlapping legacy `rename` alias.
+    gate("rename", allow_write and not compact_tier,
+         "config_disabled" if not allow_write else "policy_denied")
+    gate("rename_symbol", allow_write)
+    # `undo` can only work from the task's snapshot dir; offering it with
+    # backups off would promise a recovery that cannot happen.
+    gate("undo", allow_write and bool(getattr(cfg, "backup", False)),
+         "config_disabled" if not allow_write else "missing_dependency")
+    gate("screenshot", bool(getattr(cfg, "allow_screenshots", False)))
+    gate("browser", bool(getattr(cfg, "allow_browser", False)))
+    use_memory = bool(getattr(cfg, "use_memory", True))
+    gate("remember", use_memory and not tiny,
+         "config_disabled" if not use_memory else "policy_denied")
+    use_skills = bool(getattr(cfg, "use_skills", True))
+    skills_ok = pack == "full" and _skills_exist(cfg)
+    gate("skill", skills_ok,
+         "config_disabled" if not use_skills
+         else "policy_denied" if pack != "full" else "missing_dependency")
+    allow_subagents = bool(getattr(cfg, "allow_subagents", False))
+    task_ok = allow_subagents and (
+        not tiny
+        or bool(str(getattr(cfg, "scout_profile", "") or "").strip())
+        or bool(_PRUNE_TRIGGERS["task"].search(
+            str(getattr(cfg, "_task_text", "") or ""))))
+    # A tiny profile gets `task` only when the task text asks for a
+    # subagent/delegate/research, unless a scout profile is available to
+    # absorb the child's lookups without touching the architect's slot.
+    gate("task", task_ok,
+         "config_disabled" if not allow_subagents else "not_relevant")
+    web_offered = bool(getattr(cfg, "enable_web", False)) or bool(
+        _WEB_PROMPT_RE.search(str(getattr(cfg, "_task_text", "") or "")))
+    allow_fetch = bool(getattr(cfg, "allow_fetch", False))
+    gate("fetch", allow_fetch and not tiny and not (compact_tier and web_offered),
+         "config_disabled" if not allow_fetch else "policy_denied")
+    # The built-in web tools: offered when enabled or when the task text
+    # names a URL / web intent; each call still asks the broker while
+    # enable_web is off (see fetch_url / web_search).
+    gate(FETCH_URL_ACTION, web_offered, "not_relevant")
+    gate(WEB_SEARCH_ACTION, web_offered, "not_relevant")
+    gate("question", bool(getattr(cfg, "_interactive", False)),
+         "missing_dependency")
+    mcp_call_on = _mcp_call_offered(cfg)
+    allow_mcp = bool(getattr(cfg, "allow_mcp", False))
+    gate("mcp", allow_mcp and not (compact_tier and mcp_call_on),
+         "config_disabled" if not allow_mcp else "policy_denied")
+    # The named-server path: offered only when at least one listed tool
+    # matches the task (see _mcp_relevant_tools). Calls on servers not
+    # marked `trusted` ask the permission broker first (tool_mcp_call).
+    gate(MCP_CALL_ACTION, mcp_call_on,
+         "config_disabled" if not getattr(cfg, "enable_mcp", True)
+         else "missing_dependency" if not _named_mcp_servers(cfg)
+         else "not_relevant")
+    gate("lsp", bool(getattr(cfg, "allow_lsp", False)))
+    # Read-only static API lookup for a library the task names exactly.
+    # Offered only when the project's manifests declare that library, so
+    # unaffected tasks keep the existing schema byte-for-byte.
+    gate(API_ACTION, _api_offered(cfg), "not_relevant")
+    # Opt-in local/hosted image generation: offered only when an image
+    # profile is configured and either allow_image_gen is on or the
+    # permission broker is live (each call is then approved individually).
+    image_ok = _image_gen_offered(cfg)
+    gate(GENERATE_IMAGE_ACTION, image_ok,
+         "config_disabled" if _has_image_profile(cfg) else "missing_dependency")
+    gate("done", True)
+    return rows
+
+
+def _named_mcp_servers(cfg) -> list:
+    try:
+        from . import mcp
+        return list(mcp.named_servers(cfg) or [])
+    except Exception:
+        return []
+
+
+def _has_image_profile(cfg) -> bool:
+    try:
+        from . import imagegen
+        return bool(imagegen.has_image_profile(cfg))
+    except Exception:
+        return False
+
+
+def _session_force(cfg) -> tuple[str, ...]:
+    """The task-local `--allow-tool` names currently set on this config."""
+    return tuple(str(name) for name in (getattr(cfg, "_force_tools", ()) or ()))
+
+
+def _resolve_actions(cfg, task: str | None, force: tuple[str, ...] = ()):
+    """(rows, active, pruned, forced) for one run. `task` None reads the
+    config's own task text; a string evaluates that task without leaving it
+    on the config."""
+    had_task = hasattr(cfg, "_task_text")
+    prev = getattr(cfg, "_task_text", None)
+    if task is not None:
+        cfg._task_text = task
+    try:
+        rows = _offer_rows(cfg)
+        offered = [name for name, absent in rows if absent is None]
+        pruned: list[str] = []
+        forced: list[str] = []
+        active = _prune_optional_actions(cfg, offered, force=tuple(force),
+                                         pruned=pruned, forced=forced)
+    finally:
+        if task is not None:
+            if had_task:
+                cfg._task_text = prev
+            else:
+                try:
+                    delattr(cfg, "_task_text")
+                except AttributeError:
+                    pass
+    return rows, active, pruned, forced
+
+
 def schema_for(cfg) -> dict:
     """Return STEP_SCHEMA narrowed to the actions this run allows, so the
     model cannot pick a disabled action. Fields only a disabled action uses
     (`to`, `command`) are dropped too. A tiny pack keeps the small core plus
     `context`: a 4B model never sees two dozen tools. `step_reasoning_first`
-    moves `reasoning` to the front."""
-    from .prompts import pack_for
-    pack = pack_for(cfg)
-    tiny = pack == "tiny"
-    compact_tier = pack in ("tiny", "small")
-    actions = ["read", "grep", "find", "callers"]
-    actions.append("context")
-    actions += ["outline", "usages", "sessions", "todo"]
-    if getattr(cfg, "allow_diff", True):
-        actions.append("diff")
-    if getattr(cfg, "allow_git", True) and not tiny \
-            and getattr(cfg, "_is_git", True):
-        actions.append("git")
-        # On compact tiers `git` already covers `git diff`/`git status`;
-        # omit the overlapping `git_diff` alias to shrink the tool grammar.
-        if not compact_tier:
-            actions.append(GIT_DIFF_ACTION)
-    if getattr(cfg, "allow_shell", False):
-        actions += ["run", "diagnose"]
-    if _run_test_offered(cfg):
-        # Scoped, sandboxed pytest runner for the gather phase: offered when
-        # the repo has tests or the task text names a failure. Runtime gates
-        # (path validation, no shell, broker when the setting is off) live in
-        # tool_run_test itself.
-        actions.append(RUN_TEST_ACTION)
-    if getattr(cfg, "allow_serve", False):
-        actions.append("serve")
-    if getattr(cfg, "allow_write", False):
-        actions += ["write", "append", "move", "delete"]
-        # On tiny/small tiers keep the deterministic AST-gated `rename_symbol`
-        # and drop the overlapping legacy `rename` alias.
-        if not compact_tier:
-            actions.append("rename")
-        actions.append("rename_symbol")
-        if getattr(cfg, "backup", False):
-            # `undo` can only work from the task's snapshot dir; offering it
-            # with backups off would promise a recovery that cannot happen.
-            actions.append("undo")
-    if getattr(cfg, "allow_screenshots", False):
-        actions.append("screenshot")
-    if getattr(cfg, "allow_browser", False):
-        actions.append("browser")
-    if getattr(cfg, "use_memory", True) and not tiny:
-        actions.append("remember")
-    if pack == "full" and _skills_exist(cfg):
-        actions.append("skill")
-    if getattr(cfg, "allow_subagents", False) and (
-            not tiny
-            or str(getattr(cfg, "scout_profile", "") or "").strip()
-            or _PRUNE_TRIGGERS["task"].search(
-                str(getattr(cfg, "_task_text", "") or ""))):
-        # A tiny profile gets `task` only when the task text asks for a
-        # subagent/delegate/research, unless a scout profile is available to
-        # absorb the child's lookups without touching the architect's slot.
-        actions.append("task")
-    web_offered = bool(getattr(cfg, "enable_web", False)) or bool(
-        _WEB_PROMPT_RE.search(str(getattr(cfg, "_task_text", "") or "")))
-    if getattr(cfg, "allow_fetch", False) and not tiny \
-            and not (compact_tier and web_offered):
-        actions.append("fetch")
-    if web_offered:
-        # the built-in web tools: offered when enabled or when the task text
-        # names a URL / web intent; each call still asks the broker while
-        # enable_web is off (see fetch_url / web_search below).
-        actions += [FETCH_URL_ACTION, WEB_SEARCH_ACTION]
-    if getattr(cfg, "_interactive", False):
-        actions.append("question")
-    mcp_call_on = _mcp_call_offered(cfg)
-    if getattr(cfg, "allow_mcp", False) and not (compact_tier and mcp_call_on):
-        actions.append("mcp")
-    if mcp_call_on:
-        # The named-server path: offered only when at least one listed tool
-        # matches the task (see _mcp_relevant_tools). Calls on servers not
-        # marked `trusted` ask the permission broker first (tool_mcp_call).
-        actions.append(MCP_CALL_ACTION)
-    if getattr(cfg, "allow_lsp", False):
-        actions.append("lsp")
-    if _api_offered(cfg):
-        # Read-only static API lookup for a library the task names exactly.
-        # Offered only when the project's manifests declare that library, so
-        # unaffected tasks keep the existing schema byte-for-byte.
-        actions.append(API_ACTION)
-    if _image_gen_offered(cfg):
-        # Opt-in local/hosted image generation: offered only when an image
-        # profile is configured and either allow_image_gen is on or the
-        # permission broker is live (each call is then approved individually).
-        actions.append(GENERATE_IMAGE_ACTION)
-    actions.append("done")
-    actions = _prune_optional_actions(cfg, actions)
+    moves `reasoning` to the front. The action set comes from `_offer_rows`,
+    the same table `inspect_tools` reads."""
+    _rows, actions, _pruned, _forced = _resolve_actions(
+        cfg, None, _session_force(cfg))
 
     # Which fields no enabled action can use (computed from the tool opt-ins,
     # exactly as before, so default schemas stay byte-identical for the warm
@@ -904,6 +993,71 @@ def schema_for(cfg) -> dict:
     return build_gather_json_schema(
         actions, reasoning_first(cfg),
         compact=bool(getattr(cfg, "compact_step_schema", False)), drop=drop)
+
+
+ACTION_PERMISSION = {
+    "read": "none", "grep": "none", "find": "none", "callers": "none",
+    "context": "none", "outline": "none", "usages": "none",
+    "sessions": "none", "todo": "none", "done": "none",
+    "diff": "allow_diff", "git": "allow_git", "git_diff": "allow_git",
+    "run": "allow_shell", "diagnose": "allow_shell",
+    "run_test": "enable_run_test_in_gather or broker",
+    "serve": "allow_serve",
+    "write": "allow_write", "append": "allow_write", "move": "allow_write",
+    "delete": "allow_write", "rename": "allow_write",
+    "rename_symbol": "allow_write", "undo": "allow_write",
+    "screenshot": "allow_screenshots", "browser": "allow_browser",
+    "remember": "use_memory", "skill": "use_skills",
+    "task": "allow_subagents", "fetch": "allow_fetch",
+    "fetch_url": "enable_web or broker", "web_search": "enable_web or broker",
+    "question": "interactive session", "mcp": "allow_mcp",
+    "mcp_call": "enable_mcp and trusted server or broker",
+    "lsp": "allow_lsp", "api": "none", "generate_image": "allow_image_gen or broker",
+}
+
+TOOL_REASONS = ("active", "config_disabled", "policy_denied",
+                "missing_dependency", "not_relevant", "pruned", "forced")
+
+
+@dataclass(frozen=True)
+class ToolAvailability:
+    """One action's status for a task: whether the model is offered it, why
+    not, and the permission it would need. Built from the same table as
+    `schema_for`."""
+
+    name: str
+    active: bool
+    reason: str
+    permission: str
+
+
+def inspect_tools(cfg, index, task: str, *,
+                  force: tuple[str, ...] = ()) -> tuple[ToolAvailability, ...]:
+    """Availability of every action for `task`, read-only: nothing is run.
+
+    The result is exactly the action set `schema_for` would send for the same
+    task and `force`. `force` (the `--allow-tool` names) restores only actions
+    that dynamic pruning removed; config, capability, consent and policy gates
+    are unchanged. `index` is accepted for the planner's signature; the
+    availability does not read it.
+    """
+    rows, active, _pruned, forced = _resolve_actions(
+        cfg, str(task or ""), tuple(force or ()))
+    live = set(active)
+    out: list[ToolAvailability] = []
+    for name, absent in rows:
+        if absent is not None:
+            reason, ok = absent, False
+        elif name in forced:
+            reason, ok = "forced", True
+        elif name in live:
+            reason, ok = "active", True
+        else:
+            reason, ok = "pruned", False
+        out.append(ToolAvailability(
+            name=name, active=ok, reason=reason,
+            permission=ACTION_PERMISSION.get(name, "none")))
+    return tuple(out)
 
 
 def _as_text(value) -> str:
@@ -4510,6 +4664,7 @@ def _maybe_run_test_node(root: Path, cfg, tgt: str, filt: str):
                                cfg, kind="test")
     except Exception:
         pass
+    _emit_test_result(root, cfg, rc, stopped)
 
     raw = (out or "").strip()
     if stopped == "timeout":
@@ -4647,6 +4802,19 @@ def _polyglot_test_argv(root: Path, cfg, target: str,
     return None
 
 
+def _emit_test_result(root: Path, cfg, rc, stopped) -> None:
+    """Typed `test_result` event for autopsy: outcome and stop reason only,
+    never the test output. Never raises."""
+    try:
+        from . import events as events_mod
+        events_mod.get(root, cfg).emit(
+            "test_result", ok=bool(rc == 0 and not stopped),
+            stopped=str(stopped or ""),
+            rc=int(rc) if isinstance(rc, int) else -1)
+    except Exception:  # noqa: BLE001 - the event is best-effort
+        pass
+
+
 def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
                        display: str) -> str:
     """Execute one non-Python scoped test argv with the shared safety net:
@@ -4677,6 +4845,7 @@ def _run_polyglot_test(root: Path, cfg, argv: list[str], kind: str,
                                cfg, kind="test")
     except Exception:  # noqa: BLE001, S110 - evidence is best-effort
         pass
+    _emit_test_result(root, cfg, rc, stopped)
 
     raw = (out or "").strip()
     if stopped == "timeout":
@@ -4921,6 +5090,7 @@ def tool_run_test(index, cfg, target: str = "", k_filter: str = "") -> str:
                                cfg, kind="test")
     except Exception:
         pass
+    _emit_test_result(root, cfg, rc, stopped)
 
     raw = (out or "").strip()
     if stopped == "timeout":
